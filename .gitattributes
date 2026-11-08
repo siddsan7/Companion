@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Fixtures are byte-level producer contracts.
+tests/fixtures/** text eol=lf

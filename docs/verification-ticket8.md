@@ -27,7 +27,7 @@ The approved acceptance seam is the desktop workflow plus resulting files/histor
 | App Server exit before acknowledgement fixture | Passed | Root observed the generic-incomplete red, then a six-test green. Lost acknowledgement records an interrupted local terminal without replay. Connection closure also clears one-time sign-in UI. |
 | History write failure before provider submission | Passed | Independent review found the first history write outside cleanup. Root observed the public desktop red (Interrupt remained enabled). The first write is now inside protected cleanup: local failed state, inactive controls, no `turn/start`, and capture remains usable. |
 | Final scoped desktop suite | Passed | After the final production edit, root ran `npm.cmd test -- tests/codex.spec.js`: seven passed in 1.1 minutes, including the reviewer's file-failure case. All fourteen relevant JS files passed syntax checks. |
-| Integrated desktop/release checks | Pending root integration | Root will checkpoint the reviewed slice, synchronize the current integration branch, and run combined capture/brief/import/Codex checks. No merge to main or deployment is authorized by these scoped results. |
+| Combined desktop checks | Passed | Synchronized with reviewed intake/brief integration in `5441c14`. After pinning byte-contract draft fixtures to LF, all 43 cases completed: 42 passed and one Windows file-symlink capability skip (5.8 minutes). The first combined run exposed only checkout-induced CRLF fixture drift; assertions and production behavior stayed unchanged. No merge to main or release readiness follows from these results. |
 
 ## Runtime and checks
 
@@ -43,7 +43,7 @@ Probe selection was evidence-driven: PowerShell initialization failed with `8009
 
 The isolation certificate is process-local, visibly expires after ten minutes, and is invalidated by changed executable/config/root/account evidence. A fixture can enable the synthetic test control but can never set live `ready`. A completed live synthetic turn also leaves `ready:false` until independent prompt/tool inventory evidence is established. Persistent readiness data is evidence, never an imported certificate.
 
-Root ran `npm.cmd test -- tests/codex.spec.js` after the final production edit: seven passed. Syntax checks passed for the new modules/scripts and bootstrap files. Combined capture regression and final integration diff review remain root-owned checks after synchronization. The user deferred signed-in live checks to #16; fixture success does not change their pending status or enable chat readiness.
+Root ran `npm.cmd test -- tests/codex.spec.js` after the final production edit: seven passed. Syntax checks passed for the new modules/scripts and bootstrap files. The synchronized combined suite passed 42 tests with one file-symlink capability skip. Exact-commit independent approval remains required before integration. The user deferred signed-in live checks to #16; fixture success does not change their pending status or enable chat readiness.
 
 ## Reviewable live flow
 
