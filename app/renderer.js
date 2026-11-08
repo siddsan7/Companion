@@ -7,6 +7,7 @@ async function refresh() {
   state = await window.companion.state(); $('location').textContent = state.location || 'Choose your vault and a parent folder to begin.';
   $('warnings').textContent = [...new Set(state.warnings)].join(' ');
   window.intakeView.render(state.intake);
+  await window.intakeView.repairs();
   $('timezone').textContent = `${view === 'today' ? 'Today' : 'All captures'} · ${state.timezone} · ${day(state.now, state.timezone)}`;
   $('captures').replaceChildren();
   const query = $('search').value.toLowerCase();

@@ -15,7 +15,8 @@ function noteText(capture, revision) {
 class Intake {
   constructor(vault) { this.vault = vault; this.dir = path.join(vault.root, '.intake'); }
   async setup() {
-    await this.vault.writable(); await fs.mkdir(this.dir, { recursive: true }); await this.vault.contained(this.dir); await this.vault.contained(path.join(this.vault.root, 'Revisions'));
+    try { await this.vault.writable(); await fs.mkdir(this.dir, { recursive: true }); await this.vault.contained(this.dir); await this.vault.contained(path.join(this.vault.root, 'Revisions')); }
+    catch (error) { throw Error('Vault access failure. Restore access to the configured vault and Companion folders, then Refresh. Existing notes and intake history were preserved; no missing-note removal was inferred.', { cause: error }); }
   }
   async load() {
     const text = await read(path.join(this.dir, 'ledger.json')); if (text === null) return empty();
@@ -38,7 +39,7 @@ class Intake {
   }
   async info() {
     await this.setup();
-    try { return await this.locked(() => this.load()); } catch (error) { if (error.message.includes('already running')) return this.load(); throw error; }
+    try { return await this.locked(async () => { await this.syncMoves(); return this.load(); }); } catch (error) { if (error.message.includes('already running')) return this.load(); throw error; }
   }
   async connect(folder, scan, now) {
     if (typeof folder !== 'string' || !path.isAbsolute(folder)) throw Error('Choose an absolute draft source folder.');
@@ -61,6 +62,7 @@ class Intake {
   }
   async reconcile({ trigger = 'manual', now = new Date().toISOString() } = {}) {
     return this.locked(async () => {
+      await this.syncMoves();
       await this.retryPending();
       let ledger = await this.load(); const seen = new Map(), ready = [];
       ledger.lastCheck = { at: now, trigger, status: 'running' }; await this.save(ledger);
@@ -98,6 +100,8 @@ class Intake {
     });
   }
   async admit(ledger, draft, key, now) {
+    if (ledger.suppressed.includes(draft.sourceHash)) throw Error('Automatic re-import is suppressed. Restore this source explicitly before intake.');
+    if (ledger.captures[draft.sourceHash]?.identityIssue) throw Error(ledger.captures[draft.sourceHash].identityIssue);
     if (ledger.blocks[draft.sourceHash]) throw Error(ledger.blocks[draft.sourceHash].reason);
     if (ledger.pending[draft.sourceHash]) throw Error(ledger.pending[draft.sourceHash].reason);
     const prior = ledger.attempts[draft.identity];
@@ -116,20 +120,27 @@ class Intake {
     const revision = { schema: 1, id: revisionId, captureId: id, importedAt: now, ...draft };
     const file = capture?.file || `${id}.md`;
     if (path.basename(file) !== file) throw Error('Invalid intake destination identity. Preserve ledger for repair.');
-    const destination = path.join(this.vault.root, 'Captures', file), current = await read(destination);
-    if (capture && (current === null || hash(current) !== capture.currentHash)) throw Error('Destination changed outside Companion or is missing. Local content and incoming source are preserved; repair the note before retrying.');
+    const destination = this.destination(capture || { file }), current = await read(destination);
+    const externalConflict = !!capture && (current === null || hash(current) !== capture.currentHash);
     if (!capture && current !== null) throw Error('Destination already exists. Resolve its identity before intake.');
     capture = { ...capture, id, file, capturedAt: capture?.capturedAt || new Date(now).toISOString(), title: capture?.title || draft.target.title.replace(/[\r\n]/g, ' '), currentRevision: revisionId, revisions: [...(capture?.revisions || []), revisionId], updatedAt: now };
     const content = noteText(capture, revision); capture.currentHash = hash(content);
-    const transaction = { schema: 1, key, sourceHash: draft.sourceHash, capture, revision, content, previousHash: current === null ? null : hash(current), previous: current, backup: `${id}-${revisionId}.before.md` };
+    const transaction = { schema: 1, externalConflict, key, sourceHash: draft.sourceHash, capture, revision, content, previousHash: current === null ? null : hash(current), previous: current, backup: `${id}-${revisionId}.before.md` };
     await this.publishJournal(path.join(this.dir, 'transaction.json'), transaction);
     await this.vault.checkpoint('intake-journaled');
+    if (externalConflict) throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
     await this.finish(transaction, ledger);
+  }
+  destination(capture) {
+    if (!capture.relative) return path.join(this.vault.root, 'Captures', capture.file);
+    if (typeof capture.relative !== 'string' || path.isAbsolute(capture.relative) || capture.relative.split(/[\\/]/).some(part => !part || part === '.' || part === '..') || !capture.relative.endsWith('.md')) throw Error('Invalid moved capture path. Preserve intake history for repair.');
+    return path.join(this.vault.vault, capture.relative);
   }
   validateTransaction(tx) {
     const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
     try {
-      if (tx.schema !== 1 || typeof tx.content !== 'string' || !tx.capture || !tx.revision || !uuid.test(tx.capture.id) || !uuid.test(tx.revision.id) || !/^[a-f0-9]{64}$/.test(tx.sourceHash) || typeof tx.key !== 'string' || !uuid.test(tx.key.split(':')[0]) || tx.capture.file !== `${tx.capture.id}.md` || tx.backup !== `${tx.capture.id}-${tx.revision.id}.before.md` || tx.capture.currentHash !== hash(tx.content) || tx.revision.captureId !== tx.capture.id || tx.revision.sourceHash !== tx.sourceHash || tx.content !== noteText(tx.capture, tx.revision) || (tx.previous === null ? tx.previousHash !== null : typeof tx.previous !== 'string' || hash(tx.previous) !== tx.previousHash)) throw Error();
+      this.destination(tx.capture);
+      if (tx.schema !== 1 || typeof tx.content !== 'string' || !tx.capture || !tx.revision || !uuid.test(tx.capture.id) || !uuid.test(tx.revision.id) || !/^[a-f0-9]{64}$/.test(tx.sourceHash) || typeof tx.key !== 'string' || !uuid.test(tx.key.split(':')[0]) || tx.capture.file !== `${tx.capture.id}.md` || (tx.resolution ? !uuid.test(tx.resolution) || tx.backup !== `${tx.capture.id}-${tx.revision.id}.before-${tx.resolution}.md` : tx.backup !== `${tx.capture.id}-${tx.revision.id}.before.md`) || tx.capture.currentHash !== hash(tx.content) || tx.revision.captureId !== tx.capture.id || tx.revision.sourceHash !== tx.sourceHash || tx.content !== noteText(tx.capture, tx.revision) || (tx.previous === null ? tx.previousHash !== null : typeof tx.previous !== 'string' || hash(tx.previous) !== tx.previousHash)) throw Error();
     } catch { throw Error('Invalid intake recovery journal. Files were preserved for repair.'); }
   }
   async ownedFile(file, peers, label) {
@@ -149,7 +160,8 @@ class Intake {
   }
   async finish(tx, ledger) {
     this.validateTransaction(tx);
-    const destination = path.join(this.vault.root, 'Captures', tx.capture.file), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
+    await this.vault.contained(path.dirname(this.destination(tx.capture)));
+    const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
     const immutable = async (file, content) => {
       try { await fs.writeFile(file, content, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(file) !== content) throw Error('Immutable import file conflicts. Preserve the vault for repair.'); }
     };
@@ -211,12 +223,16 @@ class Intake {
     await fs.unlink(path.join(this.dir, 'transaction.json'));
   }
   async recover() {
+    await this.finishLink();
+    await this.finishAnnotation();
+    await this.finishRepair();
     await this.finishTitleIntent();
     const text = await read(path.join(this.dir, 'transaction.json')); if (text === null) return;
     let tx; try { tx = JSON.parse(text); } catch { throw Error('Unreadable intake recovery journal. Preserve .intake for repair before retrying.'); }
     this.validateTransaction(tx);
     const ledger = await this.load();
-    if (ledger.blocks[tx.sourceHash]) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
+    if (tx.externalConflict && !ledger.blocks[tx.sourceHash]) return this.archiveConflict(tx, ledger, 'Destination changed outside Companion. Both versions were preserved.');
+    if (ledger.blocks[tx.sourceHash] && !tx.restore) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
     if (ledger.pending[tx.sourceHash]) return this.defer(tx, ledger, ledger.pending[tx.sourceHash].reason);
     try { await this.finish(tx, ledger); } catch (error) {
       if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
@@ -226,7 +242,7 @@ class Intake {
   }
   async defer(tx, ledger, reason) {
     this.validateTransaction(tx);
-    const name = `pending-${tx.revision.id}.json`, journal = path.join(this.dir, 'transaction.json');
+    const name = `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`, journal = path.join(this.dir, 'transaction.json');
     ledger.pending[tx.sourceHash] = { journal: name, reason, key: tx.key };
     ledger.outcomes[tx.key] = { status: 'held', reason, locator: tx.revision.locator, sourceHash: tx.sourceHash, pendingRevision: tx.revision.id };
     await this.save(ledger);
@@ -236,9 +252,10 @@ class Intake {
   async retryPending() {
     let ledger = await this.load();
     for (const [sourceHash, pending] of Object.entries(ledger.pending)) {
-      if (!/^pending-[a-f0-9-]{36}\.json$/.test(pending.journal)) throw Error('Invalid deferred intake journal identity. Preserve .intake for repair.');
+      if (ledger.suppressed.includes(sourceHash)) continue;
+      if (!/^pending-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(pending.journal)) throw Error('Invalid deferred intake journal identity. Preserve .intake for repair.');
       let tx; try { tx = JSON.parse(await fs.readFile(path.join(this.dir, pending.journal), 'utf8')); } catch { throw Error('Deferred intake journal is unreadable. Preserve .intake for repair.'); }
-      this.validateTransaction(tx); if (tx.sourceHash !== sourceHash || pending.journal !== `pending-${tx.revision.id}.json`) throw Error('Deferred intake identity does not match its journal.');
+      this.validateTransaction(tx); if (tx.sourceHash !== sourceHash || pending.journal !== `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`) throw Error('Deferred intake identity does not match its journal.');
       // Every retry has the same active recovery seam as first publication.
       // A crash while turning a pending item into a conflict remains recoverable.
       await fs.link(path.join(this.dir, pending.journal), path.join(this.dir, 'transaction.json'));
@@ -258,7 +275,7 @@ class Intake {
     this.validateTransaction(tx);
     await this.setup();
     const reason = `${message} Updates to this source are paused for explicit conflict repair.`;
-    const archive = `conflict-${tx.revision.id}.json`, journal = path.join(this.dir, 'transaction.json');
+    const archive = `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`, journal = path.join(this.dir, 'transaction.json');
     ledger.blocks[tx.sourceHash] = { reason, journal: archive, incomingRevision: tx.revision.id };
     delete ledger.pending[tx.sourceHash];
     if (ledger.captures[tx.sourceHash]) ledger.captures[tx.sourceHash].conflict = reason;
@@ -266,7 +283,7 @@ class Intake {
     await this.save(ledger);
     try { await fs.link(journal, path.join(this.dir, archive)); } catch (error) { if (error.code !== 'EEXIST' || await read(journal) !== await read(path.join(this.dir, archive))) throw Error('Conflict archive already exists with different content. All files were preserved for repair.'); }
     await fs.unlink(journal);
-    const destination = path.join(this.vault.root, 'Captures', tx.capture.file), backup = path.join(this.dir, tx.backup);
+    const destination = this.destination(tx.capture), backup = path.join(this.dir, tx.backup);
     const present = await fs.lstat(destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
     if (tx.previousHash !== null && !present) {
       try {
@@ -321,4 +338,5 @@ class Intake {
     return { capture, revisions };
   }
 }
+require('./repairs').install(Intake, { hash, read, noteText });
 module.exports = { Intake };

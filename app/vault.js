@@ -56,19 +56,37 @@ class Vault {
     finally { await fs.unlink(owner).catch(() => {}); }
   }
   async release(file) { await fs.unlink(`${file}.lock`).catch(error => { if (error.code !== 'ENOENT') this.warnings.push('A saved-note lock could not be removed. Restart Companion to recover it.'); }); }
+  async scan() {
+    await this.writable();
+    const notes = [];
+    const visit = async dir => {
+      await this.contained(dir);
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        if (entry.name === '.intake' || entry.name === '.obsidian' || entry.name === '.git') continue;
+        const file = path.join(dir, entry.name);
+        if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
+        else if (entry.isFile() && entry.name.endsWith('.md')) {
+          await this.contained(file); const content = await fs.readFile(file, 'utf8'), note = parse(content);
+          if (note) notes.push({ ...note, file });
+          else if (/^(?:companion_id|artifact_type):/m.test(content) && path.dirname(file) === path.join(this.root, 'Captures')) this.warnings.push('Invalid capture metadata in ' + entry.name + '. The file was preserved; repair its identity, type, schema, title and absolute captured_at timestamp.');
+        }
+      }
+    };
+    try { await visit(this.vault); } catch (error) { throw Error('Vault access failure. Restore access to all vault folders before identity reconciliation. Notes and history were preserved; no missing-note removal was inferred.', { cause: error }); }
+    return notes;
+  }
   async list() {
     const dir = path.join(this.root, 'Captures');
     await this.writable();
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Invalid capture metadata in '));
     await this.recover(dir);
-    const entries = await fs.readdir(dir, { withFileTypes: true }); const notes = [];
-    for (const entry of entries) if (entry.isFile() && entry.name.endsWith('.md')) {
-      const file = path.join(dir, entry.name), content = await fs.readFile(file, 'utf8'), note = parse(content);
-      if (note) { notes.push({ ...note, file }); if (!this.expected.has(note.id)) this.expected.set(note.id, hash(content)); }
-      else if (/^(?:companion_id|artifact_type):/m.test(content)) this.warnings.push(`Invalid capture metadata in ${entry.name}. The file was preserved; repair its identity, type, schema, title and absolute captured_at timestamp.`);
-    }
-    if (new Set(notes.map(note => note.id)).size !== notes.length) throw Error('Duplicate capture identity. Preserve both notes and resolve the copied identity before editing.');
-    return notes.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
+    const notes = await this.scan();
+    for (const note of notes) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
+    const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
+    const visible = notes.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
+    this.warnings = this.warnings.filter(warning => !warning.startsWith('Duplicate capture identity.'));
+    if (notes.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
+    return visible.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
   }
   async find(id) { const note = (await this.list()).find(note => note.id === id); if (!note) throw Error('Capture is missing. Restore it before editing.'); return note; }
   async capture(input, now) {

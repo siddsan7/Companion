@@ -33,12 +33,18 @@ app.whenReady().then(async () => {
   ipcMain.handle('state', async () => {
     const intake = vault ? await new Intake(vault).info() : null;
     const captures = vault ? await vault.list() : [];
-    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => note.type !== 'reel_import' || Object.values(intake.captures).some(x => x.id === note.id)), warnings: vault?.warnings || [], intake };
+    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => note.type !== 'reel_import' || Object.values(intake.captures).some(x => x.id === note.id && !x.removed)), warnings: vault?.warnings || [], intake };
   });
   ipcMain.handle('capture', async (_, input) => { if (!vault) throw Error('Choose a vault first.'); return vault.capture(input, clock().now); });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
   ipcMain.handle('connect-drafts', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return new Intake(vault).connect(folder, scan, clock().now); });
   ipcMain.handle('check-intake', async () => { if (!vault) throw Error('Choose a vault first.'); return new Intake(vault).reconcile({ trigger: 'manual', now: clock().now }); });
+  ipcMain.handle('add-annotation', async (_, input) => new Intake(vault).addAnnotation(input, clock().now));
+  ipcMain.handle('choose-identity', async (_, input) => new Intake(vault).chooseIdentity(input));
+  ipcMain.handle('restore-missing', async (_, input) => new Intake(vault).restoreMissing(input, clock().now));
+  ipcMain.handle('remove-missing', async (_, input) => new Intake(vault).removeMissing(input, clock().now));
+  ipcMain.handle('vault-repairs', async () => new Intake(vault).repairs());
+  ipcMain.handle('resolve-conflict', async (_, input) => new Intake(vault).resolveConflict(input, clock().now));
   ipcMain.handle('inspect-source', async (_, id) => new Intake(vault).inspect(id));
   ipcMain.handle('open-note', async (_, id) => {
     const note = await vault.find(id);
