@@ -1,0 +1,7 @@
+# Companion assembles the context sent to Codex
+
+Companion assembles the question, allowed history and selected excerpts into a visible context package. Automatic discovery covers managed material and explicitly included notes, with rejected support excluded. The initial application limit is 32000 characters; oversized or shortened selections need explicit user resolution. Selected content goes to hosted inference, making retrieval quality Companion's responsibility.
+
+Use local Codex App Server with managed sign-in, a fresh model thread per Companion turn, an isolated working directory and controlled instructions, reads, tools, connectors, hooks and memories. Vault/project folders remain outside direct agent access. Source removal or rejection excludes dependent messages and summaries from subsequent packages while local historical records can remain inspectable with warnings. This does not erase earlier provider submissions or independent copies.
+
+The selected boundary accepts repeated context submission and potentially incomplete discovery in exchange for inspectable selection and removal. Chat readiness requires actual Windows isolation verification. Capture/import remain available if it fails. See D07, D16, D19 and D35–D37 in [the decision record](../decisions-and-tradeoffs.md). The user accepted these policies in the 2026-11-07 interview; no live isolation gate has passed during documentation work.
