@@ -2,4 +2,4 @@
 * text=auto
 
 # Finalized manifests hash exact producer bytes, including Windows CRLF.
-tests/fixtures/reel-review/** -text
+tests/fixtures/reel-review/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
