@@ -1,0 +1,125 @@
+{
+  "metadata": {
+    "synthetic": true,
+    "split": "example_only",
+    "source_group": "synthetic_retry_demo",
+    "review_status": "illustrative",
+    "teacher_model": null
+  },
+  "input": {
+    "schema_version": "1.0",
+    "clip_id": "synthetic_001",
+    "duration_seconds": 12,
+    "pipeline_version": "illustrative_v1",
+    "channels": {
+      "audio": "available",
+      "ocr": "available",
+      "vision": "available"
+    },
+    "truncated": false,
+    "evidence": [
+      {
+        "id": "a1",
+        "kind": "transcript",
+        "start_seconds": 2,
+        "end_seconds": 5,
+        "text": "Set the maximum number of retries to three.",
+        "review_flag": "normal"
+      },
+      {
+        "id": "a2",
+        "kind": "transcript",
+        "start_seconds": 7,
+        "end_seconds": 10,
+        "text": "Then run the script.",
+        "review_flag": "normal"
+      },
+      {
+        "id": "o1",
+        "kind": "ocr",
+        "start_seconds": 3.5,
+        "end_seconds": 3.5,
+        "text": "max_retries = 5",
+        "review_flag": "normal"
+      },
+      {
+        "id": "o2",
+        "kind": "ocr",
+        "start_seconds": 8,
+        "end_seconds": 8,
+        "text": "python agent.py",
+        "review_flag": "normal"
+      },
+      {
+        "id": "v1",
+        "kind": "visual_description",
+        "start_seconds": 9,
+        "end_seconds": 9,
+        "text": "A terminal is visible. The output is too blurred to read.",
+        "review_flag": "uncertain"
+      }
+    ]
+  },
+  "target": {
+    "schema_version": "1.0",
+    "title": "Configure retries and run a script",
+    "status": "partial",
+    "claims": [
+      {
+        "id": "c1",
+        "text": "The narration specifies three retries.",
+        "attribution": "narration",
+        "evidence_ids": [
+          "a1"
+        ]
+      },
+      {
+        "id": "c2",
+        "text": "OCR reports max_retries = 5 on screen.",
+        "attribution": "screen_extraction",
+        "evidence_ids": [
+          "o1"
+        ]
+      }
+    ],
+    "steps": [
+      {
+        "order": 1,
+        "text": "Configure the retry limit; the intended value is unresolved.",
+        "command": null,
+        "evidence_ids": [
+          "a1",
+          "o1"
+        ]
+      },
+      {
+        "order": 2,
+        "text": "The displayed command is python agent.py.",
+        "command": "python agent.py",
+        "evidence_ids": [
+          "a2",
+          "o2"
+        ]
+      }
+    ],
+    "conflicts": [
+      {
+        "text": "The narration specifies 3 retries, while OCR reports 5.",
+        "evidence_ids": [
+          "a1",
+          "o1"
+        ]
+      }
+    ],
+    "unknowns": [
+      {
+        "text": "Successful execution cannot be established from the supplied evidence.",
+        "basis": "evidence",
+        "evidence_ids": [
+          "v1"
+        ]
+      }
+    ],
+    "omissions": []
+  }
+}

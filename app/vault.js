@@ -13,8 +13,14 @@ function parse(text) {
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return null;
   let fields; try { fields = YAML.parse(match[1]); } catch { return null; }
-  if (!fields || typeof fields !== 'object' || typeof fields.companion_id !== 'string' || !fields.companion_id.trim() || /[\r\n]/.test(fields.companion_id) || fields.artifact_type !== 'capture' || fields.schema_version !== 1 || !['thought', 'link'].includes(fields.capture_type) || typeof fields.title !== 'string' || !fields.title.trim() || /[\r\n]/.test(fields.title) || typeof fields.captured_at !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(fields.captured_at) || !Number.isFinite(Date.parse(fields.captured_at))) return null;
+  if (!fields || typeof fields !== 'object' || typeof fields.companion_id !== 'string' || !fields.companion_id.trim() || /[\r\n]/.test(fields.companion_id) || fields.artifact_type !== 'capture' || fields.schema_version !== 1 || !['thought', 'link', 'reel_import'].includes(fields.capture_type) || typeof fields.title !== 'string' || !fields.title.trim() || /[\r\n]/.test(fields.title) || typeof fields.captured_at !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(fields.captured_at) || !Number.isFinite(Date.parse(fields.captured_at))) return null;
   return { id: fields.companion_id, title: fields.title, type: fields.capture_type, capturedAt: fields.captured_at, content: text };
+}
+function captureHeading(title, type) {
+  // Imported titles are source text. Escape punctuation so Markdown images,
+  // HTML and vault links cannot become active in the generated display heading.
+  const literal = type === 'reel_import' ? title.replace(/[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/g, character => `\\${character}`) : title;
+  return `# ${literal}`;
 }
 function withTitle(content, title) {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
@@ -22,8 +28,8 @@ function withTitle(content, title) {
   let body = content.slice(match[0].length);
   // Only the exact generated heading at its original position belongs to the display title.
   for (const newline of ['\n', '\r\n']) {
-    const generated = `${newline}# ${previous}${newline}`;
-    if (body.startsWith(generated)) { body = `${newline}# ${title}${newline}${body.slice(generated.length)}`; break; }
+    const generated = `${newline}${captureHeading(previous, metadata.get('capture_type'))}${newline}`;
+    if (body.startsWith(generated)) { body = `${newline}${captureHeading(title, metadata.get('capture_type'))}${newline}${body.slice(generated.length)}`; break; }
   }
   return `---\n${metadata.toString()}---\n${body}`;
 }
@@ -178,7 +184,7 @@ class Vault {
       if (await liveOwner(file)) continue;
       try { await fs.access(`${file}.title-transaction.json`); continue; } catch (error) { if (error.code !== 'ENOENT') throw error; }
       const content = await fs.readFile(stage, 'utf8'), note = parse(content);
-      if (!note || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(note.id) || !path.basename(file).endsWith(`--${note.id}.md`)) {
+      if (!note || note.type === 'reel_import' || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(note.id) || !path.basename(file).endsWith(`--${note.id}.md`)) {
         this.warnings.push(`Unrecognized staging file ${entry}. It was preserved for inspection.`); continue;
       }
       try {
@@ -192,4 +198,4 @@ class Vault {
     }
   }
 }
-module.exports = { Vault };
+module.exports = { Vault, withTitle, captureHeading };
