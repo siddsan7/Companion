@@ -1,0 +1,60 @@
+# Ticket 8: managed Codex setup and isolation
+
+Goal: connect managed App Server sign-in without token access; keep capture available while setup is incomplete; run each approved synthetic turn on a fresh controlled thread only after real Windows read-denial probes.
+
+The approved acceptance seam is the desktop workflow plus resulting files/history. Tests use a child process at the external Codex stdio boundary. Fixture outcomes never establish live readiness. The installed CLI is 0.163.0; its generated experimental JSON schemas were inspected before implementation.
+
+## Current evidence
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Reviewed base ancestry | Passed | `9a6985d85f8ef874a662d3c172447afa82a54439` is an ancestor of this branch. |
+| First desktop red/green | Passed | Root observed missing setup heading, then one passing desktop test. |
+| Managed cancellation/expiry fixture | Passed | Root observed second red, then two passing tests. One-time codes and account email are absent from the readiness report. |
+| Unsafe external-process canary | Passed | Root observed gate red, then three passing tests. The unrestricted fixture actually reads host canaries; the adapter rejects the result without creating a model thread. |
+| Fresh threads/interruption/restart fixture | Passed | Root observed the true restart red, then four passing scoped tests in 37.3 seconds. Two distinct completed threads, explicit interrupted terminal/partial reply, and restart without a restored certificate or automatic replay are covered. Earlier fixture quoting and stale-test-message problems were corrected before claiming that red. |
+| Usage-limit failure fixture | Passed | Root observed the expected generic-message red, then five passing tests in 46.8 seconds. Stable safe categories preserve failed history without provider-detail leakage/replay. Nonretry error events wait for terminal notification; unauthorized failures re-enable managed sign-in. |
+| Split UTF-8 stream fixture | Passed | Root observed expected intact `🎸` versus replacement characters when bytes were split across writes. Incremental UTF-8 decoding fixes it; the final seven-test suite includes this regression. |
+| Actual private App Server/account read | Passed | Root started the installed CLI in the dedicated home; managed account metadata read succeeded and reported unsigned-in. No auth file was read or copied. |
+| Actual config audit | Passed to next boundary | First live preflight failed closed on an unexpected layer. Root inspected only sanitized layer metadata: expected dedicated user config plus empty `C:\ProgramData\OpenAI\Codex\config.toml`. A narrow allowance accepts that exact empty system layer. The next live preflight advanced to skill inventory. Nonempty or unexpected layers remain blocked. |
+| Actual skill inventory | Passed to next boundary | Root first observed 36 enabled skills despite discovery settings, zero errors, and zero MCP servers. The adapter now writes explicit per-path disable entries, restarts once, and requires every skill `enabled:false`. Root's next actual preflight passed that inventory audit. No enabled-skill allowance was added. |
+| Actual Windows denied reads | Passed | Root's full actual adapter preflight passed effective config/disabled skills/MCP audit, Windows readiness, exact positive markers directly and in a child, and both protected project/vault roots denied through direct, child, case, extended-prefix and junction paths. The strict root-deny/minimal-read/work-read policy was unchanged. Final state remained incomplete solely because managed sign-in was required. No real model turn ran. |
+| Native build reproducibility | Passed | Root reviewed the source/build and ran a second build. Executable bytes remained identical: `8af4dc725326a0d654df0c3a66f07525ba87ab5fd09200a504bd59262c407576`. |
+| Actual application sign-in expiry | Passed | Root's real managed device flow reached the five-minute application deadline: process exit 1, expired, authenticated false, ready false. This does not establish provider-specific expiry behavior. |
+| Managed signed-in model completion | User-deferred to release #16 | The user explicitly skipped live sign-in for now. No further login or model request is authorized in this run. The existing device flow expired. No real inference has run. |
+| Actual prompt/tool inventory | Unverified, deferred to #16 | After actual sign-in expiry, root ran no-inference `debug prompt-input` in the controlled home. It rendered five messages (three developer/two user) and exposed no tool-inventory surface. Artifact: `C:\Users\sidds\AppData\Local\Temp\companion-context-inspection-20261107.json`. This is CLI debug, not exact App Server request/tool proof; absence of a diagnostic surface does not establish absent tools. |
+| Actual provider cancellation/expiry/interruption/offline/limit cases | User-deferred to release #16 | Fixture states are not live verification. Only the actual application deadline above has been observed. New sign-in failure harnesses are prepared but not run after the user's deferral. |
+| App Server exit before acknowledgement fixture | Passed | Root observed the generic-incomplete red, then a six-test green. Lost acknowledgement records an interrupted local terminal without replay. Connection closure also clears one-time sign-in UI. |
+| History write failure before provider submission | Passed | Independent review found the first history write outside cleanup. Root observed the public desktop red (Interrupt remained enabled). The first write is now inside protected cleanup: local failed state, inactive controls, no `turn/start`, and capture remains usable. |
+| Final scoped desktop suite | Passed | After the final production edit, root ran `npm.cmd test -- tests/codex.spec.js`: seven passed in 1.1 minutes, including the reviewer's file-failure case. All fourteen relevant JS files passed syntax checks. |
+| Integrated desktop/release checks | Pending root integration | Root will checkpoint the reviewed slice, synchronize the current integration branch, and run combined capture/brief/import/Codex checks. No merge to main or deployment is authorized by these scoped results. |
+
+## Runtime and checks
+
+`app/codex-rpc.js` owns one private child process and JSON-lines connection. It rejects server-initiated capability requests. `app/codex-policy.js` builds the dedicated managed-home profile: explicit MXC/elevated selection, root deny, minimal platform reads, isolated working directory read, protected vault/project deny, command network disabled, no approvals, controlled instructions and disabled tool/skill/memory/hook/connector surfaces. It never modifies the user's Codex home.
+
+`app/codex-isolation.js` audits effective layers before probing. `command/exec` selects the named profile explicitly. The bundled native Win32 helper avoids managed-runtime/crypto initialization; `app/codex-probe.js` verifies binary, LF-normalized C/build-source and manifest hashes before copying it exclusively into the isolated directory. A host-verified positive marker must be readable directly and through `CreateProcessW` child launch. Random markers in actual vault/project folders must return Win32 `ERROR_ACCESS_DENIED` via direct, child-process, case-variant, extended-prefix and junction paths. Missing files, child-spawn failure, model refusal and absent marker text do not count as denial. Owned canaries and junctions are removed individually.
+
+Root builds the reviewed artifact with `scripts/build-codex-probe.ps1` (MSVC 14.44.35207, Windows SDK 10.0.26100.0, `/Brepro`, no CRT, Kernel32 only). `app/native/codex-read-probe.json` pins the compiled binary and normalized source/build hashes. The reviewed first binary hash is `8af4dc725326a0d654df0c3a66f07525ba87ab5fd09200a504bd59262c407576`. Rebuild/review is required when pinned source or build inputs change.
+
+Probe selection was evidence-driven: PowerShell initialization failed with `8009001d`; standalone Node failed with a CSPRNG assertion even under a separate disposable implicit-profile diagnostic. Neither startup failure counted as denial. The reviewed native helper reads through Win32 APIs without CRT/Crypto initialization and distinguishes child-spawn failure from file access denial.
+
+`app/codex-turn.js` creates a new ephemeral thread for each turn and checks returned roots, profile and instruction sources. Only terminal `completed` succeeds. Interruption waits for terminal confirmation and closes the child after a bounded timeout. No `thread/shellCommand`, resume, fork or external token login is exposed.
+
+The isolation certificate is process-local, visibly expires after ten minutes, and is invalidated by changed executable/config/root/account evidence. A fixture can enable the synthetic test control but can never set live `ready`. A completed live synthetic turn also leaves `ready:false` until independent prompt/tool inventory evidence is established. Persistent readiness data is evidence, never an imported certificate.
+
+Root ran `npm.cmd test -- tests/codex.spec.js` after the final production edit: seven passed. Syntax checks passed for the new modules/scripts and bootstrap files. Combined capture regression and final integration diff review remain root-owned checks after synchronization. The user deferred signed-in live checks to #16; fixture success does not change their pending status or enable chat readiness.
+
+## Reviewable live flow
+
+`scripts/codex-gate.cjs` uses the same adapter as the desktop. Modes are `preflight`, `login`, and `synthetic`; supply a dedicated data root, installed executable, protected project, and disposable existing vault. Preflight never requests model inference. Login displays the managed one-time browser URL/code locally; it never stores them in readiness history. Synthetic mode requires the isolation certificate before a fresh model turn.
+
+Live evidence root: `C:\Users\sidds\AppData\Local\Temp\companion-codex-live8-20261107`. The readiness report contains sanitized status/checks/turn identifiers. Windows denial enforcement passed; the complete live chat gate remains unpassed. Capture remains available. Future signed-in checks require the user's release-stage continuation after the explicit deferral.
+
+`scripts/inspect-codex-context.cjs` runs installed `debug prompt-input` against the existing controlled home after sign-in finishes, with a root-supplied configuration digest and exclusive output path. It does not reconnect/rewrite configuration or request inference. Summaries show only structure/hashes and exposed tool names. It explicitly distinguishes message inspection from complete tool inventory and an exact App Server request.
+
+`scripts/check-codex-signin.cjs` exercises actual cancellation or the application's five-minute sign-in deadline in a new throwaway profile, never the intended signed-in home. It suppresses one-time URL/code and makes no model request. Application deadline evidence is distinct from provider-specific expiry evidence.
+
+Next release action: resume only when the user continues the deferred sign-in work. Verify the intended managed account, current executable/config/roots, exact model-visible instructions/tools and fresh-thread synthetic completion. Exercise actual interruption and provider auth/network/limit failures. The no-inference message inspection above cannot replace those checks. Keep capture/import available and chat unready until the complete gate passes.
+
+Official sources fetched during this implementation: [App Server](https://learn.chatgpt.com/docs/app-server), [permissions](https://learn.chatgpt.com/docs/permissions), and [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference). Installed schemas take precedence for method/field details. Ordinary read-only access and Windows unelevated mode do not establish the required read boundary.

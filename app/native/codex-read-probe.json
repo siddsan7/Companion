@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "platform": "win32",
+  "arch": "x64",
+  "textNormalization": "LF",
+  "sourceSha256": "4030c070ec0662d851e0e5d0115e6525d74ce46b0990d903a9930f118a8bfc8e",
+  "binarySha256": "8af4dc725326a0d654df0c3a66f07525ba87ab5fd09200a504bd59262c407576",
+  "buildScriptSha256": "83a4a70ddefd01092e78c6027410e5403116f2a449378f4d51700902a254a095",
+  "compiler": "MSVC 14.44.35207",
+  "sdk": "10.0.26100.0"
+}
