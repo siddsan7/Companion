@@ -31,3 +31,9 @@ Root's scoped suite passed all 8 review desktop/file tests in 1.6 minutes. Actua
 When #5 merges, `selectCurrent` must use its optional `capture.relative` destination resolver and shared optional `tx.resolution` backup convention. Downstream context must honor capture ambiguity/eligibility and rejected snapshot exclusion; associations confer no approval. Preserve broad fixture LF normalization and finalized fixture byte preservation. Root owns Git writes, GUI, combined checks and exact-tip review.
 
 Final ticket #4 combined gate: 50 passed, one Windows file-symlink capability skip (7.5 minutes) on synchronized d7baa6c. Independent actual producer draft smoke passed with 33 evidence entries, restart idempotence and source hashes unchanged. Exact-tip independent approval is next; natural finalized review remains skipped.
+
+## Ticket #9 source checkpoint
+
+Local discovery/context preview is implemented from reviewed e672259. See ../docs/verification-ticket9.md for criteria, evidence and remaining integration gates. Root observed full12 desktop/file GREEN plus the final delayed-preview targeted GREEN. Exact terms, honest paraphrase miss/manual recovery, immutable eligibility, Unicode bounds, explicit shortening, capture/brief derivative removal and cross-process scope exclusion are covered. No auth/model calls or live provider-bound claim.
+
+Next: root checkpoints source, synchronizes latest integration, adapts the guarded cross-vault annotation identity/header contract, then runs final13/combined and exact-tip independent review. Root owns all Git operations and integration. The #11 saved-idea reader remains an explicit provisional dependency adapter; #10 must use durable history dependencies and revalidate before any future dispatch.
