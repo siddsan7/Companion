@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { Vault } = require('./vault');
+const { installBriefs } = require('./briefs-ipc');
 const testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 async function checkpoint(name) {
@@ -35,6 +36,7 @@ app.whenReady().then(async () => {
     const uri = `obsidian://open?path=${encodeURIComponent(note.file)}`;
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri); else await shell.openExternal(uri);
   });
+  installBriefs({ ipcMain, dialog, fs, path, testRoot, getVault: () => vault, clock });
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
