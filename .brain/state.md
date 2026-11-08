@@ -29,3 +29,5 @@ Source checkpoint `f20f689` is synchronized with reviewed integration `846e608`;
 Root's scoped suite passed all 8 review desktop/file tests in 1.6 minutes. Actual Electron numeric reviver and producer-backed authored synthetic fixtures passed; natural finalized-review handoff is skipped without a genuine bundle. See `../docs/verification-ticket4.md`. Product/tests are frozen absent concrete gate/review findings.
 
 When #5 merges, `selectCurrent` must use its optional `capture.relative` destination resolver and shared optional `tx.resolution` backup convention. Downstream context must honor capture ambiguity/eligibility and rejected snapshot exclusion; associations confer no approval. Preserve broad fixture LF normalization and finalized fixture byte preservation. Root owns Git writes, GUI, combined checks and exact-tip review.
+
+Final ticket #4 combined gate: 50 passed, one Windows file-symlink capability skip (7.5 minutes) on synchronized d7baa6c. Independent actual producer draft smoke passed with 33 evidence entries, restart idempotence and source hashes unchanged. Exact-tip independent approval is next; natural finalized review remains skipped.

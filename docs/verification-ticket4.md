@@ -36,7 +36,8 @@ The independent interim reviewer identified missing processing display and permi
 
 ## Remaining gates and handoff
 
-- Final scoped review suite: **8 passed in 1.6 minutes**. Synchronize latest integration `846e608`, then run combined capture/intake/brief/Codex regressions and required checks. Preserve the draft fixture LF rule and the more specific finalized fixture `-text` rule: finalized manifests hash exact Windows producer bytes.
+- Final scoped review suite: **8 passed in 1.6 minutes**. Merger synchronization with reviewed integration `846e608` completed in `d7baa6c`; all 51 combined cases completed: **50 passed, 1 Windows file-symlink capability skip (7.5 minutes)**. Draft fixtures use LF; finalized fixtures preserve exact raw producer bytes and recognize CRLF without disabling the default whitespace checks.
+- Independent actual producer desktop smoke passed again on the synchronized tree: one capture, one immutable revision, 33 evidence entries, partial/unreviewed status, restart idempotence and unchanged producer hashes. This is real draft handoff evidence; it does not establish natural finalized-review or conversation gates.
 - Obtain fresh independent approval of the exact synchronized candidate before merge. No worker commit, merge, push, deployment or producer mutation occurred.
 - Natural finalized-review handoff: **skipped**. Prior producer inspection found no genuine finalized review bundle. Synthetic producer-library fixtures establish mechanics only. Full real producer/conversation/saved-proposal, Obsidian, scheduler and signed-in isolated Codex release gates remain separate; the sign-in deferral stays in force.
 - Downstream discovery/context must honor capture eligibility/ambiguity and rejected snapshot eligibility. Links do not confer approval or merge identities. Exact original source JSON can contain private provenance/raw response; it is retained for inspection/integrity, not automatically selected as outgoing context.
