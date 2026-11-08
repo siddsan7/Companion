@@ -1,5 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
+# Fixtures are byte-level producer contracts.
+tests/fixtures/** text eol=lf
+
 # Finalized manifests hash exact producer bytes, including Windows CRLF.
 tests/fixtures/reel-review/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
