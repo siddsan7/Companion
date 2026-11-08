@@ -1,0 +1,242 @@
+const { test, expect, _electron: electron } = require('@playwright/test');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+let root, app, page;
+test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-')); });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+async function launch(now = '2026-11-08T06:59:00Z', timezone = 'America/Phoenix') {
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now, timezone }));
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  page = await app.firstWindow();
+}
+async function setup() {
+  await page.getByRole('button', { name: 'Choose vault' }).click();
+  await page.getByLabel('Parent folder').fill('My Companion');
+  await page.getByRole('button', { name: 'Use this folder' }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+}
+test('capture offline, reject empty input, retain readable note and title across restart', async () => {
+  await launch(); await setup();
+  await page.context().setOffline(true);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Enter a thought');
+  await page.getByLabel('Thought or link').fill('Practice the chord change slowly.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Practice the chord change slowly.' })).toBeVisible();
+  const files = await fs.readdir(path.join(root, 'vault', 'My Companion', 'Captures'));
+  expect(files).toHaveLength(1);
+  const note = await fs.readFile(path.join(root, 'vault', 'My Companion', 'Captures', files[0]), 'utf8');
+  expect(note).toContain('captured_at: "2026-11-08T06:59:00.000Z"');
+  expect(note).toContain('Practice the chord change slowly.');
+  await page.getByLabel('Display title').fill('Slow changes');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  await app.close(); app = null; await launch();
+  await expect(page.getByRole('heading', { name: 'Slow changes' })).toBeVisible();
+  expect((await fs.readdir(path.join(root, 'vault', 'My Companion', 'Captures'))).filter(file => file.endsWith('.md'))).toEqual(files);
+});
+test('title edits preserve literal text and external edits are not overwritten', async () => {
+  await launch(); await setup();
+  await page.getByLabel('Thought or link').fill('A thought');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'A thought', exact: true })).toBeVisible();
+  await page.getByLabel('Display title').fill('Cost $& and $\'');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect(page.getByRole('heading', { name: 'Cost $& and $\'', exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  const file = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  await fs.appendFile(path.join(dir, file), '\nExternal writing.\n');
+  await page.getByLabel('Display title').fill('New name');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect(page.getByRole('status')).toContainText('changed outside Companion');
+  expect(await fs.readFile(path.join(dir, file), 'utf8')).toContain('External writing.');
+});
+test('restart recovers an interrupted title save and permits the next edit', async () => {
+  await launch(); await setup();
+  await page.getByLabel('Thought or link').fill('Original thought');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Original thought', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'title-staged' }));
+  await page.getByLabel('Display title').fill('Recovered title');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('title-staged');
+  app.process().kill(); await app.close().catch(() => {}); app = null;
+  await fs.unlink(path.join(root, 'faults.json'));
+  await launch();
+  await expect(page.getByRole('heading', { name: 'Recovered title', exact: true })).toBeVisible();
+  await page.getByLabel('Display title').fill('Next title');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+});
+test('a damaged capture reports its file without hiding valid captures', async () => {
+  await launch(); await setup();
+  await page.getByLabel('Thought or link').fill('Still available');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Still available', exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  const file = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  const note = await fs.readFile(path.join(dir, file), 'utf8');
+  await fs.writeFile(path.join(dir, file), note.replace('artifact_type: "capture"', 'artifact_type: capture').replace('title: "Still available"', "title: 'Still available'"));
+  await fs.writeFile(path.join(dir, 'damaged.md'), note.replace(/^companion_id: .*$/m, 'companion_id: "different-id"').replace(/^captured_at: .*$/m, 'captured_at: 123'));
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('damaged.md');
+  await expect(page.getByRole('heading', { name: 'Still available', exact: true })).toBeVisible();
+});
+test('a junction cannot redirect capture writes outside the selected vault', async () => {
+  const outside = path.join(root, 'outside');
+  const parent = path.join(root, 'vault', 'My Companion');
+  await fs.mkdir(outside); await fs.mkdir(parent, { recursive: true });
+  await fs.writeFile(path.join(outside, 'unrelated.md'), 'Keep this unchanged.');
+  await fs.symlink(outside, path.join(parent, 'Captures'), 'junction');
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault' }).click();
+  await page.getByLabel('Parent folder').fill('My Companion');
+  await page.getByRole('button', { name: 'Use this folder' }).click();
+  await expect(page.getByRole('status')).toContainText('outside the selected vault');
+  await page.getByLabel('Thought or link').fill('Must stay local to the selected vault');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  expect(await fs.readdir(outside)).toEqual(['unrelated.md']);
+  expect(await fs.readFile(path.join(outside, 'unrelated.md'), 'utf8')).toBe('Keep this unchanged.');
+});
+test('a staged capture recovers exactly once after interruption', async () => {
+  await launch(); await setup();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-staged' }));
+  await page.getByLabel('Thought or link').fill('Keep the interrupted thought.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('capture-staged');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Keep the interrupted thought.', exact: true })).toHaveCount(0);
+  expect((await fs.readdir(path.join(root, 'vault', 'My Companion', 'Captures'))).filter(file => file.endsWith('.pending'))).toHaveLength(1);
+  app.process().kill(); await app.close().catch(() => {}); app = null;
+  await fs.unlink(path.join(root, 'faults.json')); await launch();
+  await expect(page.getByRole('heading', { name: 'Keep the interrupted thought.', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  const files = (await fs.readdir(path.join(root, 'vault', 'My Companion', 'Captures'))).filter(file => file.endsWith('.md'));
+  expect(files).toHaveLength(1);
+  expect(await fs.readFile(path.join(root, 'vault', 'My Companion', 'Captures', files[0]), 'utf8')).toContain('captured_at: "2026-11-08T06:59:00.000Z"');
+});
+test('link excerpts roundtrip Unicode and Markdown rules with explicit provenance and Obsidian URI', async () => {
+  await launch(); await setup(); await page.context().setOffline(true);
+  const url = 'https://example.invalid/Path?keep=%2f#Notes';
+  const excerpt = 'A user passage 🎸\n\n---\n\nKeep this tail and its uncertainty.';
+  await page.getByLabel('Thought or link').fill(url);
+  await page.getByRole('button', { name: 'Add source excerpt', exact: true }).click();
+  await page.getByLabel('User-supplied excerpt').fill(excerpt);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.locator('article pre')).toContainText(excerpt);
+  await expect(page.locator('article pre')).toContainText('did not fetch or verify');
+  await page.getByLabel('Search captures').fill('Keep this tail');
+  await expect(page.getByRole('heading', { name: url, exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  const file = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  const note = await fs.readFile(path.join(dir, file), 'utf8'); expect(note).toContain(excerpt); expect(note).toContain(`source_url: "${url}"`);
+  await page.getByRole('button', { name: 'Open in Obsidian' }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8').catch(() => '')).toBe(`obsidian://open?path=${encodeURIComponent(path.join(dir, file))}`);
+});
+test('Today changes at local midnight and during travel while history and capture instant remain', async () => {
+  await launch(); await setup();
+  await page.getByLabel('Thought or link').fill('A midnight thought');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'A midnight thought', exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures'), file = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  const original = await fs.readFile(path.join(dir, file), 'utf8');
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T07:01:00Z', timezone: 'America/Phoenix' }));
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'A midnight thought', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'All captures', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'A midnight thought', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T07:01:00Z', timezone: 'America/Los_Angeles' }));
+  await page.getByRole('button', { name: 'Today', exact: true }).click();
+  await expect(page.locator('#timezone')).toContainText('America/Los_Angeles');
+  await expect(page.getByRole('heading', { name: 'A midnight thought', exact: true })).toBeVisible();
+  expect(await fs.readFile(path.join(dir, file), 'utf8')).toBe(original);
+});
+test('Today follows DST midnight rather than an elapsed 24 hour window', async () => {
+  await launch('2026-11-01T04:30:00Z', 'America/New_York'); await setup();
+  await page.getByLabel('Thought or link').fill('Fall-back day thought');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Fall-back day thought', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-02T04:59:00Z', timezone: 'America/New_York' }));
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Fall-back day thought', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-02T05:01:00Z', timezone: 'America/New_York' }));
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Fall-back day thought', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'All captures', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Fall-back day thought', exact: true })).toBeVisible();
+});
+test('failed capture retains the draft and explicit retry creates one note', async () => {
+  await launch(); await setup();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures'); await fs.rmdir(dir);
+  await page.getByLabel('Thought or link').fill('Retry this draft.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('ENOENT');
+  await expect(page.getByLabel('Thought or link')).toHaveValue('Retry this draft.');
+  await fs.mkdir(dir);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Retry this draft.', exact: true })).toBeVisible();
+  expect((await fs.readdir(dir)).filter(file => file.endsWith('.md'))).toHaveLength(1);
+});
+for (const phase of ['title-staged', 'title-moved']) test(`an editor write at ${phase} is preserved and reported`, async () => {
+  await launch(); await setup();
+  await page.getByLabel('Thought or link').fill('Keep the source body.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Keep the source body.', exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures'), file = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  const original = await fs.readFile(path.join(dir, file), 'utf8');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: phase }));
+  await page.getByLabel('Display title').fill('Proposed title');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(phase);
+  await fs.writeFile(path.join(dir, file), original + '\nInterleaved external writing.\n');
+  await fs.writeFile(path.join(root, 'release.txt'), 'resume');
+  await expect(page.getByRole('status')).toContainText(/conflict|preserved/i);
+  expect(await fs.readFile(path.join(dir, file), 'utf8')).toContain('Interleaved external writing.');
+});
+test('recovery never restores an unrelated backup from an invalid title transaction', async () => {
+  await launch(); await setup();
+  await page.getByLabel('Thought or link').fill('Managed original');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Managed original', exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures'), file = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'title-staged' }));
+  await page.getByLabel('Display title').fill('Proposed title');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('title-staged');
+  app.process().kill(); await app.close().catch(() => {}); app = null;
+  const journal = JSON.parse(await fs.readFile(path.join(dir, `${file}.title-transaction.json`), 'utf8'));
+  await fs.rename(path.join(dir, file), path.join(root, 'user-moved-original.md'));
+  await fs.writeFile(path.join(dir, journal.backup), 'Unrelated personal writing.');
+  await fs.unlink(path.join(root, 'faults.json')); await launch();
+  await expect(page.getByRole('alert')).toContainText(/conflict|Invalid/i);
+  expect(await fs.readFile(path.join(dir, file), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  expect(await fs.readFile(path.join(dir, journal.backup), 'utf8')).toBe('Unrelated personal writing.');
+  expect(await fs.readFile(path.join(dir, `${file}.pending`), 'utf8')).toContain('Proposed title');
+});
+test('display title edits preserve deleted or changed generated headings and later source headings', async () => {
+  await launch(); await setup();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures'), fixtures = [];
+  for (const title of ['First thought', 'Second thought']) {
+    await page.getByLabel('Thought or link').fill(`${title}\n\n# Source heading\nEvidence`);
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  }
+  await app.close(); app = null;
+  for (const file of (await fs.readdir(dir)).filter(file => file.endsWith('.md'))) {
+    const original = await fs.readFile(path.join(dir, file), 'utf8');
+    const title = original.includes('title: "First thought"') ? 'First thought' : 'Second thought';
+    const edited = original.replace(`# ${title}\n`, title === 'First thought' ? '' : '# My own heading\n');
+    await fs.writeFile(path.join(dir, file), edited);
+    fixtures.push({ file, title, body: edited.slice(edited.indexOf('\n---\n') + 5) });
+  }
+  await launch();
+  for (const fixture of fixtures) {
+    const article = page.locator('article').filter({ has: page.getByRole('heading', { name: fixture.title, exact: true }) });
+    await article.getByLabel('Display title').fill(`New ${fixture.title}`);
+    await article.getByRole('button', { name: 'Save title' }).click();
+    await expect(page.getByRole('heading', { name: `New ${fixture.title}`, exact: true })).toBeVisible();
+    const updated = await fs.readFile(path.join(dir, fixture.file), 'utf8');
+    expect(updated.slice(updated.indexOf('\n---\n') + 5)).toBe(fixture.body);
+  }
+});
