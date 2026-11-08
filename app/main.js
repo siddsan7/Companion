@@ -2,9 +2,11 @@ const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { Vault } = require('./vault');
+const { CodexSetup } = require('./codex');
 const { Intake } = require('./intake');
 const { Schedule } = require('./schedule');
 const { installBriefs } = require('./briefs-ipc');
+let codex;
 const testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
@@ -38,6 +40,9 @@ app.whenReady().then(async () => {
     return;
   }
   settingsPath = path.join(testRoot || app.getPath('userData'), 'settings.json');
+  codex = new CodexSetup({ dataRoot: path.join(testRoot || app.getPath('userData'), 'codex'), testRoot });
+  ipcMain.handle('codex-state', () => codex.snapshot());
+  ipcMain.handle('codex-action', (_, input) => codex.action(input, { vault: vault?.root }));
   try { const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8')); vault = new Vault(settings.vault, settings.parent, { checkpoint }); } catch (error) { if (error.code !== 'ENOENT') console.error('Cannot load settings:', error.message); }
   ipcMain.handle('choose-vault', async () => testRoot ? path.join(testRoot, 'vault') : (await dialog.showOpenDialog({ properties: ['openDirectory'] })).filePaths[0]);
   ipcMain.handle('configure', async (_, settings) => {
@@ -46,7 +51,7 @@ app.whenReady().then(async () => {
     if (existing && existing.mode !== 'disabled' && path.resolve(existing.vault, existing.parent).toLowerCase() !== next.root.toLowerCase()) throw Error('Disable daily intake before changing its vault.');
     await next.setup();
     await fs.mkdir(path.dirname(settingsPath), { recursive: true });
-    await fs.writeFile(settingsPath, JSON.stringify(settings)); vault = next; return true;
+    await fs.writeFile(settingsPath, JSON.stringify(settings)); vault = next; codex.invalidate(); return true;
   });
   const schedule = () => new Schedule(path.join(path.dirname(settingsPath), 'schedule.json'), vault, scheduleOptions());
   await schedule().run(clock().now).catch(error => console.error('Scheduled catch-up:', error.message));
@@ -62,8 +67,11 @@ app.whenReady().then(async () => {
   ipcMain.handle('capture', async (_, input) => { if (!vault) throw Error('Choose a vault first.'); return vault.capture(input, clock().now); });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
   ipcMain.handle('connect-drafts', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).connect(folder, scan, clock().now)); });
+  ipcMain.handle('connect-reviews', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).connect(folder, scan, clock().now, 'review')); });
   ipcMain.handle('check-intake', async () => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).reconcile({ trigger: 'manual', now: clock().now })); });
   ipcMain.handle('inspect-source', async (_, id) => new Intake(vault).inspect(id));
+  ipcMain.handle('select-review', async (_, { id, revision }) => new Intake(vault).selectCurrent(id, revision, clock().now));
+  ipcMain.handle('link-sources', async (_, { id, related }) => new Intake(vault).linkSources(id, related, clock().now));
   ipcMain.handle('open-note', async (_, id) => {
     const note = await vault.find(id);
     const uri = `obsidian://open?path=${encodeURIComponent(note.file)}`;
@@ -76,4 +84,5 @@ app.whenReady().then(async () => {
   window.webContents.on('will-navigate', event => event.preventDefault());
   await window.loadFile(path.join(__dirname, 'index.html'));
 });
+app.on('before-quit', () => codex?.close());
 app.on('window-all-closed', () => app.quit());

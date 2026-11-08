@@ -1,0 +1,116 @@
+{
+  "schema_version": "1.0",
+  "attempt": "\\\\?\\C:\\Users\\sidds\\AppData\\Local\\Temp\\companion-authored-review-v8o6u3vd\\accept\\job\\attempts\\original",
+  "original_hashes": {
+    "evidence.json": "55c8e0bc843c5285cb3bd5993a48e1b579b352c08c194a3a792605fdab74123e",
+    "run.json": "b0fd316ad34383186a65a224f9264c7020726ebd0307def5139e25704b74b398",
+    "first-pass-target.json": "994f3b5a0f521dfa2e1b21392e77522676ce086a9e84304f1bfa4913debf4f26",
+    "notes.md": "d0ad2de85c38e1843c8a79f8999a3370c57efc3fe2ab414567df7caf0a24e151"
+  },
+  "evidence": {
+    "schema_version": "1.0",
+    "clip_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "duration_seconds": 13.0,
+    "pipeline_version": "authored-fixture",
+    "channels": {
+      "audio": "available",
+      "ocr": "empty",
+      "vision": "empty"
+    },
+    "truncated": false,
+    "evidence": [
+      {
+        "id": "a1",
+        "kind": "transcript",
+        "start_seconds": 0.0,
+        "end_seconds": 13.0,
+        "text": "Authored synthetic review fixture only.",
+        "review_flag": "normal"
+      }
+    ]
+  },
+  "run": {
+    "job_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "attempt_id": "11111111111111111111111111111111",
+    "started_utc": "2026-11-01T10:00:00Z",
+    "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "input_kind": "synthetic_fixture",
+    "result_kind": "synthetic_video_wiring",
+    "validation": "passed",
+    "state": "partial",
+    "canonical_probe": {
+      "": "private use",
+      "𐀀": "astral",
+      "text": "\u0000\b\f\n\r\t\u001f é 😀 / \\ \"",
+      "numbers": [
+        13,
+        13.0,
+        -0.0,
+        0.0001,
+        1e-05,
+        1000000000000000.0,
+        1e+16,
+        5e-324,
+        9007199254740993,
+        10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000,
+        13.0
+      ]
+    }
+  },
+  "target": {
+    "schema_version": "1.0",
+    "title": "Authored synthetic review",
+    "status": "partial",
+    "claims": [
+      {
+        "id": "c1",
+        "text": "Authored synthetic review fixture only.",
+        "attribution": "narration",
+        "evidence_ids": [
+          "a1"
+        ]
+      }
+    ],
+    "steps": [],
+    "conflicts": [],
+    "unknowns": [
+      {
+        "text": "OCR and vision unavailable.",
+        "basis": "missing_channel",
+        "evidence_ids": []
+      }
+    ],
+    "omissions": []
+  },
+  "variant": "first_pass",
+  "target_file": "\\\\?\\C:\\Users\\sidds\\AppData\\Local\\Temp\\companion-authored-review-v8o6u3vd\\accept\\job\\attempts\\original\\first-pass-target.json",
+  "target_sha256": "994f3b5a0f521dfa2e1b21392e77522676ce086a9e84304f1bfa4913debf4f26",
+  "raw_response": null,
+  "synthetic": true,
+  "validity": {
+    "schema": true,
+    "semantic": true
+  },
+  "assets": [],
+  "video": null,
+  "video_matches_run": null,
+  "candidates": [
+    {
+      "path": "/title",
+      "text": "Authored synthetic review",
+      "evidence_ids": []
+    },
+    {
+      "path": "/claims/0/text",
+      "text": "Authored synthetic review fixture only.",
+      "evidence_ids": [
+        "a1"
+      ]
+    },
+    {
+      "path": "/unknowns/0/text",
+      "text": "OCR and vision unavailable.",
+      "evidence_ids": []
+    }
+  ]
+}

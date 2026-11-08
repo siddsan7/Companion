@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.0",
+  "attempt": "\\\\?\\C:\\Users\\sidds\\AppData\\Local\\Temp\\companion-authored-review-icvssv6z\\reject-missing\\job\\attempts\\original",
+  "original_hashes": {
+    "evidence.json": "55c8e0bc843c5285cb3bd5993a48e1b579b352c08c194a3a792605fdab74123e",
+    "run.json": "ad910afc6b087ff0bba89cba48e0939115a1d3d2af29b56b1dd248a390894406",
+    "notes.md": "d0ad2de85c38e1843c8a79f8999a3370c57efc3fe2ab414567df7caf0a24e151"
+  },
+  "evidence": {
+    "schema_version": "1.0",
+    "clip_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "duration_seconds": 13.0,
+    "pipeline_version": "authored-fixture",
+    "channels": {
+      "audio": "available",
+      "ocr": "empty",
+      "vision": "empty"
+    },
+    "truncated": false,
+    "evidence": [
+      {
+        "id": "a1",
+        "kind": "transcript",
+        "start_seconds": 0.0,
+        "end_seconds": 13.0,
+        "text": "Authored synthetic review fixture only.",
+        "review_flag": "normal"
+      }
+    ]
+  },
+  "run": {
+    "job_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "attempt_id": "44444444444444444444444444444444",
+    "started_utc": "2026-11-01T10:00:00Z",
+    "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "input_kind": "synthetic_fixture",
+    "result_kind": "synthetic_video_wiring",
+    "validation": "failed",
+    "state": "failed",
+    "canonical_probe": {
+      "": "private use",
+      "𐀀": "astral",
+      "text": "\u0000\b\f\n\r\t\u001f é 😀 / \\ \"",
+      "numbers": [
+        13,
+        13.0,
+        -0.0,
+        0.0001,
+        1e-05,
+        1000000000000000.0,
+        1e+16,
+        5e-324,
+        9007199254740993,
+        10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+      ]
+    }
+  },
+  "target": null,
+  "variant": "first_pass",
+  "target_file": null,
+  "target_sha256": null,
+  "raw_response": null,
+  "synthetic": true,
+  "validity": {
+    "schema": false,
+    "semantic": false
+  },
+  "assets": [],
+  "video": null,
+  "video_matches_run": null,
+  "candidates": []
+}

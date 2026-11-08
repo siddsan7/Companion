@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.0",
+  "review_id": "971114d1532d4699b8a479168ece9727",
+  "source_digest": "74517c51cc25ed9b2a39017522859ecfb9fbcb4b7ab2555e91278be2e831a4e7",
+  "reviewer": "Authored synthetic fixture reviewer",
+  "clip_key": "synthetic-review",
+  "source_group": "authored-synthetic",
+  "condition": "B1",
+  "split": "challenge",
+  "source_reviewed": true,
+  "source_matches_attempt": true,
+  "unit_coverage_confirmed": true,
+  "reference_inventory_complete": true,
+  "review_minutes": 0,
+  "decision": "reject",
+  "notes": "",
+  "facts": [],
+  "conflicts": [],
+  "gaps": [],
+  "units": [],
+  "corrected_target": null
+}

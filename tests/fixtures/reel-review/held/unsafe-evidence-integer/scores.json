@@ -1,0 +1,52 @@
+{
+  "synthesis_recall": {
+    "numerator": 0,
+    "denominator": 0,
+    "value": null
+  },
+  "end_to_end_recall": {
+    "numerator": 0,
+    "denominator": 0,
+    "value": null
+  },
+  "unsupported_claim_rate": {
+    "numerator": 0,
+    "denominator": 3,
+    "value": 0.0
+  },
+  "source_error_rate": {
+    "numerator": 0,
+    "denominator": 3,
+    "value": 0.0
+  },
+  "citation_support_precision": {
+    "numerator": 1,
+    "denominator": 1,
+    "value": 1.0
+  },
+  "reference_validity": {
+    "numerator": 1,
+    "denominator": 1,
+    "value": 1.0
+  },
+  "technical_item_accuracy": {
+    "numerator": 0,
+    "denominator": 0,
+    "value": null
+  },
+  "conflict_recall": {
+    "numerator": 0,
+    "denominator": 0,
+    "value": null
+  },
+  "uncertainty_recall": {
+    "numerator": 0,
+    "denominator": 0,
+    "value": null
+  },
+  "unnecessary_uncertainty": {
+    "numerator": 0,
+    "denominator": 0,
+    "value": null
+  }
+}

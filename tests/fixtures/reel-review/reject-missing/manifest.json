@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "finalization_id": "fa04f784853d45658aaf2936e6d2c22e",
+  "finalized_utc": "2026-11-08T08:09:29.370771+00:00",
+  "review_id": "971114d1532d4699b8a479168ece9727",
+  "files": {
+    "review.json": "a4b8d4c45f04dd483567efc0c5cb46b1b8ce0f5bb25c38a40847736c49436ed1",
+    "scores.json": "ac600456b3d5061c840267469e01d3ecb73173b58cacc9623e78b4ed7b593783",
+    "source.json": "f80d9c111bc3681578f991fd133cb3ae284d7612f1d6985ca692f85fa5912e3c"
+  }
+}
