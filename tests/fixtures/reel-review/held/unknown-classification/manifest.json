@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "finalization_id": "f79573a8c70ec05eb7a87a5c0e33bfa7",
+  "finalized_utc": "2026-11-08T07:05:02.990159+00:00",
+  "review_id": "e4be4332c82a4c118541bc09b3233563",
+  "files": {
+    "review.json": "a2496297865c3cffcf52a8c6e8d8fc2a4c01c3d712eb18fae7538fc093b9af3d",
+    "reviewed-notes.md": "d0ad2de85c38e1843c8a79f8999a3370c57efc3fe2ab414567df7caf0a24e151",
+    "reviewed-target.json": "994f3b5a0f521dfa2e1b21392e77522676ce086a9e84304f1bfa4913debf4f26",
+    "scores.json": "a0b874e9d8b3c8e974acbcc39b33e3f71a2a0588b530efe065d3806e46d6d1a3",
+    "source.json": "23e841c8d1b8bb3bb9bdbfe58e7444711d88647544a1c8b554d23de638d6609e"
+  }
+}

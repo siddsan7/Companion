@@ -16,6 +16,13 @@ function parse(text) {
   if (!fields || typeof fields !== 'object' || typeof fields.companion_id !== 'string' || !fields.companion_id.trim() || /[\r\n]/.test(fields.companion_id) || fields.artifact_type !== 'capture' || fields.schema_version !== 1 || !['thought', 'link', 'reel_import'].includes(fields.capture_type) || typeof fields.title !== 'string' || !fields.title.trim() || /[\r\n]/.test(fields.title) || typeof fields.captured_at !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(fields.captured_at) || !Number.isFinite(Date.parse(fields.captured_at))) return null;
   return { id: fields.companion_id, title: fields.title, type: fields.capture_type, capturedAt: fields.captured_at, content: text };
 }
+function parseAnnotation(text) {
+  const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  let fields; try { fields = match && YAML.parse(match[1]); } catch { return null; }
+  const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+  if (!fields || fields.artifact_type !== 'annotation' || fields.schema_version !== 1 || !uuid.test(fields.companion_id) || !uuid.test(fields.capture_id)) return null;
+  return { id: fields.companion_id, captureId: fields.capture_id, content: text };
+}
 function captureHeading(title, type) {
   // Imported titles are source text. Escape punctuation so Markdown images,
   // HTML and vault links cannot become active in the generated display heading.
@@ -56,7 +63,7 @@ class Vault {
     finally { await fs.unlink(owner).catch(() => {}); }
   }
   async release(file) { await fs.unlink(`${file}.lock`).catch(error => { if (error.code !== 'ENOENT') this.warnings.push('A saved-note lock could not be removed. Restart Companion to recover it.'); }); }
-  async scan() {
+  async scan({ annotations = false } = {}) {
     await this.writable();
     const notes = [];
     const visit = async dir => {
@@ -66,9 +73,9 @@ class Vault {
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
-          await this.contained(file); const content = await fs.readFile(file, 'utf8'), note = parse(content);
+          await this.contained(file); const content = await fs.readFile(file, 'utf8'), note = annotations ? parseAnnotation(content) : parse(content);
           if (note) notes.push({ ...note, file });
-          else if (/^(?:companion_id|artifact_type):/m.test(content) && path.dirname(file) === path.join(this.root, 'Captures')) this.warnings.push('Invalid capture metadata in ' + entry.name + '. The file was preserved; repair its identity, type, schema, title and absolute captured_at timestamp.');
+          else if (!annotations && /^(?:companion_id|artifact_type):/m.test(content) && path.dirname(file) === path.join(this.root, 'Captures')) this.warnings.push('Invalid capture metadata in ' + entry.name + '. The file was preserved; repair its identity, type, schema, title and absolute captured_at timestamp.');
         }
       }
     };
@@ -216,4 +223,4 @@ class Vault {
     }
   }
 }
-module.exports = { Vault, withTitle, captureHeading };
+module.exports = { Vault, withTitle, captureHeading, parseAnnotation };

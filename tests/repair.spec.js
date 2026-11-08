@@ -17,7 +17,9 @@ async function artifact(name = 'first', attempt = '1'.repeat(32)) {
 }
 async function launch() {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
-  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  page = await app.firstWindow();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
 }
 async function setup() {
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
@@ -75,6 +77,143 @@ test('independent annotations stay linked and unchanged after a source revision'
   await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
   await expect(page.getByLabel('Source inspection')).toContainText('My independent interpretation.');
   expect(await fs.readFile(path.join(dir, file), 'utf8')).toBe(original);
+});
+
+test('moved annotations remain inspectable with repaired links and unchanged independent writing across restart', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const writing = 'Independent writing.\n\nSource: [Capture](my-private-reference.md)\n\nUnicode: café 📝';
+  await page.getByLabel('New annotation').fill(writing);
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+  const base = path.join(root, 'vault', 'Companion'), annotations = path.join(base, 'Annotations');
+  const name = (await fs.readdir(annotations)).find(x => x.endsWith('.md'));
+  let file = path.join(annotations, name);
+  const original = await fs.readFile(file, 'utf8');
+  const captureName = (await fs.readdir(path.join(base, 'Captures'))).find(x => x.endsWith('.md'));
+  const privateNote = path.join(root, 'vault', 'Private.md'), privateBytes = '# Private\n\nSource: [Capture](private.md)\n';
+  await fs.writeFile(privateNote, privateBytes);
+  for (const [folder, expected] of [
+    [path.join(annotations, 'Nested'), '../../Captures/'],
+    [path.join(root, 'vault', 'Projects', 'Writing'), '../../Companion/Captures/']
+  ]) {
+    const moved = path.join(folder, name); await fs.mkdir(folder, { recursive: true }); await fs.rename(file, moved); file = moved;
+    await app.close(); app = null; await launch();
+    await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+    await expect(page.getByLabel('Source inspection')).toContainText('Independent writing.');
+    const expectedBytes = original.replace(/^Source: \[Capture\]\([^\r\n]*\)$/m, `Source: [Capture](${expected}${encodeURIComponent(captureName)})`);
+    expect(await fs.readFile(file, 'utf8')).toBe(expectedBytes);
+    expect(await fs.readFile(privateNote, 'utf8')).toBe(privateBytes);
+  }
+});
+
+test('duplicate annotations preserve both copies and pause relationship repair until explicit selection', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('Canonical annotation writing.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+  const base = path.join(root, 'vault', 'Companion'), folder = path.join(base, 'Annotations');
+  const name = (await fs.readdir(folder)).find(x => x.endsWith('.md')), original = path.join(folder, name);
+  const before = await fs.readFile(original, 'utf8'), copy = path.join(root, 'vault', 'Projects', 'Copied annotation.md');
+  const copied = before + '\nPreserved duplicate writing.\n';
+  await fs.mkdir(path.dirname(copy), { recursive: true }); await fs.writeFile(copy, copied);
+  const capture = path.join(base, 'Captures', (await fs.readdir(path.join(base, 'Captures'))).find(x => x.endsWith('.md')));
+  const moved = path.join(root, 'vault', 'Projects', 'Moved annotated source.md'); await fs.rename(capture, moved);
+  const independent = await artifact('independent', '3'.repeat(32));
+  const run = JSON.parse(await fs.readFile(path.join(independent, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
+  await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify(run));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await expect(page.locator('#captures article')).toHaveCount(2);
+  expect(await fs.readFile(original, 'utf8')).toBe(before); expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+  await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
+  await app.close(); app = null; await launch();
+  await expect(page.getByLabel('Vault repairs')).toContainText('Copied annotation.md');
+  const captureId = before.match(/capture_id: "([^"]+)"/)[1];
+  await page.locator('#captures article').filter({ hasText: captureId }).getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection')).toContainText('Canonical annotation writing.');
+  await expect(page.getByLabel('Source inspection')).toContainText('Preserved duplicate writing.');
+  await page.getByRole('button', { name: `Use this file: Companion/Annotations/${name}`, exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Identity selection saved');
+  expect(await fs.readFile(original, 'utf8')).toBe(before.replace(/^Source: \[Capture\]\([^\r\n]*\)$/m, 'Source: [Capture](../../Projects/Moved%20annotated%20source.md)'));
+  expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+  await fs.appendFile(copy, '\nLater duplicate change.\n');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
+  expect(await fs.readFile(copy, 'utf8')).toBe(copied + '\nLater duplicate change.\n');
+});
+
+test('custom annotation headers preserve user-owned Source links after the first frontmatter block', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('Independent body.\n\n---\n\n# Annotation\n\nSource: [Capture](my-owned-link)\n\nUser-owned footer.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+  const folder = path.join(root, 'vault', 'Companion', 'Annotations');
+  const name = (await fs.readdir(folder)).find(x => x.endsWith('.md'));
+  let file = path.join(folder, name);
+  const original = await fs.readFile(file, 'utf8');
+  const variants = [
+    original.replace('# Annotation', '# My commentary'),
+    original.replace('# Annotation\n\n', '').replace(/^Source: \[Capture\]\([^\r\n]*\)\n/m, '')
+  ];
+  for (const [index, content] of variants.entries()) {
+    await fs.writeFile(file, content);
+    const moved = path.join(root, 'vault', 'Projects', `Custom-${index}`, name);
+    await fs.mkdir(path.dirname(moved), { recursive: true }); await fs.rename(file, moved); file = moved;
+    await app.close(); app = null; await launch();
+    await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+    await expect(page.getByLabel('Source inspection')).toContainText('User-owned footer.');
+    expect(await fs.readFile(file, 'utf8')).toBe(content);
+  }
+});
+
+test('an editor change after a durable relationship intent stays held across restart while independent intake continues', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('Original independent writing.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+  const base = path.join(root, 'vault', 'Companion'), folder = path.join(base, 'Annotations');
+  const name = (await fs.readdir(folder)).find(x => x.endsWith('.md')), original = path.join(folder, name);
+  const before = await fs.readFile(original, 'utf8'), moved = path.join(folder, 'Nested', name);
+  await fs.mkdir(path.dirname(moved), { recursive: true }); await fs.rename(original, moved);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'link-intent-published' }));
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('link-intent-published');
+  const intentFile = path.join(base, '.intake', 'link-intent.json'), intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
+  await fs.appendFile(moved, '\nEditor writing after the durable relationship intent.\n');
+  const edited = await fs.readFile(moved, 'utf8');
+  expect(edited).not.toBe(intent.before); expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+  const crashEvidence = { root, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+  await fs.writeFile(test.info().outputPath('crash-processes.json'), JSON.stringify(crashEvidence, null, 2), { encoding: 'utf8' });
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abruptExit = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  crashEvidence.wrapperExit = await exited; await abruptExit;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  await fs.writeFile(test.info().outputPath('crash-processes.json'), JSON.stringify(crashEvidence, null, 2), { encoding: 'utf8' });
+  app = null;
+  await fs.writeFile(path.join(root, 'faults.json'), '{}');
+  const independent = await artifact('independent', '3'.repeat(32));
+  const run = JSON.parse(await fs.readFile(path.join(independent, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
+  await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify(run));
+  await launch();
+  await expect(page.getByLabel('Vault repairs')).toContainText('Annotation relationship paused');
+  expect(await fs.readFile(moved, 'utf8')).toBe(edited);
+  const archive = path.join(base, '.intake', `link-${intent.id}.json`);
+  expect(await fs.readFile(archive, 'utf8')).toBe(intentBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await expect(page.locator('#captures article')).toHaveCount(2);
+  expect(await fs.readFile(moved, 'utf8')).toBe(edited);
+  await page.getByRole('button', { name: 'Retry annotation relationship', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation relationship retry complete');
+  const captureName = (await fs.readdir(path.join(base, 'Captures'))).find(x => x.includes(before.match(/capture_id: "([^"]+)"/)[1]));
+  expect(await fs.readFile(moved, 'utf8')).toBe(edited.replace(/^Source: \[Capture\]\([^\r\n]*\)$/m, `Source: [Capture](../../Captures/${encodeURIComponent(captureName)})`));
+  expect(await fs.readFile(archive, 'utf8')).toBe(intentBytes);
+  expect(await fs.readFile(intentFile, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
 });
 
 test('verified moves keep stable capture identity and repair annotation links before later imports', async () => {
