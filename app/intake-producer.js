@@ -12,6 +12,8 @@ function schema(value, rule) {
     const kinds = Array.isArray(rule.type) ? rule.type : [rule.type];
     if (!kinds.some(kind => kind === 'null' ? value === null : kind === 'array' ? Array.isArray(value) : kind === 'object' ? value && typeof value === 'object' && !Array.isArray(value) : kind === 'integer' ? Number.isInteger(value) : kind === 'number' ? typeof value === 'number' && Number.isFinite(value) : typeof value === kind)) fail('Invalid producer field type.');
   }
+  if (typeof value === 'string' && rule.maxLength && [...value].length > rule.maxLength) fail('Producer text exceeds the supported length.');
+  if (Array.isArray(value) && rule.maxItems && value.length > rule.maxItems) fail('Producer array exceeds the supported length.');
   if (typeof value === 'string' && rule.minLength && [...value].length < rule.minLength) fail('Empty producer field.');
   if (typeof value === 'number' && (rule.minimum !== undefined && value < rule.minimum || rule.exclusiveMinimum !== undefined && value <= rule.exclusiveMinimum)) fail('Invalid producer number.');
   if (Array.isArray(value)) {
@@ -25,8 +27,8 @@ function schema(value, rule) {
     }
   }
 }
-function validate(packet, target) {
-  schema(packet, require('./producer-schema/evidence.schema.json')); schema(target, require('./producer-schema/target.schema.json'));
+function validateEvidence(packet) {
+  schema(packet, require('./producer-schema/evidence.schema.json'));
   const items = new Map(), channel = { transcript: 'audio', ocr: 'ocr', visual_description: 'vision' };
   for (const item of packet.evidence) {
     if (items.has(item.id) || !item.id.trim() || !item.text.trim()) fail('Duplicate or blank evidence identity/text.');
@@ -35,6 +37,11 @@ function validate(packet, target) {
     items.set(item.id, item);
   }
   for (const [key, state] of Object.entries(packet.channels)) if (state === 'available' && !packet.evidence.some(x => channel[x.kind] === key)) fail('Available channel has no evidence.');
+  return items;
+}
+function validate(packet, target) {
+  const items = validateEvidence(packet);
+  schema(target, require('./producer-schema/target.schema.json'));
   const ids = new Set();
   for (const group of ['claims', 'steps', 'conflicts', 'unknowns', 'omissions']) for (const item of target[group]) {
     if (!item[group === 'omissions' ? 'reason' : 'text'].trim() || item.evidence_ids.some(id => !items.has(id))) fail('Blank text or missing evidence reference.');
@@ -124,4 +131,4 @@ async function readDraft(folder) {
   const second = await read(); if (bytes.some((value, i) => !value.equals(second[i]))) fail('Producer files changed during admission. Retry after transfer completes.');
   return { sourceHash: run.input_sha256, identity: `${run.job_id}:${run.attempt_id}`, fingerprint: hash(Buffer.concat(bytes)), run, evidence: packet, target, text, locator: folder, humanReview: 'unreviewed', extraction: target.status, uncertainty: { channels: packet.channels, truncated: packet.truncated, uncertainEvidence: packet.evidence.filter(x => x.review_flag === 'uncertain').map(x => x.id), unknowns: target.unknowns, conflicts: target.conflicts } };
 }
-module.exports = { readDraft, hash };
+module.exports = { readDraft, hash, schema, validate, validateEvidence, render };

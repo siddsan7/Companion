@@ -38,8 +38,11 @@ app.whenReady().then(async () => {
   ipcMain.handle('capture', async (_, input) => { if (!vault) throw Error('Choose a vault first.'); return vault.capture(input, clock().now); });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
   ipcMain.handle('connect-drafts', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return new Intake(vault).connect(folder, scan, clock().now); });
+  ipcMain.handle('connect-reviews', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return new Intake(vault).connect(folder, scan, clock().now, 'review'); });
   ipcMain.handle('check-intake', async () => { if (!vault) throw Error('Choose a vault first.'); return new Intake(vault).reconcile({ trigger: 'manual', now: clock().now }); });
   ipcMain.handle('inspect-source', async (_, id) => new Intake(vault).inspect(id));
+  ipcMain.handle('select-review', async (_, { id, revision }) => new Intake(vault).selectCurrent(id, revision, clock().now));
+  ipcMain.handle('link-sources', async (_, { id, related }) => new Intake(vault).linkSources(id, related, clock().now));
   ipcMain.handle('open-note', async (_, id) => {
     const note = await vault.find(id);
     const uri = `obsidian://open?path=${encodeURIComponent(note.file)}`;

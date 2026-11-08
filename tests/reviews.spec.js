@@ -1,0 +1,264 @@
+const { test, expect, _electron: electron } = require('@playwright/test');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+let root, app, page, checks;
+test.beforeEach(async () => { checks = 0; root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-reviews-')); });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+async function bundle(name = 'accept') {
+  const dir = path.join(root, 'producer', name);
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review', name), dir, { recursive: true });
+  return dir;
+}
+async function launch() {
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+}
+async function setup() {
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Finalized review folder').fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+}
+async function check() {
+  const instant = new Date(Date.parse('2026-11-08T06:59:00Z') + ++checks * 1000).toISOString();
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · complete`);
+}
+async function snapshots() {
+  const base = path.join(root, 'vault', 'Companion', 'Revisions');
+  return Promise.all((await fs.readdir(base)).filter(x => x.endsWith('.json')).map(async x => JSON.parse(await fs.readFile(path.join(base, x), 'utf8'))));
+}
+async function captureText() {
+  const base = path.join(root, 'vault', 'Companion', 'Captures');
+  const files = (await fs.readdir(base)).filter(x => x.endsWith('.md'));
+  return fs.readFile(path.join(base, files[0]), 'utf8');
+}
+test('portable finalized acceptance retains actual review findings and immutable history across restart', async () => {
+  await bundle(); await launch();
+  // Runtime evidence: Node alone cannot establish Electron reviver support.
+  expect(await app.evaluate(() => { let raw; JSON.parse('9007199254740993', (_, value, context) => { raw = context.source; return value; }); return raw; })).toBe('9007199254740993');
+  await setup(); await check();
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const inspection = page.getByLabel('Source inspection');
+  await expect(inspection).toContainText('Human review: accept');
+  await expect(inspection).toContainText('Extraction: partial');
+  await expect(inspection).toContainText('Processing: partial');
+  await expect(inspection).toContainText('input_support');
+  await expect(inspection).toContainText('Acceptance does not verify every claim');
+  const before = await snapshots(); expect(before).toHaveLength(1);
+  expect(before[0].review.decision).toBe('accept'); expect(before[0].supportEligible).toBe(true);
+  await app.close(); app = null; await launch(); await check();
+  expect(await snapshots()).toEqual(before);
+  await expect(page.locator('#held-imports')).toHaveText('No held imports.');
+});
+test('edited review remains current while a later unreviewed draft is retained in history', async () => {
+  const edited = await bundle('edit'); await launch(); await setup(); await check();
+  await expect(page.locator('#captures article')).toContainText('Authored synthetic corrected review');
+  expect(await captureText()).toContain('human_review: "edit"');
+  const source = JSON.parse(await fs.readFile(path.join(edited, 'source.json'), 'utf8'));
+  const draft = path.join(root, 'drafts', 'later'); await fs.mkdir(draft, { recursive: true });
+  await fs.writeFile(path.join(draft, 'run.json'), JSON.stringify({ ...source.run, attempt_id: '4'.repeat(32) }));
+  await fs.writeFile(path.join(draft, 'evidence.json'), JSON.stringify(source.evidence));
+  await fs.writeFile(path.join(draft, 'first-pass-target.json'), JSON.stringify(source.target));
+  // Original authored target has exactly the producer-rendered accept notes.
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-review/accept/reviewed-notes.md'), path.join(draft, 'notes.md'));
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'drafts'));
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected'); await check();
+  expect(await snapshots()).toHaveLength(2);
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect(await captureText()).toContain('human_review: "edit"');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection').locator('article')).toHaveCount(2);
+  await expect(page.getByLabel('Source inspection')).toContainText('Human review: unreviewed');
+  await expect(page.locator('#held-imports')).toHaveText('No held imports.');
+  await app.close(); app = null; await launch(); await check(); expect(await snapshots()).toHaveLength(2);
+  expect(await captureText()).toContain('human_review: "edit"');
+});
+test('competing reviewed successors preserve current content until an explicit durable choice', async () => {
+  await bundle('accept'); await launch(); await setup(); await check();
+  const original = await captureText(), firstSnapshots = await snapshots();
+  await bundle('edit'); await check();
+  expect(await captureText()).toBe(original);
+  expect(await snapshots()).toHaveLength(2);
+  await expect(page.locator('#held-imports')).toContainText('Choose the current reviewed revision');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const edited = page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' });
+  await edited.getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  expect(await captureText()).toContain('human_review: "edit"');
+  expect(await snapshots()).toHaveLength(2);
+  expect((await snapshots()).find(x => x.id === firstSnapshots[0].id)).toEqual(firstSnapshots[0]);
+  await app.close(); app = null; await launch(); await check();
+  expect(await captureText()).toContain('human_review: "edit"');
+  await expect(page.locator('#held-imports')).toHaveText('No held imports.');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  // An explicit historical choice is reversible, using the exact retained snapshot.
+  const accepted = page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: accept' });
+  await accepted.getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  expect(await captureText()).toContain('human_review: "accept"');
+  expect(await snapshots()).toHaveLength(2);
+});
+test('rejection without a first-pass target remains inspectable and excluded from supporting evidence', async () => {
+  const rejected = await bundle('reject-missing');
+  expect(await fs.stat(path.join(rejected, 'reviewed-notes.md')).then(() => true, () => false)).toBe(false);
+  await launch(); await setup(); await check();
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect(await captureText()).toContain('human_review: "reject"');
+  expect(await captureText()).toContain('Ineligible as supporting evidence');
+  const initial = await snapshots(); expect(initial).toHaveLength(1);
+  expect(initial[0].target).toBeNull(); expect(initial[0].supportEligible).toBe(false);
+  expect(initial[0].processing).toBe('failed'); expect(initial[0].extraction).toBe('unknown');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection')).toContainText('Supporting evidence: excluded by rejection');
+  await expect(page.getByLabel('Source inspection')).toContainText('Human review: reject');
+  await expect(page.getByLabel('Source inspection')).toContainText('Processing: failed');
+  const source = JSON.parse(await fs.readFile(path.join(__dirname, 'fixtures/reel-review/accept/source.json'), 'utf8'));
+  const draft = path.join(root, 'drafts', 'after-reject'); await fs.mkdir(draft, { recursive: true });
+  await fs.writeFile(path.join(draft, 'run.json'), JSON.stringify({ ...source.run, attempt_id: '5'.repeat(32) }));
+  await fs.writeFile(path.join(draft, 'evidence.json'), JSON.stringify(source.evidence));
+  await fs.writeFile(path.join(draft, 'first-pass-target.json'), JSON.stringify(source.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-review/accept/reviewed-notes.md'), path.join(draft, 'notes.md'));
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'drafts'));
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected'); await check();
+  expect(await snapshots()).toHaveLength(2); expect(await captureText()).toContain('human_review: "reject"');
+  await app.close(); app = null; await launch(); await check();
+  const ledger = JSON.parse(await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8'));
+  expect(Object.values(ledger.captures)[0].supportEligible).toBe(false);
+  expect(Object.values(ledger.captures)[0].rejected).toBe(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection')).toContainText('Supporting evidence: excluded by rejection');
+});
+test('explicit changed-byte links preserve both captures and their separate immutable histories', async () => {
+  const accepted = await bundle('accept'); await launch(); await setup(); await check();
+  const source = JSON.parse(await fs.readFile(path.join(accepted, 'source.json'), 'utf8'));
+  const draft = path.join(root, 'drafts', 'changed-bytes'); await fs.mkdir(draft, { recursive: true });
+  await fs.writeFile(path.join(draft, 'run.json'), JSON.stringify({ ...source.run, input_sha256: 'c'.repeat(64), job_id: 'd'.repeat(64), attempt_id: '6'.repeat(32) }));
+  await fs.writeFile(path.join(draft, 'evidence.json'), JSON.stringify({ ...source.evidence, clip_id: 'd'.repeat(64) }));
+  await fs.writeFile(path.join(draft, 'first-pass-target.json'), JSON.stringify(source.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-review/accept/reviewed-notes.md'), path.join(draft, 'notes.md'));
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'drafts'));
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected'); await check();
+  await expect(page.locator('#captures article')).toHaveCount(2);
+  const before = await snapshots(), reviewed = before.find(item => item.sourceHash === 'a'.repeat(64)), changed = before.find(item => item.sourceHash === 'c'.repeat(64));
+  const base = path.join(root, 'vault', 'Companion', 'Captures');
+  const notes = await Promise.all([reviewed, changed].map(item => fs.readFile(path.join(base, `${item.captureId}.md`), 'utf8')));
+  await page.locator('#captures article').filter({ hasText: reviewed.captureId }).getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Related changed-byte capture').selectOption(changed.captureId);
+  await page.getByRole('button', { name: 'Link sources', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Sources linked');
+  await expect(page.getByLabel('Source inspection')).toContainText('User-linked source');
+  await expect(page.getByLabel('Source inspection')).toContainText('Captures and revision histories remain separate');
+  expect(await snapshots()).toEqual(before);
+  expect(await Promise.all([reviewed, changed].map(item => fs.readFile(path.join(base, `${item.captureId}.md`), 'utf8')))).toEqual(notes);
+  await app.close(); app = null; await launch(); await check();
+  await expect(page.locator('#captures article')).toHaveCount(2);
+  await page.locator('#captures article').filter({ hasText: changed.captureId }).getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection')).toContainText('User-linked source');
+  const ledger = JSON.parse(await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8'));
+  expect(ledger.links).toHaveLength(1);
+  expect(new Set(ledger.links[0].captureIds)).toEqual(new Set([reviewed.captureId, changed.captureId]));
+  expect(Object.keys(ledger.captures)).toHaveLength(2);
+});
+test('invalid finalized bundles are held without source fragments while an independent valid review continues', async () => {
+  const cases = ['source-digest', 'unknown-classification', 'missing-hash', 'legacy-review', 'pending-label', 'scores-mismatch', 'exports-mismatch', 'exports-missing', 'asset-unlisted', 'unsafe-path', 'reject-invalid-evidence', 'mismatched-clip-identity', 'unsafe-evidence-integer', 'date-only-source-time'];
+  const accepted = await bundle('accept');
+  for (const name of cases) await bundle(`held/${name}`);
+  const malformed = path.join(root, 'producer', 'malformed-json'); await fs.cp(accepted, malformed, { recursive: true });
+  const broken = '<TOPSECRET>';
+  await fs.writeFile(path.join(malformed, 'review.json'), broken);
+  const manifest = JSON.parse(await fs.readFile(path.join(malformed, 'manifest.json'), 'utf8'));
+  manifest.finalization_id = 'f'.repeat(32);
+  manifest.files['review.json'] = require('node:crypto').createHash('sha256').update(broken).digest('hex');
+  await fs.writeFile(path.join(malformed, 'manifest.json'), JSON.stringify(manifest));
+  // Python reads UTF-8 strictly; Buffer.toString alone would replace this byte
+  // and admit a manifest that the producer cannot load. No new source digest.
+  const invalidUtf8 = path.join(root, 'producer', 'invalid-utf8'); await fs.cp(accepted, invalidUtf8, { recursive: true });
+  const utf8Manifest = JSON.parse(await fs.readFile(path.join(invalidUtf8, 'manifest.json'), 'utf8')); utf8Manifest.finalization_id = 'e'.repeat(32);
+  await fs.writeFile(path.join(invalidUtf8, 'manifest.json'), Buffer.concat([Buffer.from('{"utf8_probe":"'), Buffer.from([255]), Buffer.from('",' + JSON.stringify(utf8Manifest).slice(1))]));
+  await launch(); await setup(); await check();
+  const retained = await snapshots(); expect(retained).toHaveLength(1);
+  expect(retained[0].humanReview).toBe('accept');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const held = page.locator('#held-imports');
+  for (const name of cases) await expect(held).toContainText(name);
+  await expect(held).toContainText('Unreadable producer JSON');
+  await expect(held).toContainText('Unreadable producer UTF-8 text');
+  await expect(held).not.toContainText('TOPSECRET');
+  await expect(held).toContainText('Finalized source digest mismatch');
+  await expect(held).toContainText('Legacy or unknown review classification');
+  await expect(held).toContainText('Reviewed exports do not match');
+  await expect(held).toContainText('Stored scores do not match');
+  await expect(held).toContainText('Unsafe finalized bundle path');
+  await expect(held).toContainText('Evidence time is outside the clip');
+  await expect(held).toContainText('Finalized evidence does not match the original attempt identity');
+  await expect(held).toContainText('Unsafe integer in review semantics');
+  await expect(held).toContainText('Missing or unsupported original attempt identity');
+  await app.close(); app = null; await launch(); await check();
+  expect(await snapshots()).toEqual(retained);
+  const ledger = JSON.parse(await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8'));
+  expect(Object.values(ledger.captures)[0].supportEligible).toBe(true);
+  await expect(page.locator('#held-imports')).not.toContainText('TOPSECRET');
+});
+test('one producer root can connect drafts and finalized reviews without losing either source kind', async () => {
+  const accepted = await bundle('accept'), source = JSON.parse(await fs.readFile(path.join(accepted, 'source.json'), 'utf8'));
+  const draft = path.join(root, 'producer', 'draft'); await fs.mkdir(draft, { recursive: true });
+  await fs.writeFile(path.join(draft, 'run.json'), JSON.stringify({ ...source.run, attempt_id: '7'.repeat(32) }));
+  await fs.writeFile(path.join(draft, 'evidence.json'), JSON.stringify(source.evidence));
+  await fs.writeFile(path.join(draft, 'first-pass-target.json'), JSON.stringify(source.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-review/accept/reviewed-notes.md'), path.join(draft, 'notes.md'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected'); await check();
+  expect(await snapshots()).toHaveLength(1); expect(await captureText()).toContain('human_review: "unreviewed"');
+  const capturedAt = (await captureText()).match(/^captured_at: .+$/m)[0];
+  await page.getByLabel('Finalized review folder').fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected'); await check();
+  expect(await snapshots()).toHaveLength(2);
+  expect(await captureText()).toContain('human_review: "accept"'); expect(await captureText()).toContain(capturedAt);
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  await app.close(); app = null; await launch(); await check();
+  expect(await snapshots()).toHaveLength(2);
+  await expect(page.locator('#intake-state')).toContainText('Drafts:');
+  await expect(page.locator('#intake-state')).toContainText('Finalized reviews:');
+});
+test('current choice recovers after a crash and a later reviewed successor still includes current in its choices', async () => {
+  await bundle('accept'); await launch(); await setup(); await check(); await bundle('edit'); await check();
+  const before = await snapshots(), editedId = before.find(item => item.humanReview === 'edit').id;
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const edited = page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' });
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-moved' }));
+  await edited.getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('intake-moved');
+  app.process().kill(); await app.close().catch(() => {}); app = null;
+  await fs.unlink(path.join(root, 'faults.json')); await launch();
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect(await captureText()).toContain('human_review: "edit"');
+  expect(await snapshots()).toEqual(before);
+  const base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  let ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = Object.values(ledger.captures)[0];
+  expect(capture.currentRevision).toBe(editedId); expect(capture.selectionHistory).toHaveLength(1);
+  expect(await fs.stat(path.join(base, '.intake', 'transaction.json')).then(() => true, () => false)).toBe(false);
+  await check(); expect(await snapshots()).toEqual(before);
+  const selectedNote = await captureText(); await bundle('reject'); await check();
+  const after = await snapshots(), rejectedId = after.find(item => item.humanReview === 'reject').id;
+  expect(after).toHaveLength(3); expect(await captureText()).toBe(selectedNote);
+  ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')); capture = Object.values(ledger.captures)[0];
+  expect(capture.currentRevision).toBe(editedId);
+  expect(new Set(capture.reviewChoices)).toEqual(new Set([editedId, rejectedId]));
+  expect(capture.supportEligible).toBe(false);
+  await expect(page.locator('#held-imports')).toContainText('Choose the current reviewed revision');
+});

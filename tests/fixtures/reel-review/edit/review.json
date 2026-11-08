@@ -1,0 +1,88 @@
+{
+  "schema_version": "1.0",
+  "review_id": "27653f27af8b42c2ad52a095040934ae",
+  "source_digest": "1e3e6e1281e35020c2248b4bdf381559507f5e109bdd290d6e29cf929cb1d1f5",
+  "reviewer": "Authored synthetic fixture reviewer",
+  "clip_key": "synthetic-review",
+  "source_group": "authored-synthetic",
+  "condition": "B1",
+  "split": "challenge",
+  "source_reviewed": true,
+  "source_matches_attempt": true,
+  "unit_coverage_confirmed": true,
+  "reference_inventory_complete": true,
+  "review_minutes": 0,
+  "decision": "edit",
+  "notes": "",
+  "facts": [],
+  "conflicts": [],
+  "gaps": [],
+  "units": [
+    {
+      "id": "u1",
+      "path": "/title",
+      "text": "Authored synthetic review",
+      "start": 0,
+      "end": 25,
+      "factual": true,
+      "exclusion_reason": "",
+      "input_support": "full",
+      "source_consistent": true,
+      "citations": []
+    },
+    {
+      "id": "u2",
+      "path": "/claims/0/text",
+      "text": "Authored synthetic review fixture only.",
+      "start": 0,
+      "end": 39,
+      "factual": true,
+      "exclusion_reason": "",
+      "input_support": "full",
+      "source_consistent": true,
+      "citations": [
+        {
+          "evidence_id": "a1",
+          "supports": true
+        }
+      ]
+    },
+    {
+      "id": "u3",
+      "path": "/unknowns/0/text",
+      "text": "OCR and vision unavailable.",
+      "start": 0,
+      "end": 27,
+      "factual": true,
+      "exclusion_reason": "",
+      "input_support": "full",
+      "source_consistent": true,
+      "citations": []
+    }
+  ],
+  "corrected_target": {
+    "schema_version": "1.0",
+    "title": "Authored synthetic corrected review",
+    "status": "partial",
+    "claims": [
+      {
+        "id": "c1",
+        "text": "Authored synthetic review fixture only.",
+        "attribution": "narration",
+        "evidence_ids": [
+          "a1"
+        ]
+      }
+    ],
+    "steps": [],
+    "conflicts": [],
+    "unknowns": [
+      {
+        "text": "OCR and vision unavailable.",
+        "basis": "missing_channel",
+        "evidence_ids": []
+      }
+    ],
+    "omissions": []
+  }
+}

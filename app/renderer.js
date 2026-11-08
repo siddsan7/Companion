@@ -35,4 +35,5 @@ $('history').onclick = () => action(async () => { view = 'all'; await refresh();
 $('search').oninput = () => action(refresh); $('refresh').onclick = () => action(refresh);
 $('connect-drafts').onclick = () => action(async () => { const scan = $('first-scan').checked; await window.companion['connect-drafts']({ folder: $('draft-source').value, scan }); await refresh(); status(scan ? 'Intake check complete.' : 'Source connected. Use Check now when ready.'); });
 $('check-intake').onclick = () => action(async () => { await window.companion['check-intake'](); await refresh(); status('Intake check complete. Inspect held imports and source errors.'); });
+$('connect-reviews').onclick = () => action(async () => { await window.companion['connect-reviews']({ folder: $('review-source').value, scan: false }); await refresh(); status('Source connected. Use Check now when ready.'); });
 window.addEventListener('focus', () => action(refresh)); setInterval(() => action(refresh), 60000); action(refresh);

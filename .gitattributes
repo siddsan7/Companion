@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Finalized manifests hash exact producer bytes, including Windows CRLF.
+tests/fixtures/reel-review/** -text

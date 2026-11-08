@@ -10,7 +10,7 @@
 - `app/intake-view.js`: source connection, first-scan choice, held reasons, last check and source/revision inspection. Sections have named navigation as the shell grows.
 - `tests/capture.spec.js`: Playwright Electron desktop plus persisted-files seam. Tests use disposable vaults and controlled clock/timezone/OS dispatch.
 
-Next seams: finalized-review precedence/ambiguity, annotations and identity/conflict repair, and scheduled worker registration extend intake. Preserve capture timestamps, independent user writing and journaled publication. Imported stages never use quick-capture recovery. Intake metadata is vault authority and must not roll back during later app-history restoration.
+Next seams: annotations and identity/conflict repair, and scheduled worker registration extend intake. Preserve capture timestamps, independent user writing and journaled publication. Imported stages never use quick-capture recovery. Intake metadata is vault authority and must not roll back during later app-history restoration.
 
 Settings are outside the vault in Electron user data. Captures, annotations, ideas, briefs and revisions occupy separate areas under the selected parent. Capture support began in #2; Project Brief support is described below. No retention expiry exists.
 
@@ -23,3 +23,11 @@ Settings are outside the vault in Electron user data. Captures, annotations, ide
 - `tests/briefs.spec.js`: approved desktop plus persisted-files seam, disposable selected documents and OS dialog substitute. `brief-pin` reads and validates only candidates for the requested approved numeric version, so unrelated damaged proposals/newer approvals cannot block a healthy historical pin. It returns the exact approved version, retained sources and current source warnings; unavailable, damaged or ambiguous requested versions fail rather than substitute another version.
 
 Local extraction is a transparent heading-based draft, not a model summary or semantic verification. User edits remain identified as user writing. Conversation UI and complete outgoing context limits remain downstream responsibilities.
+
+## Finalized reviews (#4)
+
+- `app/intake-review.js`: portable finalized bundle integrity, schema and human-label semantics, score recomputation, reviewed export selection, rejection metadata and normalized independent review/extraction/processing fields. It never opens producer paths retained in source provenance.
+- `app/producer-json.js`: bounded source JSON parsing with lossless numeric tokens and Python storage.digest serialization. Exact original `source.json` text is retained in review snapshots. Runtime capability is checked through real Electron acceptance, not inferred from standalone Node.
+- `tests/reviews.spec.js` and `tests/fixtures/reel-review/`: approved desktop/files workflow and producer-library-generated authored synthetic fixtures; source/video integration evidence remains separate. Finalized fixture bytes use `-text` because manifest hashes include producer CRLF bytes.
+- `app/intake.js` connects by canonical folder plus kind, retains noncurrent drafts/reviews through `retainOnly` source transactions, and selects an existing reviewed snapshot through normal journaled publication with unique `resolution` backups. `capture.reviewChoices` pauses eligibility until explicit selection. `.intake/ledger.json` also owns reciprocal changed-byte associations; captures and histories remain separate.
+- Source inspection shows processing, extraction, human findings, eligibility and exact retained revisions independently. `reviewSourceText` preserves source digest fidelity. It may contain private provenance/raw response and is not an automatic context source. Discovery must check capture eligibility/ambiguity and `revision.supportEligible`; rejection never becomes supporting evidence through a later draft or an association.
