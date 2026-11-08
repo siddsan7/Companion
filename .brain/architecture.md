@@ -12,4 +12,14 @@
 
 Next seams: finalized-review precedence/ambiguity, annotations and identity/conflict repair, and scheduled worker registration extend intake. Preserve capture timestamps, independent user writing and journaled publication. Imported stages never use quick-capture recovery. Intake metadata is vault authority and must not roll back during later app-history restoration.
 
-Settings are outside the vault in Electron user data. Captures, annotations, ideas, briefs and revisions occupy separate areas under the selected parent. Only captures are implemented in #2. No retention expiry exists.
+Settings are outside the vault in Electron user data. Captures, annotations, ideas, briefs and revisions occupy separate areas under the selected parent. Capture support began in #2; Project Brief support is described below. No retention expiry exists.
+
+## Project Briefs (#7)
+
+- `app/briefs.js`: vault-backed local extraction, append-only proposal/failure records, approved version files carrying their SHA256 in the filename, strict retained snapshot/reference validation, current source checks, and exact version lookup for downstream conversation pinning. Full selected source text is retained. Nothing is shortened automatically.
+- `app/briefs-lock.js`: cross-process kernel ownership for every brief mutation, keyed by canonical selected parent path. Windows named pipes and Linux abstract sockets release on process death; no PID/stale-file reclamation. Version allocation and exclusive publication stay in the same lock. Busy attempts preserve the editor for explicit retry.
+- `app/briefs-ipc.js`: OS file selection and serialized brief mutations; renderer cannot supply arbitrary source paths to reads. Source selection is explicit and not recursive.
+- `app/briefs-view.js`: local source/passages inspection, editable text and validated source:line references, explicit approval, staleness/failure warnings and preserved approved history.
+- `tests/briefs.spec.js`: approved desktop plus persisted-files seam, disposable selected documents and OS dialog substitute. `brief-pin` reads and validates only candidates for the requested approved numeric version, so unrelated damaged proposals/newer approvals cannot block a healthy historical pin. It returns the exact approved version, retained sources and current source warnings; unavailable, damaged or ambiguous requested versions fail rather than substitute another version.
+
+Local extraction is a transparent heading-based draft, not a model summary or semantic verification. User edits remain identified as user writing. Conversation UI and complete outgoing context limits remain downstream responsibilities.
