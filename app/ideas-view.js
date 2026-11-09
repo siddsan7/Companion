@@ -69,13 +69,14 @@
       for (const proposal of proposals) {
         const article = document.createElement('article'), title = document.createElement('h3'), resume = document.createElement('button');
         title.textContent = proposal.title; resume.textContent = 'Resume proposed idea';
+        if (proposal.cleanup) { const state = document.createElement('p'); state.textContent = 'The note is already published. Resume to review and explicitly finish local staging cleanup.'; article.append(state); }
         resume.onclick = async () => {
           invalidate(); const current = epoch;
           try {
             const retained = await window.companion['idea-resume']({ operation: proposal.operation }); if (current !== epoch) return;
             origin = { conversationId: retained.input.conversationId, requestId: retained.input.requestId };
             fillEditor(retained.input, retained.references, retained.input.referenceIds); showPreview(retained);
-            byId('idea-status').textContent = retained.blocked ? 'Proposed content retained. Context changed; review a new preview before confirmation.' : 'Proposed content restored. Confirm explicitly to retry the save.';
+            byId('idea-status').textContent = retained.blocked ? 'Proposed content retained. Context changed; review a new preview before confirmation.' : retained.cleanup ? 'Saved note already published. Confirm explicitly to finish local staging cleanup.' : 'Proposed content restored. Confirm explicitly to retry the save.';
           } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
         };
         article.append(title, resume); pendingView.append(article);

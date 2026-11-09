@@ -72,10 +72,15 @@ class Ideas {
   async list() {
     const vault = this.getVault(); if (!vault) return [];
     const parents = this.guard(vault), notes = [];
+    // A known published stage pair remains pending until explicit acknowledgement
+    // or cleanup. It is not an ordinary saved note yet, and general linked files
+    // remain rejected by the reader below.
+    const held = new Set((await this.pending()).filter(item => item.hasPublication).map(item => item.destination));
     for (const name of await fs.readdir(path.join(vault.root, 'Ideas'))) {
       if (!name.endsWith('.md')) continue;
       try {
-        const file = path.join(vault.root, 'Ideas', name), { text } = await this.readFile(vault, file, parents);
+        const file = path.join(vault.root, 'Ideas', name); if (held.has(file)) continue;
+        const { text } = await this.readFile(vault, file, parents);
         const data = metadata(text);
         if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0 });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -223,16 +228,27 @@ class Ideas {
     for (const name of await fs.readdir(directory)) {
       const match = name.match(/^([a-f0-9-]{36})\.intent\.json$/); if (!match) continue;
       const { value, fields } = await this.intent(match[1]);
-      try { await this.readFile(vault, path.join(directory, `${value.operation}.published.json`), parents); continue; }
+      let receipt;
+      try { receipt = JSON.parse((await this.readFile(vault, path.join(directory, `${value.operation}.published.json`), parents)).text); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
-      proposals.push({ operation: value.operation, title: fields.title });
+      if (receipt) this.checkReceipt(receipt, value);
+      const hasPublication = await this.knownPublication(value, vault, parents, receipt);
+      if (receipt && !hasPublication) continue;
+      proposals.push({ operation: value.operation, title: fields.title, destination: value.destination, hasPublication, cleanup: !!receipt });
     }
     return proposals;
   }
   async resume({ operation }) {
     const { value, fields, vault, parents } = await this.intent(operation);
-    try { await this.readFile(vault, path.join(vault.root, '.ideas', `${operation}.published.json`), parents); throw Error('This operation already published a saved idea. It will not create another note.'); }
+    let receipt;
+    try { receipt = JSON.parse((await this.readFile(vault, path.join(vault.root, '.ideas', `${operation}.published.json`), parents)).text); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (receipt) {
+      this.checkReceipt(receipt, value);
+      if (!await this.knownPublication(value, vault, parents, receipt)) throw Error('This operation already published a saved idea. It will not create another note.');
+      this.previews.set(operation, value);
+      return { operation, text: value.text, destination: value.destination, input: value.input, references: [], warnings: ['The exact note is already published. Confirmation only completes local staging cleanup; it does not publish another note.'], blocked: false, cleanup: true };
+    }
     const ids = value.input.referenceIds || [], bindings = value.referenceBindings || [];
     if (!Array.isArray(ids) || !Array.isArray(bindings) || ids.length !== bindings.length || ids.some(id => !uuid(id)) || bindings.some(binding => !ids.includes(binding.referenceId) || binding.conversationId !== value.input.conversationId || binding.requestId !== value.input.requestId)) throw Error('Retained citation identity is unavailable. Preserve the proposed writing and review new references.');
     for (const { referenceId, ...binding } of bindings) this.references.set(referenceId, binding);
@@ -242,6 +258,23 @@ class Ideas {
     } catch (error) {
       return { operation, text: value.text, destination: value.destination, input: value.input, references: bindings.map(binding => ({ referenceId: binding.referenceId, label: binding.label, excerpt: binding.anchor.excerpt })), warnings: [error.message], blocked: true };
     }
+  }
+  checkReceipt(receipt, value) {
+    if (receipt.schema !== 1 || receipt.operation !== value.operation || receipt.id !== value.id || receipt.digest !== value.digest || typeof receipt.dev !== 'string' || typeof receipt.ino !== 'string') throw Error('Saved idea receipt identity is damaged. Nothing was republished.');
+  }
+  async knownPublication(value, vault, parents, receipt) {
+    const stage = path.join(vault.root, '.ideas', `${value.operation}.md.pending`);
+    this.guard(vault, parents);
+    let stat;
+    try { stat = await fs.lstat(stage, { bigint: true }); }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    this.guard(vault, parents);
+    if (!stat.isFile() || stat.isSymbolicLink() || ![1n, 2n].includes(stat.nlink)) throw Error('Retained idea stage has unknown linked copies. Preserve it for repair.');
+    if (stat.nlink === 1n) return false;
+    const staged = await this.readFile(vault, stage, parents, 2), destination = await this.readFile(vault, value.destination, parents, 2);
+    if (!same(stat, staged.stat) || !same(staged.stat, destination.stat) || staged.text !== value.text || destination.text !== value.text) throw Error('Retained publication is not the exact known stage and destination pair. Preserve all files for repair.');
+    if (receipt && (destination.stat.dev.toString() !== receipt.dev || destination.stat.ino.toString() !== receipt.ino)) throw Error('Completed publication ownership changed. Nothing was republished or cleaned.');
+    return true;
   }
   async confirm({ operation }) {
     const preview = this.previews.get(operation), vault = this.getVault();
@@ -257,7 +290,7 @@ class Ideas {
       try { prior = JSON.parse((await this.readFile(vault, receipt, parents)).text); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (prior) {
-        if (prior.schema !== 1 || prior.operation !== operation || prior.id !== preview.id || prior.digest !== preview.digest) throw Error('Saved idea receipt identity is damaged. Nothing was republished.');
+        this.checkReceipt(prior, preview);
         let current;
         try {
           let retainedStage;
@@ -297,9 +330,11 @@ class Ideas {
       if (finalStage.nlink === 1n && !finalDestination) local.linkSync(stage, preview.destination);
       else if (finalStage.nlink !== 2n || !finalDestination?.isFile() || finalDestination.isSymbolicLink() || finalDestination.nlink !== 2n || !same(finalStage, finalDestination)) throw Error('Saved idea stage has an unknown peer or the destination exists. Existing files were preserved; no destination peer was created.');
       this.guard(vault, parents);
+      await this.checkpoint('idea-after-publication');
       const published = await this.readFile(vault, preview.destination, parents, 2);
       if (!same(staged.stat, published.stat) || published.text !== preview.text) throw Error('Saved idea changed during publication. Preserve the proposal and inspect the note.');
       await exclusive(receipt, JSON.stringify({ schema: 1, operation, id: preview.id, digest: preview.digest, dev: published.stat.dev.toString(), ino: published.stat.ino.toString() }));
+      await this.checkpoint('idea-after-receipt');
       this.guard(vault, parents); await fs.unlink(stage);
       return { id: preview.id, destination: preview.destination };
     });
