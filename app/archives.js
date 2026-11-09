@@ -131,7 +131,10 @@ class Archives {
     const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, root);
     const token = randomUUID();
     reviewed.matched = { token, root, snapshot: current, plan };
-    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length };
+    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, conflictRecords: plan.conflicts.map(id => {
+      const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
+      return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
+    }) };
   }
   async restore(input) {
     const reviewed = this.restoreReview; this.restoreReview = null;
@@ -141,7 +144,8 @@ class Archives {
       const current = await this.snapshot({ locked: true });
       if (this.history.getVault()?.root !== matched.root || canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
       const plan = this.restorePlan(reviewed.archive, current, matched.root);
-      if (plan.conflicts.length) throw Error('Conversation conflicts require explicit resolution. Existing history was preserved.');
+      const resolutions = input.resolutions === undefined ? [] : input.resolutions;
+      if (!Array.isArray(resolutions) || resolutions.length !== plan.conflicts.length || resolutions.some(choice => !choice || typeof choice !== 'object' || Array.isArray(choice) || Object.keys(choice).some(key => !['id', 'choice'].includes(key)) || !plan.conflicts.includes(choice.id) || choice.choice !== 'keep-current') || new Set(resolutions.map(choice => choice.id)).size !== plan.conflicts.length) throw Error('Every conflicting conversation requires an explicit Keep current choice. Existing history was preserved.');
       let restored = 0;
       try {
         for (const original of plan.additions) {

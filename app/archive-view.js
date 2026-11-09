@@ -22,8 +22,11 @@ const archiveMatch = document.getElementById('archive-match');
 const archiveMatchPreview = document.getElementById('archive-match-preview');
 const archiveRestore = document.getElementById('archive-restore');
 const archiveRestoreSummary = document.getElementById('archive-restore-summary');
-let archiveInspection, archiveRestoreToken;
-function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; }
+const archiveConflicts = document.getElementById('archive-conflicts');
+let archiveInspection, archiveRestoreToken, archiveMissing = 0;
+function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; archiveConflicts.replaceChildren(); }
+function restoreChoices() { return [...archiveConflicts.querySelectorAll('select')].map(select => ({ id: select.dataset.conversationId, choice: select.value })); }
+function updateRestoreConfirmation() { archiveRestore.disabled = !archiveRestoreToken || archiveMissing === 0 || restoreChoices().some(resolution => resolution.choice !== 'keep-current'); }
 archiveMatch.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection; };
 archiveInspect.onclick = async () => {
   archiveInspection = null; invalidateRestore(); archiveMatch.checked = false; archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
@@ -39,16 +42,24 @@ archiveMatchPreview.onclick = async () => {
   invalidateRestore(); archiveMatchPreview.disabled = true;
   try {
     const result = await window.companion['archive-match']({ id: archiveInspection, matched: archiveMatch.checked });
-    archiveRestoreToken = result.token;
+    archiveRestoreToken = result.token; archiveMissing = result.missing;
     archiveRestoreSummary.textContent = `Matched restore preview: ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Missing history may have been deleted intentionally. Confirm only if you want to add these archived conversations. Current settings and source exclusions remain authoritative. Existing history and vault files stay unchanged. Schedule intent remains inactive; task reconnection is separate. Historic packages, capacity bindings and provider IDs do not prove current eligibility or readiness.`;
-    archiveRestore.disabled = result.conflicts > 0 || result.missing === 0;
+    for (const conflict of result.conflictRecords) {
+      const row = document.createElement('div'), details = document.createElement('p'), label = document.createElement('label'), select = document.createElement('select');
+      details.textContent = `Conversation ${conflict.id}: current ${conflict.currentRequests} requests and ${conflict.currentExclusions} omitted requests; archive ${conflict.archivedRequests} requests and ${conflict.archivedExclusions} omitted requests. Keep current preserves all current text and source scope. This restore adds missing history and keeps existing conflicts; it does not overwrite or merge them.`;
+      label.textContent = `Conflict resolution for conversation ${conflict.id}`; select.dataset.conversationId = conflict.id;
+      select.id = `archive-conflict-${conflict.id}`; label.htmlFor = select.id;
+      for (const [value, text] of [['', 'Choose a resolution'], ['keep-current', 'Keep current']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option); }
+      select.onchange = updateRestoreConfirmation; row.append(details, label, select); archiveConflicts.append(row);
+    }
+    updateRestoreConfirmation();
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection; }
 };
 archiveRestore.onclick = async () => {
-  const token = archiveRestoreToken; invalidateRestore(); archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
+  const token = archiveRestoreToken, resolutions = restoreChoices(); invalidateRestore(); archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
   try {
-    const result = await window.companion['archive-restore']({ token }); archiveInspection = null; archiveMatch.checked = false;
+    const result = await window.companion['archive-restore']({ token, resolutions }); archiveInspection = null; archiveMatch.checked = false;
     archiveRestoreSummary.textContent = `Restored ${result.restored} conversation${result.restored === 1 ? '' : 's'}. ${result.equal} equal records left unchanged. No task was connected. Reopen a retained conversation to inspect its exact historical context; a new turn requires current review.`;
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); archiveInspection = null; }
   finally { archiveInspect.disabled = false; }
