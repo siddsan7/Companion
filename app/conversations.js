@@ -77,18 +77,18 @@ class Conversations {
       }
     };
     preview.sources.forEach(addDependency);
-    const warnings = [...preview.warnings], history = [];
+    const warnings = [...preview.warnings], history = [], historyExclusions = [];
     for (const request of prior?.requests || []) {
       const deps = request.package?.dependencies;
       const allowed = Array.isArray(deps) && deps.every(dep => typeof dep.key === 'string' && !excluded.has(dep.key) && all.some(source => source.key === dep.key && source.digest === dep.digest));
-      if (!allowed) { warnings.push(`Excluded historical request ${request.id}: source dependency changed, removed, rejected, or unknown.`); continue; }
-      if (request.status !== 'completed') { warnings.push(`Excluded incomplete historical request ${request.id}.`); continue; }
+      if (!allowed) { const reason = 'source dependency changed, removed, rejected, or unknown'; historyExclusions.push({ id: request.id, reason }); warnings.push(`Excluded historical request ${request.id}: ${reason}.`); continue; }
+      if (request.status !== 'completed') { historyExclusions.push({ id: request.id, reason: 'reply is incomplete' }); warnings.push(`Excluded incomplete historical request ${request.id}.`); continue; }
       for (const dep of deps) dependencies.set(dep.key, dep);
       history.push({ id: request.id, question: request.question, reply: request.reply });
     }
     const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
     const count = [...text].length;
-    return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, boundEvidence: preview.boundEvidence, warnings, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
+    return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, boundEvidence: preview.boundEvidence, warnings, historyExclusions, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
   }
   async preview(input) {
     const snapshot = await this.build(input), packageId = randomUUID();

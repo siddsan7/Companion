@@ -5,15 +5,26 @@
   byId('context-section').after(conversation);
   let conversationId = null, conversationToken = null, conversationGeneration = 0;
   let displayedHistory = '';
+  let historyExclusions = [];
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; };
+  function warnHistory() {
+    for (const warning of byId('conversation-history').querySelectorAll('.history-exclusion')) warning.remove();
+    for (const article of byId('conversation-history').children) {
+      const excluded = historyExclusions.find(item => item.id === article.dataset.requestId);
+      if (excluded) { const warning = document.createElement('p'); warning.className = 'history-exclusion'; warning.textContent = `Excluded from next request preview: ${excluded.reason}. Historical text remains locally inspectable.`; article.prepend(warning); }
+    }
+  }
   function showConversation(record) {
+    const firstDisplay = !displayedHistory;
     const revision = JSON.stringify(record.requests);
     if (revision !== displayedHistory) { invalidateConversation(); displayedHistory = revision; }
     conversationId = record.id; byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
+    if (firstDisplay) historyExclusions = record.requests.at(-1)?.package?.historyExclusions || [];
     byId('conversation-error').textContent = record.storageWarning || '';
     byId('conversation-history').replaceChildren();
     for (const request of record.requests) {
       const article = document.createElement('article'), state = document.createElement('p'), question = document.createElement('pre'), reply = document.createElement('pre');
+      article.dataset.requestId = request.id;
       state.textContent = `${request.status}${request.status === 'completed' ? '' : ' — incomplete'} · ${request.evidence || 'provider evidence unavailable'} · ${request.id}${request.error ? ` · ${request.error}` : ''}`;
       question.textContent = request.question; reply.textContent = request.reply; article.append(state, question, reply); byId('conversation-history').append(article);
       if (request.status === 'failed' || request.status === 'interrupted') {
@@ -25,6 +36,7 @@
         }; article.append(retry);
       }
     }
+    warnHistory();
   }
   async function restoreConversation() {
     try { const state = await window.companion['conversation-list'](); byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`; const record = state.conversations.find(item => item.id === conversationId) || state.conversations.at(-1); if (record && JSON.stringify(record.requests) !== displayedHistory) showConversation(record); }
@@ -112,6 +124,7 @@
       const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
       if (version !== conversationGeneration) return;
       conversationToken = preview.packageId; byId('conversation-package').value = preview.text;
+      historyExclusions = preview.historyExclusions; warnHistory();
       byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${preview.boundEvidence} ${preview.warnings.join(' ')}`;
       byId('conversation-send').disabled = preview.blocked;
     } catch (error) { if (version === conversationGeneration) byId('conversation-error').textContent = error.message; }
