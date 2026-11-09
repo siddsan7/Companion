@@ -275,6 +275,46 @@ for (const alias of ['directory junction', 'history hardlink']) test(`comparison
   }
 });
 
+test('abrupt Electron main exit retains an interrupted comparison and never reuses process proof or replays', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', turn: 'pending', messages: [{ phase: 'partial_answer', text: 'DURABLE_INTERRUPTED_COMPARISON_TEXT. Authored partial response, not a completed result.' }] }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes('DURABLE_INTERRUPTED_COMPARISON_TEXT'))).toBe(true);
+  const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+  const evidence = { wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  evidence.wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  await fs.writeFile(test.info().outputPath('comparison-crash-processes.json'), JSON.stringify(evidence, null, 2), 'utf8');
+  app = null; await launch(false);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('interrupted');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('DURABLE_INTERRUPTED_COMPARISON_TEXT');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('Elapsed: unavailable');
+  await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
+  const saved = await savedComparison(), interrupted = saved.slots.find(slot => slot.status === 'interrupted');
+  expect(interrupted.elapsedMs).toBeNull();
+  expect(interrupted.candidate.warning).toContain('unavailable or ambiguous');
+  expect(interrupted.messages[0].completed).toBe(false);
+  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(5);
+  await page.getByRole('button', { name: 'Preview Output 2', exact: true }).click();
+  await expect(page.locator('#comparison-error')).toContainText('Evidence changed or the process restarted');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
+});
+
 test('an active comparison poll cannot authorize overwriting an external history edit', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
