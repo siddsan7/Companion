@@ -2,7 +2,7 @@
 
 Goal: implement siddsan7/Companion#1 and #2–#16 on integration/1-local-second-brain. Baseline04ed4fb. Approved planning was committed in e030e51 before worktrees.
 
-Constraints: accepted spec/ADRs apply. The user approved desktop workflow plus resulting files/history as the test seam. Main owns planning, integration, Git writes, installs/network, GUI/native checks and communication. Workers edit isolated worktrees and run syntax checks. Worker escalated commands can hang; root runs them. Ticket merges require independent assigned-reviewer approval. Final merge to main is for the user. No push/deployment occurred.
+Constraints: accepted spec/ADRs apply. The user approved desktop workflow plus resulting files/history as the test seam. Main owns planning, integration, Git writes, installs/network, GUI/native checks and communication. Workers edit isolated worktrees and run syntax checks. Worker escalated commands can hang; root runs them. Ticket merges require independent assigned-reviewer approval. The latest user instruction authorizes pushing, draft PR #17, final independent code-review approval and a merge commit to main after the full implementation and required checks pass. This replaces personal-review-only main merging. Preserve every commit and existing GitHub-linked author identity; see [publishing.md](publishing.md). No deployment. Pause after remote main/history verification for the user's access-permission change.
 
 Reviewed integration:
 - #2 offline capture:9a6985d, independently approved;14 desktop/file tests and independent smoke passed; issue closed.
