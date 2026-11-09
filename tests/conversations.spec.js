@@ -841,6 +841,59 @@ test('producer rejection excludes directly and transitively derived dialogue whi
   await expect(page.getByRole('status')).toContainText('Capture saved.');
 });
 
+test('unknown historical source attribution excludes that reply and its derivative without hiding retained text', async () => {
+  test.setTimeout(90000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic UNKNOWN_ATTRIBUTION_REPLY_CANARY.' }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_ATTRIBUTION_REPLY_CANARY');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_ATTRIBUTION_REPLY_CANARY');
+  await page.getByLabel('Context question', { exact: true }).fill('What limitations follow from the prior dialogue?');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/UNKNOWN_ATTRIBUTION_REPLY_CANARY/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic UNKNOWN_DERIVATIVE_REPLY_CANARY based on the included reply.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_DERIVATIVE_REPLY_CANARY');
+  await expect(page.locator('#conversation-history article')).toHaveCount(2);
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const before = await onlyConversation();
+  expect(before.requests[1].package.historyIds).toEqual([before.requests[0].id]);
+  const callsBefore = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await app.close(); app = null;
+  // External corruption at the accepted files seam: leave original text intact, lose attribution.
+  const damaged = structuredClone(before); delete damaged.requests[0].package.dependencies;
+  await fs.writeFile(path.join(root, 'conversations', `${damaged.id}.json`), JSON.stringify(damaged, null, 2));
+  await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_ATTRIBUTION_REPLY_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_DERIVATIVE_REPLY_CANARY');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(callsBefore);
+  await page.getByLabel('Context question', { exact: true }).fill('What can selected spaced retrieval evidence support without earlier dialogue?');
+  await selectCapture();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  const reviewed = page.getByLabel('Reviewed conversation package', { exact: true });
+  await expect(reviewed).toHaveValue(/Spaced retrieval revisits/);
+  await expect(reviewed).not.toHaveValue(/UNKNOWN_ATTRIBUTION_REPLY_CANARY|UNKNOWN_DERIVATIVE_REPLY_CANARY/);
+  await expect(page.locator('#conversation-summary')).toContainText('unknown');
+  await expect(page.locator('#conversation-history .history-exclusion')).toHaveCount(2);
+  const inspect = page.getByLabel('Saved approved context', { exact: true });
+  await expect(inspect.nth(0)).toHaveValue(before.requests[0].package.text);
+  await expect(inspect.nth(1)).toHaveValue(before.requests[1].package.text);
+  const exact = await reviewed.inputValue();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic KNOWN_SELECTED_EVIDENCE_REPLY_CANARY.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('KNOWN_SELECTED_EVIDENCE_REPLY_CANARY');
+  await expect(page.locator('#conversation-history article')).toHaveCount(3);
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const saved = await onlyConversation(); expect(saved.requests[2].package.historyIds).toEqual([]);
+  expect(saved.requests[0].reply).toBe(before.requests[0].reply); expect(saved.requests[1].reply).toBe(before.requests[1].reply);
+  expect(saved.requests[0].package.text).toBe(before.requests[0].package.text); expect(saved.requests[1].package.text).toBe(before.requests[1].package.text);
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions).toHaveLength(3); expect(submissions[2].text).toBe(exact);
+  expect(submissions[2].text).not.toMatch(/UNKNOWN_ATTRIBUTION_REPLY_CANARY|UNKNOWN_DERIVATIVE_REPLY_CANARY/);
+});
+
 // Authored main-process capacity evidence is a controlled boundary, never live readiness.
 const capacityEvidence = () => ({
   capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'Authored synthetic capacity proof v1', harnessAndOutputEvidence: 'Authored synthetic harness and output proof v1' },
