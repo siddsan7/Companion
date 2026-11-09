@@ -154,6 +154,44 @@ test('returned comparison settings mismatch consumes the failed slot before turn
   expect(await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).toBe(requests);
 });
 
+test('an active comparison poll cannot authorize overwriting an external history edit', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({
+    model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', holdCompletion: true,
+    messages: [{ phase: 'final_answer', text: 'FULL_AUTHORED_REPLY_RETAINED_AFTER_EXTERNAL_EDIT. Synthetic output only.' }]
+  }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes('FULL_AUTHORED_REPLY_RETAINED_AFTER_EXTERNAL_EDIT'))).toBe(true);
+  const external = await savedComparison(); external.externalMarker = 'EXTERNAL_EDIT_MUST_REMAIN_BYTE_FOR_BYTE';
+  const file = path.join(root, 'comparisons', `${external.id}.json`), externalBytes = JSON.stringify(external, null, 2);
+  await fs.writeFile(file, externalBytes, 'utf8');
+  // This public read models an in-flight list refresh observing the other
+  // writer. It must never change the active mutation's publication baseline.
+  await page.evaluate(() => window.companion['comparison-list']());
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}', 'utf8');
+  await expect(page.locator('#comparison-slots article').first()).toContainText(/completed|interrupted|failed/);
+  expect(await fs.readFile(file, 'utf8')).toBe(externalBytes);
+  await expect(page.locator('#comparison-notice')).toContainText('unsaved');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('FULL_AUTHORED_REPLY_RETAINED_AFTER_EXTERNAL_EDIT');
+  const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(submissions.trim().split('\n')).toHaveLength(1);
+  await page.reload();
+  await expect(page.locator('#comparison-notice')).toContainText('unsaved');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('FULL_AUTHORED_REPLY_RETAINED_AFTER_EXTERNAL_EDIT');
+  expect(await fs.readFile(file, 'utf8')).toBe(externalBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+});
+
 test('independent blind aliases retain six validated ratings and reveal methods only after feedback', async () => {
   test.setTimeout(180000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
