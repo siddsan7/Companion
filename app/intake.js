@@ -21,6 +21,12 @@ class Intake {
     catch (error) { throw Error('Vault access failure. Restore access to the configured vault and Companion folders, then Refresh. Existing notes and intake history were preserved; no missing-note removal was inferred.', { cause: error }); }
   }
   async load() {
+    // Check the ordinary parent before reading authority, including source purges
+    // whose manifests contain no .intake payload backup.
+    let directory;
+    try { directory = await fs.lstat(this.dir); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (directory && (!directory.isDirectory() || directory.isSymbolicLink())) throw Error('Intake authority requires an ordinary contained folder. Preserve it for repair.');
+    if (directory) await this.vault.contained(this.dir);
     const text = await read(path.join(this.dir, 'ledger.json')); if (text === null) return empty();
     let ledger; try { ledger = JSON.parse(text); } catch { throw Error('Intake ledger is unreadable. Preserve .intake and restore a vault backup before checking sources.'); }
     if (ledger.schema !== 1 || !Array.isArray(ledger.sources) || !ledger.captures || !ledger.attempts || !ledger.blocks || !ledger.pending || !ledger.outcomes || !Array.isArray(ledger.suppressed)) throw Error('Unsupported intake ledger. Preserve it for repair.');
