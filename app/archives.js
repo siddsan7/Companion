@@ -203,6 +203,73 @@ class Archives {
     }
   }
   async state() { return this.history.lock(async () => { this.directory = this.history.safeDirectory(); return { inactiveIntents: await this.inactiveIntents() }; }); }
+  async reconnectPreview(input) {
+    this.reconnectReview = null;
+    return this.history.lock(async () => {
+      this.directory = this.history.safeDirectory();
+      const vault = this.history.getVault(); if (!vault) throw Error('Select the matched vault before reconnecting imported cadence.');
+      const intents = (await this.inactiveIntents()).filter(record => record.archiveId === input?.archiveId && record.targetRoot === vault.root);
+      if (intents.length !== 1) throw Error('Select exactly one imported cadence matched to the current vault.');
+      const imported = intents[0], schedule = this.getSchedule(), file = path.join(this.history.dataRoot, 'schedule.json');
+      const prior = await this.json(file, undefined, true), existing = prior?.value || null;
+      if (existing && (existing.schema !== 1 || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(existing.id) || !Number.isFinite(Date.parse(existing.anchor)) || typeof existing.vault !== 'string' || !path.isAbsolute(existing.vault) || typeof existing.parent !== 'string' || !['enabled', 'paused', 'disabled'].includes(existing.mode) || !Number.isSafeInteger(existing.handledSlot) || existing.handledSlot < 0 || !['pending', 'connected'].includes(existing.archiveReconnect?.status))) throw Error('Current daily intake settings need repair. They were preserved.');
+      if (existing && (!existing.archiveReconnect || existing.archiveReconnect.archiveId !== imported.archiveId || existing.archiveReconnect.sourceRoot !== imported.sourceRoot || existing.archiveReconnect.targetRoot !== imported.targetRoot || existing.archiveReconnect.intentId !== imported.intent.id || path.resolve(existing.vault, existing.parent) !== vault.root)) throw Error('Current daily intake settings belong to another schedule. Preserve them and resolve that schedule explicitly before reconnection.');
+      const state = existing || { schema: 1, id: randomUUID(), anchor: imported.intent.anchor, vault: vault.vault, parent: path.relative(vault.vault, vault.root), mode: 'disabled', handledSlot: Math.max(0, Math.floor((Date.parse(this.clock().now) - Date.parse(imported.intent.anchor)) / 86400000)), archiveReconnect: { archiveId: imported.archiveId, sourceRoot: imported.sourceRoot, targetRoot: imported.targetRoot, intentId: imported.intent.id, status: 'pending' } };
+      if (state.id === imported.intent.id || state.anchor !== imported.intent.anchor) throw Error('Imported cadence connection identity needs repair. Preserve current settings.');
+      const effective = await schedule.tasks.apply('inspect', state, file); this.guard();
+      if (effective && !schedule.tasks.matchesSchedule(effective, state, file)) throw Error('Current owned task policy differs. Use the explicit daily intake repair workflow before reconnecting.');
+      const alreadyConnected = state.archiveReconnect.status === 'connected' && state.mode === imported.intent.mode && (state.mode === 'disabled' ? !effective : effective && effective.enabled === (state.mode === 'enabled'));
+      const token = randomUUID();
+      this.reconnectReview = { token, imported, state, priorDigest: prior?.digest || null, root: vault.root, alreadyConnected };
+      return { token, anchor: state.anchor, mode: imported.intent.mode, alreadyConnected, pending: !!existing && state.archiveReconnect.status !== 'connected' };
+    });
+  }
+  async reconnect(input) {
+    const review = this.reconnectReview; this.reconnectReview = null;
+    if (!review || input?.token !== review.token || review.alreadyConnected) throw Error('Preview imported cadence and confirm its reconnection explicitly.');
+    return this.history.lock(async () => {
+      this.directory = this.history.safeDirectory();
+      const schedule = this.getSchedule();
+      return schedule.change(async () => {
+        if (this.history.getVault()?.root !== review.root) throw Error('Current vault changed. Preview reconnection again.');
+        const intents = await this.inactiveIntents();
+        if (!intents.some(record => canonical(record) === canonical(review.imported))) throw Error('Imported intent changed. Preview reconnection again.');
+        const file = path.join(this.history.dataRoot, 'schedule.json'), current = await this.json(file, undefined, true);
+        if ((current?.digest || null) !== review.priorDigest) throw Error('Daily intake settings changed. Preview reconnection again; existing settings were preserved.');
+        const state = structuredClone(review.state), requested = review.imported.intent.mode;
+        // Persist the same fresh local ID disabled before registration. Failed/crashed attempts cannot catch up.
+        state.mode = 'disabled'; state.archiveReconnect.status = 'pending';
+        state.handledSlot = Math.max(state.handledSlot || 0, Math.max(0, Math.floor((Date.parse(this.clock().now) - Date.parse(state.anchor)) / 86400000)));
+        const effective = await schedule.tasks.apply('inspect', state, file); this.guard();
+        if (effective && !schedule.tasks.matchesSchedule(effective, state, file)) throw Error('Owned task policy changed. Preserve it and repair explicitly.');
+        let digest = await this.saveReconnectSchedule(state, review.priorDigest);
+        try {
+          const action = requested === 'disabled' ? 'disable' : requested === 'paused' ? 'repair' : 'enable';
+          state.task = await schedule.tasks.apply(action, { ...state, mode: requested }, file); this.guard();
+          state.mode = requested; state.archiveReconnect.status = 'connected'; delete state.taskError;
+          await this.saveReconnectSchedule(state, digest);
+        } catch (error) {
+          // The persisted pending/disabled record owns the attempted ID. Retry reuses it, even if task creation succeeded.
+          throw Error(`Imported cadence reconnection did not finish. A pending disabled local record was saved before registration; the task or final connection write may have succeeded. Preview again to inspect the same local identity before an explicit retry. ${error.message}`);
+        }
+        return { connected: true, id: state.id, anchor: state.anchor };
+      });
+    });
+  }
+  async saveReconnectSchedule(state, expectedDigest) {
+    const directory = this.history.safeDirectory(), destination = path.join(this.history.dataRoot, 'schedule.json');
+    const stage = path.join(this.history.dataRoot, `.archive-reconnect-${randomUUID()}.pending`), text = JSON.stringify(state, null, 2); let handle;
+    try {
+      handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
+      await handle.writeFile(text, 'utf8'); this.history.safeDirectory(false, directory); await handle.sync(); await handle.close(); handle = null;
+      const current = await this.json(destination, undefined, true);
+      if ((current?.digest || null) !== expectedDigest) throw Error('Daily intake settings changed. Existing settings were preserved.');
+      this.history.safeDirectory(false, directory);
+      if (expectedDigest === null) await fs.link(stage, destination);
+      else await this.history.publishStage(stage, destination, directory);
+      this.history.safeDirectory(false, directory); return hash(text);
+    } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+  }
   async publishAddition(record) {
     const directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
     const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`); let handle;
@@ -246,5 +313,7 @@ function installArchives({ ipcMain, ...options }) {
   ipcMain.handle('archive-match', (_, input) => archives.match(input));
   ipcMain.handle('archive-restore', (_, input) => archives.restore(input));
   ipcMain.handle('archive-state', () => archives.state());
+  ipcMain.handle('archive-reconnect-preview', (_, input) => archives.reconnectPreview(input));
+  ipcMain.handle('archive-reconnect', (_, input) => archives.reconnect(input));
 }
 module.exports = { installArchives };

@@ -25,6 +25,11 @@ const archiveRestoreSummary = document.getElementById('archive-restore-summary')
 const archiveConflicts = document.getElementById('archive-conflicts');
 const archiveSource = document.getElementById('archive-source');
 const archiveIntentSummary = document.getElementById('archive-intents');
+const archiveCadence = document.getElementById('archive-cadence');
+const archiveReconnectPreview = document.getElementById('archive-reconnect-preview');
+const archiveReconnectConfirm = document.getElementById('archive-reconnect');
+const archiveReconnectSummary = document.getElementById('archive-reconnect-summary');
+let archiveReconnectToken;
 let archiveInspection, archiveRestoreToken, archiveMissing = 0;
 function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; archiveConflicts.replaceChildren(); }
 function restoreChoices() { return [...archiveConflicts.querySelectorAll('select')].map(select => ({ id: select.dataset.conversationId, choice: select.value })); }
@@ -75,6 +80,27 @@ async function showArchiveIntents() {
   try {
     const result = await window.companion['archive-state']();
     archiveIntentSummary.textContent = result.inactiveIntents.length ? `Imported daily intake intent is inactive. ${result.inactiveIntents.map(record => `Requested ${record.intent.mode}; anchor ${record.intent.anchor}; original vault ${record.sourceRoot}; matched vault ${record.targetRoot}.`).join(' ')} Explicit scheduled-task reconnection is required. Startup does not run imported cadence.` : 'No imported daily intake intent.';
+    const previous = archiveCadence.value; archiveCadence.replaceChildren();
+    for (const record of [null, ...result.inactiveIntents]) { const option = document.createElement('option'); option.value = record?.archiveId || ''; option.textContent = record ? `${record.archiveId}: ${record.intent.mode}; ${record.intent.anchor}; ${record.targetRoot}` : 'Choose an imported cadence'; archiveCadence.append(option); }
+    if ([...archiveCadence.options].some(option => option.value === previous)) archiveCadence.value = previous;
   } catch (error) { archiveIntentSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
 }
+archiveCadence.onchange = () => { archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectSummary.textContent = 'Preview the selected imported cadence before connecting it.'; };
+archiveReconnectPreview.onclick = async () => {
+  archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectPreview.disabled = true;
+  try {
+    const result = await window.companion['archive-reconnect-preview']({ archiveId: archiveCadence.value });
+    if (result.alreadyConnected) { archiveReconnectSummary.textContent = 'This imported cadence is already connected. The existing local task was inspected; no duplicate was created.'; return; }
+    archiveReconnectToken = result.token;
+    archiveReconnectSummary.textContent = `Original anchor: ${result.anchor}. Requested mode: ${result.mode}. A fresh local task identity will be used; an unfinished reconnection reuses its already reserved local identity. No missed checks run during reconnection. Historical due slots are skipped explicitly; later checks keep this anchor. Current vault sources require their own connection review. Only confirm if this current vault and cadence are intended. This does not authenticate Codex or submit model requests.`;
+    archiveReconnectConfirm.disabled = false;
+  } catch (error) { archiveReconnectSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+  finally { archiveReconnectPreview.disabled = false; }
+};
+archiveReconnectConfirm.onclick = async () => {
+  const token = archiveReconnectToken; archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectPreview.disabled = true;
+  try { const result = await window.companion['archive-reconnect']({ token }); archiveReconnectSummary.textContent = `Imported daily intake connected. Original anchor: ${result.anchor}. Current local schedule: ${result.id}. No historical missed checks were run.`; }
+  catch (error) { archiveReconnectSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+  finally { archiveReconnectPreview.disabled = false; }
+};
 showArchiveIntents();
