@@ -102,15 +102,31 @@ class Context {
         all.push(source); eligible.set(note.id, source); histories.set(note.id, inspected.revisions);
       } catch (error) { issues.push(`Evidence unavailable: ${note.title}; ${error.message}`); }
     }
-    const dir = path.join(this.vault.root, 'Annotations'); await this.vault.contained(dir);
-    for (const entry of await fs.readdir(dir, { withFileTypes: true })) if (entry.isFile() && entry.name.endsWith('.md')) {
+    const annotationGroups = new Map();
+    for (const annotation of await intake.annotations()) {
+      if (!annotationGroups.has(annotation.id)) annotationGroups.set(annotation.id, []);
+      annotationGroups.get(annotation.id).push(annotation);
+    }
+    for (const [id, copies] of annotationGroups) {
       try {
-        const file = path.join(dir, entry.name); await this.vault.contained(file);
-        const stat = await fs.lstat(file); if (stat.nlink !== 1) throw Error('linked annotation is unsupported');
-        const content = await fs.readFile(file, 'utf8'), match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/), metadata = match && YAML.parse(match[1]);
-        if (metadata?.artifact_type !== 'annotation' || metadata.schema_version !== 1 || !/^[a-f0-9-]{36}$/.test(metadata.companion_id) || !eligible.has(metadata.capture_id)) throw Error('annotation ownership or associated evidence unavailable');
-        all.push({ key: `annotation:${metadata.companion_id}`, title: `Annotation ${metadata.companion_id}`, text: body(content).replace(/^Source: \[Capture\]\([^\r\n]*\)\r?\n?/m, ''), provenance: `Independent user annotation ${metadata.companion_id}; content sha256 ${digest(content)}; unversioned capture association ${metadata.capture_id}; original source revision unknown`, digest: digest(content + eligible.get(metadata.capture_id).digest), associated: metadata.capture_id });
-      } catch (error) { issues.push(`Annotation unavailable: ${entry.name}; ${error.message}`); }
+        const key = `annotation:${id}`;
+        if (ledger.identityIssues?.[key]) throw Error('resolve duplicate annotation identity');
+        let annotation = copies[0];
+        const choice = ledger.identityChoices?.[key];
+        if (copies.length === 1 && choice?.copies.some(copy => copy.file === path.relative(this.vault.vault, annotation.file))) throw Error('recorded excluded annotation requires explicit identity selection');
+        if (copies.length > 1) {
+          const files = copies.map(note => ({ file: path.relative(this.vault.vault, note.file), hash: digest(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
+          if (!choice || !files.some(file => file.file === choice.file) || JSON.stringify(files.filter(file => file.file !== choice.file)) !== JSON.stringify(choice.copies)) throw Error('annotation copies changed; resolve duplicate identity');
+          annotation = copies.find(note => path.relative(this.vault.vault, note.file) === choice.file);
+        }
+        const { content, captureId } = annotation;
+        if (!eligible.has(captureId)) throw Error('associated evidence unavailable');
+        // Only the immediate generated body header belongs to Companion.
+        // Fix the first metadata boundary before checking it; later links are user writing.
+        const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
+        const text = content.slice(frontmatter[0].length).replace(/^\r?\n# Annotation\r?\n\r?\nSource: \[Capture\]\([^\r\n]*\)(?:\r?\n|$)/, '').trim();
+        all.push({ key, title: `Annotation ${id}`, text, provenance: `Independent user annotation ${id}; content sha256 ${digest(content)}; unversioned capture association ${captureId}; original source revision unknown`, digest: digest(content + eligible.get(captureId).digest), associated: captureId });
+      } catch (error) { issues.push(`Annotation unavailable: ${id}; ${error.message}`); }
     }
     const briefDir = path.join(this.vault.root, 'Briefs'); await this.vault.contained(briefDir);
     const versions = new Set((await fs.readdir(briefDir)).map(name => name.match(/^approved-([1-9][0-9]*)(?:-|\.md$)/)?.[1]).filter(Boolean).map(Number));

@@ -66,14 +66,21 @@ app.whenReady().then(async () => {
     let intake = null, captures = [], vaultError;
     try { intake = vault ? await new Intake(vault).info() : null; captures = vault ? await vault.list() : []; }
     catch (error) { vaultError = error.message; }
-    const importedIds = new Set(Object.values(intake?.captures || {}).map(capture => capture.id));
-    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => note.type !== 'reel_import' || importedIds.has(note.id)).map(note => importedIds.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings: [...(vault?.warnings || []), ...(vaultError ? [vaultError] : [])], intake, schedule: await schedule().info(clock().now) };
+    const imported = new Map(Object.values(intake?.captures || {}).map(capture => [capture.id, capture]));
+    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings: [...(vault?.warnings || []), ...(vaultError ? [vaultError] : [])], intake, vaultError, schedule: await schedule().info(clock().now) };
   });
   ipcMain.handle('capture', async (_, input) => { if (!vault) throw Error('Choose a vault first.'); return vault.capture(input, clock().now); });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
   ipcMain.handle('connect-drafts', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).connect(folder, scan, clock().now)); });
   ipcMain.handle('connect-reviews', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).connect(folder, scan, clock().now, 'review')); });
   ipcMain.handle('check-intake', async () => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).reconcile({ trigger: 'manual', now: clock().now })); });
+  ipcMain.handle('add-annotation', async (_, input) => new Intake(vault).addAnnotation(input, clock().now));
+  ipcMain.handle('choose-identity', async (_, input) => new Intake(vault).chooseIdentity(input));
+  ipcMain.handle('retry-annotation-link', async (_, input) => new Intake(vault).retryLink(input));
+  ipcMain.handle('restore-missing', async (_, input) => new Intake(vault).restoreMissing(input, clock().now));
+  ipcMain.handle('remove-missing', async (_, input) => new Intake(vault).removeMissing(input, clock().now));
+  ipcMain.handle('vault-repairs', async () => new Intake(vault).repairs());
+  ipcMain.handle('resolve-conflict', async (_, input) => new Intake(vault).resolveConflict(input, clock().now));
   ipcMain.handle('inspect-source', async (_, id) => new Intake(vault).inspect(id));
   ipcMain.handle('select-review', async (_, { id, revision }) => new Intake(vault).selectCurrent(id, revision, clock().now));
   ipcMain.handle('link-sources', async (_, { id, related }) => new Intake(vault).linkSources(id, related, clock().now));

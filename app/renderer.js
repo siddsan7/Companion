@@ -6,8 +6,10 @@ function day(instant, timezone) { return new Intl.DateTimeFormat('en-CA', { time
 async function refresh() {
   state = await window.companion.state(); $('location').textContent = state.location || 'Choose your vault and a parent folder to begin.';
   $('warnings').textContent = [...new Set(state.warnings)].join(' ');
+  if (state.vaultError) status(state.vaultError);
   window.intakeView.render(state.intake);
   $('schedule-state').textContent = state.schedule ? `${state.schedule.mode} | Next scheduled check: ${state.schedule.next} | Anchor: ${state.schedule.anchor} | Last success: ${state.intake?.lastSuccess?.at || state.schedule.lastSuccess?.at || 'None'} | Worker: ${state.schedule.worker?.status || 'Not run'}${state.schedule.taskError || state.schedule.workerError || state.schedule.inspectionError ? ` | Error: ${state.schedule.taskError || state.schedule.workerError || state.schedule.inspectionError}` : ''}${!state.schedule.effective && state.schedule.mode !== 'disabled' ? ' | Task missing: use Repair daily intake.' : ''}${state.schedule.taskMismatch ? ' | Task state differs: use Repair daily intake.' : ''}${state.schedule.policyMismatch ? ' | Task schedule differs: use Repair daily intake.' : ''}` : 'Daily intake is not configured.';
+  await window.intakeView.repairs();
   $('timezone').textContent = `${view === 'today' ? 'Today' : 'All captures'} · ${state.timezone} · ${day(state.now, state.timezone)}`;
   $('captures').replaceChildren();
   const query = $('search').value.toLowerCase();
