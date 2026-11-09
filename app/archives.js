@@ -2,7 +2,8 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { conversation, canonical, hash, parseArchive, archiveRecord } = require('./archive-format');
+const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent } = require('./archive-format');
+const { Briefs } = require('./briefs');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
@@ -51,6 +52,8 @@ class Archives {
       const settingsRead = await this.json(path.join(this.history.dataRoot, 'settings.json'), undefined, true), settings = settingsRead ? { vault: settingsRead.value.vault, parent: settingsRead.value.parent } : null;
       if (settings && (typeof settings.vault !== 'string' || !path.isAbsolute(settings.vault) || typeof settings.parent !== 'string' || path.isAbsolute(settings.parent) || path.relative(settings.vault, path.resolve(settings.vault, settings.parent)).startsWith('..'))) throw Error('Vault settings need repair before archive export.');
       if (settingsRead) fingerprints[path.join(this.history.dataRoot, 'settings.json')] = settingsRead.digest;
+      const inactive = await this.inactiveIntents(fingerprints);
+      if (settings && inactive.length) settings.inactiveScheduleIntents = inactive;
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
@@ -94,10 +97,15 @@ class Archives {
     await this.publish(destination, JSON.stringify(archive, null, 2) + '\n');
     return { location: destination };
   }
-  restorePlan(archive, current, matchedRoot) {
+  restorePlan(archive, current, sourceRoot, targetRoot = sourceRoot) {
     const additions = [], equal = [], conflicts = [];
-    for (const record of archive.payload.conversations) {
-      if (matchedRoot && record.vault.root !== matchedRoot) continue;
+    for (const original of archive.payload.conversations) {
+      if (sourceRoot && original.vault.root !== sourceRoot) continue;
+      const record = structuredClone(original);
+      if (sourceRoot !== targetRoot) {
+        record.vault.root = targetRoot;
+        record.archiveBinding = { archiveId: archive.id, originalManagedRoot: sourceRoot, ...(original.archiveBinding ? { previous: original.archiveBinding } : {}) };
+      }
       const existing = current.payload.conversations.find(item => item.id === record.id);
       if (!existing) additions.push(record);
       else if (canonical(existing) === canonical(record)) equal.push(record.id);
@@ -127,10 +135,12 @@ class Archives {
     const reviewed = this.restoreReview;
     if (!reviewed || reviewed.id !== input?.id || input.matched !== true) throw Error('Inspect the archive and explicitly match its vault first.');
     const vault = this.history.getVault(), root = vault?.root;
-    if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === root)) throw Error('Archive vault differs from the current vault. Explicit moved-vault matching is required; nothing was restored.');
-    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, root);
+    const sourceRoot = input.sourceRoot || root;
+    if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === sourceRoot)) throw Error('Choose an archived vault and explicitly match the current vault; nothing was restored.');
+    await this.validatePins(reviewed.archive, sourceRoot, vault);
+    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root);
     const token = randomUUID();
-    reviewed.matched = { token, root, snapshot: current, plan };
+    reviewed.matched = { token, root, sourceRoot, snapshot: current, plan };
     return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, conflictRecords: plan.conflicts.map(id => {
       const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
       return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
@@ -143,20 +153,56 @@ class Archives {
     return this.history.lock(async () => {
       const current = await this.snapshot({ locked: true });
       if (this.history.getVault()?.root !== matched.root || canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
-      const plan = this.restorePlan(reviewed.archive, current, matched.root);
+      await this.validatePins(reviewed.archive, matched.sourceRoot, this.history.getVault());
+      const plan = this.restorePlan(reviewed.archive, current, matched.sourceRoot, matched.root);
       const resolutions = input.resolutions === undefined ? [] : input.resolutions;
       if (!Array.isArray(resolutions) || resolutions.length !== plan.conflicts.length || resolutions.some(choice => !choice || typeof choice !== 'object' || Array.isArray(choice) || Object.keys(choice).some(key => !['id', 'choice'].includes(key)) || !plan.conflicts.includes(choice.id) || choice.choice !== 'keep-current') || new Set(resolutions.map(choice => choice.id)).size !== plan.conflicts.length) throw Error('Every conflicting conversation requires an explicit Keep current choice. Existing history was preserved.');
       let restored = 0;
       try {
+        await this.retainIntents(reviewed.archive, matched.sourceRoot, matched.root);
         for (const original of plan.additions) {
           const record = structuredClone(original);
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
           await this.publishAddition(record); restored++;
         }
       } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing content was preserved. Inspect again to review remaining additions; no automatic retry occurs.`); }
-      return { restored, equal: plan.equal.length };
+      return { restored, equal: plan.equal.length, inactiveIntents: (await this.inactiveIntents()).length };
     });
   }
+  async validatePins(archive, sourceRoot, vault) {
+    try {
+      for (const record of archive.payload.conversations.filter(record => record.vault.root === sourceRoot)) {
+        const pins = await new Briefs(vault).records(record.brief.version);
+        if (!pins.some(pin => pin.id === record.brief.id && pin.version === record.brief.version && pin.digest === record.brief.digest)) throw Error('Pin mismatch.');
+      }
+    } catch { throw Error('Exact archived brief pin is unavailable in the selected vault. Select its separate vault backup; nothing was restored.'); }
+  }
+  async inactiveIntents(fingerprints) {
+    const records = [], names = await fs.readdir(this.history.dataRoot); this.guard();
+    for (const name of names.sort().filter(name => /^archive-intent-[a-f0-9-]{36}-[a-f0-9]{64}\.json$/.test(name))) {
+      const file = path.join(this.history.dataRoot, name), read = await this.json(file);
+      const record = inactiveIntent(read.value);
+      if (name !== `archive-intent-${record.archiveId}-${hash(record.sourceRoot + '\n' + record.targetRoot)}.json`) throw Error('Imported schedule intent identity needs repair.');
+      records.push(record); if (fingerprints) fingerprints[file] = read.digest;
+    }
+    return records;
+  }
+  async retainIntents(archive, sourceRoot, targetRoot) {
+    const inherited = archive.payload.settings?.inactiveScheduleIntents || [];
+    const records = [...inherited, ...(archive.payload.scheduleIntent ? [{ schema: 1, archiveId: archive.id, sourceRoot, targetRoot, intent: archive.payload.scheduleIntent }] : [])];
+    for (const original of records) {
+      const record = inactiveIntent(original), destination = path.join(this.history.dataRoot, `archive-intent-${record.archiveId}-${hash(record.sourceRoot + '\n' + record.targetRoot)}.json`);
+      const existing = await this.json(destination, undefined, true);
+      if (existing) { if (canonical(existing.value) !== canonical(record)) throw Error('Imported cadence intent differs. Existing intent was preserved.'); continue; }
+      const directory = this.history.safeDirectory(), stage = path.join(this.history.dataRoot, `.archive-intent-${randomUUID()}.pending`); let handle;
+      try {
+        this.history.safeDirectory(false, directory); handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
+        await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
+        this.history.safeDirectory(false, directory); await fs.link(stage, destination); this.history.safeDirectory(false, directory);
+      } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+    }
+  }
+  async state() { return this.history.lock(async () => { this.directory = this.history.safeDirectory(); return { inactiveIntents: await this.inactiveIntents() }; }); }
   async publishAddition(record) {
     const directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
     const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`); let handle;
@@ -199,5 +245,6 @@ function installArchives({ ipcMain, ...options }) {
   ipcMain.handle('archive-inspect', () => archives.inspect());
   ipcMain.handle('archive-match', (_, input) => archives.match(input));
   ipcMain.handle('archive-restore', (_, input) => archives.restore(input));
+  ipcMain.handle('archive-state', () => archives.state());
 }
 module.exports = { installArchives };

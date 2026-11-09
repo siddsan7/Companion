@@ -27,9 +27,10 @@ function packageRecord(value) {
   for (const item of value.historyExclusions) { object(item, ['id', 'reason']); if (!uuid(item.id) || typeof item.reason !== 'string') fail(); }
 }
 function conversation(value) {
-  object(value, ['schema', 'id', 'vault', 'brief', 'createdAt', 'scope', 'requests']);
+  object(value, ['schema', 'id', 'vault', 'brief', 'createdAt', 'scope', 'requests', 'archiveBinding']);
   if (value.schema !== 1 || !uuid(value.id) || typeof value.createdAt !== 'string' || !Array.isArray(value.requests)) fail();
   root(value.vault); pin(value.brief); if (value.scope) scope(value.scope);
+  if (value.archiveBinding !== undefined) mapping(value.archiveBinding);
   const ids = new Set();
   for (const request of value.requests) {
     object(request, ['id', 'question', 'speculation', 'package', 'status', 'reply', 'startedAt', 'completedAt', 'usage', 'usageEvidence', 'messages', 'threadId', 'turnId', 'model', 'evidence', 'error']);
@@ -42,6 +43,21 @@ function conversation(value) {
     }
   }
   return structuredClone(value);
+}
+function mapping(value, depth = 0) {
+  if (depth > 24) fail();
+  object(value, ['archiveId', 'originalManagedRoot', 'previous']);
+  if (!uuid(value.archiveId) || typeof value.originalManagedRoot !== 'string') fail();
+  if (value.previous !== undefined) mapping(value.previous, depth + 1);
+}
+function scheduleIntent(intent) {
+  object(intent, ['schema', 'id', 'anchor', 'vault', 'parent', 'mode', 'reconnectRequired']);
+  if (intent.schema !== 1 || !uuid(intent.id) || !Number.isFinite(Date.parse(intent.anchor)) || typeof intent.vault !== 'string' || typeof intent.parent !== 'string' || !['enabled', 'paused', 'disabled'].includes(intent.mode) || intent.reconnectRequired !== true) fail();
+}
+function inactiveIntent(value) {
+  object(value, ['schema', 'archiveId', 'sourceRoot', 'targetRoot', 'intent']);
+  if (value.schema !== 1 || !uuid(value.archiveId) || typeof value.sourceRoot !== 'string' || typeof value.targetRoot !== 'string') fail();
+  scheduleIntent(value.intent); return value;
 }
 // v1 canonical JSON: sorted UTF-16 object keys, array order preserved, JSON primitive spelling.
 function canonical(value) {
@@ -89,7 +105,7 @@ function archiveRecord(value) {
   object(value.integrity, ['algorithm', 'digest']);
   if (value.integrity.algorithm !== 'sha256' || value.integrity.digest !== hash(canonical(value.payload))) throw Error('History archive integrity check failed. Preserve the original file; nothing was restored.');
   const payload = object(value.payload, ['settings', 'contextScopes', 'scheduleIntent', 'vaultBindings', 'conversations']);
-  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); }
+  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent', 'inactiveScheduleIntents']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); if (payload.settings.inactiveScheduleIntents !== undefined) { if (!Array.isArray(payload.settings.inactiveScheduleIntents)) fail(); payload.settings.inactiveScheduleIntents.forEach(inactiveIntent); } }
   if (!Array.isArray(payload.contextScopes) || !Array.isArray(payload.vaultBindings) || !Array.isArray(payload.conversations)) fail();
   const scopes = new Set(), roots = new Set(), ids = new Set();
   for (const item of payload.contextScopes) { object(item, ['binding', 'schema', 'files']); if (!/^[a-f0-9]{64}$/.test(item.binding) || scopes.has(item.binding) || item.schema !== 1) fail(); strings(item.files); scopes.add(item.binding); }
@@ -99,11 +115,11 @@ function archiveRecord(value) {
     binding.pins.forEach(pin); roots.add(binding.managedRoot);
   }
   if (payload.scheduleIntent !== null) {
-    const intent = object(payload.scheduleIntent, ['schema', 'id', 'anchor', 'vault', 'parent', 'mode', 'reconnectRequired']);
-    if (intent.schema !== 1 || !uuid(intent.id) || !Number.isFinite(Date.parse(intent.anchor)) || typeof intent.vault !== 'string' || typeof intent.parent !== 'string' || !['enabled', 'paused', 'disabled'].includes(intent.mode) || intent.reconnectRequired !== true) fail();
+    scheduleIntent(payload.scheduleIntent);
   }
   for (const record of payload.conversations) { conversation(record); if (ids.has(record.id) || !roots.has(record.vault.root)) fail(); ids.add(record.id); }
   return structuredClone(value);
 }
 module.exports.parseArchive = parseArchive;
 module.exports.archiveRecord = archiveRecord;
+module.exports.inactiveIntent = inactiveIntent;
