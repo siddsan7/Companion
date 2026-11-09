@@ -108,7 +108,9 @@ class Archives {
     if (canonical(current) !== canonical(review.snapshot)) throw Error('Local history or settings changed. Preview the archive again.');
     const archive = { format: 'companion-local-history', version: 1, id: randomUUID(), createdAt: this.clock().now, appVersion: this.appVersion, payload: current.payload, integrity: { algorithm: 'sha256', digest: hash(canonical(current.payload)) } };
     if (current.coverage) { archive.coverage = current.coverage; archive.integrity.digest = hash(canonical({ payload: current.payload, coverage: current.coverage })); }
-    await this.publish(destination, JSON.stringify(archive, null, 2) + '\n');
+    const serialized = JSON.stringify(archive, null, 2) + '\n';
+    if (Buffer.byteLength(serialized, 'utf8') > LIMIT) throw Error('Final serialized archive exceeds 128 MiB. No archive file was created and retained history was not shortened.');
+    await this.publish(destination, serialized);
     return { location: destination, omitted: current.coverage?.omitted.length || 0 };
   }
   restorePlan(archive, current, sourceRoot, targetRoot = sourceRoot) {
