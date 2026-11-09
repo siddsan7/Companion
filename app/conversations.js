@@ -16,7 +16,7 @@ function scopeOf(record) {
 class Conversations {
   constructor({ dataRoot, getContext, getVault, clock, provider, checkpoint, testRoot }) {
     Object.assign(this, { directory: path.join(dataRoot, 'conversations'), getContext, getVault, clock, provider, checkpoint, testRoot });
-    this.tokens = new Map(); this.running = new Set();
+    this.tokens = new Map(); this.running = new Set(); this.unsaved = new Map(); this.durable = new Map();
   }
   async lock(work) {
     await fs.mkdir(this.directory, { recursive: true });
@@ -24,6 +24,12 @@ class Conversations {
     catch (error) { if (error.message.startsWith('Project Brief store is busy')) throw Error('Conversation store is busy. Retry explicitly after the active request finishes.'); throw error; }
   }
   async read(id) {
+    const retained = this.unsaved.get(id);
+    if (retained) return structuredClone(retained.record);
+    const stored = await this.readStored(id);
+    return this.unsaved.has(id) ? structuredClone(this.unsaved.get(id).record) : stored;
+  }
+  async readStored(id) {
     if (!uuid(id)) throw Error('Conversation identity is invalid.');
     const file = path.join(this.directory, `${id}.json`), stat = await fs.lstat(file);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('Conversation is not an ordinary local history file.');
@@ -37,11 +43,12 @@ class Conversations {
     let handle, phase = 'open';
     try {
       handle = await fs.open(stage, 'wx');
-      phase = 'write'; await handle.writeFile(JSON.stringify(record, null, 2), 'utf8');
+      phase = 'write'; const text = JSON.stringify(record, null, 2); await handle.writeFile(text, 'utf8');
       phase = 'sync'; await handle.sync();
       phase = 'cleanup'; await handle.close(); handle = null;
       phase = 'rename';
       await this.publishStage(stage, path.join(this.directory, `${record.id}.json`));
+      this.durable.set(record.id, hash(text));
     } catch (error) { await this.storeFailure(phase, error); throw error; }
     finally {
       try { await handle?.close(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
@@ -70,22 +77,27 @@ class Conversations {
     const vault = this.getVault(); if (!vault) return { conversations: [], location: this.directory };
     await fs.mkdir(this.directory, { recursive: true });
     const conversations = [];
-    for (const name of await fs.readdir(this.directory)) if (name.endsWith('.json')) {
+    const names = new Set([...await fs.readdir(this.directory), ...[...this.unsaved.keys()].map(id => `${id}.json`)]);
+    for (const name of names) if (name.endsWith('.json')) {
       let record = await this.read(name.slice(0, -5));
-      if (record.requests.some(request => request.status === 'inProgress') && !this.running.has(record.id)) {
+      if (!this.unsaved.has(record.id) && record.requests.some(request => request.status === 'inProgress') && !this.running.has(record.id)) {
         try {
           record = await this.lock(async () => {
+            if (this.unsaved.has(record.id)) return this.read(record.id);
             const latest = await this.read(record.id);
+            if (this.unsaved.has(record.id)) return this.read(record.id);
             for (const request of latest.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', completedAt: this.clock().now, error: 'Previous request interrupted. The partial reply is incomplete. Retry or edit explicitly; nothing was replayed.' });
             await this.write(latest); return latest;
           });
         } catch (error) { if (!error.message.startsWith('Conversation store is busy')) throw error; }
       }
+      if (this.unsaved.has(record.id)) record = structuredClone(this.unsaved.get(record.id).record);
       if (record.vault.root === vault.root) conversations.push(record);
     }
     return { conversations, location: this.directory };
   }
   async build(input, currentRequestId) {
+    if (this.unsaved.has(input.conversationId)) throw Error('This conversation has an unsaved reply. Save the retained reply locally, or copy it before closing, before preparing another request.');
     const context = await this.getContext(), vault = context.vault;
     const prior = input.conversationId ? await this.read(input.conversationId) : null;
     if (prior && currentRequestId) prior.requests = prior.requests.filter(request => request.id !== currentRequestId);
@@ -184,10 +196,35 @@ class Conversations {
         Object.assign(request, result, { status: 'completed', completedAt: this.clock().now });
       } catch (error) { request.status = error.terminalStatus || 'failed'; request.error = error.message; request.completedAt = this.clock().now; }
       try { await this.write(record); }
-      catch (error) { request.status = 'interrupted'; record.storageWarning = 'Conversation storage failed. The visible reply is incomplete and may not survive restart. Keep this text and retry explicitly after repairing local storage.'; }
+      catch (error) {
+        request.status = 'interrupted'; record.storageWarning = 'Conversation storage failed. The visible reply is incomplete and may not survive restart. Repair local storage and save the retained reply locally, or copy it before closing.';
+        this.unsaved.set(record.id, { record: structuredClone(record), digest: this.durable.get(record.id) || null });
+      }
       finally { this.running.delete(record.id); }
-      return record;
+      return structuredClone(record);
     });
+  }
+  async preserve(id) {
+    const retained = this.unsaved.get(id);
+    if (!retained) throw Error('There is no unsaved reply to save. Refresh the conversation.');
+    try {
+      return await this.lock(async () => {
+        if (this.getVault()?.root !== retained.record.vault.root) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
+        let bytes;
+        try { await this.readStored(id); bytes = await fs.readFile(path.join(this.directory, `${id}.json`), 'utf8'); }
+        catch { throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' }); }
+        if (!retained.digest || hash(bytes) !== retained.digest) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
+        const record = structuredClone(retained.record); delete record.storageWarning;
+        await this.write(record); this.unsaved.delete(id);
+        return structuredClone(record);
+      });
+    } catch (error) {
+      const warning = error.code === 'HISTORY_CONFLICT'
+        ? 'Local history changed or is unavailable. The retained reply is still unsaved and may not survive restart. Copy it before closing; existing history was not replaced.'
+        : 'Local history could not be saved. The retained reply is still unsaved and may not survive restart. Check local storage and save again, or copy it before closing.';
+      retained.record.storageWarning = warning;
+      throw Error(warning);
+    }
   }
 }
 
@@ -196,6 +233,7 @@ function installConversations({ ipcMain, ...options }) {
   ipcMain.handle('conversation-list', () => store.list());
   ipcMain.handle('conversation-preview', (_, input) => store.preview(input));
   ipcMain.handle('conversation-send', (_, input) => store.send(input));
+  ipcMain.handle('conversation-preserve', (_, input) => store.preserve(input?.id));
   return store;
 }
 module.exports = { Conversations, installConversations };

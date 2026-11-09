@@ -8,6 +8,7 @@
   let historyExclusions = [];
   const excludedHistory = new Set();
   const restoredSources = new Set(), restoredHistory = new Set();
+  const historyRevision = record => JSON.stringify({ requests: record.requests, storageWarning: record.storageWarning });
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
   function warnHistory() {
     for (const warning of byId('conversation-history').querySelectorAll('.history-exclusion')) warning.remove();
@@ -18,7 +19,7 @@
   }
   function showConversation(record) {
     const firstDisplay = !displayedHistory;
-    const revision = JSON.stringify(record.requests);
+    const revision = historyRevision(record);
     if (revision !== displayedHistory) { invalidateConversation(); displayedHistory = revision; }
     conversationId = record.id; byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
     if (firstDisplay) {
@@ -51,11 +52,22 @@
         }; article.append(retry);
       }
     }
+    if (record.storageWarning) {
+      const save = document.createElement('button'); save.textContent = 'Save retained reply locally';
+      save.onclick = async () => {
+        save.disabled = true; invalidateConversation();
+        try { showConversation(await window.companion['conversation-preserve']({ id: record.id })); }
+        catch (error) { byId('conversation-error').textContent = error.message; }
+        finally { save.disabled = false; }
+      };
+      byId('conversation-history').prepend(save);
+    }
     warnHistory();
   }
   async function restoreConversation() {
-    try { const state = await window.companion['conversation-list'](); byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`; const record = state.conversations.find(item => item.id === conversationId) || state.conversations.at(-1); if (record && JSON.stringify(record.requests) !== displayedHistory) showConversation(record); }
-    catch (error) { byId('conversation-error').textContent = error.message; }
+    const request = conversationGeneration;
+    try { const state = await window.companion['conversation-list'](); if (request !== conversationGeneration) return; byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`; const record = state.conversations.find(item => item.id === conversationId) || state.conversations.at(-1); if (record && historyRevision(record) !== displayedHistory) showConversation(record); }
+    catch (error) { if (request === conversationGeneration) byId('conversation-error').textContent = error.message; }
   }
   let selections = [], all = [], generation = 0; const excluded = new Set();
   const clearPreview = () => { generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
