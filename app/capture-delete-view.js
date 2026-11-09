@@ -1,6 +1,19 @@
 (() => {
   const section = document.createElement('section'); section.setAttribute('aria-label', 'Capture deletion preview'); section.hidden = true;
   document.getElementById('browse-section').after(section);
+  const recovery = document.createElement('section'); recovery.setAttribute('aria-label', 'Capture deletion recovery'); recovery.hidden = true;
+  const review = document.createElement('button'); review.textContent = 'Review capture deletion recovery'; section.after(review, recovery);
+  review.onclick = () => action(async () => {
+    const pending = await window.captureDeletion.pending(); recovery.replaceChildren(); recovery.hidden = false;
+    if (!pending.length) recovery.textContent = 'No unfinished confirmed capture deletions.';
+    for (const item of pending) {
+      const article = document.createElement('article'), scope = document.createElement('p'), resume = document.createElement('button');
+      scope.textContent = `${item.id} — ${item.reason} Only the original confirmed files can be removed. Suppression remains in effect.\n${item.targets.join('\n')}`;
+      resume.textContent = 'Resume confirmed capture deletion';
+      resume.onclick = () => action(async () => { resume.disabled = true; status('Resuming confirmed capture deletion...'); try { await window.captureDeletion.resume({ id: item.id, operationId: item.operationId }); await refresh(); article.remove(); status('Capture deletion complete. Automatic re-import remains suppressed.'); } finally { resume.disabled = false; } });
+      article.append(scope, resume); recovery.append(article);
+    }
+  });
   window.captureDeletionView = {
     async preview(id) {
       const preview = await window.captureDeletion.preview({ id });
