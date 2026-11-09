@@ -31,7 +31,7 @@ function passages(text, terms) {
   return found.sort((a, b) => b.matched.length - a.matched.length || a.start - b.start);
 }
 class Context {
-  constructor(vault, { scopeFile, dependencyValidator = validateDependencies, verifiedInputBound = null, approvals = new Map() } = {}) { this.vault = vault; this.scopeFile = scopeFile; this.dependencyValidator = dependencyValidator; this.verifiedInputBound = verifiedInputBound; this.approvals = approvals; }
+  constructor(vault, { scopeFile, dependencyValidator = validateDependencies, verifiedInputBound = null, capacityBinding = null, approvals = new Map() } = {}) { this.vault = vault; this.scopeFile = scopeFile; this.dependencyValidator = dependencyValidator; this.verifiedInputBound = verifiedInputBound; this.capacityBinding = capacityBinding; this.approvals = approvals; }
   async scope() {
     try { const scope = JSON.parse(await fs.readFile(this.scopeFile, 'utf8')); if (scope.schema !== 1 || !Array.isArray(scope.files) || scope.files.some(file => typeof file !== 'string')) throw Error('Invalid explicit note scope. Preserve settings for repair.'); return scope.files; }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
@@ -231,18 +231,19 @@ class Context {
     const bound = this.verifiedInputBound;
     if (bound !== null && (!Number.isSafeInteger(bound.maxCodePoints) || bound.maxCodePoints < 1 || typeof bound.model !== 'string' || !bound.model.trim() || typeof bound.evidence !== 'string' || !bound.evidence.trim())) throw Error('Verified input bound is invalid. Preview is blocked until its main-process evidence is repaired.');
     const count = [...serialized].length, limit = Math.min(32000, bound?.maxCodePoints || 32000);
-    return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), boundEvidence: bound ? `${bound.model}: ${bound.evidence}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
+    return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), sources: chosen, capacityBinding: this.capacityBinding, boundEvidence: bound ? `${bound.model}: ${bound.evidence}${bound.harnessAndOutputEvidence ? `; ${bound.harnessAndOutputEvidence}` : ''}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
   }
 }
-function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getVerifiedInputBound = async () => null }) {
+function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvidence, getVerifiedInputBound = async () => null }) {
   let chain = Promise.resolve(); const approvals = new Map();
   const serial = work => { const next = chain.then(work); chain = next.catch(() => {}); return next; };
   const store = async () => {
     const vault = getVault(); if (!vault) throw Error('Choose a vault first.');
-    let verifiedInputBound = await getVerifiedInputBound();
+    const evidence = getEvidence ? await getEvidence() : null;
+    let verifiedInputBound = evidence ? evidence.capacity : await getVerifiedInputBound();
     // Controlled OS/provider-boundary evidence only; never accepted from renderer input.
-    if (testRoot) try { verifiedInputBound = JSON.parse(await fs.readFile(path.join(testRoot, 'context-bound.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    return new Context(vault, { scopeFile: path.join(dataRoot, `context-settings-${digest(vault.root)}`, 'notes.json'), verifiedInputBound, approvals });
+    if (testRoot && !getEvidence) try { verifiedInputBound = JSON.parse(await fs.readFile(path.join(testRoot, 'context-bound.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    return new Context(vault, { scopeFile: path.join(dataRoot, `context-settings-${digest(vault.root)}`, 'notes.json'), verifiedInputBound, capacityBinding: evidence?.binding || null, approvals });
   };
   ipcMain.handle('context-find', async (_, input) => (await store()).discover(input));
   ipcMain.handle('context-passage', async (_, input) => (await store()).approvePassage(input));
@@ -253,5 +254,6 @@ function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getVeri
     await (await store()).include(files); return true;
   }));
   ipcMain.handle('context-exclude', (_, key) => serial(async () => (await store()).exclude(key)));
+  return { store };
 }
 module.exports = { Context, installContext, validateDependencies };

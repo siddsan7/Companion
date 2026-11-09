@@ -11,7 +11,7 @@ class CodexSetup {
   constructor({ dataRoot, testRoot } = {}) {
     this.dataRoot = dataRoot; this.testRoot = testRoot; this.generation = 0;
     this.state = { status: 'incomplete', message: 'Verify Windows isolation before using Codex. Local capture remains available.', ready: false, isolationPassed: false, busy: false };
-    this.threads = new Set(); this.turnHistory = []; this.saveTail = Promise.resolve();
+    this.threads = new Set(); this.turnHistory = []; this.saveTail = Promise.resolve(); this.turnLease = null;
     this.loaded = this.restore();
   }
   async restore() {
@@ -39,38 +39,45 @@ class CodexSetup {
       this.certificate = null;
       Object.assign(this.state, { status: 'expired', ready: false, isolationPassed: false, message: 'Isolation verification expired. Verify again before sending.' });
     }
-    return structuredClone(this.state);
+    return structuredClone({ ...this.state, busy: !!this.state.busy || !!this.turnLease });
   }
   fail(message, status = 'incomplete') { this.certificate = null; Object.assign(this.state, { status, message, ready: false, isolationPassed: false, busy: false }); return this.snapshot(); }
   async persist() {
     if (!this.dataRoot) return;
+    const generation = this.generation;
     // No credentials, sign-in codes, URLs, account identifiers or provider error payloads.
     const text = JSON.stringify({ schema: 1, status: this.state.status, ready: this.state.ready, validOnlyDuringProcess: true, message: this.state.message, checkedAt: new Date().toISOString(), evidence: this.fixture ? 'controlled-fixture-not-live' : 'live', checks: this.checks || [], turns: this.turnHistory || [], reply: this.state.reply || '' }, null, 2);
     const write = async () => {
+      if (generation !== this.generation) return;
       await fs.mkdir(this.dataRoot, { recursive: true });
       const temporary = path.join(this.dataRoot, `readiness-${crypto.randomUUID()}.pending`);
-      await fs.writeFile(temporary, text, { flag: 'wx' });
-      await fs.rename(temporary, path.join(this.dataRoot, 'readiness.json'));
+      try {
+        await fs.writeFile(temporary, text, { flag: 'wx' });
+        if (generation !== this.generation) return;
+        await fs.rename(temporary, path.join(this.dataRoot, 'readiness.json'));
+      } finally { await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
     };
     this.saveTail = this.saveTail.catch(() => {}).then(write);
     await this.saveTail;
   }
   async action(input = {}, roots = {}) {
     await this.loaded;
+    let generation = this.generation;
     try {
-      if (input.action === 'cancel-login') return await this.cancelLogin();
       if (input.action === 'interrupt') return await this.interrupt();
-      if (input.action === 'invalidate') { this.invalidate(); return this.snapshot(); }
+      if (input.action === 'invalidate') { this.invalidate(); generation = this.generation; await this.persist(); return this.snapshot(); }
+      if (this.turnLease) return this.snapshot();
+      if (input.action === 'cancel-login') return await this.cancelLogin();
       if (this.state.busy || this.state.loginPending) return this.snapshot();
       this.state.busy = true;
-      if (input.action === 'connect') await this.connect(input, roots);
+      if (input.action === 'connect') { generation = this.generation + 1; await this.connect(input, roots); }
       else if (input.action === 'login') await this.login();
       else if (input.action === 'verify') await this.verify();
       else if (input.action === 'synthetic') await this.synthetic();
       else throw Error('Unknown Codex setup action.');
-      this.state.busy = false;
-    } catch (error) { this.fail(error.message, error.terminalStatus || 'incomplete'); }
-    await this.persist(); return this.snapshot();
+      if (this.generation === generation) this.state.busy = false;
+    } catch (error) { if (this.generation === generation) this.fail(error.message, error.terminalStatus || 'incomplete'); }
+    if (this.generation === generation) await this.persist(); return this.snapshot();
   }
   async connect(input, roots) {
     this.close(); this.checks = [];
@@ -174,10 +181,13 @@ class CodexSetup {
     this.state.message = 'Windows read denials passed. Send a synthetic turn to verify model completion. Capture remains available.';
   }
   async synthetic() {
-    if (!this.certificate || Date.now() >= this.certificate.expires) throw Error('Isolation verification expired. Verify again before sending.');
+    const generation = this.generation, certificate = this.certificate;
+    if (!certificate || Date.now() >= certificate.expires) throw Error('Isolation verification expired. Verify again before sending.');
     await this.readAccount();
-    if (!this.state.authenticated || await audit(this) !== this.certificate.fingerprint) throw Error('Account, executable, configuration or protected roots changed. Verify isolation again.');
+    const fingerprint = await audit(this);
+    if (generation !== this.generation || this.certificate !== certificate || Date.now() >= certificate.expires || !this.state.authenticated || fingerprint !== certificate.fingerprint) throw Error('Account, executable, configuration or protected roots changed. Verify isolation again.');
     await runTurn(this, 'Synthetic Companion setup check. Reply with exactly: Companion context received. No files or tools are needed.');
+    if (generation !== this.generation) return;
     // A completed turn and absence of tool events do not establish the model-visible tool inventory.
     // Keep the live gate closed until that inventory has independent installed-integration evidence.
     this.state.ready = false;

@@ -4,7 +4,20 @@ const os = require('node:os');
 const path = require('node:path');
 let root, app, page, checks;
 test.beforeEach(async () => { checks = 0; root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-reviews-')); });
-test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.afterEach(async ({}, testInfo) => {
+  if (testInfo.status !== testInfo.expectedStatus) {
+    const lastCheck = await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8').then(text => {
+      const value = JSON.parse(text).lastCheck;
+      return value ? { at: value.at, trigger: value.trigger, status: value.status } : null;
+    }).catch(error => ({ unavailable: error.code || error.name }));
+    const visible = page ? await page.evaluate(() => ({
+      status: document.querySelector('[role="status"]')?.textContent?.slice(0, 500),
+      timezone: document.getElementById('timezone')?.textContent?.slice(0, 200)
+    })).catch(() => ({ unavailable: true })) : { unavailable: true };
+    console.log('Review restart failure evidence: ' + JSON.stringify({ title: testInfo.title, status: testInfo.status, expectedStatus: testInfo.expectedStatus, lastCheck, visible }));
+  }
+  if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true });
+});
 async function bundle(name = 'accept') {
   const dir = path.join(root, 'producer', name);
   await fs.cp(path.join(__dirname, 'fixtures/reel-review', name), dir, { recursive: true });
@@ -77,7 +90,9 @@ test('edited review remains current while a later unreviewed draft is retained i
   await expect(page.getByLabel('Source inspection').locator('article')).toHaveCount(2);
   await expect(page.getByLabel('Source inspection')).toContainText('Human review: unreviewed');
   await expect(page.locator('#held-imports')).toHaveText('No held imports.');
-  await app.close(); app = null; await launch(); await check(); expect(await snapshots()).toHaveLength(2);
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await check(); expect(await snapshots()).toHaveLength(2);
   expect(await captureText()).toContain('human_review: "edit"');
 });
 test('competing reviewed successors preserve current content until an explicit durable choice', async () => {
@@ -159,7 +174,9 @@ test('explicit changed-byte links preserve both captures and their separate immu
   await expect(page.getByLabel('Source inspection')).toContainText('Captures and revision histories remain separate');
   expect(await snapshots()).toEqual(before);
   expect(await Promise.all([reviewed, changed].map(item => fs.readFile(path.join(base, `${item.captureId}.md`), 'utf8')))).toEqual(notes);
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await check();
   await expect(page.locator('#captures article')).toHaveCount(2);
   await page.locator('#captures article').filter({ hasText: changed.captureId }).getByRole('button', { name: 'Inspect source', exact: true }).click();
   await expect(page.getByLabel('Source inspection')).toContainText('User-linked source');
@@ -206,7 +223,9 @@ test('invalid finalized bundles are held without source fragments while an indep
   await expect(held).toContainText('Finalized evidence does not match the original attempt identity');
   await expect(held).toContainText('Unsafe integer in review semantics');
   await expect(held).toContainText('Missing or unsupported original attempt identity');
-  await app.close(); app = null; await launch(); await check('held');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await check('held');
   expect(await snapshots()).toEqual(retained);
   const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
   expect(ledger.lastCheck.status).toBe('held');
