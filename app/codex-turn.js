@@ -7,7 +7,33 @@ function failureMessage(info) {
   if (['serverOverloaded', 'flexUnavailable'].includes(info)) return 'Codex is temporarily unavailable. Retry explicitly when the service is available.';
   return 'Codex turn failed. The partial reply is incomplete. Check setup and retry explicitly.';
 }
-async function runTurn(setup, text, { beforeStart = async () => {}, onState = async () => {} } = {}) {
+async function runTurn(setup, text, options = {}) {
+  if (setup.turnLease) throw Error('Codex is still finishing a reply. Wait for it to finish, then retry explicitly.');
+  const lease = { generation: setup.generation }; setup.turnLease = lease;
+  let reply, failure;
+  try {
+    reply = await runOwnedTurn(setup, text, options);
+    if (setup.generation === lease.generation) Object.assign(setup.state, { status: 'completed', message: 'Codex turn completed. Chat readiness is checked separately.' });
+  } catch (error) {
+    failure = error;
+    if (setup.generation === lease.generation) setup.fail(error.message, error.terminalStatus || 'failed');
+  } finally {
+    try {
+      if (setup.generation === lease.generation) await setup.persist();
+    } catch {
+      if (setup.generation === lease.generation) {
+        setup.certificate = null; setup.state.ready = false; setup.state.isolationPassed = false;
+        if (!failure) {
+          failure = Object.assign(Error('Codex setup history could not be saved. The retained reply is incomplete. Check setup and retry explicitly.'), { terminalStatus: 'interrupted' });
+          setup.fail(failure.message, failure.terminalStatus);
+        }
+      }
+    } finally { if (setup.turnLease === lease) setup.turnLease = null; }
+  }
+  if (failure) throw failure;
+  return reply;
+}
+async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState = async () => {} } = {}) {
   const rpc = setup.rpc;
   const started = await rpc.request('thread/start', { cwd: setup.work, runtimeWorkspaceRoots: [setup.work], permissions: PROFILE, approvalPolicy: 'never', ephemeral: true, environments: [], selectedCapabilityRoots: [], dynamicTools: [], baseInstructions: INSTRUCTIONS, developerInstructions: '' });
   if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !Array.isArray(started.runtimeWorkspaceRoots) || started.runtimeWorkspaceRoots.length !== 1 || !samePath(started.runtimeWorkspaceRoots[0], setup.work) || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
