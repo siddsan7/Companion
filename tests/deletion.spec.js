@@ -574,6 +574,102 @@ test('same-byte restoration revokes a two-hop foreign history closure and its st
   for (const [name, bytes] of Object.entries(originals)) expect((await fs.readFile(path.join(historyDirectory, name))).toString('base64')).toBe(bytes);
 });
 
+async function pauseManualRestoration(boundary) {
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Thought or link', { exact: true }).fill('MANUALRECOVERY exact authored thought with independent ownership.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures'), name = (await fs.readdir(captures)).find(name => name.endsWith('.md'));
+  const file = path.join(captures, name), sourceBytes = await fs.readFile(file), backup = path.join(root, 'explicit-manual-recovery-backup.md');
+  await fs.writeFile(backup, sourceBytes);
+  const id = YAML.parse(sourceBytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id;
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected manual capture file', { exact: true }).fill(backup);
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  const confirm = restoration.getByRole('button', { name: 'Confirm source restoration', exact: true });
+  await expect(confirm).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+  await confirm.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+  await expect(confirm).toBeDisabled();
+  await expect(page.getByRole('status')).toContainText('Restoring selected source');
+  const ledgerFile = path.join(base, '.intake', 'ledger.json'), ledgerBytes = await fs.readFile(ledgerFile, 'utf8'), ledger = JSON.parse(ledgerBytes), authority = ledger.sourceAuthority[id];
+  expect(authority.phase).toBe('restoring');
+  return { base, file, sourceBytes, backup, id, confirm, ledgerFile, ledgerBytes, ledger, authority, stage: path.join(base, '.intake', `manual-${authority.operationId}.stage`) };
+}
+test('manual restoration never reconstructs an externally removed admitted output after actual process exit', async ({}, testInfo) => {
+  test.setTimeout(90000);
+  const selected = await pauseManualRestoration('capture-restoration-admitted');
+  expect(selected.authority.restoration.published).toBe(true);
+  expect((await fs.stat(selected.file)).nlink).toBe(2);
+  await exitMain('capture-restoration-admitted', testInfo);
+  await fs.unlink(selected.file); await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  await expect(page.getByRole('status')).toContainText(/manual restoration publication/i);
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id]).toEqual(selected.authority);
+  expect(await fs.readFile(selected.stage)).toEqual(selected.sourceBytes); expect(await fs.readFile(selected.backup)).toEqual(selected.sourceBytes);
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText(/manual restoration publication/i);
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+});
+test('manual restoration revalidates late edited bytes before final activation and preserves the edit', async () => {
+  test.setTimeout(90000);
+  const selected = await pauseManualRestoration('capture-restoration-published');
+  expect(selected.authority.restoration.published).toBe(true);
+  const edited = Buffer.concat([selected.sourceBytes, Buffer.from('\nONLYCOPY late independent editor writing.\n')]);
+  await fs.writeFile(selected.file, edited);
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue', 'utf8');
+  await expect(page.getByRole('status')).not.toContainText('Restoring selected source');
+  expect(await fs.readFile(selected.file)).toEqual(edited);
+  expect(await fs.readFile(selected.ledgerFile, 'utf8')).toBe(selected.ledgerBytes);
+  await expect(page.getByRole('status')).toContainText(/manual restoration publication/i);
+  await app.close(); app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  expect(await fs.readFile(selected.file)).toEqual(edited);
+  expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id].phase).toBe('restoring');
+});
+test('manual restoration preserves an unknown same-byte replacement stage inode after durable publication', async () => {
+  test.setTimeout(90000);
+  const selected = await pauseManualRestoration('capture-restoration-admitted');
+  const original = await fs.stat(selected.stage, { bigint: true });
+  expect(String(original.ino)).toBe(selected.authority.restoration.publication.ino);
+  await fs.unlink(selected.stage); await fs.writeFile(selected.stage, selected.sourceBytes, { flag: 'wx', flush: true });
+  const replacement = await fs.stat(selected.stage, { bigint: true });
+  expect(replacement.ino).not.toBe(original.ino); expect(replacement.nlink).toBe(1n);
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue', 'utf8');
+  await expect(page.getByRole('status')).not.toContainText('Restoring selected source');
+  const retained = await fs.readFile(selected.stage).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  expect(retained).toEqual(selected.sourceBytes);
+  expect(await fs.readFile(selected.ledgerFile, 'utf8')).toBe(selected.ledgerBytes);
+  expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes);
+  expect(String((await fs.stat(selected.file, { bigint: true })).ino)).toBe(original.ino.toString());
+  expect((await fs.stat(selected.stage, { bigint: true })).ino).toBe(replacement.ino);
+  expect(await fs.readFile(path.join(selected.base, '.intake', selected.authority.restoration.journal), 'utf8')).toContain('MANUALRECOVERY');
+});
+for (const boundary of ['capture-restoration-authorized', 'capture-restoration-admitted', 'capture-restoration-published']) test(`manual restoration recovers exactly once after actual process exit at ${boundary}`, async ({}, testInfo) => {
+  test.setTimeout(90000);
+  const selected = await pauseManualRestoration(boundary);
+  await exitMain(boundary, testInfo); await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes);
+  const restored = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id];
+  expect(restored.phase).toBe('active'); expect(restored.generation).toBe(selected.authority.generation); expect(restored.operationId).toBe(selected.authority.operationId);
+  expect(restored.manual).toEqual(selected.authority.manual);
+  expect((await fs.stat(selected.file)).nlink).toBe(1);
+  expect((await fs.readdir(path.join(selected.base, '.intake'))).filter(name => name.startsWith('manual-') || name.startsWith('restoration-'))).toEqual([]);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id]).toEqual(restored);
+  expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes);
+});
+
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
   test.setTimeout(90000);
   await artifact('first', '1'); await launch();
