@@ -101,3 +101,39 @@ test('a completed conversation result becomes a standalone saved idea only after
   expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
+
+test('an Experiment Proposal requires all five fields before preview and explicit save', async () => {
+  test.setTimeout(90000);
+  await completedConversation();
+  const ideas = path.join(root, 'vault', 'Companion', 'Ideas');
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Try a retrieval practice queue');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Propose a small comparison of two practice queues.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic hypothesis; no experiment was run and transfer is unverified.');
+  await page.getByLabel('Saved idea kind', { exact: true }).selectOption({ label: 'Experiment Proposal' });
+  const fields = [
+    ['Hypothesis', 'A delayed revisit may improve next-day clean chord changes.'],
+    ['Borrowed mechanism', 'Retrieve a previously learned chord after a delay.'],
+    ['Project application', 'Offer a delayed revisit in the MyTune practice queue.'],
+    ['Smallest test', 'Compare two short sessions with and without a delayed revisit.'],
+    ['Observable result', 'Record next-day clean chord changes out of ten attempts.']
+  ];
+  for (const [label, value] of fields) {
+    await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+    await expect(page.locator('#idea-status')).toContainText(new RegExp(`Enter.*${label}`, 'i'));
+    await expect(page.getByRole('button', { name: 'Confirm saved idea', exact: true })).not.toBeVisible();
+    expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toEqual([]);
+    await page.getByLabel(label, { exact: true }).fill(value);
+  }
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/# Experiment Proposal/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  for (const [label, value] of fields) { expect(proposed).toContain(`## ${label}`); expect(proposed).toContain(value); }
+  expect(proposed).toContain('no experiment was run');
+  expect(await fs.readdir(ideas)).toEqual([]);
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
+});
