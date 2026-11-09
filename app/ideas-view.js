@@ -15,6 +15,9 @@
     field.id = `idea-experiment-${key}`; field.rows = 3; label.htmlFor = field.id; label.textContent = title; experiments.append(label, field);
   }
   byId('idea-preview-button').before(kindLabel, kind, experiments);
+  const references = document.createElement('div'); references.id = 'idea-references';
+  byId('idea-preview-button').before(references);
+  const evidenceView = document.createElement('div'); evidenceView.id = 'idea-evidence'; section.append(evidenceView);
   let origin = null, operation = null, epoch = 0;
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
   for (const field of ['title', 'explanation', 'limitations']) byId(`idea-${field}`).oninput = invalidate;
@@ -28,6 +31,22 @@
         title.textContent = note.title; open.textContent = 'Open saved idea in Obsidian'; open.disabled = note.unavailable;
         open.onclick = async () => { try { await window.companion['idea-open'](note.id); } catch (error) { byId('idea-status').textContent = error.message; } };
         article.append(title, open); byId('saved-ideas').append(article);
+        for (let index = 0; index < note.citationCount; index++) {
+          const inspect = document.createElement('button'); inspect.textContent = 'Inspect cited evidence';
+          inspect.onclick = async () => {
+            try {
+              const evidence = await window.companion['idea-evidence']({ id: note.id, index }); evidenceView.replaceChildren();
+              const heading = document.createElement('h3'), warnings = document.createElement('p');
+              heading.textContent = `Cited revision ${evidence.anchor.revision_id}; evidence ${evidence.anchor.evidence_id}`; warnings.textContent = evidence.warnings.join('\n'); evidenceView.append(heading, warnings);
+              if (evidence.available) {
+                const details = document.createElement('p'), excerpt = document.createElement('pre'), label = document.createElement('label'), snapshot = document.createElement('textarea');
+                details.textContent = `Human review: ${evidence.humanReview}; extraction: ${evidence.extraction}; processing: ${evidence.processing}. Claims are not independently verified. Uncertainty: ${JSON.stringify(evidence.uncertainty || {})}`;
+                excerpt.textContent = evidence.anchor.excerpt; label.htmlFor = 'idea-evidence-snapshot'; label.textContent = 'Cited revision snapshot'; snapshot.id = 'idea-evidence-snapshot'; snapshot.readOnly = true; snapshot.rows = 14; snapshot.value = evidence.text;
+                evidenceView.append(details, excerpt, label, snapshot);
+              }
+            } catch (error) { byId('idea-status').textContent = error.message; }
+          }; article.append(inspect);
+        }
       }
     } catch (error) { byId('idea-status').textContent = error.message; }
   }
@@ -38,13 +57,20 @@
       byId('idea-editor').hidden = false; byId('idea-title').value = ''; byId('idea-explanation').value = draft.explanation; byId('idea-limitations').value = draft.limitations;
       kind.value = 'observation'; experiments.hidden = true;
       for (const [key] of experimentFields) byId(`idea-experiment-${key}`).value = '';
+      references.replaceChildren();
+      const warning = document.createElement('p'); warning.textContent = (draft.warnings || []).join('\n'); references.append(warning);
+      for (const reference of draft.references || []) {
+        const label = document.createElement('label'), checkbox = document.createElement('input'), excerpt = document.createElement('pre');
+        checkbox.type = 'checkbox'; checkbox.id = `idea-reference-${reference.referenceId}`; checkbox.value = reference.referenceId; checkbox.onchange = invalidate;
+        label.htmlFor = checkbox.id; label.textContent = reference.label; excerpt.textContent = reference.excerpt; references.append(label, checkbox, excerpt);
+      }
       byId('idea-title').focus();
     } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
   });
   byId('idea-preview-button').onclick = async () => {
     invalidate(); const current = epoch; byId('idea-status').textContent = '';
     try {
-      const preview = await window.companion['idea-preview']({ ...origin, title: byId('idea-title').value, explanation: byId('idea-explanation').value, limitations: byId('idea-limitations').value, kind: kind.value, experiment: Object.fromEntries(experimentFields.map(([key]) => [key, byId(`idea-experiment-${key}`).value])) });
+      const preview = await window.companion['idea-preview']({ ...origin, title: byId('idea-title').value, explanation: byId('idea-explanation').value, limitations: byId('idea-limitations').value, kind: kind.value, experiment: Object.fromEntries(experimentFields.map(([key]) => [key, byId(`idea-experiment-${key}`).value])), referenceIds: [...references.querySelectorAll('input:checked')].map(checkbox => checkbox.value) });
       if (current !== epoch) return;
       operation = preview.operation; byId('idea-destination').value = preview.destination; byId('idea-markdown').value = preview.text;
       byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false;

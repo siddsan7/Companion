@@ -16,7 +16,7 @@ function metadata(text) {
 class Ideas {
   constructor({ getVault, conversations, clock, open }) {
     Object.assign(this, { getVault, conversations, clock, open });
-    this.previews = new Map(); this.roots = new Map();
+    this.previews = new Map(); this.roots = new Map(); this.references = new Map();
   }
   guard(vault, expected, create = false) {
     const root = path.resolve(vault.vault);
@@ -39,7 +39,23 @@ class Ideas {
       if (area === '.ideas' && !create && !local.existsSync(directory)) continue;
       identities.set(directory, check(directory, expected?.get(directory)));
     }
+    for (const [file, identity] of expected || []) check(file, identity);
     return identities;
+  }
+  parents(vault, files) {
+    const parents = this.guard(vault);
+    for (const file of files) {
+      const relative = path.relative(vault.vault, path.dirname(file));
+      if (path.isAbsolute(relative) || relative.split(path.sep).includes('..')) throw Error('Evidence is outside the selected vault.');
+      let directory = path.resolve(vault.vault);
+      for (const segment of relative.split(path.sep).filter(Boolean)) {
+        directory = path.join(directory, segment);
+        const stat = local.lstatSync(directory, { bigint: true });
+        if (!stat.isDirectory() || stat.isSymbolicLink() || local.realpathSync(directory) !== directory) throw Error('Evidence requires ordinary contained folders.');
+        parents.set(directory, stat);
+      }
+    }
+    return parents;
   }
   async readFile(vault, file, parents, links = 1) {
     this.guard(vault, parents);
@@ -61,7 +77,7 @@ class Ideas {
       try {
         const file = path.join(vault.root, 'Ideas', name), { text } = await this.readFile(vault, file, parents);
         const data = metadata(text);
-        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file });
+        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0 });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
@@ -76,11 +92,83 @@ class Ideas {
     return { vault, record, request };
   }
   async draft(input) {
-    const { request } = await this.origin(input);
-    return { ...input, explanation: request.reply, limitations: 'This is an interpretation, not a verified outcome. Supporting sentence citations have not been established.' };
+    const { vault, record, request } = await this.origin(input), references = [], warnings = [];
+    if (request.status === 'completed') for (const dep of request.package.dependencies) {
+      if (!dep.captureId || !dep.revisionId || record.scope?.excludedSources.includes(dep.key)) continue;
+      try {
+        const resolved = await this.revision(vault, dep.captureId, dep.revisionId, true);
+        for (const evidence of resolved.revision.evidence?.evidence || []) {
+          const anchor = this.anchor(resolved, evidence);
+          if (!this.inPackage(request, resolved, anchor)) continue;
+          const referenceId = randomUUID();
+          this.references.set(referenceId, { conversationId: record.id, requestId: request.id, anchor });
+          references.push({ referenceId, label: `Cite evidence ${evidence.id} from ${resolved.capture.title}`, excerpt: evidence.text });
+        }
+      } catch (error) { warnings.push(`Reference unavailable: ${dep.captureId}; ${error.message}`); }
+    }
+    return { ...input, references, warnings, explanation: request.reply, limitations: 'This is an interpretation, not a verified outcome. Supporting sentence citations have not been established.' };
+  }
+  async revision(vault, captureId, revisionId, offering = false) {
+    if (!uuid(captureId) || !uuid(revisionId)) throw Error('Invalid cited revision identity.');
+    const ledgerFile = path.join(vault.root, '.intake', 'ledger.json'), revisionFile = path.join(vault.root, 'Revisions', `${revisionId}.json`);
+    const parents = this.parents(vault, [ledgerFile, revisionFile]);
+    const ledger = JSON.parse((await this.readFile(vault, ledgerFile, parents)).text);
+    if (ledger.schema !== 1 || !ledger.captures || !ledger.attempts || !Array.isArray(ledger.suppressed)) throw Error('Intake admission history is unavailable.');
+    const entries = Object.entries(ledger.captures).filter(([, item]) => item.id === captureId);
+    if (entries.length !== 1) throw Error('Cited capture admission is unavailable.');
+    const [sourceHash, capture] = entries[0];
+    const attempts = Object.values(ledger.attempts).filter(item => item.revision === revisionId);
+    if (!capture.revisions.includes(revisionId) || !attempts.length || attempts.some(item => item.captureId !== captureId || item.sourceHash !== sourceHash || !/^[a-f0-9]{64}$/.test(item.snapshotHash) || item.snapshotHash !== attempts[0].snapshotHash)) throw Error('Exact cited revision was not admitted for this capture.');
+    const { text } = await this.readFile(vault, revisionFile, parents), snapshotHash = hash(text);
+    if (snapshotHash !== attempts[0].snapshotHash) throw Error('Exact cited revision is damaged. No newer revision was substituted.');
+    const revision = JSON.parse(text);
+    if (revision.schema !== 1 || revision.id !== revisionId || revision.captureId !== captureId || revision.sourceHash !== sourceHash || typeof revision.text !== 'string') throw Error('Exact cited revision identity is damaged.');
+    const warnings = [];
+    if (capture.removed || capture.rejected || capture.supportEligible === false || capture.conflict || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.blocks?.[sourceHash] || ledger.pending?.[sourceHash]) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
+    if (revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview)) warnings.push('The cited revision is ineligible as supporting evidence.');
+    if (offering) {
+      if (warnings.length) throw Error(warnings.join(' '));
+      // Apply the capture identity authority without reading any other revision.
+      const matches = (await vault.scan()).filter(note => note.id === captureId), choice = ledger.identityChoices?.[captureId];
+      const files = matches.map(note => ({ file: path.relative(vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
+      let note;
+      if (matches.length === 1 && !choice?.copies.some(copy => copy.file === files[0].file)) note = matches[0];
+      else if (choice && files.some(file => file.file === choice.file) && JSON.stringify(files.filter(file => file.file !== choice.file)) === JSON.stringify(choice.copies)) note = matches.find(note => path.relative(vault.vault, note.file) === choice.file);
+      if (!note) throw Error('Resolve the canonical capture identity before citing evidence.');
+      const current = await this.readFile(vault, note.file, this.parents(vault, [note.file]));
+      if (hash(current.text) !== capture.currentHash) throw Error('Current capture was changed outside Companion.');
+    }
+    return { capture, revision, snapshotHash, warnings };
+  }
+  anchor(resolved, evidence) {
+    if (typeof evidence.id !== 'string' || typeof evidence.text !== 'string' || !evidence.text.trim()) throw Error('Evidence text is unavailable.');
+    return { kind: 'imported_evidence', capture_id: resolved.capture.id, revision_id: resolved.revision.id, snapshot_sha256: resolved.snapshotHash, evidence_id: evidence.id, evidence_kind: evidence.kind, start_seconds: evidence.start_seconds ?? null, end_seconds: evidence.end_seconds ?? null, excerpt: evidence.text, excerpt_sha256: hash(evidence.text) };
+  }
+  inPackage(request, resolved, anchor) {
+    const text = request.package.text;
+    return hash(text) === request.package.digest && text.includes(`Imported capture ${anchor.capture_id}; exact imported revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}`) && text.includes(resolved.revision.text.replace(/\r\n?/g, '\n')) && text.includes(anchor.excerpt.replace(/\r\n?/g, '\n'));
+  }
+  async selectedReferences(input, origin) {
+    const ids = input.referenceIds ?? [];
+    if (!Array.isArray(ids) || new Set(ids).size !== ids.length) throw Error('Inspect and select valid evidence references.');
+    const citations = [];
+    for (const id of ids) {
+      const selected = this.references.get(id);
+      if (!selected || selected.conversationId !== origin.record.id || selected.requestId !== origin.request.id || origin.request.status !== 'completed') throw Error('The selected reference no longer belongs to this completed reply.');
+      const anchor = selected.anchor;
+      if (origin.record.scope?.excludedSources.includes(`capture:${anchor.capture_id}`)) throw Error('Selected supporting source was excluded.');
+      const dep = origin.request.package.dependencies.find(dep => dep.captureId === anchor.capture_id && dep.revisionId === anchor.revision_id);
+      if (!dep) throw Error('Selected evidence is absent from the original request.');
+      const resolved = await this.revision(origin.vault, anchor.capture_id, anchor.revision_id, true);
+      const evidence = resolved.revision.evidence?.evidence?.find(item => item.id === anchor.evidence_id);
+      if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor) || !this.inPackage(origin.request, resolved, anchor)) throw Error('Selected exact evidence changed or is unavailable.');
+      citations.push(structuredClone(anchor));
+    }
+    return citations.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   }
   async preview(input) {
     const { vault, record, request } = await this.origin(input);
+    const citations = await this.selectedReferences(input, { vault, record, request });
     for (const field of ['title', 'explanation', 'limitations']) if (typeof input[field] !== 'string' || !input[field].trim()) throw Error(`Enter the idea ${field} before previewing.`);
     if (/[\r\n]/.test(input.title)) throw Error('Use a title on one line.');
     const kind = input.kind ?? 'observation';
@@ -94,23 +182,24 @@ class Ideas {
     if (brief.id !== record.brief.id || brief.digest !== record.brief.digest) throw Error('The exact conversation brief is unavailable.');
     // An unchanged proposal keeps the same immutable identity and creation instant
     // when the user cancels and reviews it again. Confirmation never regenerates it.
-    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment }));
+    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, scope: record.scope, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment, citations }));
     const retained = [...this.previews.values()].find(preview => preview.proposalKey === proposalKey);
     if (retained) {
       this.guard(vault);
       return { operation: retained.operation, text: retained.text, destination: retained.destination, warnings: [...retained.warnings] };
     }
     const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => ({ capture_id: dep.captureId || dep.key.slice(8), ...(dep.revisionId ? { revision_id: dep.revisionId } : { content_sha256: dep.digest }) }));
-    const unsupported = request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
+    const unsupported = request.status !== 'completed' || request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
     const id = randomUUID(), operation = randomUUID();
-    const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations: [], origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
-    const disclosure = 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
+    const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations, origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
+    const disclosure = citations.length ? 'Supporting references were explicitly selected and checked against exact admitted revisions and the original full source in the retained package. The original package had no structured passage offsets. These references do not establish sentence-level support for the explanation. Claims are not independently verified.' : 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
     const experimentText = kind === 'experiment_proposal' ? `\n# Experiment Proposal\n\n${Object.entries(experimentLabels).map(([key, label]) => `## ${label}\n\n${experiment[key]}`).join('\n\n')}\n` : '';
-    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
+    const citationText = citations.map(anchor => `Capture ${anchor.capture_id}; exact revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}; evidence ${anchor.evidence_id}; ${anchor.evidence_kind}; time ${anchor.start_seconds ?? 'unknown'}–${anchor.end_seconds ?? 'unknown'} seconds.\n\n${anchor.excerpt}\n\nExcerpt sha256 ${anchor.excerpt_sha256}.`).join('\n\n');
+    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\n${citationText}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
     const slug = fields.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Idea';
     const destination = path.join(vault.root, 'Ideas', `${slug}--${id}.md`);
     this.guard(vault);
-    const preview = { schema: 1, operation, id, vault: vault.root, destination, text, digest: hash(text), proposalKey, warnings: [disclosure] };
+    const preview = { schema: 1, operation, id, vault: vault.root, destination, text, digest: hash(text), proposalKey, warnings: [disclosure], input: structuredClone(input) };
     if (this.previews.size >= 64) this.previews.delete(this.previews.keys().next().value);
     this.previews.set(operation, preview);
     return { operation, text, destination, warnings: [disclosure] };
@@ -141,6 +230,8 @@ class Ideas {
       if (![1, 2].includes(links)) throw Error('Saved idea stage has unexpected linked copies. Preserve it for inspection.');
       const staged = await this.readFile(vault, stage, parents, links);
       if (staged.text !== preview.text) throw Error('Saved idea stage conflict. The proposal was preserved.');
+      const currentPreview = await this.preview(preview.input);
+      if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
       this.guard(vault, parents);
       try { await fs.link(stage, preview.destination); }
       catch (error) {
@@ -162,6 +253,20 @@ class Ideas {
     if (matches.length !== 1 || matches[0].unavailable) throw Error('Saved idea is missing or has duplicate identities. Preserve the notes and resolve them before opening.');
     await this.open(`obsidian://open?path=${encodeURIComponent(matches[0].file)}`);
   }
+  async inspectEvidence({ id, index }) {
+    if (!uuid(id) || !Number.isSafeInteger(index) || index < 0) throw Error('Choose a saved citation.');
+    const matches = (await this.list()).filter(note => note.id === id);
+    if (matches.length !== 1 || matches[0].unavailable) throw Error('Saved idea identity is missing or ambiguous.');
+    const vault = this.getVault(), { text } = await this.readFile(vault, matches[0].file, this.guard(vault));
+    const anchor = metadata(text).citations?.[index];
+    if (anchor?.kind !== 'imported_evidence') throw Error('Saved citation attribution is unavailable.');
+    try {
+      const resolved = await this.revision(vault, anchor.capture_id, anchor.revision_id);
+      const evidence = resolved.revision.evidence?.evidence?.find(item => item.id === anchor.evidence_id);
+      if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor)) throw Error('Exact cited evidence is damaged or changed.');
+      return { available: true, anchor, text: resolved.revision.text, warnings: resolved.warnings, humanReview: resolved.revision.humanReview, extraction: resolved.revision.extraction, processing: resolved.revision.processing || resolved.revision.run?.state || 'unknown', uncertainty: resolved.revision.uncertainty };
+    } catch (error) { return { available: false, anchor, warnings: [`Cited evidence unavailable: ${error.message} No newer revision was substituted.`] }; }
+  }
 }
 function installIdeas({ ipcMain, ...options }) {
   const store = new Ideas(options);
@@ -170,6 +275,7 @@ function installIdeas({ ipcMain, ...options }) {
   ipcMain.handle('idea-confirm', (_, input) => store.confirm(input));
   ipcMain.handle('idea-list', () => store.list());
   ipcMain.handle('idea-open', (_, id) => store.openNote(id));
+  ipcMain.handle('idea-evidence', (_, input) => store.inspectEvidence(input));
   return store;
 }
 module.exports = { installIdeas };
