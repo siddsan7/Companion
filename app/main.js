@@ -9,6 +9,7 @@ const { installBriefs } = require('./briefs-ipc');
 const { installContext } = require('./context');
 const { installConversations } = require('./conversations');
 const { installIdeas } = require('./ideas');
+const { installComparisons } = require('./comparisons');
 const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
 let codex, conversationProvider;
@@ -100,6 +101,7 @@ app.whenReady().then(async () => {
   installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
+  installComparisons({ ipcMain, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, getEvidence });
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

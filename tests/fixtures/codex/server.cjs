@@ -43,7 +43,7 @@ input.on('line', line => {
     // Real unrestricted child-process reads emulate a broken sandbox. The production gate must detect it.
     result = scenario.isolation === 'denied' && !file.includes('positive-') ? { exitCode: 73, stdout: 'COMPANION_OS_DENIED', stderr: '' } : { exitCode: 0, stdout: fs.readFileSync(file, 'utf8'), stderr: '' };
   }
-  if (method === 'thread/start') result = { cwd: process.cwd(), runtimeWorkspaceRoots: [process.cwd()], approvalPolicy: 'never', activePermissionProfile: { id: 'companion-context' }, instructionSources: [], model: scenario.model || 'fixture', thread: { id: `fixture-thread-${process.pid}-${++sequence}` } };
+  if (method === 'thread/start') result = { cwd: process.cwd(), runtimeWorkspaceRoots: [process.cwd()], approvalPolicy: 'never', activePermissionProfile: { id: 'companion-context' }, instructionSources: [], model: scenario.model || 'fixture', thread: { id: `fixture-thread-${process.pid}-${++sequence}` }, ...(scenario.modelProvider === undefined ? {} : { modelProvider: scenario.modelProvider }), ...(scenario.reasoningEffort === undefined ? {} : { reasoningEffort: scenario.reasoningEffort }), ...(scenario.serviceTier === undefined ? {} : { serviceTier: scenario.serviceTier }) };
   if (method === 'turn/start') {
     if (conversation) fs.appendFileSync(path.join(root, 'conversation-submissions.jsonl'), JSON.stringify({ threadId: params.threadId, text: params.input[0].text }) + '\n');
     if (scenario.turn === 'exit-before-ack') { process.exit(23); return; }

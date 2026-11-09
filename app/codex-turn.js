@@ -42,21 +42,23 @@ async function runTurn(setup, text, options = {}) {
   if (failure) throw failure;
   return reply;
 }
-async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState = async () => {} } = {}) {
+async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState = async () => {}, comparisonPin } = {}) {
   const rpc = setup.rpc;
-  const started = await rpc.request('thread/start', { cwd: setup.work, runtimeWorkspaceRoots: [setup.work], permissions: PROFILE, approvalPolicy: 'never', ephemeral: true, environments: [], selectedCapabilityRoots: [], dynamicTools: [], baseInstructions: INSTRUCTIONS, developerInstructions: '' });
+  const started = await rpc.request('thread/start', { cwd: setup.work, runtimeWorkspaceRoots: [setup.work], permissions: PROFILE, approvalPolicy: 'never', ephemeral: true, environments: [], selectedCapabilityRoots: [], dynamicTools: [], baseInstructions: INSTRUCTIONS, developerInstructions: '',
+    ...(comparisonPin ? { model: comparisonPin.model, modelProvider: comparisonPin.modelProvider, serviceTier: comparisonPin.serviceTier, config: { model_reasoning_effort: comparisonPin.reasoningEffort } } : {}) });
   if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !Array.isArray(started.runtimeWorkspaceRoots) || started.runtimeWorkspaceRoots.length !== 1 || !samePath(started.runtimeWorkspaceRoots[0], setup.work) || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
   const threadId = started.thread?.id;
   if (typeof threadId !== 'string' || !threadId.trim() || setup.threads.has(threadId)) throw Error('Codex did not create a fresh thread.');
   setup.threads.add(threadId);
   setup.state.reply = ''; setup.state.turnActive = true; setup.state.status = 'running';
   const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null, usage: null, usageEvidence: USAGE_UNAVAILABLE };
+  if (comparisonPin) record.effective = { model: typeof started.model === 'string' ? started.model : null, modelProvider: typeof started.modelProvider === 'string' ? started.modelProvider : null, reasoningEffort: typeof started.reasoningEffort === 'string' ? started.reasoningEffort : null, serviceTier: typeof started.serviceTier === 'string' ? started.serviceTier : null };
   setup.turnHistory.push(record);
   let turnId, terminal, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
   const messages = new Map();
   let sinkTail = Promise.resolve(), sinkFailure;
   const preserve = () => {
-    const snapshot = { threadId, turnId: turnId || null, model: started.model, reply: setup.state.reply, messages: [...messages.values()].map(message => ({ ...message })), usage: record.usage === null ? null : structuredClone(record.usage), usageEvidence: record.usageEvidence };
+    const snapshot = { threadId, turnId: turnId || null, model: started.model, reply: setup.state.reply, messages: [...messages.values()].map(message => ({ ...message })), usage: record.usage === null ? null : structuredClone(record.usage), usageEvidence: record.usageEvidence, ...(comparisonPin ? { effective: { ...record.effective } } : {}) };
     sinkTail = sinkTail.then(() => onState(snapshot)).catch(error => {
       sinkFailure = error;
       rpc.close('Cannot preserve the incomplete conversation reply.'); setup.settleTurn?.('interrupted');
@@ -147,6 +149,7 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     await preserve();
     if (sinkFailure) throw Error('Conversation history could not be saved. No model request was sent.');
     historySaved = true;
+    if (comparisonPin && Object.keys(comparisonPin).some(key => record.effective[key] !== comparisonPin[key])) throw Error('Codex effective model or comparison settings changed or are unavailable. Nothing was sent.');
     await beforeStart({ threadId, model: started.model });
     startAttempted = true;
     const response = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text }], environments: [] });
