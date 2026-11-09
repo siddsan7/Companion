@@ -8,6 +8,7 @@ const { Schedule } = require('./schedule');
 const { installBriefs } = require('./briefs-ipc');
 const { installContext } = require('./context');
 const { installConversations } = require('./conversations');
+const { installArchives } = require('./archives');
 const { installIdeas } = require('./ideas');
 const { installTranscripts } = require('./transcripts');
 const { installComparisons } = require('./comparisons');
@@ -103,6 +104,7 @@ app.whenReady().then(async () => {
     const selection = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'transcript-selection.json'), 'utf8')) : await dialog.showSaveDialog({ title: 'Export readable conversation transcript', defaultPath: path.join(selected.vault, 'Conversation transcript.md'), filters: [{ name: 'Markdown transcript', extensions: ['md'] }] });
     return selection.canceled ? null : selection.filePath;
   } });
+  installArchives({ ipcMain, history: conversations, settingsPath, dialog, testRoot, clock, checkpoint, appVersion: app.getVersion(), invalidateContextApprovals: context.clearApprovals, getSchedule: () => new Schedule(path.join(conversations.dataRoot, 'schedule.json'), vault, scheduleOptions()) });
   installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
