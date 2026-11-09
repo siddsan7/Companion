@@ -337,3 +337,35 @@ test('a completed restoration in a stale window cannot undo another windows late
     await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Spaced retrieval/);
   } finally { await otherApp.close(); }
 });
+
+test('ordered assistant items retain every full completed message and phase across restart', async () => {
+  test.setTimeout(60000);
+  const messages = [
+    { phase: 'commentary', delta: 'OBSOLETE_COMMENTARY_FRAGMENT', text: 'COMMENTARY_COMPLETE_CANARY: authored synthetic mechanism explanation.' },
+    { phase: 'final_answer', delta: 'OBSOLETE_FINAL_FRAGMENT', text: 'FINAL_COMPLETE_CANARY: authored synthetic hypothesis, limitation and observable test.' },
+    { phase: null, delta: 'OBSOLETE_LEGACY_FRAGMENT', text: 'UNKNOWN_PHASE_COMPLETE_CANARY: authored synthetic legacy message.' }
+  ];
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ messages }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_PHASE_COMPLETE_CANARY');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('COMMENTARY_COMPLETE_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('FINAL_COMPLETE_CANARY');
+  await expect(page.locator('#conversation-history')).not.toContainText('OBSOLETE_');
+  const files = await fs.readdir(path.join(root, 'conversations'));
+  const saved = JSON.parse(await fs.readFile(path.join(root, 'conversations', files.find(name => name.endsWith('.json'))), 'utf8'));
+  expect(saved.requests[0].reply).toBe('COMMENTARY_COMPLETE_CANARY: authored synthetic mechanism explanation.\n\nFINAL_COMPLETE_CANARY: authored synthetic hypothesis, limitation and observable test.\n\nUNKNOWN_PHASE_COMPLETE_CANARY: authored synthetic legacy message.');
+  expect(saved.requests[0].messages.map(({ text, phase, completed }) => ({ text, phase, completed }))).toEqual([
+    { text: messages[0].text, phase: 'commentary', completed: true },
+    { text: messages[1].text, phase: 'final_answer', completed: true },
+    { text: messages[2].text, phase: null, completed: true }
+  ]);
+  expect(new Set(saved.requests[0].messages.map(message => message.id)).size).toBe(3);
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('COMMENTARY_COMPLETE_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('FINAL_COMPLETE_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_PHASE_COMPLETE_CANARY');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
