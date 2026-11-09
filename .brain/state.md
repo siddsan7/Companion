@@ -51,4 +51,6 @@ Reusable test lessons:
 
 External notes use literal C:/Users/sidds/AppData/Local/Temp/ (sandbox temp can disappear): companion-producer-notes.md, companion-review-canonical-notes.md, companion-scheduler-notes.md, companion-conversation-notes.md, companion-deletion-notes.md, companion-archive-notes.md and companion-evaluation-notes.md. Canonical JSON parity had174359 oracle cases without mismatch. Static installed CLI0.163.0 protocol schemas are in companion-codex-schema10-rbEUbW/schemas; no auth/model ran. Current code and per-ticket verification records win over preparatory notes.
 
-Next: finish and independently review #11, #14 and #15; preserve their commits during integration, then advance the remaining graph. Refresh final release evidence and perform whole-PR independent review only after full implementation, then follow the publishing/merge/pause checkpoint.
+Latest #12 milestone: preserving sync07c77fa includes reviewed #14. Optional strict archive historyRefs validation1654178 passed the complete focused roundtrip and malformed-authority check (55.4s); both commits and the regression are pushed. Failed transcript publication/restart recovery regression aeaae87 failed as expected at the missing pending-recovery region (32.3s); implementation is in progress. No recovery pass is claimed.
+
+Next: finish and independently review #12, then #13 and #16. Refresh final release evidence and perform whole-PR independent review only after full implementation, then follow the publishing/merge/pause checkpoint.
