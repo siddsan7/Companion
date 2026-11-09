@@ -73,6 +73,8 @@ class Briefs {
       const stat = await fs.stat(file); if (!stat.isFile()) throw Error(`Source is not a document: ${file}`);
       if (stat.size > 128000) throw Error(`Source exceeds local brief limit: ${file}. Nothing was shortened. Select a smaller document explicitly.`);
       const bytes = await fs.readFile(file); const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      const front = text.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+      if (front && YAML.parse(front[1])?.artifact_type === 'conversation_transcript') throw Error('Conversation transcripts are historical dialogue and cannot be used as opaque project brief inputs.');
       size += [...text].length;
       if (size > 32000) throw Error('Selected documents exceed 32000 characters. Nothing was shortened. Select smaller documents explicitly.');
       sources.push({ path: file, sha256: hash(bytes), text });

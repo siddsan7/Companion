@@ -3,6 +3,10 @@
   const conversation = document.createElement('section'); conversation.id = 'conversation-section'; conversation.setAttribute('aria-label', 'Project conversations');
   conversation.innerHTML = '<h2>Project conversations</h2><p id="conversation-location"></p><label for="conversation-select">Retained conversation</label><select id="conversation-select"><option value="">New conversation</option></select><button id="conversation-new">New conversation</button><label>Conversation brief version<input id="conversation-brief" type="number" min="1" value="1"></label><label><input id="conversation-speculation" type="checkbox">Allow beyond-evidence speculation</label><button id="conversation-preview">Preview conversation</button><label>Reviewed conversation package<textarea id="conversation-package" rows="14" readonly></textarea></label><p id="conversation-summary"></p><button id="conversation-send" disabled>Send reviewed package</button><p id="conversation-error" role="alert"></p><div id="conversation-history"></div>';
   byId('context-section').after(conversation);
+  const priorSearch = document.createElement('section'); priorSearch.setAttribute('aria-label', 'Prior conversation search');
+  priorSearch.innerHTML = '<h3>Prior conversation search</h3><p>Optional for this request. Search uses the context question and local text matches. Dialogue is prior discussion, not independent evidence. Different wording can be missed.</p><button id="history-search">Search prior conversations</button><p id="history-search-status"></p><div id="history-search-results"></div><div id="history-selected"></div>';
+  byId('conversation-preview').before(priorSearch);
+  const historySelections = new Map();
   let conversationId = null, conversationToken = null, conversationGeneration = 0;
   let viewEpoch = 0, draftMode = false;
   const retained = new Map();
@@ -26,6 +30,7 @@
   function resetView() {
     viewEpoch++; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
     excludedHistory.clear(); restoredHistory.clear(); restoredSources.clear(); excluded.clear(); selections = []; all = [];
+    historySelections.clear(); byId('history-search-results').replaceChildren(); byId('history-selected').replaceChildren(); byId('history-search-status').textContent = '';
     byId('conversation-history').replaceChildren(); byId('conversation-error').textContent = '';
     byId('conversation-brief').disabled = false; byId('conversation-brief').value = '1';
     byId('conversation-speculation').checked = false; byId('context-question').value = '';
@@ -185,10 +190,37 @@
   };
   byId('conversation-brief').oninput = invalidateConversation;
   byId('conversation-speculation').onchange = invalidateConversation;
+  const conversationInput = () => ({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})), historySelections: [...historySelections.values()].map(({conversationId,requestId,digest}) => ({conversationId,requestId,digest})) });
+  function selectedHistory() {
+    byId('history-selected').replaceChildren();
+    for (const [key, item] of historySelections) {
+      const row = document.createElement('p'), remove = document.createElement('button');
+      row.textContent = `Selected historical dialogue: ${item.conversationId}/${item.requestId} · approved brief version ${item.brief.version}. `;
+      remove.textContent = 'Remove historical dialogue';
+      remove.onclick = () => { historySelections.delete(key); selectedHistory(); invalidateConversation(); };
+      row.append(remove); byId('history-selected').append(row);
+    }
+  }
+  byId('history-search').onclick = async () => {
+    invalidateConversation(); const version = conversationGeneration;
+    byId('history-search-results').replaceChildren(); byId('history-search-status').textContent = 'Searching prior dialogue…';
+    try {
+      const result = await window.companion['conversation-search'](conversationInput());
+      if (version !== conversationGeneration) return;
+      byId('history-search-status').textContent = `${result.matches.length} matching historical turns. ${result.matches.length ? '' : 'Local text matching can miss differently worded dialogue. '}${result.warnings.join(' ')}`;
+      for (const item of result.matches) {
+        const article = document.createElement('article'), provenance = document.createElement('p'), text = document.createElement('pre'), add = document.createElement('button');
+        provenance.textContent = `Historical dialogue · conversation ${item.conversationId} · request ${item.requestId} · origin sha256 ${item.digest} · approved brief ${item.brief.id}, version ${item.brief.version}, sha256 ${item.brief.digest} · Text match: ${item.matched.join(', ')}. Source dependency closure: ${JSON.stringify(item.dependencies)}`;
+        text.textContent = `User: ${item.question}\nAssistant: ${item.reply}`; add.textContent = 'Add historical dialogue';
+        add.onclick = () => { historySelections.set(`${item.conversationId}:${item.requestId}`, item); selectedHistory(); invalidateConversation(); };
+        article.append(provenance, text, add); byId('history-search-results').append(article);
+      }
+    } catch (error) { if (version === conversationGeneration) byId('history-search-status').textContent = error.message; }
+  };
   byId('conversation-preview').onclick = async () => {
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
-      const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
+      const preview = await window.companion['conversation-preview'](conversationInput());
       if (version !== conversationGeneration) return;
       // A completed restore is one reviewed action, not permission to undo future exclusions.
       restoredSources.clear(); restoredHistory.clear();

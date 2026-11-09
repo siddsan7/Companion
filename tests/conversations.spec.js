@@ -1125,3 +1125,1384 @@ for (const variant of ['matching updates', 'failed turn', 'unavailable']) {
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   });
 }
+
+test('prior conversation search is opt-in and selected excerpts are labelled historical dialogue in the exact new package', async () => {
+  test.setTimeout(90000);
+  const canary = 'HISTORICAL_DIALOGUE_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${canary}: revisit one chord after a delay; this is an unverified transfer.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const originals = await fs.readdir(path.join(root, 'conversations'));
+  const originalFile = originals.find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const original = JSON.parse(await fs.readFile(path.join(root, 'conversations', originalFile), 'utf8'));
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`What did we previously discuss about ${canary}?`);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results')).not.toContainText('unverified transfer');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/What did we previously discuss/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/revisit one chord after a delay/);
+
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  const excerpt = page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: canary });
+  await expect(excerpt).toHaveCount(1);
+  await expect(excerpt).toContainText('Historical dialogue');
+  await expect(excerpt).toContainText('unverified transfer');
+  await excerpt.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/revisit one chord after a delay/);
+  const reviewed = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  expect(reviewed).toContain('Historical dialogue');
+  expect(reviewed).toContain(original.id);
+  expect(reviewed).toContain(original.requests[0].id);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic selected historical dialogue reply.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('selected historical dialogue reply.');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions).toHaveLength(2);
+  expect(submissions[1].text).toBe(reviewed);
+  expect(submissions[1].threadId).not.toBe(submissions[0].threadId);
+  const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+  expect(records).toHaveLength(2);
+  const saved = records.find(record => record.id !== original.id).requests[0].package;
+  expect(saved.text).toBe(reviewed);
+  expect(saved.count).toBe([...reviewed].length);
+  expect(saved.historyRefs).toEqual([expect.objectContaining({ conversationId: original.id, requestId: original.requests[0].id })]);
+  for (const dependency of original.requests[0].package.dependencies) expect(saved.dependencies).toContainEqual(dependency);
+  expect(await fs.readdir(path.join(root, 'vault', 'Companion', 'Ideas'))).toEqual([]);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Use only current project context.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Use only current project context/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/HISTORICAL_DIALOGUE_12_CANARY|revisit one chord after a delay/);
+});
+
+test('omitting prior dialogue retains dependency authority without resending unselected raw ancestor text', async () => {
+  test.setTimeout(120000);
+  const ancestor = 'RAW_ANCESTOR_ONLY_12_CANARY', derived = 'DERIVED_REPLY_ONLY_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${ancestor}: a private prior-dialogue detail.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText(ancestor);
+  const firstName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const first = JSON.parse(await fs.readFile(path.join(root, 'conversations', firstName), 'utf8'));
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`Consider the historical discussion ${ancestor}.`);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: ancestor }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Apply the selected historical discussion to a controlled test.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/a private prior-dialogue detail/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${derived}: the proposed application needs a controlled test.` }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(derived);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+
+  // A fresh request allows B's own dialogue after explicitly removing raw A.
+  await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Continue with the proposed controlled test.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/the proposed application needs a controlled test/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/RAW_ANCESTOR_ONLY_12_CANARY|a private prior-dialogue detail/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic continuing the controlled test without quoting its ancestor.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('continuing the controlled test without quoting its ancestor');
+  const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+  const second = records.find(record => record.id !== first.id);
+  expect(second.requests).toHaveLength(2);
+  expect(second.requests[1].package.historyRefs).toContainEqual(expect.objectContaining({ conversationId: first.id, requestId: first.requests[0].id }));
+  for (const dependency of first.requests[0].package.dependencies) expect(second.requests[1].package.dependencies).toContainEqual(dependency);
+  expect(second.requests[1].package.text).not.toContain('a private prior-dialogue detail');
+
+  // Explicitly selecting derived B in C permits B's actual turn, not its unselected raw ancestry.
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`Inspect ${derived}.`);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  const result = page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: derived });
+  await expect(result).toHaveCount(1);
+  await result.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/the proposed application needs a controlled test/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/RAW_ANCESTOR_ONLY_12_CANARY|a private prior-dialogue detail/);
+  expect((await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue())).toContain(first.id);
+});
+
+test('foreign history revocation invalidates stale reviewed selections and asynchronous dispatch while retaining independent writing', async () => {
+  test.setTimeout(180000);
+  const ancestor = 'REVOCATION_ANCESTOR_12_CANARY', derived = 'REVOCATION_DERIVED_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${ancestor}: a retained historical mechanism.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(ancestor);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const firstName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const original = JSON.parse(await fs.readFile(path.join(root, 'conversations', firstName), 'utf8'));
+  const captures = path.join(root, 'vault', 'Companion', 'Captures');
+  const capture = path.join(captures, (await fs.readdir(captures)).find(name => name.endsWith('.md')));
+  const sourceBytes = await fs.readFile(capture, 'utf8');
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(ancestor);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: ancestor }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Use the selected discussion to propose a cautious application.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${derived}: an unverified application with a small test.` }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(derived);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const secondName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name) && name !== firstName);
+  const second = JSON.parse(await fs.readFile(path.join(root, 'conversations', secondName), 'utf8'));
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent writing survives history revocation');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('The user retains this interpretation independently of conversation history.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('The transfer is unverified and no outcome was measured.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent writing survives/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  const ideaBytes = await fs.readFile(ideaFile, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(derived);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: derived }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Inspect the selected application and its limitations.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_DERIVED_12_CANARY/);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await other.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+    await expect(other.locator('#conversation-history')).toContainText(ancestor);
+    await other.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+    await other.getByLabel('Context question', { exact: true }).fill('Exclude the original historical turn from future context.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Exclude the original historical turn/);
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/historical|changed|preview/i);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/historical|changed|unavailable/i);
+    await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Inspect the selected application/);
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
+
+    await other.getByLabel('Retained conversation', { exact: true }).selectOption(second.id);
+    await expect(other.locator('#conversation-history')).toContainText(derived);
+    await other.getByLabel('Context question', { exact: true }).fill('Continue using only currently eligible project context.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/currently eligible project context/);
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
+    await expect(other.locator('#conversation-history .history-exclusion')).toContainText(/Excluded from next request/);
+    await expect(other.locator('#conversation-history')).toContainText(derived);
+    expect(await fs.readFile(capture, 'utf8')).toBe(sourceBytes);
+    expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+
+    // Restore A through its explicit UI, then make a fresh direct selection for the async boundary.
+    await other.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+    await other.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).check();
+    await other.getByLabel('Context question', { exact: true }).fill('Explicitly restore the original historical turn.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+  } finally { await otherApp.close(); }
+
+  await page.getByLabel('Context question', { exact: true }).fill(ancestor);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: ancestor }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Review the freshly selected original discussion.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-before-turn-start' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('conversation-before-turn-start');
+  const editedSource = `${sourceBytes}\nEXPLICIT_SOURCE_EDIT_DURING_FOREIGN_PREFLIGHT\n`;
+  await fs.writeFile(capture, editedSource, 'utf8');
+  await fs.writeFile(path.join(root, 'release.txt'), 'release controlled historical preflight', 'utf8');
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  await expect(page.locator('#conversation-history')).toContainText(/changed|unavailable/i);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  const rpc = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(rpc.filter(call => call.method === 'turn/start')).toHaveLength(2);
+  expect(await fs.readFile(capture, 'utf8')).toBe(editedSource);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Continue after source change using project context alone.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/project context alone/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
+});
+
+test('transcript export is explicitly previewed and cancelled before exact readable publication at the chosen vault destination', async () => {
+  test.setTimeout(150000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_FOREIGN_ORIGIN_12: authored synthetic earlier discussion.' }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_FOREIGN_ORIGIN_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const originName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const origin = JSON.parse(await fs.readFile(path.join(root, 'conversations', originName), 'utf8'));
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('TRANSCRIPT_FOREIGN_ORIGIN_12');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: 'TRANSCRIPT_FOREIGN_ORIGIN_12' }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Retain a careful account of this selected historical discussion.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/TRANSCRIPT_FOREIGN_ORIGIN_12/);
+  const messages = [
+    { phase: 'commentary', text: 'TRANSCRIPT_COMMENTARY_12: the mechanism needs checking.' },
+    { phase: 'final_answer', text: 'TRANSCRIPT_FINAL_12: a hypothesis with limitations and an observable test.' },
+    { phase: null, text: 'TRANSCRIPT_UNKNOWN_PHASE_12: retained legacy assistant writing.' }
+  ];
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ messages }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_UNKNOWN_PHASE_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent idea beside the transcript');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Keep this author interpretation separate from the exported conversation.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('No outcome was verified.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent idea beside/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+
+  const history = {};
+  for (const name of (await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) history[name] = await fs.readFile(path.join(root, 'conversations', name), 'utf8');
+  const current = Object.values(history).map(text => JSON.parse(text)).find(record => record.id !== origin.id);
+  const captureDir = path.join(root, 'vault', 'Companion', 'Captures');
+  const captureFile = path.join(captureDir, (await fs.readdir(captureDir)).find(name => name.endsWith('.md')));
+  // This explicit external edit precedes export, so the transcript must warn about stale support.
+  await fs.appendFile(captureFile, '\nTRANSCRIPT_SOURCE_CHANGED_BEFORE_EXPORT\n', 'utf8');
+  const sourceBytes = await fs.readFile(captureFile, 'utf8'), ideaBytes = await fs.readFile(ideaFile, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const destinationDir = path.join(root, 'vault', 'Exports'); await fs.mkdir(destinationDir);
+  const destination = path.join(destinationDir, 'Chosen readable conversation.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Transcript destination', { exact: true })).toHaveValue(destination);
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(/TRANSCRIPT_COMMENTARY_12/);
+  let proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  expect(proposed).toContain('artifact_type: conversation_transcript');
+  expect(proposed).toContain(current.id);
+  expect(proposed).toContain(current.requests[0].id);
+  expect(proposed).toContain('Retain a careful account of this selected historical discussion.');
+  for (const message of messages) expect(proposed).toContain(message.text);
+  expect(proposed.indexOf(messages[0].text)).toBeLessThan(proposed.indexOf(messages[1].text));
+  expect(proposed.indexOf(messages[1].text)).toBeLessThan(proposed.indexOf(messages[2].text));
+  expect(proposed).toContain('commentary'); expect(proposed).toContain('final_answer');
+  expect(proposed).toMatch(/unknown.*phase|phase.*unknown/i);
+  expect(proposed).toContain('completed');
+  expect(proposed).toContain(current.brief.id); expect(proposed).toContain(current.brief.digest);
+  expect(proposed).toContain(origin.id); expect(proposed).toContain(origin.requests[0].id);
+  for (const dependency of current.requests[0].package.dependencies) { expect(proposed).toContain(dependency.key); expect(proposed).toContain(dependency.digest); }
+  expect(proposed).toMatch(/changed|unavailable|missing/i);
+  expect(proposed).toMatch(/previous.*provider|provider.*submission/i);
+  expect(proposed).toMatch(/independent.*cop|separate.*cop|separate.*export/i);
+  expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+  await page.getByRole('button', { name: 'Cancel transcript preview', exact: true }).click();
+  expect(await fs.readdir(destinationDir)).toEqual([]);
+  expect(await fs.stat(path.join(root, 'vault', 'Companion', '.transcripts')).catch(error => error.code)).toBe('ENOENT');
+  for (const [name, bytes] of Object.entries(history)) expect(await fs.readFile(path.join(root, 'conversations', name), 'utf8')).toBe(bytes);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(/TRANSCRIPT_FINAL_12/);
+  proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await fs.readdir(destinationDir)).toEqual(['Chosen readable conversation.md']);
+  for (const [name, bytes] of Object.entries(history)) expect(await fs.readFile(path.join(root, 'conversations', name), 'utf8')).toBe(bytes);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  await app.close(); app = null; await launch(false);
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('a copied transcript cannot bypass source eligibility through context or brief inputs using artifact metadata alone', async () => {
+  test.setTimeout(120000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_OPAQUE_COPY_12_CANARY: authored synthetic historical writing.' }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_OPAQUE_COPY_12_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent idea survives transcript guard checks');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Retain the interpretation as separate author writing.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('The transfer remains unverified.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent idea survives/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  const destination = path.join(root, 'vault', 'Companion', 'Readable transcript.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  const proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  const YAML = require('yaml'), front = proposed.match(/^---\n([\s\S]*?)\n---\n/), metadata = YAML.parse(front[1]);
+  delete metadata.companion_id;
+  expect(metadata.artifact_type).toBe('conversation_transcript');
+  const copied = `---\n${YAML.stringify(metadata)}---\n${proposed.slice(front[0].length)}`;
+  const copiedFile = path.join(root, 'vault', 'Copied historical transcript.md');
+  await fs.writeFile(copiedFile, copied, 'utf8');
+  const histories = {};
+  for (const name of (await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) histories[name] = await fs.readFile(path.join(root, 'conversations', name), 'utf8');
+  const captureDir = path.join(root, 'vault', 'Companion', 'Captures');
+  const captureFile = path.join(captureDir, (await fs.readdir(captureDir)).find(name => name.endsWith('.md')));
+  const sourceBytes = await fs.readFile(captureFile, 'utf8'), ideaBytes = await fs.readFile(ideaFile, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([copiedFile]), 'utf8');
+  await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+  await expect(page.locator('#context-error')).toContainText(/managed artifact metadata.*cannot bypass context/i);
+  await page.getByLabel('Context question', { exact: true }).fill('TRANSCRIPT_OPAQUE_COPY_12_CANARY');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-notes')).not.toContainText('Copied historical transcript');
+  await expect(page.locator('#context-results')).not.toContainText('TRANSCRIPT_OPAQUE_COPY_12_CANARY');
+  await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([copiedFile]), 'utf8');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText(copiedFile);
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await expect(page.locator('#brief-error')).toContainText(/transcripts.*historical dialogue.*cannot.*brief inputs/i);
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await fs.readFile(copiedFile, 'utf8')).toBe(copied);
+  for (const [name, bytes] of Object.entries(histories)) expect(await fs.readFile(path.join(root, 'conversations', name), 'utf8')).toBe(bytes);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('history archives roundtrip qualified foreign references and reject malformed reference authority without replay', async () => {
+  test.setTimeout(150000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'ARCHIVE_FOREIGN_A_12_CANARY: authored synthetic historical discussion.' }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_FOREIGN_A_12_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const firstName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const first = JSON.parse(await fs.readFile(path.join(root, 'conversations', firstName), 'utf8'));
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('ARCHIVE_FOREIGN_A_12_CANARY');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: 'ARCHIVE_FOREIGN_A_12_CANARY' }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Use the selected dialogue to propose a cautious application.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/ARCHIVE_FOREIGN_A_12_CANARY/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'ARCHIVE_FOREIGN_B_12_CANARY: a proposed application remains unverified.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_FOREIGN_B_12_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Keep this turn omitted from future context.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Keep this turn omitted/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_FOREIGN_A_12_CANARY|ARCHIVE_FOREIGN_B_12_CANARY/);
+  const historyDirectory = path.join(root, 'conversations'), histories = {}, records = [];
+  for (const name of (await fs.readdir(historyDirectory)).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) { histories[name] = await fs.readFile(path.join(historyDirectory, name), 'utf8'); records.push(JSON.parse(histories[name])); }
+  const second = records.find(record => record.id !== first.id);
+  expect(second.requests[0].package.historyRefs).toEqual([expect.objectContaining({ conversationId: first.id, requestId: first.requests[0].id, digest: expect.stringMatching(/^[a-f0-9]{64}$/) })]);
+  expect(second.scope.excludedHistory).toEqual([second.requests[0].id]);
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const destination = path.join(root, 'qualified-history-roundtrip.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination, open: destination }), 'utf8');
+  let region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+  await expect(region).toContainText('2 conversations');
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(region).toContainText('Archive exported');
+  const archiveText = await fs.readFile(destination, 'utf8'), archive = JSON.parse(archiveText);
+  expect(archive.payload.conversations.sort((a, b) => a.id.localeCompare(b.id))).toEqual(records.sort((a, b) => a.id.localeCompare(b.id)));
+
+  // Recompute the documented archive integrity so each refusal must come from strict reference validation.
+  const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
+  const variants = [
+    ref => { ref.conversationId = 'unknown-conversation'; },
+    ref => { ref.requestId = 'unknown-request'; },
+    ref => { ref.digest = 'not-a-literal-sha256'; },
+    ref => { ref.unrecognizedAuthority = true; },
+    (ref, refs) => { refs.push({ ...ref }); }
+  ];
+  for (const [index, mutate] of variants.entries()) {
+    const invalid = JSON.parse(archiveText), refs = invalid.payload.conversations.find(record => record.id === second.id).requests[0].package.historyRefs;
+    mutate(refs[0], refs);
+    invalid.integrity.digest = require('node:crypto').createHash('sha256').update(canonical(invalid.payload)).digest('hex');
+    const invalidFile = path.join(root, `invalid-history-reference-${index}.json`);
+    await fs.writeFile(invalidFile, JSON.stringify(invalid), 'utf8');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: invalidFile }), 'utf8');
+    await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+    await expect(region.getByRole('button', { name: 'Inspect history archive', exact: true })).toBeEnabled();
+    await expect(page.locator('#archive-restore-summary')).toContainText(/unsupported data/i);
+    await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+    for (const [name, text] of Object.entries(histories)) expect(await fs.readFile(path.join(historyDirectory, name), 'utf8')).toBe(text);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  }
+  await app.close(); app = null;
+  for (const name of Object.keys(histories)) await fs.unlink(path.join(historyDirectory, name));
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: destination }), 'utf8');
+  await launch(false);
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await expect(page.locator('#archive-restore-summary')).toContainText('2 missing conversations');
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Missing history may have been deleted intentionally');
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Restored 2 conversations');
+  for (const record of records) expect(JSON.parse(await fs.readFile(path.join(historyDirectory, `${record.id}.json`), 'utf8'))).toEqual(record);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(second.id);
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_FOREIGN_B_12_CANARY');
+  await page.getByLabel('Context question', { exact: true }).fill('Continue respecting the restored historical omission.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/restored historical omission/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_FOREIGN_A_12_CANARY|ARCHIVE_FOREIGN_B_12_CANARY/);
+  await expect(page.locator('#conversation-history .history-exclusion')).toContainText('Excluded from next request');
+  expect(await fs.readFile(destination, 'utf8')).toBe(archiveText);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('failed transcript publication retains exact writing across restart and resumes only after explicit review', async () => {
+  test.setTimeout(150000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_DURABLE_RETRY_12: authored synthetic writing must survive failed publication.' }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_DURABLE_RETRY_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent writing beside failed transcript');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('This author interpretation remains independent from transcript publication.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('No result was verified.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent writing beside/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  const historyDirectory = path.join(root, 'conversations'), historyName = (await fs.readdir(historyDirectory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const historyBytes = await fs.readFile(path.join(historyDirectory, historyName), 'utf8');
+  const captureDirectory = path.join(root, 'vault', 'Companion', 'Captures'), captureFile = path.join(captureDirectory, (await fs.readdir(captureDirectory)).find(name => name.endsWith('.md')));
+  const sourceBytes = await fs.readFile(captureFile, 'utf8'), ideaBytes = await fs.readFile(ideaFile, 'utf8'), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const outputDirectory = path.join(root, 'vault', 'Exports'); await fs.mkdir(outputDirectory);
+  const destination = path.join(outputDirectory, 'Recover this exact transcript.md'), unrelated = path.join(outputDirectory, 'Unrelated independent writing.md');
+  await fs.writeFile(unrelated, '# Unrelated writing\n\nKeep this exact independent note.\n', 'utf8');
+  const unrelatedBytes = await fs.readFile(unrelated, 'utf8');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  const proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'transcript-before-publish' }), 'utf8');
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Controlled filesystem boundary failure');
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(proposed);
+  expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+  const journalDirectory = path.join(root, 'vault', 'Companion', '.transcripts');
+  const intentNames = (await fs.readdir(journalDirectory)).filter(name => name.endsWith('.intent.json'));
+  expect(intentNames).toHaveLength(1);
+  const intentFile = path.join(journalDirectory, intentNames[0]), intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
+  expect(intent.text).toBe(proposed); expect(intent.destination).toBe(destination);
+  expect(intentNames[0]).toBe(`${intent.operation}.intent.json`);
+  const stage = path.join(journalDirectory, `${intent.operation}.md.pending`), receipt = path.join(journalDirectory, `${intent.operation}.published.json`);
+  expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
+  expect(await fs.stat(receipt).catch(error => error.code)).toBe('ENOENT');
+  await app.close(); app = null;
+  await fs.unlink(path.join(root, 'faults.json'));
+  await launch(false);
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const pending = page.getByRole('region', { name: 'Pending transcript exports', exact: true });
+  await expect(pending).toContainText(destination);
+  await expect(pending).toContainText(intent.operation);
+  await pending.getByText('Inspect retained transcript', { exact: true }).click();
+  await expect(pending.getByLabel('Retained transcript Markdown', { exact: true })).toHaveValue(proposed);
+  expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.stat(receipt).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+  expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  await pending.getByRole('button', { name: 'Resume transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Transcript destination', { exact: true })).toHaveValue(destination);
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(proposed);
+  expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({ operation: intent.operation, id: intent.id, digest: intent.digest });
+  expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT');
+  expect((await fs.readdir(journalDirectory)).filter(name => name.endsWith('.published.json'))).toEqual([`${intent.operation}.published.json`]);
+  expect((await fs.readdir(outputDirectory)).sort()).toEqual(['Recover this exact transcript.md', 'Unrelated independent writing.md']);
+  expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+  expect(await fs.readFile(unrelated, 'utf8')).toBe(unrelatedBytes);
+  expect(await fs.readFile(path.join(historyDirectory, historyName), 'utf8')).toBe(historyBytes);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+for (const [boundary, receiptExists] of [['transcript-after-link', false], ['transcript-after-receipt', true]]) {
+  test(`actual process exit at ${boundary} preserves exact transcript acknowledgement without source or origin availability`, async ({}, testInfo) => {
+    test.setTimeout(120000);
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `TRANSCRIPT_CRASH_12_CANARY: authored synthetic retained writing at ${boundary}.` }), 'utf8');
+    await prepareConversation();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_CRASH_12_CANARY');
+    await expect(page.locator('#conversation-history')).toContainText('completed');
+    const historyDirectory = path.join(root, 'conversations'), historyName = (await fs.readdir(historyDirectory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+    const historyFile = path.join(historyDirectory, historyName);
+    const captureDirectory = path.join(root, 'vault', 'Companion', 'Captures'), captureFile = path.join(captureDirectory, (await fs.readdir(captureDirectory)).find(name => name.endsWith('.md')));
+    const sourceBefore = await fs.readFile(captureFile, 'utf8'), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    const outputDirectory = path.join(root, 'vault', 'Exports'); await fs.mkdir(outputDirectory);
+    const destination = path.join(outputDirectory, `Crash ${boundary}.md`), unrelated = path.join(outputDirectory, 'Independent writing.md');
+    await fs.writeFile(unrelated, '# Independent writing\n\nNever replace this note.\n', 'utf8');
+    const unrelatedBytes = await fs.readFile(unrelated, 'utf8');
+    await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+    await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+    const proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+    const directory = path.join(root, 'vault', 'Companion', '.transcripts'), intentName = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
+    const intentFile = path.join(directory, intentName), intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
+    const stage = path.join(directory, `${intent.operation}.md.pending`), receipt = path.join(directory, `${intent.operation}.published.json`);
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
+    expect((await fs.stat(destination)).nlink).toBe(2);
+    expect(await fs.access(receipt).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(receiptExists);
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+    const evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    evidence.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await testInfo.attach('transcript-crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+    app = null;
+    const editedSource = `${sourceBefore}\nIndependent editor change after already-published transcript.\n`;
+    await fs.writeFile(captureFile, editedSource, 'utf8');
+    await fs.unlink(historyFile);
+    await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+    await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    const pending = page.getByRole('region', { name: 'Pending transcript exports', exact: true }).getByRole('article').filter({ hasText: intent.operation });
+    await expect(pending).toBeVisible();
+    await pending.getByText('Inspect retained transcript', { exact: true }).click();
+    await expect(pending.getByLabel('Retained transcript Markdown', { exact: true })).toHaveValue(proposed);
+    expect((await fs.stat(destination)).nlink).toBe(2);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+    await pending.getByRole('button', { name: 'Resume transcript export', exact: true }).click();
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(proposed);
+    await expect(page.getByLabel('Transcript destination', { exact: true })).toHaveValue(destination);
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+    await expect(page.getByRole('region', { name: 'Pending transcript exports', exact: true }).getByRole('article')).toHaveCount(0);
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect((await fs.stat(destination)).nlink).toBe(1);
+    expect(await fs.lstat(stage).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+    expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({ operation: intent.operation, id: intent.id, digest: intent.digest });
+    expect((await fs.readdir(directory)).filter(name => name.endsWith('.published.json'))).toEqual([`${intent.operation}.published.json`]);
+    expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+    expect(await fs.readFile(captureFile, 'utf8')).toBe(editedSource);
+    expect(await fs.stat(historyFile).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(unrelated, 'utf8')).toBe(unrelatedBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+    const receiptBytes = await fs.readFile(receipt, 'utf8');
+    await app.close(); app = null;
+    const editorCopy = '# Editor replacement after completed export\n\nKeep this independent writing.\n';
+    if (receiptExists) await fs.writeFile(destination, editorCopy, 'utf8'); else await fs.unlink(destination);
+    await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending transcript exports', exact: true }).getByRole('article')).toHaveCount(0);
+    if (receiptExists) expect(await fs.readFile(destination, 'utf8')).toBe(editorCopy);
+    else expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(receipt, 'utf8')).toBe(receiptBytes);
+    expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+    expect(await fs.readFile(unrelated, 'utf8')).toBe(unrelatedBytes);
+    expect(await fs.readFile(captureFile, 'utf8')).toBe(editedSource);
+    expect(await fs.stat(historyFile).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  });
+}
+
+async function guardedTranscript(label) {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `TRANSCRIPT_GUARD_${label}: authored synthetic retained writing.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(`TRANSCRIPT_GUARD_${label}`);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const historyDirectory = path.join(root, 'conversations'), historyName = (await fs.readdir(historyDirectory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), historyFile = path.join(historyDirectory, historyName);
+  const history = await fs.readFile(historyFile, 'utf8'), record = JSON.parse(history);
+  const outputDirectory = path.join(root, 'vault', 'Exports'); await fs.mkdir(outputDirectory);
+  const destination = path.join(outputDirectory, 'Guarded transcript.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  const proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  return { destination, outputDirectory, proposed, historyFile, history, record, directory: path.join(root, 'vault', 'Companion', '.transcripts'), calls: await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8') };
+}
+
+for (const area of ['destination parent', 'private journal']) {
+  test(`transcript guards preserve writing when the actual ${area} is replaced by a junction`, async () => {
+    test.setTimeout(90000);
+    const fixture = await guardedTranscript(area.replaceAll(' ', '_'));
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+    const intentName = (await fs.readdir(fixture.directory)).find(name => name.endsWith('.intent.json'));
+    const intentBytes = await fs.readFile(path.join(fixture.directory, intentName), 'utf8'), intent = JSON.parse(intentBytes);
+    const original = area === 'destination parent' ? fixture.outputDirectory : fixture.directory;
+    const retained = path.join(root, 'retained-original-directory'), outside = path.join(root, 'outside-vault-directory');
+    await fs.mkdir(outside);
+    const canaryFile = path.join(outside, 'OUTSIDE_TRANSCRIPT_CANARY.md'), canary = '# OUTSIDE_TRANSCRIPT_PRIVATE_CANARY\n\nIndependent writing must stay unchanged.\n';
+    await fs.writeFile(canaryFile, canary, 'utf8');
+    let redirected = false, moved = false;
+    try {
+      await fs.rename(original, retained); moved = true;
+      await fs.symlink(outside, original, process.platform === 'win32' ? 'junction' : 'dir'); redirected = true;
+      await fs.writeFile(path.join(root, 'release.txt'), 'release after actual parent replacement', 'utf8');
+      await expect(page.locator('#transcript-status')).toContainText(/ordinary|folder|identity|contained/i);
+      await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
+      await expect(page.locator('#conversation-section')).not.toContainText('OUTSIDE_TRANSCRIPT_PRIVATE_CANARY');
+      expect(await fs.readdir(outside)).toEqual(['OUTSIDE_TRANSCRIPT_CANARY.md']);
+      expect(await fs.readFile(canaryFile, 'utf8')).toBe(canary);
+      const journal = area === 'private journal' ? retained : fixture.directory;
+      expect(await fs.readFile(path.join(journal, intentName), 'utf8')).toBe(intentBytes);
+      expect(await fs.readFile(path.join(journal, `${intent.operation}.md.pending`), 'utf8')).toBe(fixture.proposed);
+      expect((await fs.readdir(journal)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+      expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+      expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(fixture.history);
+      expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+    } finally {
+      if (app) { await app.close(); app = null; }
+      if (redirected) await fs.unlink(original);
+      if (moved) await fs.rename(retained, original);
+    }
+  });
+}
+
+test('transcript guards reject an unknown hardlink peer before publishing any destination', async () => {
+  test.setTimeout(90000);
+  const fixture = await guardedTranscript('UNKNOWN_PEER');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+  const stageName = (await fs.readdir(fixture.directory)).find(name => name.endsWith('.md.pending'));
+  const stage = path.join(fixture.directory, stageName), peer = path.join(root, 'unknown-outside-stage-peer.md');
+  await fs.link(stage, peer);
+  await fs.writeFile(path.join(root, 'release.txt'), 'release unknown peer', 'utf8');
+  await expect(page.locator('#transcript-status')).toContainText(/linked|nonordinary|identity|peer/i);
+  expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+  expect((await fs.stat(stage)).nlink).toBe(2); expect((await fs.stat(peer)).nlink).toBe(2);
+  expect(await fs.readFile(stage, 'utf8')).toBe(fixture.proposed); expect(await fs.readFile(peer, 'utf8')).toBe(fixture.proposed);
+  expect((await fs.readdir(fixture.directory)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
+  const pending = page.getByRole('region', { name: 'Pending transcript exports', exact: true });
+  await expect(pending.getByRole('button', { name: 'Resume transcript export', exact: true })).toBeDisabled();
+  expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(fixture.history);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+for (const change of ['destination collision', 'origin record change']) {
+  test(`transcript guards reject a ${change} after preview without overwriting independent writing`, async () => {
+    test.setTimeout(90000);
+    const fixture = await guardedTranscript(change.replaceAll(' ', '_'));
+    const editorWriting = '# Explicit external edit\n\nPreserve this exact independent writing.\n';
+    let expectedHistory = fixture.history;
+    if (change === 'destination collision') await fs.writeFile(fixture.destination, editorWriting, 'utf8');
+    else {
+      const changed = JSON.parse(fixture.history); changed.requests[0].question += '\nEXTERNAL_ORIGIN_EDIT_AFTER_TRANSCRIPT_PREVIEW';
+      expectedHistory = JSON.stringify(changed, null, 2); await fs.writeFile(fixture.historyFile, expectedHistory, 'utf8');
+    }
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect(page.locator('#transcript-status')).toContainText(change === 'destination collision' ? /already exists|preserved/i : /changed|preview/i);
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
+    if (change === 'destination collision') expect(await fs.readFile(fixture.destination, 'utf8')).toBe(editorWriting);
+    else expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+    expect((await fs.readdir(fixture.directory)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+    expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(expectedHistory);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  });
+}
+
+for (const operation of ['preview', 'confirm']) {
+  test(`transcript guards keep the selected B view when an earlier A ${operation} completes`, async () => {
+    test.setTimeout(120000);
+    const fixture = await guardedTranscript(`LATE_A_${operation}`);
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await page.getByLabel('Context question', { exact: true }).fill('Independent B conversation question for view ownership.');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_VIEW_B_ONLY: authored synthetic separate B writing.' }), 'utf8');
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_VIEW_B_ONLY');
+    await expect(page.locator('#conversation-history')).toContainText('completed');
+    const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+    const second = records.find(record => record.id !== fixture.record.id), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    await page.getByLabel('Retained conversation', { exact: true }).selectOption(fixture.record.id);
+    await expect(page.locator('#conversation-history')).toContainText(`TRANSCRIPT_GUARD_LATE_A_${operation}`);
+    if (operation === 'preview') {
+      // Both actions use public controls in one renderer task; A's async IPC cannot finish first.
+      await page.evaluate(secondId => {
+        document.getElementById('transcript-preview').click();
+        const select = document.getElementById('conversation-select'); select.value = secondId; select.dispatchEvent(new Event('change', { bubbles: true }));
+      }, second.id);
+      await expect(page.locator('#transcript-status')).toContainText(/Inspect the exact historical copy|ignored|conversation changed|preview required/i);
+      expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+    } else {
+      await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+      await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+      await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+      await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+      await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+      await page.getByLabel('Retained conversation', { exact: true }).selectOption(second.id);
+      await fs.writeFile(path.join(root, 'release.txt'), 'finish already-authorized A publication after selecting B', 'utf8');
+      await expect.poll(() => fs.readFile(fixture.destination, 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toContain('TRANSCRIPT_GUARD_LATE_A_confirm');
+      await expect(page.locator('#transcript-confirm')).toBeEnabled();
+      await expect(page.locator('#transcript-status')).not.toContainText('Transcript exported:');
+    }
+    await expect(page.getByLabel('Retained conversation', { exact: true })).toHaveValue(second.id);
+    await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_VIEW_B_ONLY');
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).not.toBeVisible();
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  });
+}
+
+test('explicit conversation deletion previews and cancels before removing only local history while independent writing and copies survive', async () => {
+  test.setTimeout(150000);
+  const canary = 'DELETE_SELECTED_HISTORY_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${canary}: retained dialogue is independent from deliberately saved writing.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const historyDirectory = path.join(root, 'conversations'), historyName = (await fs.readdir(historyDirectory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), historyFile = path.join(historyDirectory, historyName);
+  const historyBytes = await fs.readFile(historyFile, 'utf8'), record = JSON.parse(historyBytes);
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent interpretation survives conversation deletion');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Keep this deliberate author interpretation after removing the conversation.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('No result was independently verified.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent interpretation survives/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  const outputDirectory = path.join(root, 'vault', 'Exports'); await fs.mkdir(outputDirectory);
+  const transcript = path.join(outputDirectory, 'Independent transcript copy.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: transcript }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  const vault = path.join(root, 'vault', 'Companion'), captureDirectory = path.join(vault, 'Captures'), captureFile = path.join(captureDirectory, (await fs.readdir(captureDirectory)).find(name => name.endsWith('.md')));
+  const sourceBytes = await fs.readFile(captureFile, 'utf8'), ideaBytes = await fs.readFile(ideaFile, 'utf8'), transcriptBytes = await fs.readFile(transcript, 'utf8'), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const journals = {};
+  for (const area of ['.ideas', '.transcripts']) for (const name of await fs.readdir(path.join(vault, area))) journals[path.join(area, name)] = await fs.readFile(path.join(vault, area, name), 'utf8');
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await other.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await other.getByLabel('Context question', { exact: true }).fill(canary);
+    await other.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+    await other.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: canary }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+    await other.getByLabel('Context question', { exact: true }).fill('Review the selected historical interpretation.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/DELETE_SELECTED_HISTORY_12_CANARY/);
+    await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+    const review = page.getByRole('region', { name: 'Conversation deletion review', exact: true });
+    await expect(review).toBeVisible();
+    await expect(review).toContainText(record.id);
+    await expect(review).toContainText('1 request');
+    await expect(review).toContainText(/saved ideas.*remain|saved writing.*remain/i);
+    await expect(review).toContainText(/transcript.*remain|export.*remain/i);
+    await expect(review).toContainText(/previous.*provider|provider.*submission/i);
+    await expect(review).toContainText(/quotation|independent cop/i);
+    await expect(review).toContainText(/no automatic expiry|does not expire automatically/i);
+    await expect(review).toContainText(/source.*remain|capture.*remain/i);
+    await page.getByRole('button', { name: 'Cancel conversation deletion', exact: true }).click();
+    expect(await fs.readFile(historyFile, 'utf8')).toBe(historyBytes);
+    expect(await fs.stat(path.join(historyDirectory, '.control')).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+    expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+    expect(await fs.readFile(transcript, 'utf8')).toBe(transcriptBytes);
+    for (const [file, text] of Object.entries(journals)) expect(await fs.readFile(path.join(vault, file), 'utf8')).toBe(text);
+    await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+    await expect(review).toBeVisible();
+    await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+    await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+    expect(await fs.stat(historyFile).catch(error => error.code)).toBe('ENOENT');
+    const controlBytes = await fs.readFile(path.join(historyDirectory, '.control', `${record.id}.json`), 'utf8'), control = JSON.parse(controlBytes);
+    expect(control).toMatchObject({ id: record.id, phase: 'deleted', generation: expect.stringMatching(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/) });
+    expect(controlBytes).not.toContain(canary); expect(controlBytes).not.toContain('Spaced retrieval revisits a learned chord.');
+    await other.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(other.locator('#conversation-error')).toContainText(/deleted|historical|unavailable|changed/i);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  } finally { await otherApp.close(); }
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  expect(await fs.readFile(transcript, 'utf8')).toBe(transcriptBytes);
+  for (const [file, text] of Object.entries(journals)) expect(await fs.readFile(path.join(vault, file), 'utf8')).toBe(text);
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await expect(page.locator('#saved-ideas')).toContainText('Independent interpretation survives conversation deletion');
+  await expect(page.getByLabel('Retained conversation', { exact: true }).locator('option')).toHaveCount(1);
+  await page.getByLabel('Context question', { exact: true }).fill(canary);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await expect(page.locator('#history-search-status')).toContainText('0 matching historical turns');
+  await expect(page.locator('#history-search-results')).not.toContainText(canary);
+  expect((await fs.readdir(historyDirectory)).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))).toEqual([]);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  expect(await fs.readFile(transcript, 'utf8')).toBe(transcriptBytes);
+  for (const [file, text] of Object.entries(journals)) expect(await fs.readFile(path.join(vault, file), 'utf8')).toBe(text);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+async function deletionFixture(label) {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `DELETE_RECOVERY_${label}: authored synthetic retained dialogue.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(`DELETE_RECOVERY_${label}`);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Retain this explicit history exclusion through deletion recovery.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Retain this explicit history exclusion/);
+  const directory = path.join(root, 'conversations'), name = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), file = path.join(directory, name);
+  const text = await fs.readFile(file, 'utf8'), record = JSON.parse(text);
+  const captureDirectory = path.join(root, 'vault', 'Companion', 'Captures'), source = path.join(captureDirectory, (await fs.readdir(captureDirectory)).find(name => name.endsWith('.md')));
+  const independent = path.join(root, 'vault', 'Independent deletion writing.md');
+  await fs.writeFile(independent, '# Independent writing\n\nRetain these words after conversation removal.\n', 'utf8');
+  return { directory, name, file, text, record, source, sourceBytes: await fs.readFile(source, 'utf8'), independent, independentBytes: await fs.readFile(independent, 'utf8'), calls: await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8') };
+}
+
+for (const boundary of ['conversation-delete-after-tombstone', 'conversation-delete-after-unlink']) {
+  test(`conversation deletion guards recover explicitly after actual main exit at ${boundary}`, async ({}, testInfo) => {
+    test.setTimeout(120000);
+    const fixture = await deletionFixture(boundary);
+    await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+    await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+    const controlFile = path.join(fixture.directory, '.control', `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8'), marker = JSON.parse(controlBytes);
+    expect(marker.phase).toBe('deleting');
+    expect(marker.scope.excludedHistory).toEqual(fixture.record.scope.excludedHistory);
+    expect(marker.targets).toEqual([expect.objectContaining({ name: fixture.name, sha256: require('node:crypto').createHash('sha256').update(fixture.text).digest('hex'), dev: expect.any(String), ino: expect.any(String) })]);
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    evidence.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await testInfo.attach('deletion-crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+    app = null;
+    const existedBeforeRestart = await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    expect(existedBeforeRestart).toBe(boundary === 'conversation-delete-after-tombstone');
+    await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+    await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    const pending = page.getByRole('region', { name: 'Pending conversation deletions', exact: true });
+    await expect(pending).toContainText(fixture.record.id);
+    await expect(pending).toContainText(marker.generation);
+    expect(await fs.readFile(controlFile, 'utf8')).toBe(controlBytes);
+    expect(await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(existedBeforeRestart);
+    if (existedBeforeRestart) expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+    expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+    expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+    await pending.getByRole('button', { name: 'Resume conversation deletion', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+    await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+    expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+    const completed = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+    expect(completed.phase).toBe('deleted'); expect(completed.generation).toBe(marker.generation);
+    expect(completed.scope).toEqual(marker.scope); expect(completed.targets).toEqual(marker.targets);
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending conversation deletions', exact: true }).getByRole('button', { name: 'Resume conversation deletion', exact: true })).toHaveCount(0);
+    expect(JSON.parse(await fs.readFile(controlFile, 'utf8'))).toEqual(completed);
+    expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+    expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  });
+}
+
+test('conversation deletion guards refuse an active request without removing its durable intent', async () => {
+  test.setTimeout(90000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ holdCompletion: true, messages: [{ delta: 'ACTIVE_DELETE_GUARD_12', text: 'Completed authored synthetic reply after explicit release.', phase: 'final_answer' }] }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ACTIVE_DELETE_GUARD_12');
+  const directory = path.join(root, 'conversations'), name = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const intent = await fs.readFile(path.join(directory, name), 'utf8'), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText(/active|busy|finish/i);
+  expect(await fs.readFile(path.join(directory, name), 'utf8')).toBe(intent);
+  expect(await fs.stat(path.join(directory, '.control')).catch(error => error.code)).toBe('ENOENT');
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}', 'utf8');
+  await expect(page.locator('#conversation-history')).toContainText('Completed authored synthetic reply after explicit release.');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('conversation deletion guards retain the only unsaved overlay until it is explicitly preserved', async () => {
+  test.setTimeout(90000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  const before = await fs.readFile(savedFile, 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText(/unsaved|preserve/i);
+  await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+  await expect(page.locator('#conversation-error')).toContainText('may not survive restart');
+  expect(await fs.readFile(savedFile, 'utf8')).toBe(before);
+  expect(await fs.stat(path.join(root, 'conversations', '.control')).catch(error => error.code)).toBe('ENOENT');
+  await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+  await expect(page.locator('#conversation-error')).not.toContainText('may not survive restart');
+  await expect.poll(async () => JSON.parse(await fs.readFile(savedFile, 'utf8')).requests[0].reply).toContain('LATEST_VISIBLE_REPLY_CANARY');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('conversation deletion guards inventory exact selected stages, preserve unknown writing and retain unrelated pending history', async () => {
+  test.setTimeout(120000);
+  const fixture = await deletionFixture('PENDING_INVENTORY');
+  const { randomUUID } = require('node:crypto');
+  const selectedStage = path.join(fixture.directory, `${randomUUID()}.pending`), selected = JSON.parse(fixture.text);
+  selected.requests[0].reply += '\nONLY_SELECTED_PENDING_VARIANT_12';
+  const selectedBytes = JSON.stringify(selected, null, 2); await fs.writeFile(selectedStage, selectedBytes, 'utf8');
+  const unknownStage = path.join(fixture.directory, `${randomUUID()}.pending`), damaged = JSON.parse(fixture.text);
+  damaged.requests[0].reply = 'UNKNOWN_PENDING_ONLY_COPY_12: preserve this damaged same-identity writing.';
+  damaged.requests[0].status = 'unknown-provider-authority'; damaged.requests[0].package.dependencies = null;
+  const unknownBytes = JSON.stringify(damaged, null, 2);
+  await fs.writeFile(unknownStage, unknownBytes, 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText(/unknown pending|blocked|preserved/i);
+  expect(await fs.readFile(unknownStage, 'utf8')).toBe(unknownBytes); expect(await fs.readFile(selectedStage, 'utf8')).toBe(selectedBytes);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  expect(await fs.stat(path.join(fixture.directory, '.control')).catch(error => error.code)).toBe('ENOENT');
+  // The test owner separately removes its unknown fixture; the application must never infer permission.
+  await fs.unlink(unknownStage);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Independent unrelated conversation for pending ownership.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'UNRELATED_PENDING_HISTORY_12: authored synthetic separate writing.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('UNRELATED_PENDING_HISTORY_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const otherName = (await fs.readdir(fixture.directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name) && name !== fixture.name), otherFile = path.join(fixture.directory, otherName), otherBytes = await fs.readFile(otherFile, 'utf8');
+  const unrelatedStage = path.join(fixture.directory, `${randomUUID()}.pending`); await fs.writeFile(unrelatedStage, otherBytes, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(fixture.record.id);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  const review = page.getByRole('region', { name: 'Conversation deletion review', exact: true });
+  await expect(review).toBeVisible();
+  await expect(review).toContainText(path.basename(selectedStage));
+  await expect(review).not.toContainText(path.basename(unrelatedStage));
+  await expect(review.getByLabel(`Selected pending history ${path.basename(selectedStage)}`, { exact: true })).toHaveValue(selectedBytes);
+  await page.getByRole('button', { name: 'Cancel conversation deletion', exact: true }).click();
+  expect(await fs.readFile(selectedStage, 'utf8')).toBe(selectedBytes); expect(await fs.readFile(unrelatedStage, 'utf8')).toBe(otherBytes);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(review).toBeVisible();
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+  expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT'); expect(await fs.stat(selectedStage).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(unrelatedStage, 'utf8')).toBe(otherBytes); expect(await fs.readFile(otherFile, 'utf8')).toBe(otherBytes);
+  const marker = JSON.parse(await fs.readFile(path.join(fixture.directory, '.control', `${fixture.record.id}.json`), 'utf8'));
+  expect(marker.targets.map(target => target.name).sort()).toEqual([fixture.name, path.basename(selectedStage)].sort());
+  expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('conversation deletion guards preserve an externally altered target after the durable tombstone', async () => {
+  test.setTimeout(90000);
+  const fixture = await deletionFixture('ALTERED_TARGET');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-delete-after-tombstone' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('conversation-delete-after-tombstone');
+  const editorBytes = '# External independent editor writing\n\nCHANGED_DELETION_TARGET_12 must survive.\n';
+  await fs.writeFile(fixture.file, editorBytes, 'utf8');
+  await fs.writeFile(path.join(root, 'release.txt'), 'release changed target', 'utf8');
+  await expect(page.locator('#conversation-delete-status')).toContainText(/target changed|identity changed|preserve/i);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(editorBytes);
+  const marker = JSON.parse(await fs.readFile(path.join(fixture.directory, '.control', `${fixture.record.id}.json`), 'utf8'));
+  expect(marker.phase).toBe('deleting');
+  expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+async function exportHistoryForGeneration(targetPage, destination) {
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination, open: destination }), 'utf8');
+  const region = targetPage.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(targetPage.locator('#archive-summary')).toContainText('Archive exported');
+}
+async function restoreHistoryForGeneration(targetPage, destination) {
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: destination }), 'utf8');
+  const region = targetPage.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(targetPage.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect(targetPage.locator('#archive-restore-summary')).toContainText('Restored 1 conversation');
+}
+async function deleteHistoryForGeneration(targetPage) {
+  await targetPage.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(targetPage.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await targetPage.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(targetPage.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+}
+
+test('archive generation restoration retains current exclusions and only a fresh explicit scope review can change them', async () => {
+  test.setTimeout(180000);
+  const canary = 'ARCHIVE_GENERATION_SCOPE_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${canary}: retain the original historical writing.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const directory = path.join(root, 'conversations'), name = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), historyFile = path.join(directory, name);
+  const original = JSON.parse(await fs.readFile(historyFile, 'utf8')), captureKey = original.requests[0].package.dependencies.find(dep => dep.key.startsWith('capture:')).key;
+  const sourceDirectory = path.join(root, 'vault', 'Companion', 'Captures'), sourceFile = path.join(sourceDirectory, (await fs.readdir(sourceDirectory)).find(name => name.endsWith('.md'))), sourceBytes = await fs.readFile(sourceFile, 'utf8');
+  const optionalLedger = () => fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const ledgerBytes = await optionalLedger(), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const archive = path.join(root, 'older-generation-history.json'); await exportHistoryForGeneration(page, archive);
+  const archiveBytes = await fs.readFile(archive, 'utf8');
+  expect(JSON.parse(archiveBytes).payload.conversations[0].scope.excludedHistory).toEqual([]);
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Keep both the source and the original turn excluded.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Keep both the source/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_GENERATION_SCOPE_12_CANARY|Spaced retrieval/);
+  const excluded = JSON.parse(await fs.readFile(historyFile, 'utf8'));
+  await deleteHistoryForGeneration(page);
+  const controlFile = path.join(directory, '.control', `${original.id}.json`), tombstone = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(tombstone.scope.excludedSources).toContain(captureKey); expect(tombstone.scope.excludedHistory).toContain(original.requests[0].id);
+  await restoreHistoryForGeneration(page, archive);
+  let restored = JSON.parse(await fs.readFile(historyFile, 'utf8')), active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(active.phase).toBe('active'); expect(active.generation).not.toBe(tombstone.generation); expect(restored.generation).toBe(active.generation);
+  expect(restored.requests).toEqual(original.requests); expect(restored.brief).toEqual(original.brief);
+  expect(restored.scope.excludedSources).toEqual(excluded.scope.excludedSources); expect(restored.scope.excludedHistory).toEqual(excluded.scope.excludedHistory);
+  expect(active.scope.excludedSources).toEqual(excluded.scope.excludedSources); expect(active.scope.excludedHistory).toEqual(excluded.scope.excludedHistory);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await page.getByLabel('Context question', { exact: true }).fill('Continue respecting restored exclusions.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/respecting restored exclusions/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_GENERATION_SCOPE_12_CANARY|Spaced retrieval/);
+  // A new explicit selection and checkbox restore can change current scope; old archive bytes cannot.
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: deliberately restore the source and its historical turn.');
+  await selectCapture();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/ARCHIVE_GENERATION_SCOPE_12_CANARY/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Spaced retrieval/);
+  restored = JSON.parse(await fs.readFile(historyFile, 'utf8')); active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(restored.scope.excludedSources).not.toContain(captureKey); expect(restored.scope.excludedHistory).not.toContain(original.requests[0].id);
+  expect(active.scope.excludedSources).toEqual(restored.scope.excludedSources); expect(active.scope.excludedHistory).toEqual(restored.scope.excludedHistory);
+  const firstActiveGeneration = active.generation;
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Keep the newer reviewed source and history exclusions.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/newer reviewed source/);
+  active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(active.scope.excludedSources).toContain(captureKey); expect(active.scope.excludedHistory).toContain(original.requests[0].id);
+  await deleteHistoryForGeneration(page); await restoreHistoryForGeneration(page, archive);
+  restored = JSON.parse(await fs.readFile(historyFile, 'utf8')); active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(active.phase).toBe('active'); expect(active.generation).not.toBe(firstActiveGeneration); expect(restored.generation).toBe(active.generation);
+  expect(active.scope.excludedSources).toContain(captureKey); expect(active.scope.excludedHistory).toContain(original.requests[0].id);
+  expect(restored.scope.excludedSources).toContain(captureKey); expect(restored.scope.excludedHistory).toContain(original.requests[0].id);
+  expect(await fs.readFile(archive, 'utf8')).toBe(archiveBytes); expect(await fs.readFile(sourceFile, 'utf8')).toBe(sourceBytes); expect(await optionalLedger()).toBe(ledgerBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('archive generation restoration fences a stale other-instance unsaved overlay even when old durable bytes return', async () => {
+  test.setTimeout(150000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  const oldBytes = await fs.readFile(savedFile, 'utf8'), old = JSON.parse(oldBytes), controlFile = path.join(root, 'conversations', '.control', `${old.id}.json`);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(other.locator('#conversation-history')).toContainText('DURABLE_PREFIX');
+    await expect(other.locator('#conversation-history')).toContainText('interrupted');
+    const archive = path.join(root, 'overlay-generation-history.json');
+    await exportHistoryForGeneration(other, archive);
+    await deleteHistoryForGeneration(other);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    await restoreHistoryForGeneration(other, archive);
+    const freshBytes = await fs.readFile(savedFile, 'utf8'), fresh = JSON.parse(freshBytes), active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+    expect(active.phase).toBe('active'); expect(fresh.generation).toBe(active.generation);
+    expect(fresh.generation).not.toBe(old.generation);
+    // Exact old baseline bytes do not restore the old overlay's local generation authority.
+    await fs.writeFile(savedFile, oldBytes, 'utf8');
+    await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|unavailable|unsaved|generation/i);
+    expect(await fs.readFile(savedFile, 'utf8')).toBe(oldBytes);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    await fs.writeFile(savedFile, freshBytes, 'utf8');
+    await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|unavailable|unsaved|generation/i);
+    expect(await fs.readFile(savedFile, 'utf8')).toBe(freshBytes);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    expect(JSON.parse(await fs.readFile(controlFile, 'utf8'))).toEqual(active);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  } finally { await otherApp.close(); }
+});
+
+async function deletedArchiveFixture(label) {
+  const fixture = await deletionFixture(label), archive = path.join(root, `reserved-${label}.json`);
+  await exportHistoryForGeneration(page, archive);
+  const archiveBytes = await fs.readFile(archive, 'utf8');
+  await deleteHistoryForGeneration(page);
+  return { ...fixture, archive, archiveBytes, controlFile: path.join(fixture.directory, '.control', `${fixture.record.id}.json`) };
+}
+async function reviewReservedArchive(targetPage, archive) {
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: archive }), 'utf8');
+  const region = targetPage.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(targetPage.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+  return region;
+}
+for (const boundary of ['archive-restore-after-reservation', 'archive-restore-after-link', 'archive-restore-before-active']) {
+  test(`restoration authority guards explicitly recover after actual main exit at ${boundary}`, async ({}, testInfo) => {
+    test.setTimeout(150000);
+    const fixture = await deletedArchiveFixture(`RESTORE_CRASH_${boundary}`), region = await reviewReservedArchive(page, fixture.archive);
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+    await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+    const markerBytes = await fs.readFile(fixture.controlFile, 'utf8'), marker = JSON.parse(markerBytes), stageTarget = marker.targets.find(target => target.name.endsWith('.pending'));
+    expect(marker.phase).toBe('restoring'); expect(marker.restoration.archiveId).toBe(JSON.parse(fixture.archiveBytes).id);
+    expect(marker.scope.excludedHistory).toEqual(fixture.record.scope.excludedHistory);
+    const stage = path.join(fixture.directory, stageTarget.name);
+    const stageExists = boundary !== 'archive-restore-before-active', destinationExists = boundary !== 'archive-restore-after-reservation';
+    expect(await fs.access(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(stageExists);
+    expect(await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(destinationExists);
+    const reservedBytes = await fs.readFile(stageExists ? stage : fixture.file, 'utf8'), reserved = JSON.parse(reservedBytes);
+    expect(reserved.generation).toBe(marker.generation); expect(reserved.requests).toEqual(fixture.record.requests);
+    expect(require('node:crypto').createHash('sha256').update(reservedBytes).digest('hex')).toBe(marker.restoration.recordDigest);
+    const expectedLinks = boundary === 'archive-restore-after-link' ? 2 : 1;
+    expect((await fs.stat(stageExists ? stage : fixture.file)).nlink).toBe(expectedLinks);
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    evidence.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await testInfo.attach('restoration-crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+    app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+    await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    const pending = page.getByRole('region', { name: 'Pending history restorations', exact: true });
+    await expect(pending).toContainText(fixture.record.id); await expect(pending).toContainText(marker.generation); await expect(pending).toContainText(marker.restoration.archiveId);
+    expect(await fs.readFile(fixture.controlFile, 'utf8')).toBe(markerBytes);
+    expect(await fs.access(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(stageExists);
+    expect(await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(destinationExists);
+    expect(await fs.readFile(stageExists ? stage : fixture.file, 'utf8')).toBe(reservedBytes);
+    await pending.getByRole('button', { name: 'Resume history restoration', exact: true }).click();
+    const review = page.getByRole('region', { name: 'History restoration recovery review', exact: true });
+    await expect(review).toBeVisible(); await expect(review).toContainText(marker.generation);
+    await review.getByRole('button', { name: 'Confirm history restoration recovery', exact: true }).click();
+    await expect(page.locator('#archive-restore-summary')).toContainText('Restoration recovered');
+    const completed = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+    expect(completed.phase).toBe('active'); expect(completed.generation).toBe(marker.generation); expect(completed.scope).toEqual(marker.scope); expect(completed.restoration).toEqual(marker.restoration);
+    expect(await fs.readFile(fixture.file, 'utf8')).toBe(reservedBytes); expect((await fs.stat(fixture.file)).nlink).toBe(1);
+    expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT');
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending history restorations', exact: true }).getByRole('button', { name: 'Resume history restoration', exact: true })).toHaveCount(0);
+    await expect(page.locator('#conversation-history')).toContainText(`DELETE_RECOVERY_RESTORE_CRASH_${boundary}`);
+    expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'))).toEqual(completed);
+    expect(await fs.readFile(fixture.file, 'utf8')).toBe(reservedBytes); expect(await fs.readFile(fixture.archive, 'utf8')).toBe(fixture.archiveBytes);
+    expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  });
+}
+
+test('restoration authority guards reject a stale other-instance approved send instead of appending to a new generation', async () => {
+  test.setTimeout(150000);
+  const fixture = await deletionFixture('STALE_APPROVED_SEND'), archive = path.join(root, 'stale-approved-send.json');
+  await exportHistoryForGeneration(page, archive);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow(); await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(other.locator('#conversation-history')).toContainText('DELETE_RECOVERY_STALE_APPROVED_SEND');
+    await other.getByLabel('Context question', { exact: true }).fill('Approved before deletion; never append this stale request after restoration.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await deleteHistoryForGeneration(page); await restoreHistoryForGeneration(page, archive);
+    const restoredBytes = await fs.readFile(fixture.file, 'utf8'), restored = JSON.parse(restoredBytes), controlFile = path.join(fixture.directory, '.control', `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8');
+    expect(restored.generation).toBe(JSON.parse(controlBytes).generation); expect(restored.scope.version).not.toBe(fixture.record.scope.version);
+    await other.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(other.locator('#conversation-error')).toContainText(/changed|generation|preview/i);
+    expect(await fs.readFile(fixture.file, 'utf8')).toBe(restoredBytes); expect(await fs.readFile(controlFile, 'utf8')).toBe(controlBytes);
+    expect(JSON.parse(await fs.readFile(fixture.file, 'utf8')).requests).toHaveLength(1);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+    await other.getByLabel('Context question', { exact: true }).fill('Fresh review may use current project context alone.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Fresh review may use current project/);
+    await expect(other.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  } finally { await otherApp.close(); }
+});
+
+test('restoration authority guards keep an active generation usable after a failed scope save without losing prior exclusions', async () => {
+  test.setTimeout(150000);
+  const fixture = await deletedArchiveFixture('FAILED_SCOPE_SAVE'); await restoreHistoryForGeneration(page, fixture.archive);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(fixture.record.id);
+  await expect(page.locator('#conversation-history')).toContainText('DELETE_RECOVERY_FAILED_SCOPE_SAVE');
+  const before = await fs.readFile(fixture.file, 'utf8'), active = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  expect(active.phase).toBe('active'); expect(active.scope.excludedHistory).toEqual(fixture.record.scope.excludedHistory);
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: exclude this source in a deliberately failed scope save.'); await selectCapture();
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'conversation-before-store', code: 'EACCES' }), 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-error')).toContainText('Controlled filesystem boundary failure');
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(before);
+  expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8')).scope.excludedHistory).toEqual(active.scope.excludedHistory);
+  await fs.unlink(path.join(root, 'faults.json'));
+  await page.reload(); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await expect(page.locator('#conversation-history')).toContainText('DELETE_RECOVERY_FAILED_SCOPE_SAVE');
+  await page.getByLabel('Context question', { exact: true }).fill('Continue respecting the previously retained history exclusion after local save failure.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/previously retained history exclusion/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/DELETE_RECOVERY_FAILED_SCOPE_SAVE/);
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: explicitly retry the current source exclusion.'); await selectCapture();
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/explicitly retry the current source exclusion/);
+  const saved = JSON.parse(await fs.readFile(fixture.file, 'utf8')), marker = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  const sourceKey = fixture.record.requests[0].package.dependencies.find(dep => dep.key.startsWith('capture:')).key;
+  expect(saved.generation).toBe(active.generation); expect(marker.generation).toBe(active.generation);
+  expect(saved.scope.excludedSources).toContain(sourceKey); expect(marker.scope.excludedSources).toContain(sourceKey);
+  expect(saved.scope.excludedHistory).toEqual(active.scope.excludedHistory); expect(marker.scope.excludedHistory).toEqual(active.scope.excludedHistory);
+  expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+async function interruptedControlFixture(label, testInfo) {
+  const fixture = await deletionFixture(label);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-delete-after-tombstone' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('conversation-delete-after-tombstone');
+  const controlDirectory = path.join(fixture.directory, '.control'), controlFile = path.join(controlDirectory, `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8'), marker = JSON.parse(controlBytes);
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { wrapperPid: child.pid, mainPid, boundary: 'conversation-delete-after-tombstone', exitBoundary: 'Electron app.exit(77)' };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  evidence.wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  await testInfo.attach('control-guard-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+  app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+  return { ...fixture, controlDirectory, controlFile, controlBytes, marker };
+}
+
+test('local control guards explicitly finish only the exact known two-link control publication pair', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const fixture = await interruptedControlFixture('KNOWN_CONTROL_PAIR', testInfo);
+  const stage = path.join(fixture.controlDirectory, `${fixture.marker.publication}.pending`);
+  // Actual OS hardlink reproduces the exact link-before-cleanup publication state while main is absent.
+  await fs.link(fixture.controlFile, stage);
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(2); expect(await fs.readFile(stage, 'utf8')).toBe(fixture.controlBytes);
+  await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const pending = page.getByRole('region', { name: 'Pending conversation deletions', exact: true });
+  await expect(pending).toContainText(fixture.record.id);
+  await expect(pending.getByRole('button', { name: 'Resume conversation deletion', exact: true })).toBeEnabled();
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(2); expect(await fs.readFile(stage, 'utf8')).toBe(fixture.controlBytes);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  await pending.getByRole('button', { name: 'Resume conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+  const completed = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  expect(completed.phase).toBe('deleted'); expect(completed.generation).toBe(fixture.marker.generation); expect(completed.scope).toEqual(fixture.marker.scope); expect(completed.targets).toEqual(fixture.marker.targets);
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(1); expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT'); expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes); expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+test('local control guards preserve an unknown control hardlink peer and block deletion recovery', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const fixture = await interruptedControlFixture('UNKNOWN_CONTROL_PEER', testInfo), peer = path.join(root, 'unknown-control-authority-peer.json');
+  await fs.link(fixture.controlFile, peer);
+  await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const pending = page.getByRole('region', { name: 'Pending conversation deletions', exact: true });
+  await expect(pending).toContainText(fixture.record.id);
+  await expect(pending.getByRole('button', { name: 'Resume conversation deletion', exact: true })).toBeDisabled();
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(2); expect((await fs.stat(peer)).nlink).toBe(2);
+  expect(await fs.readFile(fixture.controlFile, 'utf8')).toBe(fixture.controlBytes); expect(await fs.readFile(peer, 'utf8')).toBe(fixture.controlBytes);
+  expect(await fs.stat(path.join(fixture.controlDirectory, `${fixture.marker.publication}.pending`)).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes); expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+test('local control guards reject an actual control-folder junction without exposing or modifying outside writing', async () => {
+  test.setTimeout(120000);
+  const fixture = await deletionFixture('CONTROL_JUNCTION'); await deleteHistoryForGeneration(page);
+  const controlDirectory = path.join(fixture.directory, '.control'), controlFile = path.join(controlDirectory, `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8');
+  await app.close(); app = null;
+  const retained = path.join(root, 'retained-control-folder'), outside = path.join(root, 'outside-control-folder'); await fs.mkdir(outside);
+  const outsideFile = path.join(outside, `${fixture.record.id}.json`), outsideBytes = 'OUTSIDE_CONTROL_PRIVATE_CANARY_12: independent writing must remain unchanged.\n';
+  await fs.writeFile(outsideFile, outsideBytes, 'utf8');
+  let moved = false, redirected = false;
+  try {
+    await fs.rename(controlDirectory, retained); moved = true;
+    await fs.symlink(outside, controlDirectory, process.platform === 'win32' ? 'junction' : 'dir'); redirected = true;
+    await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending conversation deletions', exact: true })).toContainText(/ordinary|folder|contained/i);
+    await expect(page.locator('#conversation-section')).not.toContainText('OUTSIDE_CONTROL_PRIVATE_CANARY_12');
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await page.getByLabel('Context question', { exact: true }).fill('Prepare project-only context while local controls require repair.');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/ordinary|folder|contained/i);
+    expect(await fs.readFile(outsideFile, 'utf8')).toBe(outsideBytes); expect(await fs.readdir(outside)).toEqual([`${fixture.record.id}.json`]);
+    expect(await fs.readFile(path.join(retained, `${fixture.record.id}.json`), 'utf8')).toBe(controlBytes);
+    expect((await fs.readdir(fixture.directory)).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))).toEqual([]);
+    expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes); expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (redirected) await fs.unlink(controlDirectory);
+    if (moved) await fs.rename(retained, controlDirectory);
+  }
+});

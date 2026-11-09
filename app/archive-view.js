@@ -82,6 +82,7 @@ archiveMatchPreview.onclick = async () => {
     const result = await window.companion['archive-match']({ id: archiveInspection, matched: archiveMatch.checked, sourceRoot: archiveSource.value, settingsMode: archiveSettings.value });
     archiveRestoreToken = result.token; archiveMissing = result.missing; archiveMetadata = result.metadataAdditions; archiveMetadataConflicts = result.metadataConflicts;
     archiveRestoreSummary.textContent = `Matched restore preview: ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Missing history may have been deleted intentionally. Confirm only if you want to add these archived conversations. Current settings and source exclusions remain authoritative. Existing history and vault files stay unchanged. Exact retained brief pins match; original external documents may be unavailable or outdated. Historical restore does not refresh them. Schedule intent remains inactive; task reconnection is separate. Historic packages, capacity bindings and provider IDs do not prove current eligibility or readiness.`;
+    if (result.newGenerations) archiveRestoreSummary.textContent += ` ${result.newGenerations} previously deleted or generation-bound identities will receive a fresh local generation and scope version. Current retained source and history exclusions are added to the archive scope; older archives cannot remove them. Fresh explicit context review is required to change those exclusions.`;
     archiveRestoreSummary.textContent += ` Current vault configuration is kept: ${result.currentVault.vault}; managed folder ${result.currentVault.managedRoot}. Archived hints: ${result.archivedVault.vault || 'unavailable'}; managed folder ${result.archivedVault.managedRoot}. Use Choose vault to change configuration. Note inclusions change only for individually checked current text below; conversation exclusions remain authoritative.`;
     archiveRestoreSummary.textContent += ` ${result.metadataAdditions} inert settings records to preserve: ${result.metadataTypes.cadence} cadence intents, ${result.metadataTypes.codexHints} Codex reconnect hints, ${result.metadataTypes.coverage} incomplete-archive coverage records. ${result.missing === 0 ? 'No conversations will be added; current settings stay active. ' : ''}This confirmation only preserves those inactive records; task or Codex reconnection requires its separate explicit workflow. ${result.metadataConflicts} inert metadata conflicts; conflicts block restore and existing records are kept.`;
     if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Their recovery content cannot be restored from this archive.`;
@@ -152,3 +153,57 @@ archiveReconnectConfirm.onclick = async () => {
   finally { archiveReconnectPreview.disabled = false; }
 };
 showArchiveIntents();
+
+// Interrupted restorations use their exact locally reserved manifest, never an old provider thread.
+const restorationRecovery = document.createElement('section'); restorationRecovery.setAttribute('aria-label', 'Pending history restorations');
+restorationRecovery.innerHTML = '<h3>Pending history restorations</h3><p>Inspect retained history and its exact manifest. Nothing is promoted or removed automatically.</p><div id="archive-recovery-pending"></div><section id="archive-recovery-review" aria-label="History restoration recovery review" hidden><p id="archive-recovery-description"></p><label>Retained restoration record<textarea id="archive-recovery-record" rows="12" readonly></textarea></label><button id="archive-recovery-confirm">Confirm history restoration recovery</button><button id="archive-recovery-cancel">Cancel history restoration recovery</button></section>';
+document.querySelector('section[aria-label="Local history archive"]').append(restorationRecovery);
+let restorationRecoveryToken, restorationRecoveryEpoch = 0, restorationPendingEpoch = 0;
+function invalidateRestorationRecovery() {
+  restorationRecoveryEpoch++; const previous = restorationRecoveryToken; restorationRecoveryToken = null;
+  document.getElementById('archive-recovery-review').hidden = true; document.getElementById('archive-recovery-record').value = '';
+  document.getElementById('archive-recovery-confirm').disabled = false;
+  if (previous) window.companion['conversation-delete-cancel']({ token: previous }).catch(() => {});
+}
+async function refreshRestorationRecovery() {
+  const request = ++restorationPendingEpoch;
+  try {
+    const result = await window.companion['archive-recovery-pending'](); if (request !== restorationPendingEpoch) return;
+    const list = document.getElementById('archive-recovery-pending'); list.replaceChildren();
+    for (const issue of result.issues) { const row = document.createElement('p'); row.textContent = issue; list.append(row); }
+    for (const record of result.records) {
+      const article = document.createElement('article'), description = document.createElement('p'), details = document.createElement('details'), summary = document.createElement('summary'), label = document.createElement('label'), text = document.createElement('textarea'), resume = document.createElement('button');
+      description.textContent = `${record.id} · generation ${record.generation} · archive ${record.archiveId} · exact manifest: ${record.targets.join(', ')}. ${record.warning || 'Retained history awaits explicit restoration recovery.'}`;
+      summary.textContent = 'Inspect retained restoration'; label.textContent = 'Retained pending restoration record'; text.readOnly = true; text.rows = 10; text.value = record.text; label.append(text); details.append(summary, label);
+      resume.textContent = 'Resume history restoration'; resume.disabled = !record.canResume;
+      resume.onclick = async () => {
+        if (request !== restorationPendingEpoch) return;
+        invalidateRestorationRecovery(); const current = restorationRecoveryEpoch; resume.disabled = true;
+        try {
+          const result = await window.companion['archive-recovery-resume']({ id: record.id });
+          if (current !== restorationRecoveryEpoch) { await window.companion['conversation-delete-cancel']({ token: result.token }); return; }
+          restorationRecoveryToken = result.token;
+          document.getElementById('archive-recovery-description').textContent = `Recover only ${result.id}, generation ${result.generation}, from archive ${result.archiveId}. Exact retained targets: ${result.targets.join(', ')}. Current exclusions remain. No source authority, provider request, missing payload or independent writing is reconstructed.`;
+          document.getElementById('archive-recovery-record').value = result.text; document.getElementById('archive-recovery-review').hidden = false;
+        } catch (error) { if (current === restorationRecoveryEpoch) archiveRestoreSummary.textContent = error.message; }
+        finally { if (current === restorationRecoveryEpoch) resume.disabled = !record.canResume; }
+      };
+      article.append(description, details, resume); list.append(article);
+    }
+  } catch (error) { if (request === restorationPendingEpoch) document.getElementById('archive-recovery-pending').textContent = error.message; }
+}
+document.getElementById('archive-recovery-confirm').onclick = async () => {
+  const current = restorationRecoveryEpoch, approved = restorationRecoveryToken; document.getElementById('archive-recovery-confirm').disabled = true;
+  try {
+    const result = await window.companion['archive-recovery-confirm']({ token: approved });
+    if (current !== restorationRecoveryEpoch) return;
+    restorationRecoveryToken = null; document.getElementById('archive-recovery-review').hidden = true;
+    archiveRestoreSummary.textContent = `Restoration recovered locally: ${result.id}, generation ${result.generation}. Original retained writing and current exclusions remain; no request was replayed.`;
+  } catch (error) { if (current === restorationRecoveryEpoch) archiveRestoreSummary.textContent = error.message; }
+  finally { if (current === restorationRecoveryEpoch) document.getElementById('archive-recovery-confirm').disabled = false; await refreshRestorationRecovery(); }
+};
+document.getElementById('archive-recovery-cancel').onclick = invalidateRestorationRecovery;
+for (const [id, event] of [['conversation-new', 'click'], ['conversation-select', 'change']]) document.getElementById(id).addEventListener(event, invalidateRestorationRecovery);
+document.getElementById('configure').addEventListener('click', () => { restorationPendingEpoch++; invalidateRestorationRecovery(); document.getElementById('archive-recovery-pending').replaceChildren(); });
+window.addEventListener('companion-vault-configured', () => refreshRestorationRecovery());
+refreshRestorationRecovery();

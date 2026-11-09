@@ -56,6 +56,7 @@ class Archives {
         if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.json$/.test(name)) throw Error('Unrecognized history file. Preserve it for repair.');
         const file = path.join(this.history.directory, name), read = await this.json(file);
         const record = conversation(read.value); if (`${record.id}.json` !== name) throw Error('History identity differs from its filename.');
+        await this.history.controls.check(record);
         if (record.requests.some(request => request.status === 'inProgress')) throw Error('Interrupted request needs inspection before exporting history.');
         fingerprints[file] = read.digest; conversations.push(record);
       }
@@ -91,7 +92,7 @@ class Archives {
       const payload = { settings, contextScopes, scheduleIntent, vaultBindings, conversations };
       this.guard();
       if (Buffer.byteLength(canonical(payload)) > LIMIT) throw Error('History archive exceeds the 128 MiB limit.');
-      return { payload, fingerprints, ...(coverage ? { coverage } : {}) };
+      return { payload, fingerprints, authority: await this.history.controls.authority(), ...(coverage ? { coverage } : {}) };
     };
     return locked ? collect() : this.history.lock(collect);
   }
@@ -117,8 +118,8 @@ class Archives {
     await this.publish(destination, serialized);
     return { location: destination, omitted: current.coverage?.omitted.length || 0 };
   }
-  restorePlan(archive, current, sourceRoot, targetRoot = sourceRoot) {
-    const additions = [], equal = [], conflicts = [];
+  restorePlan(archive, current, sourceRoot, targetRoot = sourceRoot, allocations = new Map()) {
+    const additions = [], equal = [], conflicts = [], transitions = [];
     for (const original of archive.payload.conversations) {
       if (sourceRoot && original.vault.root !== sourceRoot) continue;
       const record = structuredClone(original);
@@ -127,11 +128,22 @@ class Archives {
         record.archiveBinding = { archiveId: archive.id, originalManagedRoot: sourceRoot, ...(original.archiveBinding ? { previous: original.archiveBinding } : {}) };
       }
       const existing = current.payload.conversations.find(item => item.id === record.id);
-      if (!existing) additions.push(record);
+      if (!existing) {
+        const baseline = current.authority.markers.find(marker => marker.id === record.id) || null;
+        if (baseline && !['deleted', 'active'].includes(baseline.phase)) throw Error('Finish the interrupted local deletion or restoration before adding this archived identity.');
+        if (baseline || record.generation) {
+          if (!allocations.has(record.id)) allocations.set(record.id, { generation: randomUUID(), scopeVersion: randomUUID() });
+          const allocated = allocations.get(record.id), scope = record.scope || { excludedSources: [], excludedHistory: record.requests.at(-1)?.package?.excludedHistory || [] };
+          record.generation = allocated.generation;
+          record.scope = { version: allocated.scopeVersion, excludedSources: [...new Set([...scope.excludedSources, ...(baseline?.scope.excludedSources || [])])].sort(), excludedHistory: [...new Set([...scope.excludedHistory, ...(baseline?.scope.excludedHistory || [])])].sort() };
+          transitions.push({ id: record.id, baseline, archiveId: archive.id });
+        }
+        additions.push(record);
+      }
       else if (canonical(existing) === canonical(record)) equal.push(record.id);
       else conflicts.push(record.id);
     }
-    return { additions, equal, conflicts };
+    return { additions, equal, conflicts, transitions };
   }
   async inspect() {
     this.restoreReview = null;
@@ -147,8 +159,8 @@ class Archives {
       if (!identity.isDirectory() || identity.isSymbolicLink() || current.isSymbolicLink() || !same(identity, current) || local.realpathSync(parent) !== parent) throw Error('Archive folder changed or is an alias. Choose an ordinary folder.');
     };
     const read = await this.json(file, guard, false, true), archive = archiveRecord(read.value);
-    const current = await this.snapshot(), plan = this.restorePlan(archive, current), id = randomUUID();
-    this.restoreReview = { id, archive, inspection: current, input: { file, guard, digest: read.digest } };
+    const current = await this.snapshot(), allocations = new Map(), plan = this.restorePlan(archive, current, undefined, undefined, allocations), id = randomUUID();
+    this.restoreReview = { id, archive, allocations, inspection: current, input: { file, guard, digest: read.digest } };
     return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null, omitted: archive.coverage?.omitted.length || 0, codexHints: this.archiveCodexHints(archive) };
   }
   async match(input) {
@@ -159,14 +171,14 @@ class Archives {
     const sourceRoot = input.sourceRoot || root;
     if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === sourceRoot)) throw Error('Choose an archived vault and explicitly match the current vault; nothing was restored.');
     await this.validatePins(reviewed.archive, sourceRoot, vault);
-    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root);
+    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root, reviewed.allocations);
     const metadata = await this.metadataPlan(reviewed.archive, sourceRoot, root);
     const settingsMode = input.settingsMode || 'keep-current';
     if (!['keep-current', 'review-note-inclusions'].includes(settingsMode)) throw Error('Choose an explicit settings restoration policy.');
     const noteCandidates = settingsMode === 'review-note-inclusions' ? await this.noteCandidates(reviewed.archive, sourceRoot, vault) : [];
     const token = randomUUID();
     reviewed.matched = { token, root, sourceRoot, snapshot: current, plan, metadata, settingsMode, noteCandidates };
-    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, metadataAdditions: metadata.additions.length, metadataConflicts: metadata.conflicts.length, metadataTypes: metadata.types, omitted: reviewed.archive.coverage?.omitted.length || 0, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
+    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, newGenerations: plan.transitions.length, metadataAdditions: metadata.additions.length, metadataConflicts: metadata.conflicts.length, metadataTypes: metadata.types, omitted: reviewed.archive.coverage?.omitted.length || 0, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
       const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
       return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
     }) };
@@ -180,7 +192,8 @@ class Archives {
       const current = await this.snapshot({ locked: true });
       if (this.history.getVault()?.root !== matched.root || canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
       await this.validatePins(reviewed.archive, matched.sourceRoot, this.history.getVault());
-      const plan = this.restorePlan(reviewed.archive, current, matched.sourceRoot, matched.root);
+      const plan = this.restorePlan(reviewed.archive, current, matched.sourceRoot, matched.root, reviewed.allocations);
+      if (canonical(plan) !== canonical(matched.plan)) throw Error('Local restoration generations or retained exclusions changed. Preview the matched restore again.');
       const metadata = await this.metadataPlan(reviewed.archive, matched.sourceRoot, matched.root);
       if (canonical(metadata) !== canonical(matched.metadata)) throw Error('Inert settings changed. Inspect and preview their preservation again.');
       if (metadata.conflicts.length) throw Error('Archived inert settings conflict with existing metadata. Existing records were preserved; nothing was restored.');
@@ -198,7 +211,7 @@ class Archives {
         for (const original of plan.additions) {
           const record = structuredClone(original);
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
-          await this.publishAddition(record); restored++;
+          await this.publishAddition(record, plan.transitions.find(transition => transition.id === record.id)); restored++;
         }
         if (noteFiles.length) restoredNotes = await this.includeReviewedNotes(noteFiles, matched);
       } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing conversations were preserved. Inert metadata may already have been preserved; inspect it before retrying. ${noteFiles.length ? 'Reviewed note settings may have been published; inspect the current inclusions before retrying. ' : ''}Inspect again to review remaining additions; no automatic retry occurs.`); }
@@ -491,7 +504,32 @@ class Archives {
       this.history.safeDirectory(false, directory); return hash(text);
     } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
   }
-  async publishAddition(record) {
+  async publishGenerationAddition(record, transition) {
+    const controls = this.history.controls, directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
+    const baseline = await controls.state(record.id);
+    if (canonical(baseline) !== canonical(transition.baseline)) throw Error('Local generation or exclusion authority changed. Inspect the archive again.');
+    if (baseline) await controls.settlePublication(baseline);
+    const stage = path.join(this.history.directory, `${randomUUID()}.pending`), text = JSON.stringify(record, null, 2);
+    // This source-bearing stage is preserved on failure; only its exact published peer can finish it.
+    this.history.safeDirectory(false, directory); await fs.writeFile(stage, text, { flag: 'wx', flush: true });
+    const staged = await controls.file(stage, directory), target = { ...staged.owned, name: `${record.id}.json` };
+    if (staged.text !== text) throw Error('Restoration stage changed. Preserve the retained writing.');
+    let marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: hash(text) } }, baseline);
+    this.history.tokens.clear(); this.history.durable.delete(record.id);
+    await this.checkpoint('archive-restore-after-reservation');
+    await controls.file(stage, directory, staged.owned); this.history.safeDirectory(false, directory);
+    await fs.link(stage, destination); this.history.safeDirectory(false, directory);
+    await this.checkpoint('archive-restore-after-link');
+    const a = await controls.file(stage, directory, staged.owned, 2), b = await controls.file(destination, directory, target, 2);
+    if (!same(a.stat, b.stat) || a.text !== text || b.text !== text || canonical(await controls.state(record.id)) !== canonical(marker)) throw Error('Restoration publication changed. Preserve both copies and local authority for explicit recovery.');
+    this.history.safeDirectory(false, directory); await fs.unlink(stage);
+    await this.checkpoint('archive-restore-before-active');
+    await controls.file(destination, directory, target);
+    marker = await controls.put({ ...marker, phase: 'active', targets: [] }, marker);
+    await controls.check(record); this.history.durable.set(record.id, hash(text));
+  }
+  async publishAddition(record, transition) {
+    if (transition) return this.publishGenerationAddition(record, transition);
     const directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
     const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`); let handle;
     try {
@@ -538,5 +576,8 @@ function installArchives({ ipcMain, ...options }) {
   ipcMain.handle('archive-reconnect-preview', (_, input) => archives.reconnectPreview(input));
   ipcMain.handle('archive-reconnect', (_, input) => archives.reconnect(input));
   ipcMain.handle('archive-review-pending', () => archives.reviewPending());
+  ipcMain.handle('archive-recovery-pending', () => archives.history.controls.pendingRestorations());
+  ipcMain.handle('archive-recovery-resume', (_, input) => archives.history.controls.resumeRestoration(input?.id));
+  ipcMain.handle('archive-recovery-confirm', (_, input) => archives.history.controls.confirm(input?.token, 'restoration'));
 }
 module.exports = { installArchives };

@@ -3,6 +3,9 @@
   section.innerHTML = '<h2>Saved ideas</h2><p>Keep useful observations and failed analogies explicitly. A conversation does not create a note automatically.</p><div id="idea-editor" hidden><label>Idea title<input id="idea-title"></label><label>Idea explanation<textarea id="idea-explanation" rows="8"></textarea></label><label>Idea limitations<textarea id="idea-limitations" rows="3"></textarea></label><button id="idea-preview-button">Preview saved idea</button><div id="idea-preview" hidden><label>Proposed idea destination<input id="idea-destination" readonly></label><label>Proposed idea Markdown<textarea id="idea-markdown" rows="16" readonly></textarea></label><p id="idea-warnings"></p><button id="idea-confirm">Confirm saved idea</button><button id="idea-cancel">Cancel saved idea preview</button></div></div><p id="idea-status" aria-live="polite"></p><div id="saved-ideas"></div>';
   document.getElementById('conversation-section').after(section);
   const byId = id => document.getElementById(id);
+  const refreshSupport = document.createElement('button'), supportStatus = document.createElement('p');
+  refreshSupport.textContent = 'Refresh saved idea support'; refreshSupport.disabled = true; supportStatus.id = 'idea-support-status';
+  byId('saved-ideas').before(refreshSupport, supportStatus);
   const kindLabel = document.createElement('label'), kind = document.createElement('select');
   kindLabel.htmlFor = 'idea-kind'; kindLabel.textContent = 'Saved idea kind'; kind.id = 'idea-kind';
   for (const [value, label] of [['observation', 'Observation'], ['failed_analogy', 'Failed analogy'], ['experiment_proposal', 'Experiment Proposal']]) {
@@ -19,7 +22,7 @@
   byId('idea-preview-button').before(references);
   const evidenceView = document.createElement('div'); evidenceView.id = 'idea-evidence'; section.append(evidenceView);
   const pendingView = document.createElement('div'); pendingView.id = 'pending-ideas'; section.append(pendingView);
-  let origin = null, operation = null, epoch = 0;
+  let origin = null, operation = null, epoch = 0, listEpoch = 0, vaultEpoch = 0, initialSupportPending = true;
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
   for (const field of ['title', 'explanation', 'limitations']) byId(`idea-${field}`).oninput = invalidate;
   for (const [key] of experimentFields) byId(`idea-experiment-${key}`).oninput = invalidate;
@@ -41,18 +44,26 @@
     byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false; byId('idea-confirm').disabled = !!preview.blocked;
   }
   async function list() {
+    const request = ++listEpoch, owner = vaultEpoch, view = epoch;
+    const current = () => request === listEpoch && owner === vaultEpoch && view === epoch;
+    supportStatus.textContent = 'Checking current saved idea support…';
     try {
-      const notes = await window.companion['idea-list'](); byId('saved-ideas').replaceChildren();
+      const notes = await window.companion['idea-list'](); if (!current()) return;
+      byId('saved-ideas').replaceChildren();
       for (const note of notes) {
         const article = document.createElement('article'), title = document.createElement('h3'), open = document.createElement('button');
         title.textContent = note.title; open.textContent = 'Open saved idea in Obsidian'; open.disabled = note.unavailable;
-        open.onclick = async () => { try { await window.companion['idea-open'](note.id); } catch (error) { byId('idea-status').textContent = error.message; } };
+        open.onclick = async () => { try { await window.companion['idea-open'](note.id); } catch (error) { if (current()) byId('idea-status').textContent = error.message; } };
         article.append(title, open); byId('saved-ideas').append(article);
+        if (note.reviewSupport) {
+          const warning = document.createElement('p'); warning.textContent = `Review support. ${note.supportWarnings.join(' ')} Independent writing remains available; this inspection does not rewrite it.`; article.append(warning);
+        }
         for (let index = 0; index < note.citationCount; index++) {
           const inspect = document.createElement('button'); inspect.textContent = 'Inspect cited evidence';
           inspect.onclick = async () => {
             try {
-              const evidence = await window.companion['idea-evidence']({ id: note.id, index }); evidenceView.replaceChildren();
+              const evidence = await window.companion['idea-evidence']({ id: note.id, index }); if (!current()) return;
+              evidenceView.replaceChildren();
               const heading = document.createElement('h3'), warnings = document.createElement('p');
               heading.textContent = `Cited revision ${evidence.anchor.revision_id}; evidence ${evidence.anchor.evidence_id}`; warnings.textContent = evidence.warnings.join('\n'); evidenceView.append(heading, warnings);
               if (evidence.available) {
@@ -61,11 +72,12 @@
                 excerpt.textContent = evidence.anchor.excerpt; label.htmlFor = 'idea-evidence-snapshot'; label.textContent = 'Cited revision snapshot'; snapshot.id = 'idea-evidence-snapshot'; snapshot.readOnly = true; snapshot.rows = 14; snapshot.value = evidence.text;
                 evidenceView.append(details, excerpt, label, snapshot);
               }
-            } catch (error) { byId('idea-status').textContent = error.message; }
+            } catch (error) { if (current()) byId('idea-status').textContent = error.message; }
           }; article.append(inspect);
         }
       }
-      const proposals = await window.companion['idea-pending'](); pendingView.replaceChildren();
+      const proposals = await window.companion['idea-pending'](); if (!current()) return;
+      pendingView.replaceChildren();
       for (const proposal of proposals) {
         const article = document.createElement('article'), title = document.createElement('h3'), resume = document.createElement('button');
         title.textContent = proposal.title; resume.textContent = 'Resume proposed idea';
@@ -82,7 +94,13 @@
         };
         article.append(title, resume); pendingView.append(article);
       }
-    } catch (error) { byId('idea-status').textContent = error.message; }
+      supportStatus.textContent = 'Current support inspected. Warnings do not change note ownership or independently verify claims.';
+    } catch (error) {
+      if (current()) {
+        supportStatus.textContent = `Support inspection unavailable: ${error.message}`;
+        byId('idea-status').textContent = error.message;
+      }
+    }
   }
   window.addEventListener('companion-idea-draft', async event => {
     invalidate(); const current = epoch; origin = event.detail; byId('idea-status').textContent = '';
@@ -112,6 +130,17 @@
     } catch (error) { if (current === epoch) byId('idea-status').textContent = `Save failed. Proposed content is retained. Retry confirmation explicitly. ${error.message}`; }
     finally { byId('idea-confirm').disabled = false; }
   };
-  document.getElementById('configure').addEventListener('click', () => setTimeout(list, 500));
-  list();
+  refreshSupport.onclick = () => list();
+  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
+  function inspectInitialSupport(event) {
+    if (configurationBusy || event?.detail && event.detail.configurationEpoch !== configurationEpoch) return;
+    refreshSupport.disabled = false;
+    if (!initialSupportPending) return;
+    initialSupportPending = false; list();
+  }
+  // Support inspection can reconcile intake. Start it only after the real base
+  // refresh (including repairs) succeeds, rather than competing with startup.
+  window.addEventListener('companion-base-refreshed', inspectInitialSupport);
+  for (const [id, event] of [['conversation-new', 'click'], ['conversation-select', 'change']]) document.getElementById(id).addEventListener(event, () => { listEpoch++; supportStatus.textContent = ''; });
+  if (byId('timezone').textContent) inspectInitialSupport();
 })();
