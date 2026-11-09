@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
@@ -15,12 +16,34 @@ function scopeOf(record) {
 
 class Conversations {
   constructor({ dataRoot, getContext, getVault, clock, provider, checkpoint, testRoot }) {
-    Object.assign(this, { directory: path.join(dataRoot, 'conversations'), getContext, getVault, clock, provider, checkpoint, testRoot });
+    this.dataRoot = path.resolve(dataRoot);
+    Object.assign(this, { directory: path.join(this.dataRoot, 'conversations'), getContext, getVault, clock, provider, checkpoint, testRoot });
     this.tokens = new Map(); this.running = new Set(); this.unsaved = new Map(); this.durable = new Map();
+    // Storage faults belong to conversation operations; they must not prevent capture startup.
+    try { this.anchorRoot(); } catch {}
+  }
+  anchorRoot(create = false) {
+    if (this.rootIdentity) return;
+    if (create) local.mkdirSync(this.dataRoot, { recursive: true });
+    const canonical = local.realpathSync(this.dataRoot), identity = local.statSync(canonical, { bigint: true });
+    this.dataRoot = canonical; this.rootIdentity = identity;
+    this.directory = path.join(canonical, 'conversations');
+  }
+  safeDirectory(create = false, expected) {
+    this.anchorRoot(create);
+    const reject = () => { throw Error('Conversation directory is not an ordinary contained local history folder. Restore the folder before continuing.'); };
+    const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+    const root = local.lstatSync(this.dataRoot, { bigint: true });
+    if (!root.isDirectory() || root.isSymbolicLink() || !same(root, this.rootIdentity) || local.realpathSync(this.dataRoot) !== this.dataRoot) reject();
+    // Check the trusted parent before creating its single direct child. Never traverse an alias.
+    if (create) { try { local.mkdirSync(this.directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } }
+    const directory = local.lstatSync(this.directory, { bigint: true });
+    if (!directory.isDirectory() || directory.isSymbolicLink() || local.realpathSync(this.directory) !== this.directory || expected && !same(directory, expected)) reject();
+    return directory;
   }
   async lock(work) {
-    await fs.mkdir(this.directory, { recursive: true });
-    try { return await withBriefMutation(this.directory, work); }
+    const directory = this.safeDirectory(true);
+    try { return await withBriefMutation(this.directory, () => { this.safeDirectory(false, directory); return work(); }); }
     catch (error) { if (error.message.startsWith('Project Brief store is busy')) throw Error('Conversation store is busy. Retry explicitly after the active request finishes.'); throw error; }
   }
   async read(id) {
@@ -29,36 +52,47 @@ class Conversations {
     const stored = await this.readStored(id);
     return this.unsaved.has(id) ? structuredClone(this.unsaved.get(id).record) : stored;
   }
-  async readStored(id) {
+  async readStored(id, withBytes = false) {
     if (!uuid(id)) throw Error('Conversation identity is invalid.');
+    const directory = this.safeDirectory();
     const file = path.join(this.directory, `${id}.json`), stat = await fs.lstat(file);
+    this.safeDirectory(false, directory);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('Conversation is not an ordinary local history file.');
-    const record = JSON.parse(await fs.readFile(file, 'utf8'));
+    const text = await fs.readFile(file, 'utf8');
+    this.safeDirectory(false, directory);
+    const record = JSON.parse(text);
     if (record.schema !== 1 || record.id !== id || !Array.isArray(record.requests)) throw Error('Conversation history needs repair. Preserve the file.');
-    return record;
+    return withBytes ? { record, text } : record;
   }
   async write(record) {
     await this.checkpoint('conversation-before-store');
+    const directory = this.safeDirectory();
     const stage = path.join(this.directory, `${randomUUID()}.pending`);
     let handle, phase = 'open';
     try {
       handle = await fs.open(stage, 'wx');
+      this.safeDirectory(false, directory);
       phase = 'write'; const text = JSON.stringify(record, null, 2); await handle.writeFile(text, 'utf8');
       phase = 'sync'; await handle.sync();
       phase = 'cleanup'; await handle.close(); handle = null;
       phase = 'rename';
-      await this.publishStage(stage, path.join(this.directory, `${record.id}.json`));
+      await this.publishStage(stage, path.join(this.directory, `${record.id}.json`), directory);
       this.durable.set(record.id, hash(text));
     } catch (error) { await this.storeFailure(phase, error); throw error; }
     finally {
-      try { await handle?.close(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+      try {
+        await handle?.close();
+        // A changed parent can resolve this stage name to unrelated outside writing. Leave it alone.
+        this.safeDirectory(false, directory);
+        await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      }
       catch (error) { await this.storeFailure('cleanup', error); throw error; }
     }
   }
-  async publishStage(stage, destination) {
+  async publishStage(stage, destination, directory) {
     const deadline = performance.now() + 1000; let delay = 15;
     while (true) {
-      try { await fs.rename(stage, destination); return; }
+      try { this.safeDirectory(false, directory); await fs.rename(stage, destination); this.safeDirectory(false, directory); return; }
       catch (error) {
         const remaining = deadline - performance.now();
         if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
@@ -75,9 +109,10 @@ class Conversations {
   }
   async list() {
     const vault = this.getVault(); if (!vault) return { conversations: [], location: this.directory };
-    await fs.mkdir(this.directory, { recursive: true });
+    const directory = this.safeDirectory(true);
     const conversations = [];
     const names = new Set([...await fs.readdir(this.directory), ...[...this.unsaved.keys()].map(id => `${id}.json`)]);
+    this.safeDirectory(false, directory);
     for (const name of names) if (name.endsWith('.json')) {
       let record = await this.read(name.slice(0, -5));
       if (!this.unsaved.has(record.id) && record.requests.some(request => request.status === 'inProgress') && !this.running.has(record.id)) {
@@ -97,6 +132,7 @@ class Conversations {
     return { conversations, location: this.directory };
   }
   async build(input, currentRequestId) {
+    const directory = this.safeDirectory(true);
     if (this.unsaved.has(input.conversationId)) throw Error('This conversation has an unsaved reply. Save the retained reply locally, or copy it before closing, before preparing another request.');
     const context = await this.getContext(), vault = context.vault;
     const prior = input.conversationId ? await this.read(input.conversationId) : null;
@@ -149,6 +185,7 @@ class Conversations {
     const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
     const count = [...text].length;
     const scope = { version: baseline.version, excludedSources: [...excluded].sort(), excludedHistory: [...excludedHistory].sort() };
+    this.safeDirectory(false, directory);
     return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, capacityBinding: preview.capacityBinding, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
   }
   async preview(input) {
@@ -211,7 +248,7 @@ class Conversations {
       return await this.lock(async () => {
         if (this.getVault()?.root !== retained.record.vault.root) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
         let bytes;
-        try { await this.readStored(id); bytes = await fs.readFile(path.join(this.directory, `${id}.json`), 'utf8'); }
+        try { bytes = (await this.readStored(id, true)).text; }
         catch { throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' }); }
         if (!retained.digest || hash(bytes) !== retained.digest) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
         const record = structuredClone(retained.record); delete record.storageWarning;
