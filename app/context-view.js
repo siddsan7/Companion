@@ -1,15 +1,42 @@
 (() => {
   const byId = id => document.getElementById(id);
   const conversation = document.createElement('section'); conversation.id = 'conversation-section'; conversation.setAttribute('aria-label', 'Project conversations');
-  conversation.innerHTML = '<h2>Project conversations</h2><p id="conversation-location"></p><label>Conversation brief version<input id="conversation-brief" type="number" min="1" value="1"></label><label><input id="conversation-speculation" type="checkbox">Allow beyond-evidence speculation</label><button id="conversation-preview">Preview conversation</button><label>Reviewed conversation package<textarea id="conversation-package" rows="14" readonly></textarea></label><p id="conversation-summary"></p><button id="conversation-send" disabled>Send reviewed package</button><p id="conversation-error" role="alert"></p><div id="conversation-history"></div>';
+  conversation.innerHTML = '<h2>Project conversations</h2><p id="conversation-location"></p><label for="conversation-select">Retained conversation</label><select id="conversation-select"><option value="">New conversation</option></select><button id="conversation-new">New conversation</button><label>Conversation brief version<input id="conversation-brief" type="number" min="1" value="1"></label><label><input id="conversation-speculation" type="checkbox">Allow beyond-evidence speculation</label><button id="conversation-preview">Preview conversation</button><label>Reviewed conversation package<textarea id="conversation-package" rows="14" readonly></textarea></label><p id="conversation-summary"></p><button id="conversation-send" disabled>Send reviewed package</button><p id="conversation-error" role="alert"></p><div id="conversation-history"></div>';
   byId('context-section').after(conversation);
   let conversationId = null, conversationToken = null, conversationGeneration = 0;
+  let viewEpoch = 0, draftMode = false;
+  const retained = new Map();
+  let renderedChoices = '';
   let displayedHistory = '';
   let historyExclusions = [];
   const excludedHistory = new Set();
   const restoredSources = new Set(), restoredHistory = new Set();
   const historyRevision = record => JSON.stringify({ requests: record.requests, storageWarning: record.storageWarning });
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
+  function choices() {
+    const select = byId('conversation-select');
+    const options = [['', 'New conversation'], ...[...retained.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)).map(record => [record.id, `${record.requests[0]?.question.slice(0, 80) || 'Conversation'} · brief ${record.brief.version} · ${record.id.slice(0, 8)}`])];
+    const revision = JSON.stringify(options);
+    if (revision !== renderedChoices) {
+      renderedChoices = revision;
+      select.replaceChildren(...options.map(([id, label]) => { const option = document.createElement('option'); option.value = id; option.textContent = label; return option; }));
+    }
+    if (select.value !== (conversationId || '')) select.value = conversationId || '';
+  }
+  function resetView() {
+    viewEpoch++; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
+    excludedHistory.clear(); restoredHistory.clear(); restoredSources.clear(); excluded.clear(); selections = []; all = [];
+    byId('conversation-history').replaceChildren(); byId('conversation-error').textContent = '';
+    byId('conversation-brief').disabled = false; byId('conversation-brief').value = '1';
+    byId('conversation-speculation').checked = false; byId('context-question').value = '';
+    byId('context-results').replaceChildren(); byId('context-manual').replaceChildren(); byId('context-notes').replaceChildren(); byId('context-error').textContent = '';
+    selected(); clearPreview(); choices();
+  }
+  byId('conversation-new').onclick = resetView;
+  byId('conversation-select').onchange = () => {
+    const record = retained.get(byId('conversation-select').value);
+    resetView(); if (record) showConversation(record);
+  };
   function warnHistory() {
     for (const warning of byId('conversation-history').querySelectorAll('.history-exclusion')) warning.remove();
     for (const article of byId('conversation-history').children) {
@@ -21,7 +48,8 @@
     const firstDisplay = !displayedHistory;
     const revision = historyRevision(record);
     if (revision !== displayedHistory) { invalidateConversation(); displayedHistory = revision; }
-    conversationId = record.id; byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
+    conversationId = record.id; draftMode = false; retained.set(record.id, record); choices();
+    byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
     if (firstDisplay) {
       historyExclusions = record.requests.at(-1)?.package?.historyExclusions || [];
       const scope = record.scope || { excludedSources: [], excludedHistory: record.requests.at(-1)?.package?.excludedHistory || [] };
@@ -55,9 +83,10 @@
     if (record.storageWarning) {
       const save = document.createElement('button'); save.textContent = 'Save retained reply locally';
       save.onclick = async () => {
+        const epoch = viewEpoch;
         save.disabled = true; invalidateConversation();
-        try { showConversation(await window.companion['conversation-preserve']({ id: record.id })); }
-        catch (error) { byId('conversation-error').textContent = error.message; }
+        try { const saved = await window.companion['conversation-preserve']({ id: record.id }); if (epoch === viewEpoch) showConversation(saved); }
+        catch (error) { if (epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
         finally { save.disabled = false; }
       };
       byId('conversation-history').prepend(save);
@@ -65,9 +94,15 @@
     warnHistory();
   }
   async function restoreConversation() {
-    const request = conversationGeneration;
-    try { const state = await window.companion['conversation-list'](); if (request !== conversationGeneration) return; byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`; const record = state.conversations.find(item => item.id === conversationId) || state.conversations.at(-1); if (record && historyRevision(record) !== displayedHistory) showConversation(record); }
-    catch (error) { if (request === conversationGeneration) byId('conversation-error').textContent = error.message; }
+    const request = conversationGeneration, epoch = viewEpoch;
+    try {
+      const state = await window.companion['conversation-list'](); if (request !== conversationGeneration || epoch !== viewEpoch) return;
+      byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`;
+      retained.clear(); for (const record of state.conversations) retained.set(record.id, record); choices();
+      const record = state.conversations.find(item => item.id === conversationId) || (!draftMode && state.conversations.at(-1));
+      if (record && historyRevision(record) !== displayedHistory) showConversation(record);
+    }
+    catch (error) { if (request === conversationGeneration && epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
   }
   let selections = [], all = [], generation = 0; const excluded = new Set();
   const clearPreview = () => { generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
@@ -159,9 +194,9 @@
     } catch (error) { if (version === conversationGeneration) byId('conversation-error').textContent = error.message; }
   };
   byId('conversation-send').onclick = async () => {
-    const packageId = conversationToken; invalidateConversation();
-    try { showConversation(await window.companion['conversation-send']({ packageId })); }
-    catch (error) { byId('conversation-error').textContent = error.message; }
+    const packageId = conversationToken, epoch = viewEpoch; invalidateConversation();
+    try { const record = await window.companion['conversation-send']({ packageId }); if (epoch === viewEpoch) showConversation(record); }
+    catch (error) { if (epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
   };
   restoreConversation();
   setInterval(restoreConversation, 300);
