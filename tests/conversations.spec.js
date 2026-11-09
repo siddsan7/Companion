@@ -728,6 +728,50 @@ test('late completion of conversation A preserves the explicitly reviewed new co
   await expect(page.locator('#conversation-history')).not.toContainText('B_REVIEWED_COMPLETION_CANARY');
 });
 
+test('beyond-evidence speculation requires a fresh explicit review for permission and its removal', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic Speculative: a rhythm reminder might help; selected evidence does not establish this transfer.' }));
+  await prepareConversation();
+  const permission = page.getByLabel('Allow beyond-evidence speculation', { exact: true });
+  const reviewed = page.getByLabel('Reviewed conversation package', { exact: true });
+  const send = page.getByRole('button', { name: 'Send reviewed package', exact: true });
+  await expect(permission).not.toBeChecked();
+  await expect(reviewed).toHaveValue(/Beyond-evidence speculation: Not permitted\./);
+  await expect(send).toBeEnabled();
+  await permission.check();
+  await expect(send).toBeDisabled(); await expect(reviewed).toHaveValue('');
+  await noSubmission();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(reviewed).toHaveValue(/Beyond-evidence speculation: Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations\./);
+  await expect(send).toBeEnabled(); const allowed = await reviewed.inputValue();
+  await send.click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('Speculative: a rhythm reminder');
+  const first = await onlyConversation();
+  expect(first.requests).toHaveLength(1); expect(first.requests[0].speculation).toBe(true);
+  expect(first.requests[0].package.speculation).toBe(true); expect(first.requests[0].package.text).toBe(allowed);
+  await page.getByLabel('Context question', { exact: true }).fill('What limitations follow from the selected spaced retrieval evidence?');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(send).toBeEnabled(); await expect(reviewed).toHaveValue(/Beyond-evidence speculation: Explicitly permitted/);
+  await permission.uncheck();
+  await expect(send).toBeDisabled(); await expect(reviewed).toHaveValue('');
+  expect((await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(1);
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(reviewed).toHaveValue(/Beyond-evidence speculation: Not permitted\./);
+  await expect(reviewed).not.toHaveValue(/Beyond-evidence speculation: Explicitly permitted/);
+  await expect(send).toBeEnabled(); const disallowed = await reviewed.inputValue();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic No Supported Connection: the selected evidence does not establish this transfer mechanism.' }));
+  await send.click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('No Supported Connection');
+  const saved = await onlyConversation(); expect(saved.requests).toHaveLength(2);
+  expect(saved.requests[1].speculation).toBe(false); expect(saved.requests[1].package.speculation).toBe(false);
+  expect(saved.requests[1].package.text).toBe(disallowed);
+  expect(saved.requests[0].speculation).toBe(true); expect(saved.requests[0].reply).toContain('Speculative:');
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions.map(call => call.text)).toEqual([allowed, disallowed]);
+});
+
 // Authored main-process capacity evidence is a controlled boundary, never live readiness.
 const capacityEvidence = () => ({
   capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'Authored synthetic capacity proof v1', harnessAndOutputEvidence: 'Authored synthetic harness and output proof v1' },
