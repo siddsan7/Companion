@@ -53,11 +53,11 @@ const archiveReconnectPreview = document.getElementById('archive-reconnect-previ
 const archiveReconnectConfirm = document.getElementById('archive-reconnect');
 const archiveReconnectSummary = document.getElementById('archive-reconnect-summary');
 let archiveReconnectToken;
-let archiveInspection, archiveRestoreToken, archiveMissing = 0;
+let archiveInspection, archiveRestoreToken, archiveMissing = 0, archiveMetadata = 0, archiveMetadataConflicts = 0;
 function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; archiveConflicts.replaceChildren(); archiveNotes.replaceChildren(); }
 function restoreChoices() { return [...archiveConflicts.querySelectorAll('select')].map(select => ({ id: select.dataset.conversationId, choice: select.value })); }
 function selectedArchiveNotes() { return [...archiveNotes.querySelectorAll('input:checked')].map(input => input.dataset.noteFile); }
-function updateRestoreConfirmation() { archiveRestore.disabled = !archiveRestoreToken || archiveMissing === 0 && selectedArchiveNotes().length === 0 || restoreChoices().some(resolution => resolution.choice !== 'keep-current'); }
+function updateRestoreConfirmation() { archiveRestore.disabled = !archiveRestoreToken || archiveMissing === 0 && selectedArchiveNotes().length === 0 && archiveMetadata === 0 || archiveMetadataConflicts > 0 || restoreChoices().some(resolution => resolution.choice !== 'keep-current'); }
 archiveMatch.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; };
 archiveSource.onchange = () => { archiveMatch.checked = false; invalidateRestore(); archiveMatchPreview.disabled = true; };
 archiveSettings.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; };
@@ -80,9 +80,10 @@ archiveMatchPreview.onclick = async () => {
   invalidateRestore(); archiveMatchPreview.disabled = true;
   try {
     const result = await window.companion['archive-match']({ id: archiveInspection, matched: archiveMatch.checked, sourceRoot: archiveSource.value, settingsMode: archiveSettings.value });
-    archiveRestoreToken = result.token; archiveMissing = result.missing;
+    archiveRestoreToken = result.token; archiveMissing = result.missing; archiveMetadata = result.metadataAdditions; archiveMetadataConflicts = result.metadataConflicts;
     archiveRestoreSummary.textContent = `Matched restore preview: ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Missing history may have been deleted intentionally. Confirm only if you want to add these archived conversations. Current settings and source exclusions remain authoritative. Existing history and vault files stay unchanged. Exact retained brief pins match; original external documents may be unavailable or outdated. Historical restore does not refresh them. Schedule intent remains inactive; task reconnection is separate. Historic packages, capacity bindings and provider IDs do not prove current eligibility or readiness.`;
     archiveRestoreSummary.textContent += ` Current vault configuration is kept: ${result.currentVault.vault}; managed folder ${result.currentVault.managedRoot}. Archived hints: ${result.archivedVault.vault || 'unavailable'}; managed folder ${result.archivedVault.managedRoot}. Use Choose vault to change configuration. Note inclusions change only for individually checked current text below; conversation exclusions remain authoritative.`;
+    archiveRestoreSummary.textContent += ` ${result.metadataAdditions} inert settings records to preserve: ${result.metadataTypes.cadence} cadence intents, ${result.metadataTypes.codexHints} Codex reconnect hints, ${result.metadataTypes.coverage} incomplete-archive coverage records. ${result.missing === 0 ? 'No conversations will be added; current settings stay active. ' : ''}This confirmation only preserves those inactive records; task or Codex reconnection requires its separate explicit workflow. ${result.metadataConflicts} inert metadata conflicts; conflicts block restore and existing records are kept.`;
     if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Their recovery content cannot be restored from this archive.`;
     for (const conflict of result.conflictRecords) {
       const row = document.createElement('div'), details = document.createElement('p'), label = document.createElement('label'), select = document.createElement('select');
@@ -114,6 +115,7 @@ archiveRestore.onclick = async () => {
     const result = await window.companion['archive-restore']({ token, resolutions, noteFiles }); archiveInspection = null; archiveMatch.checked = false;
     archiveRestoreSummary.textContent = `Restored ${result.restored} conversation${result.restored === 1 ? '' : 's'}. ${result.equal} equal records left unchanged. No task was connected. Reopen a retained conversation to inspect its exact historical context; a new turn requires current review.`;
     if (result.restoredNotes) archiveRestoreSummary.textContent += ` Restored ${result.restoredNotes} reviewed note inclusion${result.restoredNotes === 1 ? '' : 's'}. Existing conversation exclusions remain unchanged.`;
+    if (result.preservedMetadata) archiveRestoreSummary.textContent += ` Preserved ${result.preservedMetadata} inert settings records. Active settings and task/provider connections were not changed.`;
     await showArchiveIntents();
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); archiveInspection = null; }
   finally { archiveInspect.disabled = false; }
