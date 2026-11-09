@@ -409,3 +409,28 @@ test('ordered assistant items retain every full completed message and phase acro
   await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_PHASE_COMPLETE_CANARY');
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
+
+test('full terminal item order includes an earlier assistant item whose individual events were absent', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ messages: [
+    { text: 'TERMINAL_EARLIER_CANARY: authored synthetic commentary.', phase: 'commentary', omitIndividualEvents: true },
+    { text: 'STREAMED_LATER_CANARY: authored synthetic final hypothesis.', phase: 'final_answer' }
+  ] }));
+  await prepareConversation(); await observeConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('STREAMED_LATER_CANARY');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('TERMINAL_EARLIER_CANARY');
+  const files = await fs.readdir(path.join(root, 'conversations'));
+  const saved = JSON.parse(await fs.readFile(path.join(root, 'conversations', files.find(name => name.endsWith('.json'))), 'utf8'));
+  expect(saved.requests[0].reply).toBe('TERMINAL_EARLIER_CANARY: authored synthetic commentary.\n\nSTREAMED_LATER_CANARY: authored synthetic final hypothesis.');
+  expect(saved.requests[0].messages.map(message => message.phase)).toEqual(['commentary', 'final_answer']);
+  const visible = await page.locator('#conversation-history').textContent();
+  expect(visible.indexOf('TERMINAL_EARLIER_CANARY')).toBeLessThan(visible.indexOf('STREAMED_LATER_CANARY'));
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(calls.trim().split('\n').filter(Boolean)).toHaveLength(1);
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('TERMINAL_EARLIER_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('STREAMED_LATER_CANARY');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});

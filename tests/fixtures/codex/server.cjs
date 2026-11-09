@@ -54,11 +54,14 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     messages.forEach((message, index) => {
       const itemId = `fixture-message-${process.pid}-${sequence}-${index}`;
       const identity = { threadId: active.threadId, turnId: active.turnId };
-      notify('item/started', { ...identity, item: agentItem(itemId, '', message.phase), startedAtMs: 1794139200000 + index });
-      notify('item/agentMessage/delta', { ...identity, itemId, delta: message.delta === undefined ? message.text : message.delta });
+      const item = agentItem(itemId, message.text, message.phase);
+      if (!message.omitIndividualEvents) {
+        notify('item/started', { ...identity, item: agentItem(itemId, '', message.phase), startedAtMs: 1794139200000 + index });
+        notify('item/agentMessage/delta', { ...identity, itemId, delta: message.delta === undefined ? message.text : message.delta });
+        if (scenario.turn !== 'pending') notify('item/completed', { ...identity, item, completedAtMs: 1794139200000 + index });
+      }
       if (scenario.turn !== 'pending') {
-        const item = agentItem(itemId, message.text, message.phase); completedItems.push(item);
-        notify('item/completed', { ...identity, item, completedAtMs: 1794139200000 + index });
+        completedItems.push(item);
       }
     });
     if (scenario.turn === 'usage-limit') notify('error', { threadId: active.threadId, turnId: active.turnId, willRetry: false, error: { message: 'PRIVATE_PROVIDER_DETAIL', codexErrorInfo: 'usageLimitExceeded' } });
