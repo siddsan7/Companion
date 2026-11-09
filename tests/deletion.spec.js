@@ -942,6 +942,58 @@ test('an orphan manual journal for the same capture under another operation prev
   await expect(recovery).toContainText(selected.id); await expect(recovery).toContainText('additional selected-source restoration journal');
 });
 
+for (const boundary of ['capture-restoration-retirement-authorized', 'capture-restoration-retirement-unlinked', 'capture-restoration-retired']) test(`authorized manual retirement recovers exactly once after actual process exit at ${boundary}`, async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const selected = await pauseManualRestoration('capture-restoration-admitted');
+  await exitMain('capture-restoration-admitted', testInfo, 'initial-manual-publication-processes.json');
+  await fs.unlink(selected.file); await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
+  const recovery = page.getByLabel('Capture deletion recovery', { exact: true });
+  await expect(recovery).toContainText(selected.id);
+  await recovery.getByLabel('Selected recovery backup file', { exact: true }).fill(selected.backup);
+  await recovery.getByRole('button', { name: 'Preview a new source restoration', exact: true }).click();
+  const confirm = recovery.getByLabel('New source restoration preview', { exact: true }).getByRole('button', { name: 'Confirm new source restoration', exact: true });
+  await expect(confirm).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+  await confirm.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+  await expect(confirm).toBeDisabled();
+  const reserved = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')), authority = reserved.sourceAuthority[selected.id];
+  expect(authority.phase).toBe('restoring'); expect(authority.operationId).not.toBe(selected.authority.operationId); expect(authority.generation).not.toBe(selected.authority.generation);
+  expect(authority.restoration.published).toBeUndefined();
+  const newJournal = path.join(selected.base, '.intake', authority.restoration.journal), journalIdentity = await fs.stat(newJournal, { bigint: true });
+  expect(authority.restoration.journalIdentity).toEqual({ dev: String(journalIdentity.dev), ino: String(journalIdentity.ino), bytes: String(journalIdentity.size) });
+  if (boundary === 'capture-restoration-retirement-authorized') {
+    expect(await fs.readFile(selected.stage)).toEqual(selected.sourceBytes);
+    expect(authority.restoration.retirement.operationId).toBe(selected.authority.operationId);
+    expect(authority.retiredRestorations).toBeUndefined();
+  } else if (boundary === 'capture-restoration-retirement-unlinked') {
+    expect(await fs.access(selected.stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+    expect(authority.restoration.retirement.operationId).toBe(selected.authority.operationId);
+    expect(await fs.access(path.join(selected.base, '.intake', selected.authority.restoration.journal)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(true);
+  } else {
+    expect(authority.restoration.retirement).toBeUndefined();
+    expect(authority.retiredRestorations).toHaveLength(1);
+    expect(authority.retiredRestorations[0].operationId).toBe(selected.authority.operationId);
+  }
+  await exitMain(boundary, testInfo, 'retirement-boundary-processes.json');
+  await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const restored = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')), current = restored.sourceAuthority[selected.id];
+  expect(current.phase).toBe('active'); expect(current.operationId).toBe(authority.operationId); expect(current.generation).toBe(authority.generation);
+  expect(current.manual).toEqual(selected.authority.manual); expect(restored.attempts).toEqual(selected.ledger.attempts);
+  expect(current.retiredRestorations).toHaveLength(1); expect(current.retiredRestorations[0]).toMatchObject({ captureId: selected.id, operationId: selected.authority.operationId, generation: selected.authority.generation, publication: selected.authority.restoration.publication });
+  expect(current.history).toEqual(selected.authority.history);
+  expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes); expect((await fs.stat(selected.file)).nlink).toBe(1);
+  expect(await fs.readFile(selected.backup)).toEqual(selected.sourceBytes);
+  expect((await fs.readdir(path.join(selected.base, '.intake'))).filter(name => name.startsWith('manual-') || name.startsWith('restoration-'))).toEqual([]);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id]).toEqual(current);
+  expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes);
+});
+
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
   test.setTimeout(90000);
   await artifact('first', '1'); await launch();
@@ -1015,13 +1067,13 @@ async function pauseSelectedRestoration(boundary) {
   await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
   return { base, ledgerFile, original, id: capture.id, capture };
 }
-async function exitMain(boundary, testInfo) {
+async function exitMain(boundary, testInfo, proof = 'restoration-boundary-processes.json') {
   const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
   const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
   const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
   evidence.wrapperExit = await exited; await abrupt;
   await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
-  await fs.writeFile(testInfo.outputPath('restoration-boundary-processes.json'), JSON.stringify(evidence, null, 2), 'utf8'); app = null;
+  await fs.writeFile(testInfo.outputPath(proof), JSON.stringify(evidence, null, 2), 'utf8'); app = null;
 }
 
 for (const edited of ['capture', 'snapshot']) test(`restoration activation revalidates the ${edited} after its final publication boundary`, async () => {
