@@ -17,7 +17,7 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
   setup.state.reply = ''; setup.state.turnActive = true; setup.state.status = 'running';
   const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null };
   setup.turnHistory.push(record);
-  let turnId, terminal, unexpected = false, resolveTerminal, fatalFailure, historySaved = false;
+  let turnId, terminal, unexpected = false, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
   let sinkTail = Promise.resolve(), sinkFailure;
   const preserve = () => {
     const snapshot = { threadId, turnId: turnId || null, model: started.model, reply: setup.state.reply };
@@ -57,8 +57,9 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
     await setup.persist();
     await preserve();
     if (sinkFailure) throw Error('Conversation history could not be saved. No model request was sent.');
-    await beforeStart({ threadId, model: started.model });
     historySaved = true;
+    await beforeStart({ threadId, model: started.model });
+    startAttempted = true;
     const response = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text }], environments: [] });
     turnId = response.turn?.id || turnId;
     if (!turnId) throw Error('Codex did not identify the active turn.');
@@ -81,11 +82,11 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
   } catch (error) {
     // Once turn/start can have reached the server, a lost acknowledgement is ambiguous.
     // Preserve an interrupted local terminal; never call it completed or replay it.
-    const interrupted = historySaved && (record.status === 'interrupted' || rpc.closed);
+    const interrupted = startAttempted && (record.status === 'interrupted' || rpc.closed);
     Object.assign(record, { turnId: turnId || null, status: interrupted ? 'interrupted' : 'failed', completedAt: new Date().toISOString() });
     if (!error.terminalStatus) error.terminalStatus = record.status;
     if (!historySaved) error.message = 'Codex history could not be saved. No model request was sent. Check application-data access and retry explicitly.';
-    else if (rpc.closed) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
+    else if (startAttempted && rpc.closed) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
     throw error;
   } finally {
     clearTimeout(timeout); clearTimeout(setup.interruptTimer);
