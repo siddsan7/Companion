@@ -3,6 +3,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
+const YAML = require('yaml');
 let root, app, page;
 
 test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-deletion-')); });
@@ -263,6 +264,100 @@ test('same-byte manual restoration preserves the literal hash while excluding it
   expect(freshDependency.sourceGenerations).toEqual([{ captureId: id, generation }]);
   const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   expect(submissions).toHaveLength(2); expect(submissions[1].text).toBe(nextPackage); expect(submissions[1].text).not.toContain(oldReply);
+});
+
+async function manualConversationForRestoration() {
+  const sourceText = 'IDEAGENERATION spaced retrieval revisits a learned chord.';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'OLDIDEAGENERATION authored synthetic interpretation.' }), 'utf8');
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Thought or link', { exact: true }).fill(sourceText);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  const base = path.join(root, 'vault', 'Companion'), captureName = (await fs.readdir(path.join(base, 'Captures'))).find(name => name.endsWith('.md'));
+  const sourceBytes = await fs.readFile(path.join(base, 'Captures', captureName)), backup = path.join(root, 'explicit-manual-idea-backup.md');
+  await fs.writeFile(backup, sourceBytes);
+  const readme = path.join(root, 'README.md'); await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
+  await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]), 'utf8');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  await page.getByLabel('Context question', { exact: true }).fill('How could retrieval help MyTune?');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: 'IDEAGENERATION' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('OLDIDEAGENERATION');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const metadata = YAML.parse(sourceBytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]);
+  return { base, backup, id: metadata.companion_id, sourceBytes };
+}
+async function restoreManualConversation(fixture) {
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected manual capture file', { exact: true }).fill(fixture.backup);
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source restored');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.getByLabel('Manual context source', { exact: true }).selectOption('capture:' + fixture.id);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'FRESHIDEAGENERATION authored synthetic interpretation.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('FRESHIDEAGENERATION');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const ledger = JSON.parse(await fs.readFile(path.join(fixture.base, '.intake', 'ledger.json'), 'utf8'));
+  return ledger.sourceAuthority[fixture.id].generation;
+}
+async function previewManualIdea(title) {
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).last().click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Independent writing: retrieval may inform a practice queue. The transfer has not been tested.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic evidence; no outcome was measured.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Confirm saved idea', exact: true })).toBeVisible();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/^---\r?\n/);
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(title));
+  const text = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const file = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  return { text, file, metadata: YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]) };
+}
+test('restored manual source generation supports a newly saved idea while earlier idea writing stays unchanged and warned', async () => {
+  test.setTimeout(150000);
+  const fixture = await manualConversationForRestoration();
+  const old = await previewManualIdea('Earlier source interpretation');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#saved-ideas')).toContainText('Earlier source interpretation');
+  expect(old.metadata.source_dependencies[0].source_generation).toBeUndefined();
+  const generation = await restoreManualConversation(fixture);
+  await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+  await expect(page.locator('#saved-ideas article').filter({ hasText: 'Earlier source interpretation' })).toContainText('Review support');
+  expect(await fs.readFile(old.file, 'utf8')).toBe(old.text);
+  const fresh = await previewManualIdea('Fresh source interpretation');
+  expect(fresh.metadata.source_dependencies).toEqual([{ capture_id: fixture.id, content_sha256: old.metadata.source_dependencies[0].content_sha256, source_generation: generation }]);
+  expect(fresh.metadata.support_attribution_unavailable).toBe(false);
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#saved-ideas')).toContainText('Fresh source interpretation');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const source = page.getByLabel('Manual context source', { exact: true });
+  await expect(source.locator('option').filter({ hasText: 'Fresh source interpretation' })).toHaveCount(1);
+  await expect(source.locator('option').filter({ hasText: 'Earlier source interpretation' })).toHaveCount(0);
+  await app.close(); app = null; await launch();
+  await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#saved-ideas article').filter({ hasText: 'Fresh source interpretation' })).toBeVisible();
+  await expect(page.locator('#saved-ideas article').filter({ hasText: 'Fresh source interpretation' })).not.toContainText('Review support');
+  await expect(page.locator('#saved-ideas article').filter({ hasText: 'Earlier source interpretation' })).toContainText('Review support');
+  expect(await fs.readFile(old.file, 'utf8')).toBe(old.text); expect(await fs.readFile(fresh.file, 'utf8')).toBe(fresh.text);
 });
 
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
