@@ -154,7 +154,7 @@ test('returned comparison settings mismatch consumes the failed slot before turn
   expect(await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).toBe(requests);
 });
 
-test('independent blind aliases bind feedback to actual shown candidates across restart', async () => {
+test('independent blind aliases retain six validated ratings and reveal methods only after feedback', async () => {
   test.setTimeout(180000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
@@ -239,6 +239,30 @@ test('independent blind aliases bind feedback to actual shown candidates across 
   expect(scored.blindOrder.map(entry => entry.label)).toEqual(blindLabels);
   expect(new Set(scored.blindOrder.map(entry => entry.slotId)).size).toBe(6);
   expect(scored.displayOrder).toEqual(initial.displayOrder);
+  await page.getByRole('button', { name: 'Save feedback ' + firstLabel, exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Save feedback ' + firstLabel, exact: true })).toBeEnabled();
+  expect((await savedComparison()).slots.find(slot => slot.candidate?.text === shownCandidate).rating).toEqual(scored.slots.find(slot => slot.candidate?.text === shownCandidate).rating);
+  const nextLabel = blindLabels[1];
+  await page.getByLabel(nextLabel + ' Usefulness', { exact: true }).fill('6');
+  await page.getByLabel(nextLabel + ' Surprise', { exact: true }).fill('3');
+  await page.getByLabel(nextLabel + ' Grounding', { exact: true }).fill('3');
+  await page.getByLabel(nextLabel + ' Ease of testing', { exact: true }).fill('3');
+  await page.getByLabel(nextLabel + ' Rating reason', { exact: true }).fill('An authored validation check.');
+  await page.getByRole('button', { name: 'Save feedback ' + nextLabel, exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Save feedback ' + nextLabel, exact: true })).toBeEnabled();
+  await expect(page.locator('#comparison-error')).toContainText('four separate integer ratings from 1 to 5');
+  expect((await savedComparison()).slots.filter(slot => slot.rating)).toHaveLength(1);
+  await page.getByLabel(nextLabel + ' Usefulness', { exact: true }).fill('1.5');
+  await page.getByRole('button', { name: 'Save feedback ' + nextLabel, exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Save feedback ' + nextLabel, exact: true })).toBeEnabled();
+  await expect(page.locator('#comparison-error')).toContainText('four separate integer ratings from 1 to 5');
+  await page.getByLabel(nextLabel + ' Usefulness', { exact: true }).fill('3');
+  await page.getByLabel(nextLabel + ' Rating reason', { exact: true }).fill('');
+  await page.getByRole('button', { name: 'Save feedback ' + nextLabel, exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Save feedback ' + nextLabel, exact: true })).toBeEnabled();
+  await expect(page.locator('#comparison-error')).toContainText('short reason');
+  expect((await savedComparison()).slots.filter(slot => slot.rating)).toHaveLength(1);
+  await expect(page.getByRole('button', { name: 'Reveal methods and effort', exact: true })).toBeDisabled();
   await app.close(); app = null; await launch(false);
   await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
   await expect(page.locator('#comparison-score article')).toHaveCount(6);
@@ -246,5 +270,47 @@ test('independent blind aliases bind feedback to actual shown candidates across 
   expect(await page.locator('#comparison-score article').first().locator('pre').innerText()).toBe(shownCandidate);
   await expect(page.getByLabel(firstLabel + ' Surprise', { exact: true })).toHaveValue('5');
   await expect(page.getByLabel(firstLabel + ' Material error', { exact: true })).toBeChecked();
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#comparison-slots article')).toHaveCount(6);
+    await other.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
+    await expect(other.locator('#comparison-score article')).toHaveCount(6);
+    await other.getByLabel(firstLabel + ' Rating reason', { exact: true }).fill('A later independently confirmed rating reason.');
+    await other.getByRole('button', { name: 'Save feedback ' + firstLabel, exact: true }).click();
+    await expect(other.locator('#comparison-error')).toHaveText('');
+    await expect.poll(async () => (await savedComparison()).slots.find(slot => slot.candidate?.text === shownCandidate).rating.reason).toBe('A later independently confirmed rating reason.');
+    await page.getByLabel(firstLabel + ' Rating reason', { exact: true }).fill('This stale confirmation must not replace the later feedback.');
+    await page.getByRole('button', { name: 'Save feedback ' + firstLabel, exact: true }).click();
+    await expect(page.locator('#comparison-error')).toContainText('Feedback changed in another view');
+    expect((await savedComparison()).slots.find(slot => slot.candidate?.text === shownCandidate).rating.reason).toBe('A later independently confirmed rating reason.');
+  } finally { await otherApp.close(); }
+  for (const label of blindLabels.slice(1)) {
+    for (const dimension of ['Usefulness', 'Surprise', 'Grounding', 'Ease of testing']) await page.getByLabel(label + ' ' + dimension, { exact: true }).fill('3');
+    await page.getByLabel(label + ' Rating reason', { exact: true }).fill('Authored exploratory judgment; a generation failure is distinct from grounded abstention.');
+    await page.getByRole('button', { name: 'Save feedback ' + label, exact: true }).click();
+    await expect(page.locator('#comparison-score article').filter({ has: page.getByRole('heading', { name: label, exact: true }) })).toContainText('Feedback saved');
+  }
+  const fullyScored = await savedComparison();
+  expect(fullyScored.slots.filter(slot => slot.rating)).toHaveLength(6);
+  await expect(page.getByRole('button', { name: 'Reveal methods and effort', exact: true })).toBeEnabled();
+  await expect(page.locator('#comparison-reveal')).toBeEmpty();
+  await page.getByRole('button', { name: 'Reveal methods and effort', exact: true }).click();
+  await expect(page.locator('#comparison-reveal article')).toHaveCount(6);
+  for (const entry of fullyScored.blindOrder) {
+    const slot = fullyScored.slots.find(item => item.id === entry.slotId);
+    const audit = page.locator('#comparison-reveal article').filter({ has: page.getByRole('heading', { name: entry.label, exact: true }) });
+    await expect(audit).toContainText(slot.method);
+    await expect(audit).toContainText(slot.package.text);
+    await expect(audit).toContainText(slot.reply);
+    await expect(audit).toContainText('controlled-fixture-not-live');
+    await expect(audit).toContainText(slot.usageEvidence);
+  }
+  await expect(page.locator('#comparison-reveal')).toContainText('No equal consumption');
+  const final = await savedComparison();
+  expect(final.revealedAt).toBeTruthy();
+  expect(final.slots.find(slot => slot.candidate?.text === shownCandidate).rating.materialError).toBe(true);
+  expect(final.slots.find(slot => slot.candidate?.text === shownCandidate).rating.surprise).toBe(5);
+  expect(final).not.toHaveProperty('compositeScore');
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
