@@ -2,15 +2,20 @@ const readline = require('node:readline');
 const fs = require('node:fs');
 const path = require('node:path');
 const root = process.argv[2], home = process.env.CODEX_HOME;
-let signedIn = false, loginId = 'fixture-login', sequence = 0, active;
+let signedIn = false, loginId = 'fixture-login', sequence = 0, active, output = Promise.resolve();
+const write = bytes => new Promise((resolve, reject) => process.stdout.write(bytes, error => error ? reject(error) : resolve()));
 const send = message => {
   const bytes = Buffer.from(JSON.stringify(message) + '\n');
   const emoji = bytes.indexOf(Buffer.from('🎸'));
-  if (emoji < 0) process.stdout.write(bytes);
-  else {
-    process.stdout.write(bytes.subarray(0, emoji + 2));
-    setTimeout(() => process.stdout.write(bytes.subarray(emoji + 2)), 15);
-  }
+  // Split a UTF-8 character without interleaving another JSON frame into this one.
+  output = output.then(async () => {
+    if (emoji < 0) await write(bytes);
+    else {
+      await write(bytes.subarray(0, emoji + 2));
+      await new Promise(resolve => setTimeout(resolve, 15));
+      await write(bytes.subarray(emoji + 2));
+    }
+  }).catch(() => process.exit(24));
 };
 const notify = (method, params) => send({ method, params });
 readline.createInterface({ input: process.stdin }).on('line', line => {
