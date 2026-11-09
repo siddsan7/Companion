@@ -510,3 +510,83 @@ test('explicit reviewed note settings restore keeps current defaults and convers
   expect(await fs.readFile(path.join(root, 'conversations', name), 'utf8')).toBe(recordBefore);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(before.calls);
 });
+
+async function createSafetyArchive() {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic ARCHIVE_SAFETY_HISTORY 🎸.' }), 'utf8');
+  await launch();
+  await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  const readme = path.join(root, 'README.md');
+  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
+  await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]), 'utf8');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  await page.getByLabel('Context question', { exact: true }).fill('How could retrieval help MyTune?');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_SAFETY_HISTORY');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const file = path.join(root, 'safety-history.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: file, open: file }), 'utf8');
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(region).toContainText('Archive exported');
+  const text = await fs.readFile(file, 'utf8'), archive = JSON.parse(text);
+  return { file, text, archive, record: archive.payload.conversations[0] };
+}
+async function archiveSafetyState() {
+  const optional = async name => fs.readFile(path.join(root, name), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const scopes = {};
+  for (const directory of (await fs.readdir(root)).filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) scopes[directory] = await optional(path.join(directory, 'notes.json'));
+  return { history: await tree(path.join(root, 'conversations')), vault: await tree(path.join(root, 'vault')), settings: await optional('settings.json'), scopes, schedule: await optional('schedule.json'), task: await optional('scheduler-task.json'), calls: await optional('conversation-submissions.jsonl') };
+}
+test('invalid archive inputs and a file changed after matched preview preserve current history and authority', async () => {
+  test.setTimeout(150000);
+  const valid = await createSafetyArchive();
+  const before = await archiveSafetyState();
+  const tampered = JSON.parse(valid.text); tampered.payload.conversations[0].requests[0].reply = 'CHANGED_UNREVIEWED_REPLY';
+  const future = JSON.parse(valid.text); future.version = 999;
+  const unknown = JSON.parse(valid.text); unknown.effectiveReadiness = true;
+  const cases = [
+    ['tampered.json', Buffer.from(JSON.stringify(tampered), 'utf8'), /integrity check failed/],
+    ['future.json', Buffer.from(JSON.stringify(future), 'utf8'), /Unsupported history archive format or version/],
+    ['invalid-utf8.json', Buffer.from([0x7b, 0xff, 0x7d]), /encoded data|utf-8|UTF-8/],
+    ['duplicate.json', Buffer.from(valid.text.replace('"version": 1,', '"version": 1, "version": 1,'), 'utf8'), /Duplicate archive JSON member/],
+    ['truncated.json', Buffer.from(valid.text.slice(0, -24), 'utf8'), /Incomplete archive JSON|Invalid archive JSON/],
+    ['unknown-authority.json', Buffer.from(JSON.stringify(unknown), 'utf8'), /unsupported data/],
+  ];
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  for (const [name, bytes, refusal] of cases) {
+    const file = path.join(root, name); await fs.writeFile(file, bytes);
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: file }), 'utf8');
+    await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+    await expect(region.locator('#archive-restore-summary')).toContainText(refusal);
+    await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+    expect(await archiveSafetyState()).toEqual(before);
+  }
+  await app.close(); app = null;
+  await fs.unlink(path.join(root, 'conversations', `${valid.record.id}.json`));
+  const missingBefore = await archiveSafetyState();
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: valid.file }), 'utf8');
+  const restore = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await restore.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(restore).toContainText('Integrity and version validated');
+  await restore.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await restore.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(restore.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+  await fs.writeFile(valid.file, JSON.stringify(tampered), 'utf8');
+  await restore.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect(restore.locator('#archive-restore-summary')).toContainText('Archive file changed since inspection');
+  expect(await archiveSafetyState()).toEqual(missingBefore);
+  await expect(restore.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+});
