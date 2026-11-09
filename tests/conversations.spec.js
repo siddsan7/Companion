@@ -681,6 +681,53 @@ test('explicit conversation selection preserves independent brief pins and resum
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
 
+test('late completion of conversation A preserves the explicitly reviewed new conversation B draft', async () => {
+  test.setTimeout(90000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ holdCompletion: true, messages: [
+    { delta: 'Authored synthetic A_PENDING_VIEW_CANARY.', text: 'Authored synthetic A_LATE_COMPLETION_CANARY.', phase: 'final_answer' }
+  ] }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('A_PENDING_VIEW_CANARY');
+  const a = await onlyConversation(); expect(a.requests[0].status).toBe('inProgress');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Conversation brief version', { exact: true }).fill('1');
+  const questionB = 'B_DRAFT_VIEW_CANARY: what can spaced retrieval support independently?';
+  await page.getByLabel('Context question', { exact: true }).fill(questionB); await selectCapture();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/B_DRAFT_VIEW_CANARY/);
+  const reviewedB = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  expect(reviewedB).not.toMatch(/A_PENDING_VIEW_CANARY|A_LATE_COMPLETION_CANARY/);
+  await expect(page.locator('#conversation-history article')).toHaveCount(0);
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}');
+  await expect.poll(async () => (await onlyConversation()).requests[0].status).toBe('completed');
+  // A normal capture round trip after terminal publication also lets queued renderer replies settle.
+  await page.getByLabel('Thought or link', { exact: true }).fill('Capture after A completes while B remains a draft.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  await expect(page.getByLabel('Retained conversation', { exact: true })).toHaveValue('');
+  await expect(page.getByLabel('Context question', { exact: true })).toHaveValue(questionB);
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toHaveValue('1');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toBeEnabled();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(reviewedB);
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await expect(page.locator('#conversation-history article')).toHaveCount(0);
+  const completedA = await onlyConversation(); expect(completedA.requests).toHaveLength(1);
+  expect(completedA.requests[0].reply).toContain('A_LATE_COMPLETION_CANARY');
+  expect((await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n')).toHaveLength(1);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic B_REVIEWED_COMPLETION_CANARY.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('B_REVIEWED_COMPLETION_CANARY');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).not.toContainText('A_LATE_COMPLETION_CANARY');
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions).toHaveLength(2); expect(submissions[1].text).toBe(reviewedB);
+  expect(submissions[0].threadId).not.toBe(submissions[1].threadId);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(a.id);
+  await expect(page.locator('#conversation-history')).toContainText('A_LATE_COMPLETION_CANARY');
+  await expect(page.locator('#conversation-history')).not.toContainText('B_REVIEWED_COMPLETION_CANARY');
+});
+
 // Authored main-process capacity evidence is a controlled boundary, never live readiness.
 const capacityEvidence = () => ({
   capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'Authored synthetic capacity proof v1', harnessAndOutputEvidence: 'Authored synthetic harness and output proof v1' },
