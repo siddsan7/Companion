@@ -189,6 +189,39 @@ test('changed comparison proof during thread preflight blocks turn start while c
   await expect(page.getByRole('status')).toContainText('Capture saved.');
 });
 
+test('changed pinned brief input before comparison dispatch starts no provider thread or turn', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', messages: [{ phase: 'final_answer', text: 'NO_OUTPUT_AFTER_BRIEF_INPUT_CHANGE' }] }), 'utf8');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'comparison-before-dispatch' }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  const pinned = await savedComparison();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('comparison-before-dispatch');
+  await fs.appendFile(path.join(root, 'README.md'), '\nA newly supplied constraint requires a fresh brief review.\n', 'utf8');
+  await fs.writeFile(path.join(root, 'release.txt'), 'release', 'utf8');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('failed');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('Pinned approved brief or its selected inputs changed');
+  const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(0);
+  expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(0);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
+  const saved = await savedComparison();
+  expect(saved.brief).toEqual(pinned.brief);
+  expect(saved.slots.filter(slot => slot.status === 'failed')).toHaveLength(1);
+  await page.getByLabel('Thought or link', { exact: true }).fill('Capture survives stale comparison brief inputs.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+});
+
 test('an active comparison poll cannot authorize overwriting an external history edit', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
