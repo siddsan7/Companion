@@ -313,3 +313,80 @@ for (const removed of ['capture', 'snapshot']) test(`durable restoration admissi
   await expect(page.getByRole('status')).toContainText('Restoration');
   expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
 });
+
+async function pauseSelectedRestoration(boundary) {
+  await artifact('first', '1'); await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now' }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures['a'.repeat(64)];
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(root, 'producer', 'first'));
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await expect(restoration.getByRole('button', { name: 'Confirm source restoration', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }));
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+  return { base, ledgerFile, original, id: capture.id, capture };
+}
+async function exitMain(boundary, testInfo) {
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  evidence.wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  await fs.writeFile(testInfo.outputPath('restoration-boundary-processes.json'), JSON.stringify(evidence, null, 2), 'utf8'); app = null;
+}
+
+for (const edited of ['capture', 'snapshot']) test(`restoration activation revalidates the ${edited} after its final publication boundary`, async () => {
+  test.setTimeout(90000);
+  const { base, ledgerFile, original, id } = await pauseSelectedRestoration('capture-restoration-published');
+  const published = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = published.captures['a'.repeat(64)];
+  expect(published.sourceAuthority[id].phase).toBe('restoring');
+  expect(published.sourceAuthority[id].restoration.published).toBe(true);
+  expect(published.suppressed).toContain('a'.repeat(64));
+  const file = edited === 'capture' ? path.join(base, 'Captures', capture.file) : path.join(base, 'Revisions', capture.currentRevision + '.json');
+  await fs.appendFile(file, '\nIndependent edit after publication verification.\n');
+  const changedBytes = await fs.readFile(file);
+  await expect(page.getByRole('status')).toContainText('Restoring selected source');
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+  await expect(page.getByRole('status')).not.toContainText('Restoring selected source');
+  const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(held.sourceAuthority[id].phase).toBe('restoring');
+  expect(held.suppressed).toContain('a'.repeat(64));
+  expect(held.attempts).toEqual(original.attempts);
+  expect(await fs.readFile(file)).toEqual(changedBytes);
+  await app.close(); app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).suppressed).toContain('a'.repeat(64));
+  expect(await fs.readFile(file)).toEqual(changedBytes);
+  await expect(page.locator('#captures article')).toHaveCount(0);
+});
+
+for (const parent of ['Captures', 'Revisions']) test(`restoration rejects a replaced ${parent} parent before pre-admission recovery`, async ({}, testInfo) => {
+  test.setTimeout(90000);
+  const { base, ledgerFile, original, id, capture } = await pauseSelectedRestoration('capture-restoration-authorized');
+  const authorized = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(authorized.sourceAuthority[id].phase).toBe('restoring');
+  await exitMain('capture-restoration-authorized', testInfo);
+  await fs.writeFile(path.join(root, 'faults.json'), '{}');
+  const directory = path.join(base, parent); await fs.rename(directory, directory + '.original'); await fs.mkdir(directory);
+  await fs.writeFile(path.join(directory, 'independent.txt'), 'Independent replacement directory sentinel.');
+  await launch();
+  const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(held.sourceAuthority[id].phase).toBe('restoring');
+  expect(held.suppressed).toContain('a'.repeat(64));
+  expect(held.attempts).toEqual(original.attempts); expect(held.admissions).toBeUndefined();
+  expect(await fs.readdir(directory)).toEqual(['independent.txt']);
+  expect(await fs.readFile(path.join(directory, 'independent.txt'), 'utf8')).toBe('Independent replacement directory sentinel.');
+  expect(await fs.access(path.join(base, 'Captures', capture.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  await expect(page.locator('#captures article')).toHaveCount(0);
+});
