@@ -133,9 +133,9 @@ class Vault {
     const note = await this.find(id);
     if (hash(note.content) !== this.expected.get(id)) throw Error('This note changed outside Companion. Reopen Companion to inspect it before editing.');
     const content = withTitle(note.content, title.trim());
+    const authority = (await new (require('./intake').Intake)(this).load()).sourceAuthority?.[id];
     // Fully write ownership before publishing the exclusive lock. A crash cannot leave a partial lock.
     await this.acquire(note.file);
-    const authority = (await new (require('./intake').Intake)(this).load()).sourceAuthority?.[id];
     const transaction = { expectedHash: hash(note.content), content, backup: `${path.basename(note.file)}.before-title-${randomUUID()}.bak`, ...(authority?.phase === 'active' ? { sourceGeneration: authority.generation } : {}) };
     try {
       const current = await fs.readFile(note.file, 'utf8'); if (hash(current) !== hash(note.content)) throw Error('The note changed. Your file was preserved.');
