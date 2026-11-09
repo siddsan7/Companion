@@ -130,6 +130,7 @@ test('repairing a damaged artifact retains its imported attempt identity without
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.locator('#held-imports')).toContainText('Notes do not match');
   await app.close(); app = null; await launch();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(dir, 'notes.md'));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Intake check complete');

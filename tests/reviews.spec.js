@@ -330,7 +330,9 @@ for (const successor of ['draft', 'review']) test(`external writing on reviewed 
   expect(annotations).toHaveLength(1);
   const annotation = await fs.readFile(path.join(base, 'Annotations', annotations[0]), 'utf8');
   expect(annotation).toContain('My reviewed external writing.'); expect(annotation).toContain('../../Moved%20reviewed%20source.md');
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await check();
   expect(await fs.readFile(moved, 'utf8')).toBe(managed); expect(await snapshots()).toHaveLength(2);
   await expect(page.locator('#held-imports')).toContainText(successor === 'review' ? 'Choose the current reviewed revision' : 'No held imports.');
   if (successor === 'review') {
