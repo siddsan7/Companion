@@ -138,6 +138,8 @@
     try {
       const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
       if (version !== conversationGeneration) return;
+      // A completed restore is one reviewed action, not permission to undo future exclusions.
+      restoredSources.clear(); restoredHistory.clear();
       conversationToken = preview.packageId; byId('conversation-package').value = preview.text;
       historyExclusions = preview.historyExclusions; warnHistory();
       byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${conversationId ? 'Reviewed exclusion scope saved locally. ' : ''}${preview.boundEvidence} ${preview.warnings.join(' ')}`;
