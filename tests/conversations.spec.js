@@ -2159,3 +2159,128 @@ test('conversation deletion guards preserve an externally altered target after t
   expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
 });
+
+async function exportHistoryForGeneration(targetPage, destination) {
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination, open: destination }), 'utf8');
+  const region = targetPage.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(targetPage.locator('#archive-summary')).toContainText('Archive exported');
+}
+async function restoreHistoryForGeneration(targetPage, destination) {
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: destination }), 'utf8');
+  const region = targetPage.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(targetPage.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect(targetPage.locator('#archive-restore-summary')).toContainText('Restored 1 conversation');
+}
+async function deleteHistoryForGeneration(targetPage) {
+  await targetPage.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(targetPage.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await targetPage.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(targetPage.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+}
+
+test('archive generation restoration retains current exclusions and only a fresh explicit scope review can change them', async () => {
+  test.setTimeout(180000);
+  const canary = 'ARCHIVE_GENERATION_SCOPE_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${canary}: retain the original historical writing.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const directory = path.join(root, 'conversations'), name = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), historyFile = path.join(directory, name);
+  const original = JSON.parse(await fs.readFile(historyFile, 'utf8')), captureKey = original.requests[0].package.dependencies.find(dep => dep.key.startsWith('capture:')).key;
+  const sourceDirectory = path.join(root, 'vault', 'Companion', 'Captures'), sourceFile = path.join(sourceDirectory, (await fs.readdir(sourceDirectory)).find(name => name.endsWith('.md'))), sourceBytes = await fs.readFile(sourceFile, 'utf8');
+  const optionalLedger = () => fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const ledgerBytes = await optionalLedger(), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const archive = path.join(root, 'older-generation-history.json'); await exportHistoryForGeneration(page, archive);
+  const archiveBytes = await fs.readFile(archive, 'utf8');
+  expect(JSON.parse(archiveBytes).payload.conversations[0].scope.excludedHistory).toEqual([]);
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Keep both the source and the original turn excluded.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Keep both the source/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_GENERATION_SCOPE_12_CANARY|Spaced retrieval/);
+  const excluded = JSON.parse(await fs.readFile(historyFile, 'utf8'));
+  await deleteHistoryForGeneration(page);
+  const controlFile = path.join(directory, '.control', `${original.id}.json`), tombstone = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(tombstone.scope.excludedSources).toContain(captureKey); expect(tombstone.scope.excludedHistory).toContain(original.requests[0].id);
+  await restoreHistoryForGeneration(page, archive);
+  let restored = JSON.parse(await fs.readFile(historyFile, 'utf8')), active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(active.phase).toBe('active'); expect(active.generation).not.toBe(tombstone.generation); expect(restored.generation).toBe(active.generation);
+  expect(restored.requests).toEqual(original.requests); expect(restored.brief).toEqual(original.brief);
+  expect(restored.scope.excludedSources).toEqual(excluded.scope.excludedSources); expect(restored.scope.excludedHistory).toEqual(excluded.scope.excludedHistory);
+  expect(active.scope.excludedSources).toEqual(excluded.scope.excludedSources); expect(active.scope.excludedHistory).toEqual(excluded.scope.excludedHistory);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await page.getByLabel('Context question', { exact: true }).fill('Continue respecting restored exclusions.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/respecting restored exclusions/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_GENERATION_SCOPE_12_CANARY|Spaced retrieval/);
+  // A new explicit selection and checkbox restore can change current scope; old archive bytes cannot.
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: deliberately restore the source and its historical turn.');
+  await selectCapture();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/ARCHIVE_GENERATION_SCOPE_12_CANARY/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Spaced retrieval/);
+  restored = JSON.parse(await fs.readFile(historyFile, 'utf8')); active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(restored.scope.excludedSources).not.toContain(captureKey); expect(restored.scope.excludedHistory).not.toContain(original.requests[0].id);
+  expect(active.scope.excludedSources).toEqual(restored.scope.excludedSources); expect(active.scope.excludedHistory).toEqual(restored.scope.excludedHistory);
+  const firstActiveGeneration = active.generation;
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Keep the newer reviewed source and history exclusions.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/newer reviewed source/);
+  active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(active.scope.excludedSources).toContain(captureKey); expect(active.scope.excludedHistory).toContain(original.requests[0].id);
+  await deleteHistoryForGeneration(page); await restoreHistoryForGeneration(page, archive);
+  restored = JSON.parse(await fs.readFile(historyFile, 'utf8')); active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+  expect(active.phase).toBe('active'); expect(active.generation).not.toBe(firstActiveGeneration); expect(restored.generation).toBe(active.generation);
+  expect(active.scope.excludedSources).toContain(captureKey); expect(active.scope.excludedHistory).toContain(original.requests[0].id);
+  expect(restored.scope.excludedSources).toContain(captureKey); expect(restored.scope.excludedHistory).toContain(original.requests[0].id);
+  expect(await fs.readFile(archive, 'utf8')).toBe(archiveBytes); expect(await fs.readFile(sourceFile, 'utf8')).toBe(sourceBytes); expect(await optionalLedger()).toBe(ledgerBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('archive generation restoration fences a stale other-instance unsaved overlay even when old durable bytes return', async () => {
+  test.setTimeout(150000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  const oldBytes = await fs.readFile(savedFile, 'utf8'), old = JSON.parse(oldBytes), controlFile = path.join(root, 'conversations', '.control', `${old.id}.json`);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(other.locator('#conversation-history')).toContainText('DURABLE_PREFIX');
+    await expect(other.locator('#conversation-history')).toContainText('interrupted');
+    const archive = path.join(root, 'overlay-generation-history.json');
+    await exportHistoryForGeneration(other, archive);
+    await deleteHistoryForGeneration(other);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    await restoreHistoryForGeneration(other, archive);
+    const freshBytes = await fs.readFile(savedFile, 'utf8'), fresh = JSON.parse(freshBytes), active = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+    expect(active.phase).toBe('active'); expect(fresh.generation).toBe(active.generation);
+    expect(fresh.generation).not.toBe(old.generation);
+    // Exact old baseline bytes do not restore the old overlay's local generation authority.
+    await fs.writeFile(savedFile, oldBytes, 'utf8');
+    await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|unavailable|unsaved|generation/i);
+    expect(await fs.readFile(savedFile, 'utf8')).toBe(oldBytes);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    await fs.writeFile(savedFile, freshBytes, 'utf8');
+    await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|unavailable|unsaved|generation/i);
+    expect(await fs.readFile(savedFile, 'utf8')).toBe(freshBytes);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    expect(JSON.parse(await fs.readFile(controlFile, 'utf8'))).toEqual(active);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  } finally { await otherApp.close(); }
+});
