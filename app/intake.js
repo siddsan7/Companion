@@ -327,9 +327,13 @@ class Intake {
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
     await fs.unlink(intentFile);
   }
+  async publicationAuthority(tx, ledger) {
+    assertPublication(ledger, tx.capture.id, tx);
+    if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
+  }
   async finish(tx, ledger) {
     this.validateTransaction(tx);
-    assertPublication(ledger, tx.capture.id, tx);
+    await this.publicationAuthority(tx, ledger);
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
     const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
@@ -337,6 +341,7 @@ class Intake {
       try { await fs.writeFile(file, content, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(file) !== content) throw Error('Immutable import file conflicts. Preserve the vault for repair.'); }
     };
     const staged = async (file, content, peer) => {
+      await this.publicationAuthority(tx, ledger);
       const info = await this.ownedFile(file, peer, 'Unsafe import staging file');
       const existing = await read(file);
       if (existing !== null && existing !== content) {
@@ -347,6 +352,7 @@ class Intake {
       await this.ownedFile(file, peer, 'Unsafe import staging file');
     };
     await staged(snapshotStage, snapshotBytes, snapshot); await this.vault.checkpoint('intake-snapshot-staged');
+    await this.publicationAuthority(tx, ledger);
     if (!await this.ownedFile(snapshotStage, snapshot, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
     await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
     try { await fs.link(snapshotStage, snapshot); } catch (error) {
@@ -367,7 +373,7 @@ class Intake {
       if (tx.previousHash !== null) {
         if (old === null) {
           if (current === null || hash(current) !== tx.previousHash) throw conflict('Destination changed outside Companion. Both source revision and local writing were preserved.');
-          try { await this.vault.checkpoint('intake-before-move'); await fs.rename(destination, backup); }
+          try { await this.vault.checkpoint('intake-before-move'); await this.publicationAuthority(tx, ledger); await fs.rename(destination, backup); }
           catch (error) { if (['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw deferred('Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.'); throw error; }
           await this.vault.checkpoint('intake-moved'); old = await read(backup); current = await read(destination);
         }
@@ -376,10 +382,12 @@ class Intake {
       if (current !== null) throw conflict('Destination changed outside Companion. The new destination was preserved.');
       await staged(stage, tx.content, destination);
       await this.vault.checkpoint('intake-capture-staged');
+      await this.publicationAuthority(tx, ledger);
       if (!await this.ownedFile(stage, destination, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
       try { await fs.link(stage, destination); } catch (error) { if (error.code !== 'EEXIST') throw error; await this.ownedFile(destination, [stage, backup], 'Capture destination'); if (await read(destination) !== tx.content) throw conflict('External edit conflict. The new destination was preserved.'); }
     }
     await this.vault.checkpoint('intake-published');
+    await this.publicationAuthority(tx, ledger);
     await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
     await this.ownedFile(destination, [stage, backup], 'Capture destination');
     await this.ownedFile(backup, destination, 'Previous capture backup');
@@ -391,6 +399,7 @@ class Intake {
     ledger.outcomes[tx.key] = outcome; ledger.attempts[tx.revision.identity] ||= outcome;
     if (tx.sourceGeneration) { ledger.admissions ||= {}; const existing = ledger.admissions[tx.revision.id]; if (existing && JSON.stringify(existing) !== JSON.stringify(outcome)) throw Error('Revision admission changed.'); ledger.admissions[tx.revision.id] = outcome; }
     delete ledger.pending[tx.sourceHash];
+    await this.publicationAuthority(tx, ledger);
     await this.save(ledger); await this.vault.checkpoint('intake-ledger');
     this.vault.expected.set(tx.capture.id, tx.capture.currentHash);
     for (const file of [stage, snapshotStage]) await fs.unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; });
