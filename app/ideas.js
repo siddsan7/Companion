@@ -6,6 +6,7 @@ const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
+const { generations, sameEvidence, sameGenerations } = require('./source-generations');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -102,7 +103,7 @@ class Ideas {
       if (data.support_attribution_unavailable !== false) warnings.push('Source attribution is unknown or unavailable; retained writing is not verified support.');
       if (!Array.isArray(dependencies)) warnings.push('Recorded source dependency attribution is unavailable.');
       else for (const dep of dependencies) {
-        if (!dep || typeof dep !== 'object' || Array.isArray(dep) || Object.keys(dep).some(key => !['capture_id', 'revision_id', 'content_sha256'].includes(key)) || !uuid(dep.capture_id) || ids.has(dep.capture_id) || (dep.revision_id !== undefined) === (dep.content_sha256 !== undefined) || dep.revision_id !== undefined && !uuid(dep.revision_id) || dep.content_sha256 !== undefined && (typeof dep.content_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(dep.content_sha256))) {
+        if (!dep || typeof dep !== 'object' || Array.isArray(dep) || Object.keys(dep).some(key => !['capture_id', 'revision_id', 'content_sha256', 'source_generation'].includes(key)) || !uuid(dep.capture_id) || ids.has(dep.capture_id) || dep.source_generation !== undefined && !uuid(dep.source_generation) || (dep.revision_id !== undefined) === (dep.content_sha256 !== undefined) || dep.revision_id !== undefined && !uuid(dep.revision_id) || dep.content_sha256 !== undefined && (typeof dep.content_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(dep.content_sha256))) {
           warnings.push('Recorded source dependency identity is unknown, ambiguous or damaged.'); continue;
         }
         ids.add(dep.capture_id);
@@ -213,14 +214,14 @@ class Ideas {
       const entry = entries.length === 1 ? entries[0] : null, capture = entry?.[1];
       const authorityKey = captureId || dep.key;
       const authority = { identityChoice: ledger.identityChoices?.[authorityKey] || null, identityIssue: ledger.identityIssues?.[authorityKey] || null, ...(capture ? { sourceHash: entry[0], file: capture.relative || capture.file, currentRevision: capture.currentRevision, currentHash: capture.currentHash, removed: !!capture.removed, rejected: !!capture.rejected, supportEligible: capture.supportEligible !== false, conflict: !!capture.conflict, pending: !!ledger.pending?.[entry[0]], blocked: !!ledger.blocks?.[entry[0]], suppressed: ledger.suppressed.includes(entry[0]) } : {}) };
-      state.push({ key: dep.key, originalDigest: dep.digest, currentDigest: source?.digest || null, excluded, authority, warnings: source?.warnings || [] });
+      state.push({ key: dep.key, originalDigest: dep.digest, currentDigest: source?.digest || null, originalSourceGenerations: generations(dep.sourceGenerations), currentSourceGenerations: source ? generations(source.sourceGenerations) : null, excluded, authority, warnings: source?.warnings || [] });
       if (!source || excluded) {
         unavailable = true; warnings.push(`Supporting context ${dep.key} is currently unavailable or excluded. Retained writing is independent; no current support is claimed.`);
-      } else if (source.digest !== dep.digest) {
+      } else if (!sameEvidence(source, dep)) {
         // An imported citation can retain exact admitted historical evidence even
         // after the current capture changes. Ordinary captures lack that snapshot.
         let historical = false;
-        if (captureId && dep.revisionId) {
+        if (captureId && dep.revisionId && sameGenerations(source, dep)) {
           try {
             const retained = await this.revision(vault, captureId, dep.revisionId);
             historical = retained.warnings.length === 0;
@@ -256,7 +257,10 @@ class Ideas {
       this.guard(vault);
       return { operation: retained.operation, text: retained.text, destination: retained.destination, warnings: [...retained.warnings] };
     }
-    const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => ({ capture_id: dep.captureId || dep.key.slice(8), ...(dep.revisionId ? { revision_id: dep.revisionId } : { content_sha256: dep.digest }) }));
+    const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => {
+      const captureId = dep.captureId || dep.key.slice(8), generation = generations(dep.sourceGenerations).find(item => item.captureId === captureId)?.generation;
+      return { capture_id: captureId, ...(dep.revisionId ? { revision_id: dep.revisionId } : { content_sha256: dep.digest }), ...(generation ? { source_generation: generation } : {}) };
+    });
     const unsupported = support.unavailable || request.status !== 'completed' || request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
     const id = identity?.id || randomUUID(), operation = identity?.operation || randomUUID();
     const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: identity?.createdAt || this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations, origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
