@@ -386,7 +386,13 @@ async function finishManualRestoration(intake, ledger, id) {
   for (const [file, peers, expected] of [[stage, [destination], authority.manual.currentHash], [journal, [], restoration.sha256]]) {
     await guardRestorationParents(intake, authority);
     const info = await intake.ownedFile(file, peers, 'Manual restoration cleanup');
-    if (info) { if (hash(await fs.readFile(file)) !== expected) throw changed(); await fs.unlink(file); }
+    if (info) {
+      if (file === stage && (info.nlink !== 2n || String(info.dev) !== restoration.publication.dev || String(info.ino) !== restoration.publication.ino || String(info.size) !== restoration.publication.bytes)) throw Error('Manual restoration stage identity changed. The replacement was preserved for explicit review.');
+      if (hash(await fs.readFile(file)) !== expected) throw changed();
+      const fresh = await intake.ownedFile(file, peers, 'Manual restoration cleanup');
+      if (!fresh || fresh.dev !== info.dev || fresh.ino !== info.ino || fresh.size !== info.size || fresh.nlink !== info.nlink) throw changed();
+      await fs.unlink(file);
+    }
   }
   await verify(); await vault.checkpoint('capture-restoration-published'); await verify();
   authority.phase = 'active'; delete authority.restoration; await intake.save(ledger);
