@@ -1,7 +1,37 @@
 (() => {
   const byId = id => document.getElementById(id);
+  const conversation = document.createElement('section'); conversation.id = 'conversation-section'; conversation.setAttribute('aria-label', 'Project conversations');
+  conversation.innerHTML = '<h2>Project conversations</h2><p id="conversation-location"></p><label>Conversation brief version<input id="conversation-brief" type="number" min="1" value="1"></label><label><input id="conversation-speculation" type="checkbox">Allow beyond-evidence speculation</label><button id="conversation-preview">Preview conversation</button><label>Reviewed conversation package<textarea id="conversation-package" rows="14" readonly></textarea></label><p id="conversation-summary"></p><button id="conversation-send" disabled>Send reviewed package</button><p id="conversation-error" role="alert"></p><div id="conversation-history"></div>';
+  byId('context-section').after(conversation);
+  let conversationId = null, conversationToken = null, conversationGeneration = 0;
+  let displayedHistory = '';
+  const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; };
+  function showConversation(record) {
+    const revision = JSON.stringify(record.requests);
+    if (revision !== displayedHistory) { invalidateConversation(); displayedHistory = revision; }
+    conversationId = record.id; byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
+    byId('conversation-error').textContent = record.storageWarning || '';
+    byId('conversation-history').replaceChildren();
+    for (const request of record.requests) {
+      const article = document.createElement('article'), state = document.createElement('p'), question = document.createElement('pre'), reply = document.createElement('pre');
+      state.textContent = `${request.status}${request.status === 'completed' ? '' : ' — incomplete'} · ${request.evidence || 'provider evidence unavailable'} · ${request.id}${request.error ? ` · ${request.error}` : ''}`;
+      question.textContent = request.question; reply.textContent = request.reply; article.append(state, question, reply); byId('conversation-history').append(article);
+      if (request.status === 'failed' || request.status === 'interrupted') {
+        const retry = document.createElement('button'); retry.textContent = 'Retry or edit request';
+        retry.onclick = () => {
+          byId('context-question').value = request.question; byId('conversation-speculation').checked = request.speculation === true;
+          selections = []; excluded.clear(); selected(); clearPreview();
+          byId('conversation-summary').textContent = 'Explicit retry: inspect and select current sources, then preview and send a new request. Earlier partial output stays incomplete.';
+        }; article.append(retry);
+      }
+    }
+  }
+  async function restoreConversation() {
+    try { const state = await window.companion['conversation-list'](); byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`; const record = state.conversations.find(item => item.id === conversationId) || state.conversations.at(-1); if (record && JSON.stringify(record.requests) !== displayedHistory) showConversation(record); }
+    catch (error) { byId('conversation-error').textContent = error.message; }
+  }
   let selections = [], all = [], generation = 0; const excluded = new Set();
-  const clearPreview = () => { generation++; byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
+  const clearPreview = () => { generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
   const run = async work => { try { byId('context-error').textContent = ''; await work(); } catch (error) { clearPreview(); byId('context-error').textContent = error.message; } };
   const dependentOn = (item, key) => [item.associated, ...(item.associatedIds || [])].some(id => `capture:${id}` === key) || item.projectVersion !== undefined && `brief:${item.projectVersion}` === key;
   function revoke(item) { delete item.approval; delete item.approvedText; delete item.approvalLabel; }
@@ -74,4 +104,23 @@
       clearPreview(); byId('context-error').textContent = error.message;
     }
   };
+  byId('conversation-brief').oninput = invalidateConversation;
+  byId('conversation-speculation').onchange = invalidateConversation;
+  byId('conversation-preview').onclick = async () => {
+    invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
+    try {
+      const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
+      if (version !== conversationGeneration) return;
+      conversationToken = preview.packageId; byId('conversation-package').value = preview.text;
+      byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${preview.boundEvidence} ${preview.warnings.join(' ')}`;
+      byId('conversation-send').disabled = preview.blocked;
+    } catch (error) { if (version === conversationGeneration) byId('conversation-error').textContent = error.message; }
+  };
+  byId('conversation-send').onclick = async () => {
+    const packageId = conversationToken; invalidateConversation();
+    try { showConversation(await window.companion['conversation-send']({ packageId })); }
+    catch (error) { byId('conversation-error').textContent = error.message; }
+  };
+  restoreConversation();
+  setInterval(restoreConversation, 300);
 })();

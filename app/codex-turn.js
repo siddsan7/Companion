@@ -7,7 +7,7 @@ function failureMessage(info) {
   if (['serverOverloaded', 'flexUnavailable'].includes(info)) return 'Codex is temporarily unavailable. Retry explicitly when the service is available.';
   return 'Codex turn failed. The partial reply is incomplete. Check setup and retry explicitly.';
 }
-async function runTurn(setup, text) {
+async function runTurn(setup, text, { beforeStart = async () => {}, onState = async () => {} } = {}) {
   const rpc = setup.rpc;
   const started = await rpc.request('thread/start', { cwd: setup.work, runtimeWorkspaceRoots: [setup.work], permissions: PROFILE, approvalPolicy: 'never', ephemeral: true, environments: [], selectedCapabilityRoots: [], dynamicTools: [], baseInstructions: INSTRUCTIONS, developerInstructions: '' });
   if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !Array.isArray(started.runtimeWorkspaceRoots) || started.runtimeWorkspaceRoots.length !== 1 || !samePath(started.runtimeWorkspaceRoots[0], setup.work) || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
@@ -18,6 +18,15 @@ async function runTurn(setup, text) {
   const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null };
   setup.turnHistory.push(record);
   let turnId, terminal, unexpected = false, resolveTerminal, fatalFailure, historySaved = false;
+  let sinkTail = Promise.resolve(), sinkFailure;
+  const preserve = () => {
+    const snapshot = { threadId, turnId: turnId || null, model: started.model, reply: setup.state.reply };
+    sinkTail = sinkTail.then(() => onState(snapshot)).catch(error => {
+      sinkFailure = error;
+      rpc.close('Cannot preserve the incomplete conversation reply.'); setup.settleTurn?.('interrupted');
+    });
+    return sinkTail;
+  };
   const completed = new Promise(resolve => { resolveTerminal = resolve; });
   setup.settleTurn = status => { terminal = status; resolveTerminal(status); };
   const handler = (method, params) => {
@@ -25,13 +34,14 @@ async function runTurn(setup, text) {
     if (method === 'turn/started' && params.turn?.id) turnId = params.turn.id;
     if (method === 'item/agentMessage/delta' && typeof params.delta === 'string') {
       setup.state.reply += params.delta;
+      preserve();
       if (!setup.replySaveTimer) setup.replySaveTimer = setTimeout(() => { setup.replySaveTimer = null; setup.persist().catch(() => rpc.close('Cannot preserve the incomplete Codex reply.')); }, 50);
     }
     if (method === 'item/started' || method === 'item/completed') {
       if (!['userMessage', 'agentMessage', 'reasoning'].includes(params.item?.type)) {
         unexpected = true; rpc.close('An unselected tool or context item appeared.');
       }
-      if (method === 'item/completed' && params.item?.type === 'agentMessage' && typeof params.item.text === 'string') setup.state.reply = params.item.text;
+      if (method === 'item/completed' && params.item?.type === 'agentMessage' && typeof params.item.text === 'string') { setup.state.reply = params.item.text; preserve(); }
     }
     if (method === 'turn/completed') { turnId = params.turn?.id || turnId; setup.settleTurn(params.turn?.status || 'failed'); }
     if (method === 'error' && params.willRetry !== true) {
@@ -45,14 +55,20 @@ async function runTurn(setup, text) {
   const timeout = setTimeout(() => { rpc.close('Codex turn timed out.'); setup.settleTurn?.('interrupted'); }, 90000);
   try {
     await setup.persist();
+    await preserve();
+    if (sinkFailure) throw Error('Conversation history could not be saved. No model request was sent.');
+    await beforeStart({ threadId, model: started.model });
     historySaved = true;
     const response = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text }], environments: [] });
     turnId = response.turn?.id || turnId;
     if (!turnId) throw Error('Codex did not identify the active turn.');
     setup.activeTurn = { threadId, turnId };
     record.turnId = turnId; await setup.persist();
+    await preserve();
     if (setup.cancelRequested) await rpc.request('turn/interrupt', setup.activeTurn);
     const reported = terminal || await completed;
+    await sinkTail;
+    if (sinkFailure) throw Error('Conversation history could not preserve the complete reply. The retained reply is incomplete.');
     const status = fatalFailure && reported === 'completed' ? 'failed' : reported;
     Object.assign(record, { turnId, status, completedAt: new Date().toISOString() });
     if (unexpected) throw Error('Unselected tool or context item prevented completion.');
@@ -75,6 +91,7 @@ async function runTurn(setup, text) {
     clearTimeout(timeout); clearTimeout(setup.interruptTimer);
     clearTimeout(setup.replySaveTimer); setup.replySaveTimer = null;
     rpc.off('notification', handler); setup.activeTurn = null; setup.settleTurn = null; setup.cancelRequested = false; setup.state.turnActive = false;
+    await sinkTail;
   }
 }
 module.exports = { runTurn };

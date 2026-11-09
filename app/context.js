@@ -215,7 +215,7 @@ class Context {
     const bound = this.verifiedInputBound;
     if (bound !== null && (!Number.isSafeInteger(bound.maxCodePoints) || bound.maxCodePoints < 1 || typeof bound.model !== 'string' || !bound.model.trim() || typeof bound.evidence !== 'string' || !bound.evidence.trim())) throw Error('Verified input bound is invalid. Preview is blocked until its main-process evidence is repaired.');
     const count = [...serialized].length, limit = Math.min(32000, bound?.maxCodePoints || 32000);
-    return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), boundEvidence: bound ? `${bound.model}: ${bound.evidence}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
+    return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), sources: chosen, boundEvidence: bound ? `${bound.model}: ${bound.evidence}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
   }
 }
 function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getVerifiedInputBound = async () => null }) {
@@ -237,5 +237,6 @@ function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getVeri
     await (await store()).include(files); return true;
   }));
   ipcMain.handle('context-exclude', (_, key) => serial(async () => (await store()).exclude(key)));
+  return { store };
 }
 module.exports = { Context, installContext, validateDependencies };
