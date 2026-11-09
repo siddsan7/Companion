@@ -113,6 +113,56 @@ async function selectCapture() {
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
   await page.locator('#context-results article').filter({ hasText: 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
 }
+test('a history-directory junction cannot expose or change outside history and capture stays usable', async ({}, testInfo) => {
+  test.setTimeout(90000);
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-outside-history-'));
+  const directory = path.join(root, 'conversations'), externalHistory = path.join(outside, 'history');
+  let redirected = false;
+  const snapshot = async () => Object.fromEntries(await Promise.all((await fs.readdir(externalHistory)).sort().map(async name => [name, await fs.readFile(path.join(externalHistory, name), 'utf8')])));
+  try {
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic OUTSIDE_HISTORY_PRIVATE_CANARY.' }), 'utf8');
+    await prepareConversation();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('OUTSIDE_HISTORY_PRIVATE_CANARY');
+    await expect(page.locator('#conversation-history')).toContainText('completed');
+    await app.close(); app = null;
+    await fs.rename(directory, externalHistory);
+    const before = await snapshot();
+    const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    await fs.symlink(externalHistory, directory, process.platform === 'win32' ? 'junction' : 'dir'); redirected = true;
+    await launch(false);
+    await expect(page.getByRole('heading', { name: 'Spaced retrieval revisits a learned chord.', exact: true })).toBeVisible();
+    await expect.soft(page.locator('#conversation-error')).toContainText(/ordinary|local history|directory|contained/i);
+    await expect.soft(page.locator('#conversation-section')).not.toContainText('OUTSIDE_HISTORY_PRIVATE_CANARY');
+    await expect.soft(page.getByLabel('Retained conversation', { exact: true }).locator('option')).toHaveCount(1);
+
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await page.getByLabel('Context question', { exact: true }).fill('How could spaced retrieval help MyTune without reading outside history?');
+    await selectCapture();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    // A new draft can be reviewed without stored history; durable intent must still reject the alias.
+    await expect.poll(async () => await page.getByRole('button', { name: 'Send reviewed package', exact: true }).isEnabled() || /ordinary|local history|directory|contained/i.test(await page.locator('#conversation-error').innerText())).toBe(true);
+    if (await page.getByRole('button', { name: 'Send reviewed package', exact: true }).isEnabled()) {
+      await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+      await expect.soft(page.locator('#conversation-error')).toContainText(/ordinary|local history|directory|contained/i);
+    }
+    await expect.soft(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/OUTSIDE_HISTORY_PRIVATE_CANARY/);
+    await page.getByLabel('Thought or link', { exact: true }).fill('Capture remains usable when history is redirected.');
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture saved.');
+    await expect(page.getByRole('heading', { name: 'Capture remains usable when history is redirected.', exact: true })).toBeVisible();
+    await app.close(); app = null;
+    const after = await snapshot();
+    await testInfo.attach('outside-history-boundary.json', { body: JSON.stringify({ before, after }, null, 2), contentType: 'application/json' });
+    expect.soft(after).toEqual(before);
+    expect.soft(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (redirected) await fs.unlink(directory);
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
 test('streamed incomplete replies survive restart and explicit retry uses a fresh App Server thread and request', async () => {
   // First measured complete setup/send/restart was 17.1s; this case adds another explicit turn.
   test.setTimeout(60000);
