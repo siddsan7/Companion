@@ -318,8 +318,9 @@ async function restoreManualConversation(fixture) {
   const ledger = JSON.parse(await fs.readFile(path.join(fixture.base, '.intake', 'ledger.json'), 'utf8'));
   return ledger.sourceAuthority[fixture.id].generation;
 }
-async function previewManualIdea(title) {
-  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).last().click();
+async function previewManualIdea(title, origin = 'last') {
+  const drafts = page.getByRole('button', { name: 'Draft saved idea', exact: true });
+  await (origin === 'first' ? drafts.first() : drafts.last()).click();
   await page.getByLabel('Idea title', { exact: true }).fill(title);
   await page.getByLabel('Idea explanation', { exact: true }).fill('Independent writing: retrieval may inform a practice queue. The transfer has not been tested.');
   await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic evidence; no outcome was measured.');
@@ -358,6 +359,30 @@ test('restored manual source generation supports a newly saved idea while earlie
   await expect(page.locator('#saved-ideas article').filter({ hasText: 'Fresh source interpretation' })).not.toContainText('Review support');
   await expect(page.locator('#saved-ideas article').filter({ hasText: 'Earlier source interpretation' })).toContainText('Review support');
   expect(await fs.readFile(old.file, 'utf8')).toBe(old.text); expect(await fs.readFile(fresh.file, 'utf8')).toBe(fresh.text);
+});
+
+test('drafting an idea from the earlier manual conversation never inherits the restored same-byte source generation', async () => {
+  test.setTimeout(150000);
+  const fixture = await manualConversationForRestoration();
+  const historyDirectory = path.join(root, 'conversations'), name = (await fs.readdir(historyDirectory)).find(name => name.endsWith('.json'));
+  const historyFile = path.join(historyDirectory, name), earlier = JSON.parse(await fs.readFile(historyFile, 'utf8'));
+  const originalPackage = earlier.requests[0].package;
+  const generation = await restoreManualConversation(fixture);
+  const retained = await previewManualIdea('Retained earlier interpretation', 'first');
+  expect(retained.metadata.origin.request_id).toBe(earlier.requests[0].id);
+  expect(retained.metadata.source_dependencies).toEqual([{ capture_id: fixture.id, content_sha256: originalPackage.dependencies.find(dep => dep.captureId === fixture.id).digest }]);
+  expect(retained.metadata.support_attribution_unavailable).toBe(true);
+  expect(retained.text).not.toContain('source_generation: ' + generation);
+  await expect(page.locator('#idea-warnings')).toContainText('unavailable or unverified support');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  const saved = page.locator('#saved-ideas article').filter({ hasText: 'Retained earlier interpretation' });
+  await expect(saved).toBeVisible(); await expect(saved).toContainText('Review support');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByLabel('Manual context source', { exact: true }).locator('option').filter({ hasText: 'Retained earlier interpretation' })).toHaveCount(0);
+  expect(await fs.readFile(retained.file, 'utf8')).toBe(retained.text);
+  const current = JSON.parse(await fs.readFile(historyFile, 'utf8'));
+  expect(current.requests[0].package).toEqual(originalPackage);
+  expect(current.requests[1].package.dependencies.find(dep => dep.captureId === fixture.id).sourceGenerations).toEqual([{ captureId: fixture.id, generation }]);
 });
 
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
