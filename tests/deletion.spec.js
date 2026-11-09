@@ -835,6 +835,34 @@ test('held manual restoration remains inspectable without blocking unrelated cap
   expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id]).toEqual(current);
 });
 
+test('a changed retirement target after preview preserves unique replacement writing and cannot authorize a new manual operation', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const selected = await pauseManualRestoration('capture-restoration-admitted');
+  await exitMain('capture-restoration-admitted', testInfo);
+  await fs.unlink(selected.file); await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
+  const recovery = page.getByLabel('Capture deletion recovery', { exact: true });
+  await expect(recovery).toContainText(selected.id);
+  await recovery.getByLabel('Selected recovery backup file', { exact: true }).fill(selected.backup);
+  await recovery.getByRole('button', { name: 'Preview a new source restoration', exact: true }).click();
+  const preview = recovery.getByLabel('New source restoration preview', { exact: true });
+  await expect(preview.getByRole('button', { name: 'Confirm new source restoration', exact: true })).toBeVisible();
+  const ledgerBytes = await fs.readFile(selected.ledgerFile, 'utf8'), journal = path.join(selected.base, '.intake', selected.authority.restoration.journal), journalBytes = await fs.readFile(journal);
+  const names = (await fs.readdir(path.join(selected.base, '.intake'))).sort(), original = await fs.stat(selected.stage, { bigint: true });
+  const writing = Buffer.from('ONLYCOPY retirement-stage replacement: independently authored text must survive a stale preview.\n', 'utf8');
+  await fs.unlink(selected.stage); await fs.writeFile(selected.stage, writing, { flag: 'wx', flush: true });
+  const replacement = await fs.stat(selected.stage, { bigint: true }); expect(replacement.ino).not.toBe(original.ino);
+  await preview.getByRole('button', { name: 'Confirm new source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('replacement stage');
+  expect(await fs.readFile(selected.stage)).toEqual(writing);
+  expect((await fs.stat(selected.stage, { bigint: true })).ino).toBe(replacement.ino);
+  expect(await fs.readFile(selected.ledgerFile, 'utf8')).toBe(ledgerBytes);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await fs.readdir(path.join(selected.base, '.intake'))).sort()).toEqual(names);
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await fs.readFile(selected.backup)).toEqual(selected.sourceBytes);
+});
+
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
   test.setTimeout(90000);
   await artifact('first', '1'); await launch();
