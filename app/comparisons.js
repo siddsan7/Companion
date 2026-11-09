@@ -46,11 +46,11 @@ class Comparisons {
     const directory = this.safeDirectory(true);
     return withBriefMutation(this.directory, () => { this.safeDirectory(false, directory); return work(); });
   }
-  async read(id) {
+  async read(id, forMutation = false) {
     if (this.unsaved.has(id)) return structuredClone(this.unsaved.get(id));
-    return this.readStored(id);
+    return this.readStored(id, forMutation);
   }
-  async readStored(id) {
+  async readStored(id, forMutation = false) {
     if (!uuid(id)) throw Error('Comparison identity is invalid.');
     const directory = this.safeDirectory(), file = path.join(this.directory, `${id}.json`);
     const stat = await fs.lstat(file); this.safeDirectory(false, directory);
@@ -61,7 +61,11 @@ class Comparisons {
     const pairs = record.slots.map(slot => `${slot.fixtureId}:${slot.method}`);
     if (new Set(pairs).size !== 6 || fixtures.some(fixture => ['direct', 'analogy'].some(method => !pairs.includes(`${fixture.id}:${method}`))) || record.slots.some(slot => !['pending', 'inProgress', 'completed', 'failed', 'interrupted'].includes(slot.status))) throw Error('Comparison outcome slots need repair. Preserve the file.');
     if (record.blindOrder !== undefined && (!Array.isArray(record.blindOrder) || record.blindOrder.length !== 6 || record.blindOrder.some(entry => !entry || !/^Sample [a-f0-9]{8}$/.test(entry.label) || !record.slots.some(slot => slot.id === entry.slotId)) || new Set(record.blindOrder.map(entry => entry.label)).size !== 6 || new Set(record.blindOrder.map(entry => entry.slotId)).size !== 6)) throw Error('Comparison blind mapping needs repair. Preserve the file; labels were not reassigned.');
-    this.durable.set(id, hash(bytes)); return record;
+    // Only an intentional fresh read under the mutation lock establishes a
+    // writer baseline. Background reads must not bless another writer's bytes
+    // for an already active request. Its own successful writes advance it.
+    if (forMutation) this.durable.set(id, hash(bytes));
+    return record;
   }
   async write(record, create = false) {
     await this.checkpoint('comparison-before-store');
@@ -118,7 +122,7 @@ class Comparisons {
     for (const name of names) if (name.endsWith('.json')) {
       let record = await this.read(name.slice(0, -5));
       if (!this.unsaved.has(record.id) && !this.running.has(record.id) && record.slots.some(slot => slot.status === 'inProgress')) record = await this.lock(async () => {
-        const latest = await this.read(record.id);
+        const latest = await this.read(record.id, true);
         for (const slot of latest.slots) if (slot.status === 'inProgress') {
           Object.assign(slot, { status: 'interrupted', completedAt: this.clock().now, elapsedMs: null, error: 'Previous request interrupted. Duration is unavailable after restart. No request was replayed.' });
           this.selectCandidate(slot);
@@ -173,7 +177,7 @@ class Comparisons {
   }
   async preview(input) {
     return this.lock(async () => {
-      const record = await this.read(input?.id), slotId = record.displayOrder[input?.displayIndex], slot = record.slots.find(item => item.id === slotId);
+      const record = await this.read(input?.id, true), slotId = record.displayOrder[input?.displayIndex], slot = record.slots.find(item => item.id === slotId);
       if (!slot || slot.status !== 'pending') throw Error('This slot already has an attempt or is unavailable. It cannot be rerolled.');
       const snapshot = await this.build(record, slot);
       if (record.generationPin && JSON.stringify(record.generationPin) !== JSON.stringify(snapshot.pin) && record.slots.some(item => item.status !== 'pending')) throw Error('Evidence changed or the process restarted. This run cannot establish matched conditions. Preserve it and create a separate comparison.');
@@ -196,7 +200,7 @@ class Comparisons {
     const approved = this.tokens.get(input?.packageId); this.tokens.delete(input?.packageId);
     if (!approved) throw Error('Preview the comparison slot again before sending.');
     return this.lock(async () => {
-      const record = await this.read(approved.id), slot = record.slots.find(item => item.id === approved.snapshot.slotId);
+      const record = await this.read(approved.id, true), slot = record.slots.find(item => item.id === approved.snapshot.slotId);
       if (!slot || slot.status !== 'pending' || JSON.stringify(record.generationPin) !== JSON.stringify(approved.snapshot.pin) || JSON.stringify(await this.build(record, slot)) !== JSON.stringify(approved.snapshot)) throw Error('Comparison conditions changed. Review the current package again.');
       Object.assign(slot, { status: 'inProgress', startedAt: this.clock().now, completedAt: null, requested: approved.snapshot.pin.requested, effective: null, messages: [], usage: null, usageEvidence: 'Usage unavailable: no valid matching provider update was observed.', elapsedMs: null, elapsedBoundary: 'Monotonic local elapsed time from before preflight to provider terminal handling, including intermediate persistence; excludes initial intent and final publication, not pure generation time.' });
       this.running.add(record.id);
@@ -242,7 +246,7 @@ class Comparisons {
   }
   async scoreView(input) {
     return this.lock(async () => {
-      const record = await this.read(input?.id);
+      const record = await this.read(input?.id, true);
       if (record.vault.root !== this.getVault()?.root) throw Error('Comparison belongs to another vault.');
       if (record.slots.some(slot => slot.status === 'pending' || slot.status === 'inProgress')) throw Error('Complete all six explicit attempts before blind scoring. Retained failures remain eligible.');
       if (!record.blindOrder) {
@@ -265,7 +269,7 @@ class Comparisons {
     const fields = rubric.dimensions.map(dimension => dimension.key), rating = input?.rating;
     if (!rating || Object.keys(rating).sort().join(',') !== [...fields, 'reason', 'materialError'].sort().join(',') || fields.some(key => !Number.isSafeInteger(rating[key]) || rating[key] < 1 || rating[key] > 5) || typeof rating.reason !== 'string' || !rating.reason.trim() || rating.reason.length > 2000 || typeof rating.materialError !== 'boolean') throw Error('Enter four separate integer ratings from 1 to 5, a short reason and a material-error choice.');
     return this.lock(async () => {
-      const record = await this.read(input.id);
+      const record = await this.read(input.id, true);
       if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output. Repair storage before saving feedback.');
       const entry = record.blindOrder?.find(item => item.label === input.displayId), slot = record.slots.find(item => item.id === entry?.slotId);
       if (!slot || !['completed', 'failed', 'interrupted'].includes(slot.status) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
@@ -280,7 +284,7 @@ class Comparisons {
   }
   async reveal(input) {
     return this.lock(async () => {
-      const record = await this.read(input?.id);
+      const record = await this.read(input?.id, true);
       if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output.');
       if (!record.blindOrder || !this.completeFeedback(record)) throw Error('All six outcomes require complete feedback bound to their retained candidates before method reveal.');
       if (!record.revealedAt) { record.revealedAt = this.clock().now; await this.write(record); }
