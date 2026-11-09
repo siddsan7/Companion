@@ -27,4 +27,15 @@ Complete valid pending-only authority can be explicitly reviewed, revalidated an
 
 ## Remaining checks and scope
 
-The observed GREEN covers the first published stage/output pair vertical only. It does not complete ticket 13. Required follow-up verticals include retained intent-only writing, process exit around authority publication and target removal, stale export confirmations and acknowledgements, changed files, unknown aliases, and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
+The observed checks do not complete ticket 13. Required follow-up verticals include process exit around authority publication and target removal, stale export confirmations and acknowledgements, changed files, unknown aliases, and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
+
+## Retained intent with missing output
+
+Root ran a second desktop/file vertical after the first implementation milestone. The normal UI published an export. A controlled external file removal then removed its output, leaving the app-owned intent as the only retained export writing and keeping the original publication receipt as historical metadata.
+
+- RED: exit 1 in 25.8 seconds. The selected intent and receipt were present, but removal review stayed hidden because inventory required a current output or stage. Root committed the regression as `e1f85b444954a3f1a9ebc1f8ead852faa1527412` before the fix. Evidence is under `Temp/companion-ticket13-transcript-intent-red-20261109/`.
+- Minimum fix: allow exact valid retained intent scope without a current output or stage. A receipt still binds its strict fields, original transcript ID, export operation, digest and decimal historical device/inode values. Any present stage or output must still match actual known peer and receipt identities. An absent output supplies no current ownership or peer proof. Normal export acknowledgement and publication cutoffs are unchanged.
+- The removal review now states that the missing output will not be recreated and that the retained receipt records historical identity facts. It lists only present selected files. Fresh inventory comparison and committed-scope checks hold a destination that reappears outside the reviewed scope.
+- GREEN: root session `25930`, exit 0 in 27.8 seconds; case 27.4 seconds. Preview and cancel preserved exact bytes. Confirm removed the exact intent and receipt without recreating output. Origin conversation, source capture, external backup and provider submissions stayed unchanged. Restart kept the same result.
+
+The original paired-export regression then passed on the same source: root session80551, exit0,33.6 seconds (case33.3). Its exact four-copy scope, mutation-free cancellation, selected-only removal, retained origin/source/other export/backup and restart checks remained intact. These are two focused runs, not a complete release gate.

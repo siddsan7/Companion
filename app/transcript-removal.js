@@ -58,7 +58,6 @@ class TranscriptRemoval {
       if (!stat.isFile() || stat.isSymbolicLink()) throw held();
       present.push({ ...item, stat });
     }
-    if (!present.some(item => item.kind === 'output' || item.kind === 'stage')) throw held();
     const targets = [], texts = new Map();
     for (const item of present) {
       const peers = present.filter(peer => same(peer.stat, item.stat)).map(peer => this.relative(vault, peer.file)).sort();
@@ -72,7 +71,7 @@ class TranscriptRemoval {
     if (output && stage && !same(output.stat, stage.stat)) throw held();
     if (texts.has('receipt')) {
       const receipt = JSON.parse(texts.get('receipt')), target = output || stage;
-      if (!exact(receipt, ['schema', 'operation', 'id', 'digest', 'dev', 'ino']) || receipt.schema !== 1 || receipt.operation !== operation || receipt.id !== intent.id || receipt.digest !== intent.digest || !same(receipt, target.stat) || !output) throw held();
+      if (!exact(receipt, ['schema', 'operation', 'id', 'digest', 'dev', 'ino']) || receipt.schema !== 1 || receipt.operation !== operation || receipt.id !== intent.id || receipt.digest !== intent.digest || !number(receipt.dev) || !number(receipt.ino) || target && !same(receipt, target.stat)) throw held();
     } else if (output && !stage) throw held();
     return {
       vault, intent, parents,
@@ -112,7 +111,8 @@ class TranscriptRemoval {
     const token = randomUUID(); if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
     this.previews.set(token, value);
     const marker = value.marker || value.scope;
-    return { token, id: marker.id, destination: marker.destination, files: marker.targets.map(item => this.absolute(value.vault, item.file)) };
+    const missingOutput = !marker.targets.some(item => item.kind === 'output');
+    return { token, id: marker.id, destination: marker.destination, files: marker.targets.map(item => this.absolute(value.vault, item.file)), warning: missingOutput ? `The transcript output is missing and will not be recreated. Only the displayed retained files are selected.${marker.targets.some(item => item.kind === 'receipt') ? ' The retained publication receipt records historical identity facts; it does not prove a current output exists.' : ''}` : '' };
   }
   async preview(operation) { return this.remember(await this.inventory(operation)); }
   cancel(token) { this.previews.delete(token); }

@@ -17,6 +17,8 @@
   }
   function showRemoval(result) {
     removalToken = result.token; byId('transcript-remove-files').replaceChildren();
+    const warning = document.createElement('li'); warning.textContent = result.warning || '';
+    if (result.warning) byId('transcript-remove-files').append(warning);
     for (const file of result.files) { const row = document.createElement('li'); row.textContent = file; byId('transcript-remove-files').append(row); }
     byId('transcript-remove-review').hidden = false;
   }
