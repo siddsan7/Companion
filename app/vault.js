@@ -88,7 +88,8 @@ class Vault {
     return sourceMutation(this.root, () => this.listOwned());
   }
   async publication(id, transaction = {}) {
-    const ledger = await new (require('./intake').Intake)(this).load();
+    const intake = new (require('./intake').Intake)(this), ledger = await intake.load();
+    await require('./source-recovery').pendingParents(intake, ledger);
     assertPublication(ledger, id, transaction); return ledger.sourceAuthority?.[id]?.generation;
   }
   async listOwned() {

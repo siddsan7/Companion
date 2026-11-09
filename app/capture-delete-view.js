@@ -2,21 +2,58 @@
   const section = document.createElement('section'); section.setAttribute('aria-label', 'Capture deletion preview'); section.hidden = true;
   document.getElementById('browse-section').after(section);
   const recovery = document.createElement('section'); recovery.setAttribute('aria-label', 'Capture deletion recovery'); recovery.hidden = true;
+  const recoveryControls = document.createElement('fieldset'); Object.assign(recoveryControls.style, { border: '0', padding: '0', margin: '0', minWidth: '0' }); recovery.append(recoveryControls);
+  let recoveryEpoch = 0;
   const review = document.createElement('button'); review.textContent = 'Review capture deletion recovery'; section.after(review, recovery);
+  function recoveryFolders(item, article, afterReview) {
+    const inspect = document.createElement('button'), details = document.createElement('div'); inspect.textContent = 'Review recovery folders';
+    inspect.onclick = () => action(async () => {
+      const selected = await window.captureDeletion['scope-preview']({ id: item.id, operationId: item.operationId });
+      const paths = document.createElement('p'), confirm = document.createElement('button'), cancel = document.createElement('button');
+      paths.textContent = 'Older recovery metadata did not record all shared folders. Review these ordinary folders explicitly. Existing recorded identities must still match. This does not restore source content.\n' + selected.directories.join('\n');
+      confirm.textContent = 'Confirm reviewed recovery folders'; cancel.textContent = 'Cancel recovery folder review';
+      cancel.onclick = () => action(async () => { await window.captureDeletion['scope-cancel']({ token: selected.token }); details.replaceChildren(); });
+      confirm.onclick = () => action(async () => { await window.captureDeletion['scope-confirm']({ token: selected.token }); await afterReview(); status('Recovery folders reviewed. Inspect the exact operation before resuming.'); });
+      details.replaceChildren(paths, confirm, cancel);
+    });
+    article.append(inspect, details);
+  }
   review.onclick = () => action(async () => {
-    const pending = await window.captureDeletion.pending(); recovery.replaceChildren(); recovery.hidden = false;
-    if (!pending.length) recovery.textContent = 'No unfinished confirmed capture deletions.';
+    const owner = ++recoveryEpoch, configuration = configurationEpoch; recoveryControls.disabled = true; recovery.setAttribute('aria-busy', 'true');
+    try {
+    const pending = await window.captureDeletion.pending();
+    if (owner !== recoveryEpoch || configuration !== configurationEpoch) return;
+    recoveryControls.replaceChildren(); recovery.hidden = false;
+    if (!pending.length) recoveryControls.textContent = 'No unfinished confirmed source operations.';
     for (const item of pending) {
       const article = document.createElement('article'), scope = document.createElement('p'), resume = document.createElement('button');
-      scope.textContent = `${item.id} — ${item.reason} Only the original confirmed files can be removed. Suppression remains in effect.\n${item.targets.join('\n')}`;
-      resume.textContent = 'Resume confirmed capture deletion';
-      resume.onclick = () => action(async () => { resume.disabled = true; status('Resuming confirmed capture deletion...'); try { await window.captureDeletion.resume({ id: item.id, operationId: item.operationId }); await refresh(); article.remove(); status('Capture deletion complete. Automatic re-import remains suppressed.'); } finally { resume.disabled = false; } });
-      article.append(scope, resume); recovery.append(article);
+      scope.textContent = `${item.id} — ${item.reason} Only the original confirmed scope is authorized. Source evidence stays unavailable until verified restoration.\n${item.targets.join('\n')}`;
+      resume.textContent = item.phase === 'restoring' ? 'Resume verified source restoration' : 'Resume confirmed capture deletion'; resume.disabled = item.blockedByScope;
+      resume.onclick = () => action(async () => { resume.disabled = true; status(item.phase === 'restoring' ? 'Resuming verified source restoration...' : 'Resuming confirmed capture deletion...'); try { await window.captureDeletion.resume({ id: item.id, operationId: item.operationId }); await refresh(); article.remove(); status(item.phase === 'restoring' ? 'Source restored from the exact authorized operation.' : 'Capture deletion complete. Automatic re-import remains suppressed.'); } finally { resume.disabled = item.blockedByScope; } });
+      article.append(scope, resume); recoveryControls.append(article);
+      if (item.needsScopeReview) recoveryFolders(item, article, () => review.onclick());
+      if (item.phase === 'restoring' && item.manual && !item.blockedByScope) {
+        const label = document.createElement('label'), file = document.createElement('input'), preview = document.createElement('button'), details = document.createElement('div');
+        label.textContent = 'Selected recovery backup file'; label.append(file); preview.textContent = 'Preview a new source restoration';
+        details.setAttribute('aria-label', 'New source restoration preview'); details.hidden = true;
+        preview.onclick = () => action(async () => {
+          const selected = await window.captureDeletion['retry-preview']({ id: item.id, operationId: item.operationId, file: file.value });
+          const scope = document.createElement('p'), text = document.createElement('pre'), confirm = document.createElement('button'), cancel = document.createElement('button');
+          scope.textContent = 'This is a new explicitly selected restoration, with a fresh source generation. The earlier operation cannot recreate its missing publication. Only these reviewed old copies will be retired before new publication. Previously absent slots must remain absent. No existing destination or edited writing will be overwritten.\n' + selected.targets.map(target => `${target.absent ? 'Must stay absent' : 'Retire exact reviewed copy'}: ${target.file}`).join('\n');
+          text.textContent = selected.text; confirm.textContent = 'Confirm new source restoration'; cancel.textContent = 'Cancel new source restoration';
+          cancel.onclick = () => action(async () => { await window.captureDeletion['retry-cancel']({ token: selected.token }); details.hidden = true; });
+          confirm.onclick = () => action(async () => { confirm.disabled = true; status('Restoring newly reviewed source...'); try { await window.captureDeletion['retry-confirm']({ token: selected.token }); await refresh(); article.remove(); status('Source restored from a newly reviewed operation. Earlier references remain unavailable.'); } finally { confirm.disabled = false; } });
+          details.replaceChildren(scope, text, confirm, cancel); details.hidden = false;
+        });
+        article.append(label, preview, details);
+      }
     }
+    } finally { if (owner === recoveryEpoch) { recoveryControls.disabled = false; recovery.removeAttribute('aria-busy'); } }
   });
   const restoreReview = document.createElement('button'); restoreReview.textContent = 'Review suppressed captures';
   const restoration = document.createElement('section'); restoration.setAttribute('aria-label', 'Source restoration'); restoration.hidden = true;
   recovery.after(restoreReview, restoration);
+  document.getElementById('configure').addEventListener('click', () => { recoveryEpoch++; recoveryControls.disabled = false; recovery.removeAttribute('aria-busy'); recovery.hidden = true; restoration.hidden = true; section.hidden = true; });
   restoreReview.onclick = () => action(async () => {
     const captures = await window.captureDeletion.suppressed(); restoration.replaceChildren(); restoration.hidden = false;
     if (!captures.length) restoration.textContent = 'No deliberately deleted sources.';
@@ -37,6 +74,7 @@
         details.append(scope, text, confirm);
       });
       article.append(title, label, kindLabel, preview, details); restoration.append(article);
+      if (capture.needsScopeReview) recoveryFolders(capture, article, () => restoreReview.onclick());
     }
   });
   window.captureDeletionView = {

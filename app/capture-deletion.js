@@ -8,11 +8,12 @@ const { readReview } = require('./intake-review');
 const { sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
 const { parse } = require('./vault');
+const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf } = require('./source-recovery');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
-const changed = () => Error('Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.');
+const changed = () => Object.assign(Error('Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.'), { code: 'SOURCE_FILE_CHANGED' });
 
 class CaptureDeletion {
-  constructor({ getVault, conversations, clearApprovals, clock }) { Object.assign(this, { getVault, conversations, clearApprovals, clock }); this.previews = new Map(); this.restorations = new Map(); }
+  constructor({ getVault, conversations, clearApprovals, clock }) { Object.assign(this, { getVault, conversations, clearApprovals, clock }); this.previews = new Map(); this.restorations = new Map(); this.retries = new Map(); this.scopeReviews = new Map(); }
   async directory(vault, file) {
     const stat = await fs.lstat(file, { bigint: true }); await vault.contained(file);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw changed();
@@ -60,15 +61,7 @@ class CaptureDeletion {
       targets.push(await this.target(vault, file, 'source-backup'));
     }
     const directories = new Map();
-    const intakeDirectory = await this.directory(vault, intake.dir); directories.set(intakeDirectory.file, intakeDirectory);
-    for (const target of targets) {
-      let directory = path.dirname(path.join(vault.vault, target.file));
-      while (true) {
-        const value = await this.directory(vault, directory); directories.set(value.file, value);
-        if (directory === vault.vault) break;
-        const parent = path.dirname(directory); if (parent === directory) throw changed(); directory = parent;
-      }
-    }
+    for (const name of requiredDirectories(intake, targets)) { const value = await this.directory(vault, path.join(vault.vault, name)); directories.set(name, value); }
     const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
     if (manual) await inspectManualPeers(vault, manual);
     return { id, root: await fs.realpath(vault.vault), sourceHash, capture, ...(manual ? { manual } : {}), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations };
@@ -81,7 +74,12 @@ class CaptureDeletion {
   async suppressed() {
     const vault = this.getVault(); if (!vault) return [];
     const ledger = await new Intake(vault).load();
-    return Object.entries(ledger.sourceAuthority || {}).filter(([, authority]) => authority.phase === 'deleted').map(([id, authority]) => ({ id, manual: !!authority.manual, title: ledger.captures[authority.sourceHash]?.title || id }));
+    const result = [];
+    for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) if (authority.phase === 'deleted') {
+      const directories = await sourceParents(new Intake(vault), authority, true);
+      result.push({ id, operationId: authority.operationId, manual: !!authority.manual, title: ledger.captures[authority.sourceHash]?.title || id, needsScopeReview: directories.length !== authority.directories.length });
+    }
+    return result;
   }
   async restorationInput(input) {
     const vault = this.getVault();
@@ -116,13 +114,15 @@ class CaptureDeletion {
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw Error('Selected restoration material changed. Preview it again.');
       const intake = new Intake(vault), ledger = await intake.load(), operationId = randomUUID(), generation = randomUUID(), revisionId = randomUUID(), now = this.clock().now;
       if (selected.authority.manual) {
-        const journal = `restoration-${operationId}.json`, value = { schema: 1, id: selected.input.id, operationId, generation, content: selected.selected.content }, bytes = JSON.stringify(value);
+        const value = { schema: 1, id: selected.input.id, operationId, generation, content: selected.selected.content };
         await guardRestorationParents(intake, selected.authority);
-        await intake.publishJournal(path.join(intake.dir, journal), value);
+        const journal = await publishManualJournal(intake, selected.authority, value);
         await guardRestorationParents(intake, selected.authority);
         const { history, ...prior } = selected.authority;
-        ledger.sourceAuthority[selected.input.id] = { ...selected.authority, phase: 'restoring', operationId, generation, history: [...(history || []), prior], restoration: { journal, revision: null, sha256: hash(bytes) } };
-        await intake.save(ledger); this.restorations.delete(token); this.clearApprovals();
+        ledger.sourceAuthority[selected.input.id] = { ...selected.authority, phase: 'restoring', operationId, generation, history: [...(history || []), prior], restoration: { ...journal, revision: null } };
+        try { await intake.save(ledger); }
+        catch (error) { if (!await cleanupManualJournal(intake, selected.authority, journal)) error.message += ' The new journal was preserved because its cleanup ownership could not be verified.'; throw error; }
+        this.restorations.delete(token); this.clearApprovals();
         await vault.checkpoint('capture-restoration-authorized');
         await finishRestoration(intake, ledger, selected.input.id); return true;
       }
@@ -145,20 +145,104 @@ class CaptureDeletion {
   async pending() {
     const vault = this.getVault(); if (!vault) return [];
     const intake = new Intake(vault), ledger = await intake.load(), result = [];
-    for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) if (authority.phase === 'deleting') {
+    const missing = new Set();
+    for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) if (['deleting', 'restoring'].includes(authority.phase)) {
+      if ((await sourceParents(intake, authority, true)).length !== authority.directories.length) missing.add(id);
+    }
+    await globalRecovery(intake, ledger);
+    for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) if (['deleting', 'restoring'].includes(authority.phase)) {
       let reason = 'Confirmed scope is ready to resume.';
-      try { await inspectDeletion(intake, ledger, id); } catch (error) { reason = error.message; }
-      result.push({ id, operationId: authority.operationId, targets: authority.targets.map(target => target.file), reason });
+      if (missing.size) reason = missing.has(id) ? 'Recovery folders need a fresh explicit review before this operation can continue.' : 'Another pending operation needs a fresh recovery-folder review first.';
+      else if (authority.phase === 'deleting') { try { await inspectDeletion(intake, ledger, id); } catch (error) { reason = error.message; } }
+      else if (authority.manual) {
+        try {
+          if (authority.restoration.published) await verifyManualPublication(intake, ledger, id, [manualFiles(intake, authority).stage]);
+          await scanManualRecovery(intake, ledger, id); reason = 'Only this exact authorized manual restoration can be resumed.';
+        } catch (error) { if (!isManualHold(error, id, authority)) throw error; reason = error.message; }
+      } else reason = 'Only this exact selected producer restoration can be resumed.';
+      const targets = authority.phase === 'restoring' && authority.manual ? Object.values(manualFiles(intake, authority)).map(file => relative(vault, file)) : authority.targets.map(target => target.file);
+      result.push({ id, operationId: authority.operationId, phase: authority.phase, manual: !!authority.manual, targets, reason, needsScopeReview: missing.has(id), blockedByScope: missing.size > 0 });
     }
     return result;
+  }
+  async scopeInput(input) {
+    const vault = this.getVault(); if (!vault || !uuid(input?.id) || !uuid(input?.operationId)) throw Error('Review the recovery operation again.');
+    const intake = new Intake(vault), ledger = await intake.load(), authority = ledger.sourceAuthority?.[input.id];
+    if (!authority || authority.operationId !== input.operationId || !['deleting', 'restoring', 'deleted'].includes(authority.phase)) throw Error('Recovery operation changed. Review it again.');
+    for (const value of Object.values(ledger.sourceAuthority || {})) if (['deleting', 'restoring'].includes(value.phase)) await sourceParents(intake, value, true);
+    await globalRecovery(intake, ledger);
+    const directories = await sourceParents(intake, authority, true);
+    if (directories.length === authority.directories.length) throw Error('The recovery folders already have complete identity bindings.');
+    return { input: { id: input.id, operationId: input.operationId }, root: vault.root, authority, directories };
+  }
+  async previewScope(input) {
+    const selected = await this.scopeInput(input), token = randomUUID(); this.scopeReviews.set(token, selected);
+    return { token, directories: selected.directories.map(item => item.file) };
+  }
+  async confirmScope(token) {
+    const selected = this.scopeReviews.get(token); if (!selected) throw Error('Review the recovery folders again.');
+    const vault = this.getVault(); if (!vault || vault.root !== selected.root) throw Error('Selected vault changed. Review the recovery folders again.');
+    return this.conversations.lock(() => sourceMutation(vault.root, async () => {
+      const fresh = await this.scopeInput(selected.input); if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw Error('Recovery folders or authority changed. Review them again.');
+      const intake = new Intake(vault), ledger = await intake.load();
+      if (JSON.stringify(ledger.sourceAuthority?.[selected.input.id]) !== JSON.stringify(selected.authority)) throw Error('Recovery authority changed. Review the folders again.');
+      ledger.sourceAuthority[selected.input.id].directories = selected.directories;
+      await intake.save(ledger); this.scopeReviews.delete(token); this.clearApprovals(); return true;
+    }));
+  }
+  async retryInput(input) {
+    const vault = this.getVault(); if (!vault || !uuid(input?.id) || !uuid(input?.operationId)) throw Error('Review the held manual restoration again.');
+    const intake = new Intake(vault), ledger = await intake.load(), authority = ledger.sourceAuthority?.[input.id];
+    if (!authority?.manual || authority.phase !== 'restoring' || authority.operationId !== input.operationId || authority.restoration.published !== true || authority.restoration.retirement) throw Error('Choose a published held manual restoration. Its existing operation remains verify-only.');
+    await pendingParents(intake, ledger); await verifyRetiredSlots(intake, ledger, input.id);
+    const selected = await readManualSelection(input.file, authority.manual), access = manualAccess(intake, ledger, input.id), files = manualFiles(intake, authority), inspector = new CaptureDeletion({ getVault: () => vault });
+    if (await fs.lstat(files.destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) throw access.fail('The restoration destination exists. Preserve its writing and use exact Resume; a new retry cannot overwrite it.');
+    const slots = [];
+    for (const [file, kind, ownership] of [[files.stage, 'manual-restoration-stage', 'receipt'], [files.journal, 'restoration-journal', 'reviewed-operation-journal']]) {
+      const info = await access.owned(file, [], 'Reviewed old restoration copy');
+      if (!info) { slots.push({ file: relative(vault, file), kind, expected: null }); continue; }
+      const target = await access.run(file, () => inspector.target(vault, file, 'source-backup'));
+      if (kind === 'manual-restoration-stage' && (target.sha256 !== authority.manual.currentHash || ['dev', 'ino', 'bytes'].some(key => target[key] !== authority.restoration.publication[key]))) throw access.fail('An unknown replacement stage was preserved. This retry does not authorize its removal.');
+      if (kind === 'restoration-journal') {
+        const bytes = await access.read(file); if (hash(bytes) !== authority.restoration.sha256) throw access.fail('The old restoration journal changed. It was preserved.');
+        const value = await access.run(file, () => JSON.parse(bytes.toString('utf8')));
+        if (Object.keys(value).sort().join(',') !== 'content,generation,id,operationId,schema' || value.schema !== 1 || value.id !== input.id || value.operationId !== authority.operationId || value.generation !== authority.generation || hash(value.content || '') !== authority.manual.currentHash) throw access.fail('The old restoration journal does not prove this source operation.');
+      }
+      slots.push({ file: target.file, kind, expected: { sha256: target.sha256, dev: target.dev, ino: target.ino, bytes: target.bytes, ownership } });
+    }
+    const retirement = { captureId: input.id, operationId: authority.operationId, generation: authority.generation, publication: authority.restoration.publication, sourceSha256: authority.manual.currentHash, journalSha256: authority.restoration.sha256, slots: slots.sort((a, b) => a.file.localeCompare(b.file)) };
+    retirementFiles(intake, retirement);
+    return { input: { id: input.id, operationId: input.operationId, file: input.file }, root: vault.root, authority, selected, retirement };
+  }
+  async previewRetry(input) {
+    const selected = await this.retryInput(input), token = randomUUID(); this.retries.set(token, selected);
+    return { token, text: selected.selected.content, targets: selected.retirement.slots.map(slot => ({ file: slot.file, absent: slot.expected === null })) };
+  }
+  async confirmRetry(token) {
+    const selected = this.retries.get(token); if (!selected) throw Error('Preview the new restoration and its old-copy retirement again.');
+    const vault = this.getVault(); if (!vault || vault.root !== selected.root) throw Error('Selected vault changed. Preview the new restoration again.');
+    return this.conversations.lock(() => sourceMutation(vault.root, async () => {
+      if (JSON.stringify(await this.retryInput(selected.input)) !== JSON.stringify(selected)) throw Error('Reviewed source or retirement scope changed. Preview it again.');
+      const intake = new Intake(vault), ledger = await intake.load(), operationId = randomUUID(), generation = randomUUID(), id = selected.input.id;
+      if (JSON.stringify(ledger.sourceAuthority?.[id]) !== JSON.stringify(selected.authority)) throw Error('Held source authority changed. Review the new operation again.');
+      await pendingParents(intake, ledger);
+      const journal = await publishManualJournal(intake, selected.authority, { schema: 1, id, operationId, generation, content: selected.selected.content });
+      ledger.sourceAuthority[id] = { ...selected.authority, operationId, generation, restoration: { ...journal, revision: null, retirement: selected.retirement } };
+      try { await intake.save(ledger); }
+      catch (error) { if (!await cleanupManualJournal(intake, selected.authority, journal)) error.message += ' The new journal was preserved because its cleanup ownership could not be verified.'; throw error; }
+      this.retries.delete(token); this.clearApprovals(); await vault.checkpoint('capture-restoration-retirement-authorized');
+      await finishRestoration(intake, ledger, id); return true;
+    }));
   }
   async resume(input) {
     if (!uuid(input?.id) || !uuid(input?.operationId)) throw Error('Review the confirmed deletion operation again.');
     const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
     return this.conversations.lock(() => sourceMutation(vault.root, async () => {
       const intake = new Intake(vault), ledger = await intake.load(), authority = ledger.sourceAuthority?.[input.id];
-      if (!authority || authority.operationId !== input.operationId || authority.phase !== 'deleting') throw Error('The confirmed deletion operation changed. Review recovery again.');
-      await finishDeletion(intake, ledger, input.id); return true;
+      if (!authority || authority.operationId !== input.operationId || !['deleting', 'restoring'].includes(authority.phase)) throw Error('The confirmed source operation changed. Review recovery again.');
+      await pendingParents(intake, ledger);
+      if (authority.phase === 'deleting') await finishDeletion(intake, ledger, input.id); else await finishRestoration(intake, ledger, input.id);
+      return true;
     }));
   }
   async confirm(token) {
@@ -173,7 +257,7 @@ class CaptureDeletion {
         if (JSON.stringify(await this.inventory(selected.id)) !== JSON.stringify(selected)) throw changed();
         const intake = new Intake(vault), ledger = await intake.load();
         ledger.sourceAuthority ||= {};
-        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId: randomUUID(), sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual } : {}), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}) };
+        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId: randomUUID(), sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual } : {}), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}), ...(ledger.sourceAuthority[selected.id]?.retiredRestorations ? { retiredRestorations: ledger.sourceAuthority[selected.id].retiredRestorations } : {}) };
         if (!fresh.manual) { ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])]; ledger.captures[fresh.sourceHash].removed = true; }
         await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
         await vault.checkpoint('capture-deletion-authorized');
@@ -227,16 +311,7 @@ async function inspectDeletion(intake, ledger, id) {
   if (authority.phase !== 'deleting') return [];
   if (await fs.realpath(vault.vault) !== authority.root) throw changed();
   const deletion = new CaptureDeletion({ getVault: () => vault });
-  const requiredDirectories = new Set([relative(vault, intake.dir)]);
-  for (const target of authority.targets) {
-    let directory = path.dirname(path.join(vault.vault, target.file));
-    while (true) {
-      requiredDirectories.add(relative(vault, directory)); if (directory === vault.vault) break;
-      const parent = path.dirname(directory); if (parent === directory) throw changed(); directory = parent;
-    }
-  }
-  if (new Set(authority.directories.map(item => item.file)).size !== authority.directories.length || authority.directories.length !== requiredDirectories.size || authority.directories.some(item => !requiredDirectories.has(item.file))) throw changed();
-  for (const directory of authority.directories) if (JSON.stringify(await deletion.directory(vault, path.join(vault.vault, directory.file))) !== JSON.stringify(directory)) throw changed();
+  await sourceParents(intake, authority);
   const capture = ledger.captures[authority.sourceHash];
   if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
   if (authority.manual) await inspectManualPeers(vault, authority.manual);
@@ -294,6 +369,12 @@ function installCaptureDeletion({ ipcMain, ...options }) {
   ipcMain.handle('capture-delete-suppressed', () => store.suppressed());
   ipcMain.handle('capture-delete-restoration-preview', (_, input) => store.previewRestoration(input));
   ipcMain.handle('capture-delete-restoration-confirm', (_, input) => store.confirmRestoration(input?.token));
+  ipcMain.handle('capture-delete-retry-preview', (_, input) => store.previewRetry(input));
+  ipcMain.handle('capture-delete-retry-cancel', (_, input) => store.retries.delete(input?.token));
+  ipcMain.handle('capture-delete-retry-confirm', (_, input) => store.confirmRetry(input?.token));
+  ipcMain.handle('capture-delete-scope-preview', (_, input) => store.previewScope(input));
+  ipcMain.handle('capture-delete-scope-cancel', (_, input) => store.scopeReviews.delete(input?.token));
+  ipcMain.handle('capture-delete-scope-confirm', (_, input) => store.confirmScope(input?.token));
 }
 async function finishRestoration(intake, ledger, id) {
   validateAuthority(ledger);
@@ -352,29 +433,158 @@ async function finishRestoration(intake, ledger, id) {
   ledger.suppressed = ledger.suppressed.filter(item => item !== authority.sourceHash);
   await intake.save(ledger);
 }
-async function finishManualRestoration(intake, ledger, id) {
-  const authority = ledger.sourceAuthority[id], vault = intake.vault, restoration = authority.restoration;
-  const journal = path.join(intake.dir, restoration.journal), stage = path.join(intake.dir, `manual-${authority.operationId}.stage`), destination = path.join(vault.vault, authority.manual.relative);
-  const verify = async (peers = []) => {
-    await guardRestorationParents(intake, authority);
-    const info = await intake.ownedFile(destination, peers, 'Manual restoration capture');
-    if (!info || hash(await fs.readFile(destination)) !== authority.manual.currentHash) throw Error('Manual restoration publication is missing or changed. Old source authority remains unavailable.');
-    if (restoration.publication && (String(info.dev) !== restoration.publication.dev || String(info.ino) !== restoration.publication.ino || String(info.size) !== restoration.publication.bytes)) throw changed();
-    return info;
+function manualFiles(intake, authority) {
+  return { journal: path.join(intake.dir, authority.restoration.journal), stage: path.join(intake.dir, `manual-${authority.operationId}.stage`), destination: path.join(intake.vault.vault, authority.manual.relative) };
+}
+function retirementFiles(intake, receipt) {
+  const expected = [path.join(intake.dir, `manual-${receipt.operationId}.stage`), path.join(intake.dir, `restoration-${receipt.operationId}.json`)].map(file => relative(intake.vault, file)).sort();
+  if (JSON.stringify(receipt.slots.map(slot => slot.file)) !== JSON.stringify(expected)) throw Error('Restoration retirement does not name this intake folder. All files were preserved.');
+  return expected;
+}
+async function scanManualRecovery(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id], current = manualFiles(intake, authority), known = new Set([current.stage, current.journal]);
+  const receipts = [...(authority.retiredRestorations || []), ...(authority.restoration.retirement ? [authority.restoration.retirement] : [])], operations = [authority.operationId, ...receipts.map(receipt => receipt.operationId)];
+  for (const receipt of receipts) for (const name of retirementFiles(intake, receipt)) known.add(path.join(intake.vault.vault, name));
+  for (const entry of await fs.readdir(intake.dir, { withFileTypes: true })) {
+    const file = path.join(intake.dir, entry.name);
+    if (known.has(file)) continue;
+    if (operations.some(operation => entry.name.startsWith(`manual-${operation}.`) || entry.name.startsWith(`restoration-${operation}.`))) throw held(id, authority, 'An additional manual-operation recovery copy needs explicit review. All files were preserved.');
+    const match = entry.name.match(/^(manual|restoration)-([a-f0-9-]{36})\.(stage|json)$/);
+    if (!match || !uuid(match[2]) || (match[1] === 'manual') !== (match[3] === 'stage')) continue;
+    const other = Object.entries(ledger.sourceAuthority || {}).find(([, value]) => value.operationId === match[2]), peers = [];
+    if (other?.[1].manual && match[1] === 'manual') peers.push(path.join(intake.vault.vault, other[1].manual.relative));
+    if (other?.[1].phase === 'restoring' && !other[1].manual && other[1].restoration.journal === entry.name) peers.push(path.join(intake.dir, 'transaction.json'));
+    const info = await intake.ownedFile(file, peers, 'Additional restoration recovery file');
+    if (!info) continue;
+    const text = await fs.readFile(file, 'utf8');
+    if (match[1] === 'manual') {
+      const note = parse(text);
+      if (!note || !uuid(note.id) || !['thought', 'link'].includes(note.type)) throw Error('Unattributed manual restoration data needs repair.');
+      if (note.id === id) throw held(id, authority, 'An additional manual source stage needs explicit review. All files were preserved.');
+      if (info.nlink > 1n && (other?.[0] !== note.id || hash(text) !== other[1].manual.currentHash)) throw Error('Unattributed linked manual restoration data needs repair.');
+    } else {
+      const value = JSON.parse(text), captureId = value.id || value.capture?.id;
+      if (captureId === id) throw held(id, authority, 'An additional selected-source restoration journal needs explicit review. All files were preserved.');
+      if (value.content && value.operationId === match[2]) {
+        const note = parse(value.content);
+        if (Object.keys(value).sort().join(',') !== 'content,generation,id,operationId,schema' || value.schema !== 1 || !uuid(value.id) || !uuid(value.generation) || !note || note.id !== value.id || !['thought', 'link'].includes(note.type)) throw Error('Unattributed restoration journal needs repair.');
+      } else {
+        intake.validateTransaction(value);
+        if (value.restoreOperation !== match[2] || info.nlink > 1n && (other?.[0] !== value.capture.id || hash(text) !== other[1].restoration.sha256)) throw Error('Unattributed imported restoration journal needs repair.');
+      }
+    }
+  }
+}
+async function verifyRetiredSlots(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id];
+  await pendingParents(intake, ledger);
+  for (const receipt of authority.retiredRestorations || []) for (const name of retirementFiles(intake, receipt)) {
+    const file = path.join(intake.vault.vault, name);
+    if (await fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) throw held(id, authority, 'A file appeared in a retired restoration slot. It was preserved; review the new scope.');
+  }
+  await scanManualRecovery(intake, ledger, id);
+}
+async function retireManualOperation(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id], receipt = authority.restoration.retirement, access = manualAccess(intake, ledger, id), inspector = new CaptureDeletion({ getVault: () => intake.vault });
+  retirementFiles(intake, receipt); await pendingParents(intake, ledger); await scanManualRecovery(intake, ledger, id);
+  const inspect = async slot => {
+    const file = path.join(intake.vault.vault, slot.file);
+    const exists = await fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    if (!exists) return null;
+    if (!slot.expected) throw access.fail('A file appeared in a previously absent restoration slot. It was preserved.');
+    const actual = await access.run(file, () => inspector.target(intake.vault, file, 'source-backup'));
+    if (['sha256', 'dev', 'ino', 'bytes'].some(key => actual[key] !== slot.expected[key])) throw access.fail('A reviewed retirement file changed. It was preserved.');
+    return file;
   };
+  for (const slot of receipt.slots) await inspect(slot);
+  for (const slot of receipt.slots) {
+    await pendingParents(intake, ledger); const file = await inspect(slot);
+    if (file) { await access.run(file, () => fs.unlink(file)); await intake.vault.checkpoint('capture-restoration-retirement-unlinked'); }
+  }
+  for (const slot of receipt.slots) if (await inspect(slot)) throw access.fail('Restoration retirement is incomplete.');
+  authority.retiredRestorations = [...(authority.retiredRestorations || []), receipt]; delete authority.restoration.retirement;
+  await intake.save(ledger); await intake.vault.checkpoint('capture-restoration-retired');
+}
+async function publishManualJournal(intake, authority, value) {
+  await sourceParents(intake, authority);
+  const bytes = Buffer.from(JSON.stringify(value), 'utf8'), stage = path.join(intake.dir, `journal-${randomUUID()}.stage`), file = path.join(intake.dir, `restoration-${value.operationId}.json`);
+  let original;
+  try {
+    const handle = await fs.open(stage, 'wx');
+    try { await handle.writeFile(bytes); await handle.sync(); original = await handle.stat({ bigint: true }); }
+    finally { await handle.close(); }
+    const verify = async (target, peer) => {
+      await sourceParents(intake, authority);
+      const info = await intake.ownedFile(target, peer ? [peer] : [], 'Created manual restoration journal');
+      if (!info || info.dev !== original.dev || info.ino !== original.ino || info.size !== original.size || hash(await fs.readFile(target)) !== hash(bytes)) throw Error('Created manual journal identity changed. All replacements were preserved.');
+      const fresh = await intake.ownedFile(target, peer ? [peer] : [], 'Created manual restoration journal');
+      if (!fresh || fresh.dev !== original.dev || fresh.ino !== original.ino || fresh.size !== original.size || fresh.nlink !== info.nlink) throw Error('Created manual journal identity changed. All replacements were preserved.');
+      return fresh;
+    };
+    await verify(stage); await fs.link(stage, file); await verify(file, stage); await verify(stage, file); await fs.unlink(stage);
+    const info = await verify(file);
+    return { journal: path.basename(file), sha256: hash(bytes), journalIdentity: { dev: String(info.dev), ino: String(info.ino), bytes: String(info.size) } };
+  } catch (error) {
+    // Only the inode created by this call can be cleaned after a failed publish.
+    for (const target of [stage, file]) if (original) {
+      try {
+        const peer = target === stage ? file : stage;
+        await sourceParents(intake, authority); const info = await intake.ownedFile(target, [peer], 'Created manual journal cleanup');
+        if (!info || info.dev !== original.dev || info.ino !== original.ino || info.size !== original.size || hash(await fs.readFile(target)) !== hash(bytes)) continue;
+        await sourceParents(intake, authority); const fresh = await intake.ownedFile(target, [peer], 'Created manual journal cleanup');
+        if (fresh && fresh.dev === original.dev && fresh.ino === original.ino && fresh.size === original.size && fresh.nlink === info.nlink) await fs.unlink(target);
+      } catch {}
+    }
+    throw error;
+  }
+}
+async function cleanupManualJournal(intake, authority, journal) {
+  const file = path.join(intake.dir, journal.journal);
+  try {
+    await sourceParents(intake, authority);
+    const info = await intake.ownedFile(file, [], 'Uncommitted created manual journal');
+    if (!info) return true;
+    if (['dev', 'ino', 'size'].some(key => String(info[key]) !== journal.journalIdentity[key === 'size' ? 'bytes' : key]) || hash(await fs.readFile(file)) !== journal.sha256) return false;
+    await sourceParents(intake, authority);
+    const fresh = await intake.ownedFile(file, [], 'Uncommitted created manual journal');
+    if (!fresh || fresh.dev !== info.dev || fresh.ino !== info.ino || fresh.size !== info.size || fresh.nlink !== 1n) return false;
+    await fs.unlink(file); return true;
+  } catch { return false; }
+}
+function manualAccess(intake, ledger, id) {
+  const run = (file, work) => manualLeaf(intake, ledger, id, file, work);
+  return { run, read: file => run(file, () => fs.readFile(file)), owned: (file, peers, label) => run(file, () => intake.ownedFile(file, peers, label)), fail: message => held(id, ledger.sourceAuthority[id], message) };
+}
+async function verifyManualPublication(intake, ledger, id, peers = []) {
+  const authority = ledger.sourceAuthority[id], access = manualAccess(intake, ledger, id), { destination } = manualFiles(intake, authority);
+  await guardRestorationParents(intake, authority);
+  const info = await access.owned(destination, peers, 'Manual restoration capture');
+  if (!info || hash(await access.read(destination)) !== authority.manual.currentHash) throw access.fail('Manual restoration publication is missing or changed. Old source authority remains unavailable.');
+  const receipt = authority.restoration.publication;
+  if (receipt && (String(info.dev) !== receipt.dev || String(info.ino) !== receipt.ino || String(info.size) !== receipt.bytes)) throw access.fail('Manual restoration publication identity changed. The current file was preserved.');
+  return info;
+}
+async function finishManualRestoration(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id], vault = intake.vault, restoration = authority.restoration, access = manualAccess(intake, ledger, id);
+  const { journal, stage, destination } = manualFiles(intake, authority), verify = peers => verifyManualPublication(intake, ledger, id, peers);
+  if (restoration.retirement) await retireManualOperation(intake, ledger, id);
+  await verifyRetiredSlots(intake, ledger, id);
   if (!restoration.published) {
-    if (!await intake.ownedFile(journal, [], 'Selected manual restoration journal')) throw changed();
-    const bytes = await fs.readFile(journal, 'utf8'); if (hash(bytes) !== restoration.sha256) throw changed();
-    const value = JSON.parse(bytes), note = parse(value.content || '');
-    if (Object.keys(value).sort().join(',') !== 'content,generation,id,operationId,schema' || value.schema !== 1 || value.id !== id || value.operationId !== authority.operationId || value.generation !== authority.generation || !note || note.id !== id || note.type !== authority.manual.type || note.capturedAt !== authority.manual.capturedAt || hash(value.content) !== authority.manual.currentHash) throw changed();
-    const existingStage = await intake.ownedFile(stage, destination, 'Manual restoration stage');
-    if (existingStage && hash(await fs.readFile(stage)) !== authority.manual.currentHash) throw changed();
-    if (!existingStage) await fs.writeFile(stage, value.content, { flag: 'wx', flush: true });
+    const journalInfo = await access.owned(journal, [], 'Selected manual restoration journal');
+    if (!journalInfo) throw access.fail('Selected manual restoration journal is missing.');
+    if (restoration.journalIdentity && ['dev', 'ino', 'size'].some(key => String(journalInfo[key]) !== restoration.journalIdentity[key === 'size' ? 'bytes' : key])) throw access.fail('Selected manual restoration journal identity changed.');
+    const bytes = await access.read(journal); if (hash(bytes) !== restoration.sha256) throw access.fail('Selected manual restoration journal changed.');
+    const value = await access.run(journal, () => JSON.parse(bytes.toString('utf8'))), note = parse(value.content || '');
+    if (Object.keys(value).sort().join(',') !== 'content,generation,id,operationId,schema' || value.schema !== 1 || value.id !== id || value.operationId !== authority.operationId || value.generation !== authority.generation || !note || note.id !== id || note.type !== authority.manual.type || note.capturedAt !== authority.manual.capturedAt || hash(value.content) !== authority.manual.currentHash) throw access.fail('Selected manual restoration journal identity or content changed.');
+    const existingStage = await access.owned(stage, destination, 'Manual restoration stage');
+    if (existingStage && hash(await access.read(stage)) !== authority.manual.currentHash) throw access.fail('Manual restoration stage changed.');
+    if (!existingStage) await access.run(stage, () => fs.writeFile(stage, value.content, { flag: 'wx', flush: true }));
     await guardRestorationParents(intake, authority);
+    await verifyRetiredSlots(intake, ledger, id);
     try { await fs.link(stage, destination); } catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      const output = await intake.ownedFile(destination, stage, 'Manual restoration existing output'), peer = await intake.ownedFile(stage, destination, 'Manual restoration existing stage');
-      if (!output || !peer || output.nlink !== 2n || output.dev !== peer.dev || output.ino !== peer.ino) throw Error('Another file occupies the manual restoration destination. It was preserved.');
+      const output = await access.owned(destination, stage, 'Manual restoration existing output'), peer = await access.owned(stage, destination, 'Manual restoration existing stage');
+      if (!output || !peer || output.nlink !== 2n || output.dev !== peer.dev || output.ino !== peer.ino) throw access.fail('Another file occupies the manual restoration destination. It was preserved.');
     }
     const info = await verify([stage]);
     // This durable receipt marks completed publication. Recovery afterwards
@@ -385,34 +595,22 @@ async function finishManualRestoration(intake, ledger, id) {
   await verify([stage]);
   for (const [file, peers, expected] of [[stage, [destination], authority.manual.currentHash], [journal, [], restoration.sha256]]) {
     await guardRestorationParents(intake, authority);
-    const info = await intake.ownedFile(file, peers, 'Manual restoration cleanup');
+    const info = await access.owned(file, peers, 'Manual restoration cleanup');
     if (info) {
-      if (file === stage && (info.nlink !== 2n || String(info.dev) !== restoration.publication.dev || String(info.ino) !== restoration.publication.ino || String(info.size) !== restoration.publication.bytes)) throw Error('Manual restoration stage identity changed. The replacement was preserved for explicit review.');
-      if (hash(await fs.readFile(file)) !== expected) throw changed();
-      const fresh = await intake.ownedFile(file, peers, 'Manual restoration cleanup');
-      if (!fresh || fresh.dev !== info.dev || fresh.ino !== info.ino || fresh.size !== info.size || fresh.nlink !== info.nlink) throw changed();
-      await fs.unlink(file);
+      if (file === stage && (info.nlink !== 2n || String(info.dev) !== restoration.publication.dev || String(info.ino) !== restoration.publication.ino || String(info.size) !== restoration.publication.bytes)) throw access.fail('Manual restoration stage identity changed. The replacement was preserved for explicit review.');
+      if (file === journal && restoration.journalIdentity && ['dev', 'ino', 'size'].some(key => String(info[key]) !== restoration.journalIdentity[key === 'size' ? 'bytes' : key])) throw access.fail('Manual restoration journal identity changed.');
+      if (hash(await access.read(file)) !== expected) throw access.fail('Manual restoration cleanup bytes changed.');
+      const fresh = await access.owned(file, peers, 'Manual restoration cleanup');
+      if (!fresh || fresh.dev !== info.dev || fresh.ino !== info.ino || fresh.size !== info.size || fresh.nlink !== info.nlink) throw access.fail('Manual restoration cleanup identity changed.');
+      await access.run(file, () => fs.unlink(file));
     }
   }
   await verify(); await vault.checkpoint('capture-restoration-published'); await verify();
+  await verifyRetiredSlots(intake, ledger, id);
   authority.phase = 'active'; delete authority.restoration; await intake.save(ledger);
 }
 async function guardRestorationParents(intake, authority) {
-  const vault = intake.vault, deletion = new CaptureDeletion({ getVault: () => vault });
-  if (await fs.realpath(vault.vault) !== authority.root) throw Error('Restoration vault identity changed. Suppression remains.');
-  const required = new Set([relative(vault, intake.dir)]);
-  for (const target of authority.targets) {
-    let directory = path.dirname(path.join(vault.vault, target.file));
-    while (true) {
-      required.add(relative(vault, directory)); if (directory === vault.vault) break;
-      const parent = path.dirname(directory); if (parent === directory) throw Error('Restoration directory scope is invalid.'); directory = parent;
-    }
-  }
-  if (authority.directories.length !== required.size || new Set(authority.directories.map(item => item.file)).size !== required.size || authority.directories.some(item => !required.has(item.file))) throw Error('Restoration directory scope changed.');
-  for (const directory of authority.directories) {
-    const observed = await deletion.directory(vault, path.join(vault.vault, directory.file));
-    if (JSON.stringify(observed) !== JSON.stringify(directory)) throw Error('Restoration parent identity changed. Suppression remains.');
-  }
+  return sourceParents(intake, authority);
 }
 async function verifyRestorationPublication(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], vault = intake.vault;

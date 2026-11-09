@@ -7,6 +7,7 @@ const { sourceMutation } = require('./source-mutation');
 const { withTitle, captureHeading } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission } = require('./source-authority');
 const { IntakeLedger } = require('./intake-ledger');
+const { pendingParents, isManualHold } = require('./source-recovery');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
 const conflict = message => Object.assign(Error(message), { intakeConflict: true });
@@ -420,8 +421,18 @@ class Intake {
   }
   async recover() {
     const controlled = await this.load();
+    await pendingParents(this, controlled);
+    this.vault.warnings = this.vault.warnings.filter(warning => !warning.startsWith('Source restoration held:'));
     for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'deleting') await require('./capture-deletion').finishDeletion(this, controlled, id);
-    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'restoring') await require('./capture-deletion').finishRestoration(this, controlled, id);
+    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'restoring') {
+      try { await require('./capture-deletion').finishRestoration(this, controlled, id); }
+      catch (error) {
+        if (!isManualHold(error, id, authority)) throw error;
+        await pendingParents(this, controlled);
+        if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed during source recovery. Refresh before retrying.');
+        this.vault.warnings.push(`Source restoration held: ${id}. ${error.message}`);
+      }
+    }
     await this.finishLink();
     await this.finishAnnotation();
     try { await this.finishRepair(); }
