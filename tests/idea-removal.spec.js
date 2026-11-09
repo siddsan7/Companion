@@ -208,3 +208,58 @@ test('an unowned selected-idea stage added after removal preview holds before an
   expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
 });
 
+test('a pending-only proposed idea can be explicitly previewed, cancelled and removed without publishing its writing', async () => {
+  test.setTimeout(120000);
+  await completedConversation();
+  const retained = await saveIdea('Saved idea retained beside proposed writing'), retainedBytes = await fs.readFile(retained, 'utf8');
+  const title = 'Remove only this unpublished proposed writing';
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('PENDING_ONLY_IDEA_13: independent proposed writing that was never published.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Unverified authored proposal; explicitly discard only these displayed managed copies.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/PENDING_ONLY_IDEA_13/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-before-publication' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+  await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+  const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+  const id = YAML.parse(proposed.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+  const intents = (await fs.readdir(directory)).filter(name => name.endsWith('.intent.json'));
+  let intentFile, operation;
+  for (const name of intents) {
+    const file = path.join(directory, name), value = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (value.id === id) { intentFile = file; operation = value.operation; }
+  }
+  expect(intentFile).toBeTruthy();
+  const stage = path.join(directory, `${operation}.md.pending`);
+  expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
+  expect(await fs.lstat(destination).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  const before = await bytesIn(vault), history = await bytesIn(path.join(root, 'conversations')), sources = await bytesIn(path.join(vault, 'Captures'));
+  await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+  const pending = page.locator('#pending-ideas article').filter({ hasText: title });
+  await expect(pending).toBeVisible();
+  await pending.getByRole('button', { name: 'Preview proposed idea removal', exact: true }).click();
+  const preview = page.getByLabel('Saved idea removal preview', { exact: true });
+  await expect(preview).toContainText(id);
+  await expect(preview).toContainText(intentFile); await expect(preview).toContainText(stage);
+  expect(await bytesIn(vault)).toEqual(before);
+  await page.getByRole('button', { name: 'Cancel saved idea removal', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await bytesIn(vault)).toEqual(before);
+  await pending.getByRole('button', { name: 'Preview proposed idea removal', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm saved idea removal', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea removal complete.');
+  for (const file of [intentFile, stage, destination]) expect(await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+  expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+  expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#pending-ideas article')).toHaveCount(0);
+  await expect(page.locator('#saved-ideas article')).toHaveCount(1);
+  expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+  for (const file of [intentFile, stage, destination]) expect(await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+});
+
