@@ -7,6 +7,7 @@
   let displayedHistory = '';
   let historyExclusions = [];
   const excludedHistory = new Set();
+  const restoredSources = new Set(), restoredHistory = new Set();
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
   function warnHistory() {
     for (const warning of byId('conversation-history').querySelectorAll('.history-exclusion')) warning.remove();
@@ -22,7 +23,10 @@
     conversationId = record.id; byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
     if (firstDisplay) {
       historyExclusions = record.requests.at(-1)?.package?.historyExclusions || [];
-      excludedHistory.clear(); for (const id of record.requests.at(-1)?.package?.excludedHistory || []) excludedHistory.add(id);
+      const scope = record.scope || { excludedSources: [], excludedHistory: record.requests.at(-1)?.package?.excludedHistory || [] };
+      // A delayed initial read must not undo explicit controls already changed in this window.
+      for (const key of scope.excludedSources) if (!restoredSources.has(key)) excluded.add(key);
+      for (const id of scope.excludedHistory) if (!restoredHistory.has(id)) excludedHistory.add(id);
     }
     byId('conversation-error').textContent = record.storageWarning || '';
     byId('conversation-history').replaceChildren();
@@ -34,7 +38,7 @@
       const includeLabel = document.createElement('label'), include = document.createElement('input');
       include.type = 'checkbox'; include.checked = request.status === 'completed' && !excludedHistory.has(request.id); include.disabled = request.status !== 'completed';
       includeLabel.append(include, document.createTextNode('Include request in next context'));
-      include.onchange = () => { if (include.checked) excludedHistory.delete(request.id); else excludedHistory.add(request.id); invalidateConversation(); };
+      include.onchange = () => { if (include.checked) { excludedHistory.delete(request.id); restoredHistory.add(request.id); } else { excludedHistory.add(request.id); restoredHistory.delete(request.id); } invalidateConversation(); };
       const contextDetails = document.createElement('details'), contextTitle = document.createElement('summary'), contextLabel = document.createElement('label'), contextText = document.createElement('textarea');
       contextTitle.textContent = 'Inspect approved context'; contextLabel.textContent = 'Saved approved context'; contextText.readOnly = true; contextText.rows = 8; contextText.value = request.package?.text || 'Saved context is unavailable.';
       contextLabel.append(contextText); contextDetails.append(contextTitle, contextLabel); article.append(includeLabel, contextDetails);
@@ -42,7 +46,7 @@
         const retry = document.createElement('button'); retry.textContent = 'Retry or edit request';
         retry.onclick = () => {
           byId('context-question').value = request.question; byId('conversation-speculation').checked = request.speculation === true;
-          selections = []; excluded.clear(); selected(); clearPreview();
+          selections = []; restoredSources.clear(); selected(); clearPreview();
           byId('conversation-summary').textContent = 'Explicit retry: inspect and select current sources, then preview and send a new request. Earlier partial output stays incomplete.';
         }; article.append(retry);
       }
@@ -59,7 +63,7 @@
   const dependentOn = (item, key) => [item.associated, ...(item.associatedIds || [])].some(id => `capture:${id}` === key) || item.projectVersion !== undefined && `brief:${item.projectVersion}` === key;
   function revoke(item) { delete item.approval; delete item.approvedText; delete item.approvalLabel; }
   function add(source) {
-    if (source) { if (excluded.delete(source.key)) for (const item of selections) if (dependentOn(item, source.key)) revoke(item); selections = selections.filter(item => item.key !== source.key); selections.push({ ...source }); }
+    if (source) { restoredSources.add(source.key); if (excluded.delete(source.key)) for (const item of selections) if (dependentOn(item, source.key)) revoke(item); selections = selections.filter(item => item.key !== source.key); selections.push({ ...source }); }
     selected(); clearPreview();
   }
   function selected() {
@@ -67,7 +71,7 @@
     for (const source of selections) {
       const article = document.createElement('article'), title = document.createElement('p'), remove = document.createElement('button');
       title.textContent = source.title; remove.textContent = 'Remove from context';
-      remove.onclick = () => { excluded.add(source.key); selections = selections.filter(item => item.key !== source.key); for (const item of selections) if (dependentOn(item, source.key)) revoke(item); selected(); clearPreview(); };
+      remove.onclick = () => { excluded.add(source.key); restoredSources.delete(source.key); selections = selections.filter(item => item.key !== source.key); for (const item of selections) if (dependentOn(item, source.key)) revoke(item); selected(); clearPreview(); };
       const label = document.createElement('label'), editor = document.createElement('textarea'), approve = document.createElement('button'), proposed = document.createElement('pre'), state = document.createElement('p');
       label.textContent = 'Shorter passage'; editor.rows = 4; editor.value = source.approvedText || source.text; label.append(editor);
       const proposal = () => { proposed.textContent = `${source.provenance}; ${source.approvalLabel || 'Explicitly shortened passage'}\n${editor.value}`; };
@@ -132,11 +136,11 @@
   byId('conversation-preview').onclick = async () => {
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
-      const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
+      const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
       if (version !== conversationGeneration) return;
       conversationToken = preview.packageId; byId('conversation-package').value = preview.text;
       historyExclusions = preview.historyExclusions; warnHistory();
-      byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${preview.boundEvidence} ${preview.warnings.join(' ')}`;
+      byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${conversationId ? 'Reviewed exclusion scope saved locally. ' : ''}${preview.boundEvidence} ${preview.warnings.join(' ')}`;
       byId('conversation-send').disabled = preview.blocked;
     } catch (error) { if (version === conversationGeneration) byId('conversation-error').textContent = error.message; }
   };
