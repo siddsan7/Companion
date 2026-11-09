@@ -1346,3 +1346,94 @@ test('foreign history revocation invalidates stale reviewed selections and async
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/project context alone/);
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
 });
+
+test('transcript export is explicitly previewed and cancelled before exact readable publication at the chosen vault destination', async () => {
+  test.setTimeout(150000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_FOREIGN_ORIGIN_12: authored synthetic earlier discussion.' }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_FOREIGN_ORIGIN_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const originName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const origin = JSON.parse(await fs.readFile(path.join(root, 'conversations', originName), 'utf8'));
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('TRANSCRIPT_FOREIGN_ORIGIN_12');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: 'TRANSCRIPT_FOREIGN_ORIGIN_12' }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Retain a careful account of this selected historical discussion.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/TRANSCRIPT_FOREIGN_ORIGIN_12/);
+  const messages = [
+    { phase: 'commentary', text: 'TRANSCRIPT_COMMENTARY_12: the mechanism needs checking.' },
+    { phase: 'final_answer', text: 'TRANSCRIPT_FINAL_12: a hypothesis with limitations and an observable test.' },
+    { phase: null, text: 'TRANSCRIPT_UNKNOWN_PHASE_12: retained legacy assistant writing.' }
+  ];
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ messages }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_UNKNOWN_PHASE_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent idea beside the transcript');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Keep this author interpretation separate from the exported conversation.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('No outcome was verified.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent idea beside/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+
+  const history = {};
+  for (const name of (await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) history[name] = await fs.readFile(path.join(root, 'conversations', name), 'utf8');
+  const current = Object.values(history).map(text => JSON.parse(text)).find(record => record.id !== origin.id);
+  const captureDir = path.join(root, 'vault', 'Companion', 'Captures');
+  const captureFile = path.join(captureDir, (await fs.readdir(captureDir)).find(name => name.endsWith('.md')));
+  // This explicit external edit precedes export, so the transcript must warn about stale support.
+  await fs.appendFile(captureFile, '\nTRANSCRIPT_SOURCE_CHANGED_BEFORE_EXPORT\n', 'utf8');
+  const sourceBytes = await fs.readFile(captureFile, 'utf8'), ideaBytes = await fs.readFile(ideaFile, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const destinationDir = path.join(root, 'vault', 'Exports'); await fs.mkdir(destinationDir);
+  const destination = path.join(destinationDir, 'Chosen readable conversation.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Transcript destination', { exact: true })).toHaveValue(destination);
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(/TRANSCRIPT_COMMENTARY_12/);
+  let proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  expect(proposed).toContain('artifact_type: conversation_transcript');
+  expect(proposed).toContain(current.id);
+  expect(proposed).toContain(current.requests[0].id);
+  expect(proposed).toContain('Retain a careful account of this selected historical discussion.');
+  for (const message of messages) expect(proposed).toContain(message.text);
+  expect(proposed.indexOf(messages[0].text)).toBeLessThan(proposed.indexOf(messages[1].text));
+  expect(proposed.indexOf(messages[1].text)).toBeLessThan(proposed.indexOf(messages[2].text));
+  expect(proposed).toContain('commentary'); expect(proposed).toContain('final_answer');
+  expect(proposed).toMatch(/unknown.*phase|phase.*unknown/i);
+  expect(proposed).toContain('completed');
+  expect(proposed).toContain(current.brief.id); expect(proposed).toContain(current.brief.digest);
+  expect(proposed).toContain(origin.id); expect(proposed).toContain(origin.requests[0].id);
+  for (const dependency of current.requests[0].package.dependencies) { expect(proposed).toContain(dependency.key); expect(proposed).toContain(dependency.digest); }
+  expect(proposed).toMatch(/changed|unavailable|missing/i);
+  expect(proposed).toMatch(/previous.*provider|provider.*submission/i);
+  expect(proposed).toMatch(/independent.*cop|separate.*cop|separate.*export/i);
+  expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+  await page.getByRole('button', { name: 'Cancel transcript preview', exact: true }).click();
+  expect(await fs.readdir(destinationDir)).toEqual([]);
+  expect(await fs.stat(path.join(root, 'vault', 'Companion', '.transcripts')).catch(error => error.code)).toBe('ENOENT');
+  for (const [name, bytes] of Object.entries(history)) expect(await fs.readFile(path.join(root, 'conversations', name), 'utf8')).toBe(bytes);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(/TRANSCRIPT_FINAL_12/);
+  proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await fs.readdir(destinationDir)).toEqual(['Chosen readable conversation.md']);
+  for (const [name, bytes] of Object.entries(history)) expect(await fs.readFile(path.join(root, 'conversations', name), 'utf8')).toBe(bytes);
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(sourceBytes);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  await app.close(); app = null; await launch(false);
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
