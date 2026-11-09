@@ -60,6 +60,7 @@ class Comparisons {
     if (record.schema !== 1 || record.id !== id || !Array.isArray(record.fixtures) || record.fixtures.length !== 3 || !Array.isArray(record.slots) || record.slots.length !== 6 || !Array.isArray(record.displayOrder) || record.displayOrder.length !== 6 || new Set(record.displayOrder).size !== 6 || record.displayOrder.some(slotId => !record.slots.some(slot => slot.id === slotId)) || record.slots.some(slot => !uuid(slot.id) || !['direct', 'analogy'].includes(slot.method) || slot.package?.digest !== hash(slot.package.text))) throw Error('Comparison history needs repair. Preserve the file.');
     const pairs = record.slots.map(slot => `${slot.fixtureId}:${slot.method}`);
     if (new Set(pairs).size !== 6 || fixtures.some(fixture => ['direct', 'analogy'].some(method => !pairs.includes(`${fixture.id}:${method}`))) || record.slots.some(slot => !['pending', 'inProgress', 'completed', 'failed', 'interrupted'].includes(slot.status))) throw Error('Comparison outcome slots need repair. Preserve the file.');
+    if (record.blindOrder !== undefined && (!Array.isArray(record.blindOrder) || record.blindOrder.length !== 6 || record.blindOrder.some(entry => !entry || !/^Sample [a-f0-9]{8}$/.test(entry.label) || !record.slots.some(slot => slot.id === entry.slotId)) || new Set(record.blindOrder.map(entry => entry.label)).size !== 6 || new Set(record.blindOrder.map(entry => entry.slotId)).size !== 6)) throw Error('Comparison blind mapping needs repair. Preserve the file; labels were not reassigned.');
     this.durable.set(id, hash(bytes)); return record;
   }
   async write(record, create = false) {
@@ -227,16 +228,32 @@ class Comparisons {
   scoreProjection(record) {
     return { id: record.id, rubric, storageWarning: record.storageWarning || null,
       notice: 'Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.',
-      outputs: record.displayOrder.map((id, index) => {
-        const slot = record.slots.find(item => item.id === id);
+      outputs: record.blindOrder.map((entry, index) => {
+        const slot = record.slots.find(item => item.id === entry.slotId);
         const candidateDigest = hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
-        return { displayIndex: index, displayId: `Output ${index + 1}`, status: slot.status, candidate: slot.candidate || null, candidateDigest, error: slot.error || null, rating: slot.rating || null };
+        return { displayIndex: index, displayId: entry.label, status: slot.status, candidate: slot.candidate || null, candidateDigest, error: slot.error || null, rating: slot.rating || null };
       }) };
   }
   async scoreView(input) {
-    const record = await this.read(input?.id);
-    if (record.vault.root !== this.getVault()?.root) throw Error('Comparison belongs to another vault.');
-    return this.scoreProjection(record);
+    return this.lock(async () => {
+      const record = await this.read(input?.id);
+      if (record.vault.root !== this.getVault()?.root) throw Error('Comparison belongs to another vault.');
+      if (record.slots.some(slot => slot.status === 'pending' || slot.status === 'inProgress')) throw Error('Complete all six explicit attempts before blind scoring. Retained failures remain eligible.');
+      if (!record.blindOrder) {
+        if (this.unsaved.has(record.id)) throw Error('Repair unsaved comparison storage before assigning persistent blind labels.');
+        // Independent post-generation shuffle. Never reuse the known preview
+        // order or aliases, even if the permutations happen to coincide.
+        const order = record.slots.map(slot => slot.id), labels = new Set();
+        for (let i = order.length - 1; i > 0; i--) { const j = randomInt(i + 1); [order[i], order[j]] = [order[j], order[i]]; }
+        record.blindOrder = order.map(slotId => {
+          let label;
+          do { label = `Sample ${randomUUID().slice(0, 8)}`; } while (labels.has(label));
+          labels.add(label); return { label, slotId };
+        });
+        await this.write(record);
+      }
+      return this.scoreProjection(record);
+    });
   }
   async rate(input) {
     const fields = rubric.dimensions.map(dimension => dimension.key), rating = input?.rating;
@@ -244,9 +261,9 @@ class Comparisons {
     return this.lock(async () => {
       const record = await this.read(input.id);
       if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output. Repair storage before saving feedback.');
-      const slotId = record.displayOrder[input.displayIndex], slot = record.slots.find(item => item.id === slotId);
+      const entry = record.blindOrder?.find(item => item.label === input.displayId), slot = record.slots.find(item => item.id === entry?.slotId);
       if (!slot || !['completed', 'failed', 'interrupted'].includes(slot.status) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
-      const projection = this.scoreProjection(record).outputs[input.displayIndex];
+      const projection = this.scoreProjection(record).outputs.find(item => item.displayId === input.displayId);
       if (projection.candidateDigest !== input.candidateDigest) throw Error('Retained output changed. Inspect it again before saving feedback.');
       const values = { ...rating, reason: rating.reason.trim() };
       if (slot.rating && fields.concat('reason', 'materialError').every(key => slot.rating[key] === values[key]) && slot.rating.candidateDigest === input.candidateDigest) return this.scoreProjection(record);

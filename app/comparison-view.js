@@ -13,9 +13,9 @@
   const records = new Map();
   const drafts = new Map();
   function scoreMode(enabled) {
-    for (const id of ['comparison-cases', 'comparison-package', 'comparison-preview-summary', 'comparison-send', 'comparison-slots']) {
+    for (const id of ['comparison-brief', 'comparison-create', 'comparison-cases', 'comparison-package', 'comparison-preview-summary', 'comparison-send', 'comparison-slots']) {
       byId(id).hidden = enabled;
-      if (id === 'comparison-package') byId(id).parentElement.hidden = enabled;
+      if (id === 'comparison-package' || id === 'comparison-brief') byId(id).parentElement.hidden = enabled;
     }
     byId('comparison-notice').hidden = enabled; byId('comparison-score-panel').hidden = !enabled;
     byId('comparison-score-start').hidden = enabled;
@@ -77,7 +77,7 @@
       heading.textContent = output.displayId; text.textContent = output.candidate?.text || '';
       state.textContent = `${output.status}. ${output.candidate?.warning || ''} ${output.error || ''}${output.status === 'failed' || output.status === 'interrupted' ? ' Generation failure is not grounded abstention; explain that distinction in the rating reason.' : ''}`;
       article.append(heading, state, text);
-      const key = `${result.id}:${output.displayIndex}`;
+      const key = `${result.id}:${output.displayId}`;
       let draft = drafts.get(key);
       if (!draft || draft.candidateDigest !== output.candidateDigest) { draft = { candidateDigest: output.candidateDigest, values: { ...output.rating } }; drafts.set(key, draft); }
       const controls = {};
@@ -102,7 +102,7 @@
         rating.reason = controls.reason.value; rating.materialError = controls.materialError.checked;
         save.disabled = true;
         try {
-          const saved = await window.companion['comparison-rate']({ id: result.id, displayIndex: output.displayIndex, candidateDigest: output.candidateDigest, expectedRevision: output.rating?.revision || null, rating });
+          const saved = await window.companion['comparison-rate']({ id: result.id, displayId: output.displayId, candidateDigest: output.candidateDigest, expectedRevision: output.rating?.revision || null, rating });
           if (observedEpoch !== epoch) return;
           output.rating = saved.outputs[output.displayIndex].rating; draft.values = { ...output.rating }; feedback.textContent = 'Feedback saved';
         } finally { if (observedEpoch === epoch) save.disabled = false; }
