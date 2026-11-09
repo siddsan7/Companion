@@ -50,7 +50,7 @@ class Comparisons {
     if (this.unsaved.has(id)) return structuredClone(this.unsaved.get(id));
     return this.readStored(id, forMutation);
   }
-  async readStored(id, forMutation = false) {
+  async readStored(id, forMutation = false, withBytes = false) {
     if (!uuid(id)) throw Error('Comparison identity is invalid.');
     const directory = this.safeDirectory(), file = path.join(this.directory, `${id}.json`);
     const stat = await fs.lstat(file); this.safeDirectory(false, directory);
@@ -65,7 +65,7 @@ class Comparisons {
     // writer baseline. Background reads must not bless another writer's bytes
     // for an already active request. Its own successful writes advance it.
     if (forMutation) this.durable.set(id, hash(bytes));
-    return record;
+    return withBytes ? { record, bytes } : record;
   }
   async write(record, create = false) {
     await this.checkpoint('comparison-before-store');
@@ -116,7 +116,7 @@ class Comparisons {
   }
   async list() {
     const vault = this.getVault(); if (!vault) return { comparisons: [] };
-    const directory = this.safeDirectory(true), names = await fs.readdir(this.directory);
+    const directory = this.safeDirectory(true), names = new Set([...await fs.readdir(this.directory), ...[...this.unsaved.keys()].map(id => `${id}.json`)]);
     this.safeDirectory(false, directory);
     const records = [];
     for (const name of names) if (name.endsWith('.json')) {
@@ -229,6 +229,30 @@ class Comparisons {
       return this.view(record);
     });
   }
+  async preserve(input) {
+    const retained = this.unsaved.get(input?.id);
+    if (!retained) throw Error('There is no unsaved comparison output to save. Refresh the view.');
+    try {
+      return await this.lock(async () => {
+        if (retained.vault.root !== this.getVault()?.root) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
+        let stored;
+        try { stored = await this.readStored(retained.id, false, true); }
+        catch { throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' }); }
+        const expected = this.durable.get(retained.id);
+        if (!expected || hash(stored.bytes) !== expected) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
+        const record = structuredClone(retained); delete record.storageWarning;
+        // This publication uses the exact last-owned durable baseline. It does
+        // not establish a new baseline from the observed conflicting file.
+        await this.write(record); this.unsaved.delete(record.id);
+        return this.view(record);
+      });
+    } catch (error) {
+      retained.storageWarning = error.code === 'HISTORY_CONFLICT'
+        ? 'Local comparison history changed or is unavailable. Retained output is still unsaved and may not survive restart. Restore the exact last durable file or copy the retained output before closing; existing history was not replaced.'
+        : 'Local comparison could not be saved. Retained output is still unsaved and may not survive restart. Repair storage and save again, or copy the output before closing.';
+      throw Error(retained.storageWarning);
+    }
+  }
   scoreProjection(record) {
     return { id: record.id, rubric, storageWarning: record.storageWarning || null, canReveal: this.completeFeedback(record), revealedAt: record.revealedAt || null,
       notice: `Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.${record.revealedAt ? ' Methods were already revealed; subsequent judgments are not blinded.' : ''}`,
@@ -308,6 +332,7 @@ function installComparisons({ ipcMain, ...options }) {
   ipcMain.handle('comparison-create', (_, input) => store.create(input));
   ipcMain.handle('comparison-preview', (_, input) => store.preview(input));
   ipcMain.handle('comparison-send', (_, input) => store.send(input));
+  ipcMain.handle('comparison-preserve', (_, input) => store.preserve(input));
   ipcMain.handle('comparison-score-view', (_, input) => store.scoreView(input));
   ipcMain.handle('comparison-rate', (_, input) => store.rate(input));
   ipcMain.handle('comparison-reveal', (_, input) => store.reveal(input));

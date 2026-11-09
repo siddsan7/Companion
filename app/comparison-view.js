@@ -7,6 +7,8 @@
   section.append(scoring);
   const startScoring = document.createElement('button'); startScoring.id = 'comparison-score-start'; startScoring.textContent = 'Start blind scoring';
   document.getElementById('comparison-notice').after(startScoring);
+  const preserve = document.createElement('button'); preserve.id = 'comparison-preserve'; preserve.textContent = 'Save retained comparison locally'; preserve.hidden = true;
+  document.getElementById('comparison-notice').after(preserve);
   const byId = id => document.getElementById(id);
   let current = null;
   let token = null, epoch = 0, sending = false;
@@ -27,6 +29,7 @@
     scoreMode(false);
     current = record.id; byId('comparison-select').value = current;
     byId('comparison-notice').textContent = `${record.notice} Approved brief version ${record.brief.version}; sha256 ${record.brief.digest}.${record.storageWarning ? ` ${record.storageWarning}` : ''}`;
+    byId('comparison-preserve').hidden = !record.storageWarning;
     byId('comparison-cases').replaceChildren();
     for (const fixture of record.fixtures) {
       const article = document.createElement('article'), heading = document.createElement('h3'), text = document.createElement('pre'), limits = document.createElement('p');
@@ -119,6 +122,13 @@
     scoreMode(true); renderScores(result);
   });
   byId('comparison-inspect').onclick = () => { if (current && records.has(current)) show(records.get(current)); };
+  byId('comparison-preserve').onclick = () => perform(async () => {
+    const observedEpoch = epoch, id = current; byId('comparison-preserve').disabled = true;
+    try {
+      const record = await window.companion['comparison-preserve']({ id }); records.set(record.id, record);
+      if (observedEpoch === epoch && current === id) show(record);
+    } finally { byId('comparison-preserve').disabled = false; }
+  });
   byId('comparison-reveal-button').onclick = () => perform(async () => {
     const observedEpoch = epoch, id = current; byId('comparison-reveal-button').disabled = true;
     try {
