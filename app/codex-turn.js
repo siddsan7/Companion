@@ -40,7 +40,10 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
   const validateItem = item => {
     if (!item || !validId(item.id) || !['userMessage', 'agentMessage', 'reasoning'].includes(item.type)) return rejectContext('An unselected tool or malformed context item appeared. The reply is incomplete.');
     if (item.type !== 'agentMessage') return true;
-    if (item.memoryCitation !== null) return rejectContext('Unselected memory appeared in the Codex reply. The reply is incomplete.');
+    if (item.memoryCitation !== null) {
+      messages.delete(item.id); preserveMessages();
+      return rejectContext('Codex cited unselected memory. The retained text is incomplete. Check setup and retry explicitly.');
+    }
     if (typeof item.text !== 'string' || item.phase !== null && !['commentary', 'partial_answer', 'final_answer'].includes(item.phase)) return rejectContext('Codex returned a malformed assistant message. The reply is incomplete.');
     return true;
   };
@@ -85,7 +88,7 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
         preserveMessages();
       } else for (const item of params.turn.items) if (!validateItem(item)) return;
       if (params.turn.status === 'completed' && [...messages.values()].some(message => !message.completed)) {
-        rejectContext('Codex reported completion without authoritative assistant message completion. The retained reply is incomplete.'); return;
+        rejectContext('Codex did not supply a complete final reply. The retained text is incomplete. Check setup and retry explicitly.'); return;
       }
       setup.settleTurn(params.turn.status);
     }
