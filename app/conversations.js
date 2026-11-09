@@ -245,9 +245,14 @@ class Conversations {
     const warnings = [...preview.warnings], history = [], historyExclusions = [];
     const scope = { version: baseline.version, excludedSources: [...excluded].sort(), excludedHistory: [...excludedHistory].sort() };
     const resolveHistory = this.historyResolver({ all, vault, active: prior && { ...prior, scope }, excludedSources: excluded, excludedHistory });
-    const foreign = new Map();
-    const includeForeign = result => {
+    const foreign = new Map(), selectedDialogue = new Map();
+    const includeForeign = (result, includeText = false) => {
+      // Ancestry authorizes eligibility checks, never implicit inclusion of raw dialogue.
       for (const turn of result.turns) if (turn.ref.conversationId !== prior?.id) foreign.set(`${turn.ref.conversationId}:${turn.ref.requestId}`, turn);
+      if (includeText) {
+        const primary = result.turns.at(-1);
+        selectedDialogue.set(`${primary.ref.conversationId}:${primary.ref.requestId}`, primary);
+      }
       for (const dep of result.dependencies) dependencies.set(dep.key, dep);
     };
     for (const request of prior?.requests || []) {
@@ -271,11 +276,12 @@ class Conversations {
     if (!Array.isArray(selectedHistory) || selectedHistory.length > 64 || new Set(selectedHistory.map(ref => `${ref?.conversationId}:${ref?.requestId}`)).size !== selectedHistory.length) throw Error('Historical selection is invalid. Search and explicitly select prior dialogue again.');
     for (const ref of selectedHistory) {
       if (!ref || !uuid(ref.conversationId) || !uuid(ref.requestId) || typeof ref.digest !== 'string' || ref.conversationId === prior?.id) throw Error('Historical selection is invalid. Use this conversation’s history controls for its own dialogue.');
-      try { includeForeign(await resolveHistory(ref.conversationId, ref.requestId, ref.digest)); }
+      try { includeForeign(await resolveHistory(ref.conversationId, ref.requestId, ref.digest), true); }
       catch (error) { throw Error(`Selected historical dialogue is unavailable: ${error.message}. Preview current context again.`); }
     }
-    const foreignText = [...foreign.values()].map(turn => `Historical dialogue from conversation ${turn.ref.conversationId}; request ${turn.ref.requestId}; origin sha256 ${turn.ref.digest}\nOrigin approved brief ${turn.brief.id}; version ${turn.brief.version}; sha256 ${turn.brief.digest}\nSource dependency closure: ${JSON.stringify(turn.dependencies)}\nUser: ${turn.question}\nAssistant: ${turn.reply}`).join('\n\n');
-    const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}${foreignText ? `\n\nPrior-conversation historical dialogue (retained discussion, not independent evidence):\n${foreignText}` : ''}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
+    const foreignText = [...selectedDialogue.values()].map(turn => `Historical dialogue from conversation ${turn.ref.conversationId}; request ${turn.ref.requestId}; origin sha256 ${turn.ref.digest}\nOrigin approved brief ${turn.brief.id}; version ${turn.brief.version}; sha256 ${turn.brief.digest}\nSource dependency closure: ${JSON.stringify(turn.dependencies)}\nUser: ${turn.question}\nAssistant: ${turn.reply}`).join('\n\n');
+    const authorityText = [...foreign.values()].map(turn => JSON.stringify({ ...turn.ref, brief: turn.brief, dependencies: turn.dependencies })).join('\n');
+    const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}${foreignText ? `\n\nPrior-conversation historical dialogue (retained discussion, not independent evidence):\n${foreignText}` : ''}${authorityText ? `\n\nHistorical dependency authority (provenance only; unselected ancestor dialogue is omitted):\n${authorityText}` : ''}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
     const count = [...text].length;
     this.safeDirectory(false, directory);
     return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, capacityBinding: preview.capacityBinding, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), historyRefs: [...foreign.values()].map(turn => turn.ref), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
