@@ -2,7 +2,7 @@
 
 Goal: retain a chosen conversation interpretation as an independent vault Markdown note after reviewing its exact content and destination. The approved seam is the ordinary Electron UI plus resulting Markdown, conversation files and operation journals. Tests use the real external stdio fixture, portable authored producer review bundles, controlled time and the existing OS dispatch/filesystem checkpoint substitutes. They do not establish live model readiness or installed Obsidian behavior.
 
-Source checkpoint: `bc9a312`, followed by history-preserving upstream integration merge `73e5afd` from `52488c9`. Root owns actual tests, Git and integration. The implementer ran syntax and whitespace checks. Production and test files are frozen for the coupled gate. The complete ideas/context/conversations gate and final independent ticket review are **pending**; this report does not call them passed.
+Source checkpoint: `bc9a312`, followed by history-preserving upstream integration merge `73e5afd` from `52488c9`. The initial frozen tip `1dafd2d` passed the 62-case ideas/context/conversations gate. Independent Spec review then found a recovery blocker; regression `7d61dad` reproduced it, and source fix `5cfc77a` passed the focused check. Root owns actual tests, Git and integration. Production and tests are frozen. Sync with integration `6a7c7fb` (including approved #15), all ideas checks on that resolved union, and final-tip independent reapproval are **pending**. The earlier 62-case pass is not a passing rerun of the later fix or resolved union.
 
 ## Acceptance coverage
 
@@ -19,7 +19,7 @@ Source checkpoint: `bc9a312`, followed by history-preserving upstream integratio
 
 ## Actual verification
 
-All elapsed times below are root-reported actual Electron runs. Incremental checks are not a substitute for the pending final coupled gate.
+All elapsed times below are root-reported actual Electron runs. The pre-fix combined pass and subsequent focused check are separate evidence; final union checks and independent reapproval remain pending.
 
 | Check | Actual result |
 | --- | --- |
@@ -36,14 +36,22 @@ All elapsed times below are root-reported actual Electron runs. Incremental chec
 | Two crash boundaries RED/GREEN | Both missing-checkpoint REDs took 27.8 seconds each. After narrow checkpoints and exact-pair recovery, both passed: 26.5 and 28.3 seconds, 55.3 seconds total. Tests record actual main PID, wrapper exit and main absence, rather than killing only a shell wrapper. |
 | Source-change and parent-junction checks | Source edit initially failed in 28.1 seconds because publication proceeded. `Ideas` and `.ideas` junction cases passed in 25.6 and 25.5 seconds. After current-support binding, source edit passed in 23.2 seconds. |
 | Worker checks | Changed JavaScript syntax checks and `git diff --check` passed after the final runtime edit. These supplement actual root-owned acceptance checks. |
-| Final combined gate | Pending at this report's creation: `npm.cmd test -- tests/ideas.spec.js tests/context.spec.js tests/conversations.spec.js`. |
-| Independent ticket review | Pending. No ticket-complete, integration approval or release-ready claim. |
+| Initial frozen combined gate | At `1dafd2d`, `npm.cmd test -- tests/ideas.spec.js tests/context.spec.js tests/conversations.spec.js`: all 62 passed, no skips, exit 0, 26.9 minutes. This preceded the review regression and recovery fix. |
+| Initial independent review | Standards approved `1dafd2d`, with an optional suggestion to consolidate duplicated five-field labels. Spec found the P1 recovery issue described below and withheld approval. The optional label consolidation was not a blocker and introduced no unrelated runtime change. |
+| Review recovery RED/GREEN | Regression `7d61dad`: actual RED 57.1 seconds; after a source edit following link/before receipt, Resume left Confirm disabled although the exact published pair remained intact. Fix `5cfc77a`: focused GREEN 30.4 seconds, exit 0. |
+| Final union checks and independent review | Pending: history-preserving sync from integration `6a7c7fb`, all ideas checks on the resolved union, and independent final-tip Standards/Spec reapproval. No ticket-complete, final integration approval or release-ready claim. |
+
+The P1 review cited [D04-I05](local-second-brain-spec.md):
+
+> Write the note safely, avoid overwriting unrelated files, and make retries recoverable without duplicate successful saves. Preserve the proposed content after failure so the user can retry.
+
+The old recovery path treated acknowledgement of an already-published note as authorization for a new publication. Changed source support therefore stranded the exact known stage/destination pair. The fix gives explicit acknowledgement its own mode: under the mutation lock, main revalidates exact intent, text, destination, inode/device and known peers; it writes one receipt without a new link or model call, then rechecks ownership before removing only the known stage. The regression preserves the external source edit and original note/intent bytes, checks one receipt and visible idea, removes the stage to one remaining link, and verifies no new submission. Current support eligibility remains the Context authority. New unpublished proposals still require fresh support binding.
 
 ## Reference and eligibility contract
 
 `app/ideas.js` owns authoring, validation, publication, pending recovery, exact evidence inspection and saved-note identity resolution. `app/ideas-view.js` supplies the ordinary desktop controls through narrow preload/IPC operations. Main constructs the fixed `obsidian://open?path=` URI from a validated unique idea identity and an encoded contained path; the renderer supplies neither a path nor a URI.
 
-The main-owned preview binds original conversation/request identity, retained package and reply, output status, exclusion scope, exact brief pin, editable fields, kind, complete experiment fields, selected anchors and current support state. Unchanged repreview retains its identity and creation instant. Confirmation reconstructs with that same identity and compares content/destination/key after the filesystem checkpoint. Changed context requires a new explicit review. No model call occurs during authoring, preview, confirmation or recovery.
+The main-owned preview binds original conversation/request identity, retained package and reply, output status, exclusion scope, exact brief pin, editable fields, kind, complete experiment fields, selected anchors and current support state. Unchanged repreview retains its identity and creation instant. New-publication confirmation reconstructs with that same identity and compares content/destination/key after the filesystem checkpoint. Changed context requires a new explicit review before a new publication. Acknowledging an exact already-published pair validates publication ownership without reauthorizing its use as current supporting context. No model call occurs during authoring, preview, confirmation or recovery.
 
 An imported citation anchor is:
 
@@ -76,7 +84,7 @@ These artifacts belong to the selected vault parent, separately from app-data co
 
 Publication uses kernel-owned mutation coordination, flushed exclusive intent/stage writes and exclusive no-replace linking. Parents are checked for ordinary type, canonical path and retained identity around I/O. Immediately before publication, the stage must have one link with an absent destination, or exactly two links comprising the known stage/destination inode/device pair. Unknown peers are preserved and rejected. Pending stages and published pairs are never exposed by weakening the normal ordinary one-link note reader.
 
-After publication but before receipt, explicit recovery acknowledges only the exact pair without linking again. After receipt but before cleanup, explicit confirmation removes only the known stage. Completed receipts without a stage stay completed even if the destination is edited or deleted. Journals remain for ownership and audit. Source purge in #13 must inventory the full intent/stage/note set and preserve or materialize independent writing before removing source-bearing copies; separate explicit scope is required to remove that writing.
+After publication but before receipt, explicit recovery acknowledges only the exact pair without linking again, including when supporting sources changed after publication. This completes the earlier publication; it does not authorize new supporting context. After receipt but before cleanup, explicit confirmation removes only the known stage. Completed receipts without a stage stay completed even if the destination is edited or deleted. Journals remain for ownership and audit. Source purge in #13 must inventory the full intent/stage/note set and preserve or materialize independent writing before removing source-bearing copies; separate explicit scope is required to remove that writing.
 
 ## Limits and deferred gates
 
