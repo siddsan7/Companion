@@ -3,9 +3,23 @@
   section.innerHTML = '<h2>Saved ideas</h2><p>Keep useful observations and failed analogies explicitly. A conversation does not create a note automatically.</p><div id="idea-editor" hidden><label>Idea title<input id="idea-title"></label><label>Idea explanation<textarea id="idea-explanation" rows="8"></textarea></label><label>Idea limitations<textarea id="idea-limitations" rows="3"></textarea></label><button id="idea-preview-button">Preview saved idea</button><div id="idea-preview" hidden><label>Proposed idea destination<input id="idea-destination" readonly></label><label>Proposed idea Markdown<textarea id="idea-markdown" rows="16" readonly></textarea></label><p id="idea-warnings"></p><button id="idea-confirm">Confirm saved idea</button><button id="idea-cancel">Cancel saved idea preview</button></div></div><p id="idea-status" aria-live="polite"></p><div id="saved-ideas"></div>';
   document.getElementById('conversation-section').after(section);
   const byId = id => document.getElementById(id);
+  const kindLabel = document.createElement('label'), kind = document.createElement('select');
+  kindLabel.htmlFor = 'idea-kind'; kindLabel.textContent = 'Saved idea kind'; kind.id = 'idea-kind';
+  for (const [value, label] of [['observation', 'Observation'], ['failed_analogy', 'Failed analogy'], ['experiment_proposal', 'Experiment Proposal']]) {
+    const option = document.createElement('option'); option.value = value; option.textContent = label; kind.append(option);
+  }
+  const experiments = document.createElement('div'); experiments.id = 'idea-experiment-fields'; experiments.hidden = true;
+  const experimentFields = [['hypothesis', 'Hypothesis'], ['borrowed_mechanism', 'Borrowed mechanism'], ['project_application', 'Project application'], ['smallest_test', 'Smallest test'], ['observable_result', 'Observable result']];
+  for (const [key, title] of experimentFields) {
+    const label = document.createElement('label'), field = document.createElement('textarea');
+    field.id = `idea-experiment-${key}`; field.rows = 3; label.htmlFor = field.id; label.textContent = title; experiments.append(label, field);
+  }
+  byId('idea-preview-button').before(kindLabel, kind, experiments);
   let origin = null, operation = null, epoch = 0;
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
   for (const field of ['title', 'explanation', 'limitations']) byId(`idea-${field}`).oninput = invalidate;
+  for (const [key] of experimentFields) byId(`idea-experiment-${key}`).oninput = invalidate;
+  kind.onchange = () => { invalidate(); experiments.hidden = kind.value !== 'experiment_proposal'; };
   async function list() {
     try {
       const notes = await window.companion['idea-list'](); byId('saved-ideas').replaceChildren();
@@ -22,13 +36,15 @@
     try {
       const draft = await window.companion['idea-draft'](origin); if (current !== epoch) return;
       byId('idea-editor').hidden = false; byId('idea-title').value = ''; byId('idea-explanation').value = draft.explanation; byId('idea-limitations').value = draft.limitations;
+      kind.value = 'observation'; experiments.hidden = true;
+      for (const [key] of experimentFields) byId(`idea-experiment-${key}`).value = '';
       byId('idea-title').focus();
     } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
   });
   byId('idea-preview-button').onclick = async () => {
     invalidate(); const current = epoch; byId('idea-status').textContent = '';
     try {
-      const preview = await window.companion['idea-preview']({ ...origin, title: byId('idea-title').value, explanation: byId('idea-explanation').value, limitations: byId('idea-limitations').value });
+      const preview = await window.companion['idea-preview']({ ...origin, title: byId('idea-title').value, explanation: byId('idea-explanation').value, limitations: byId('idea-limitations').value, kind: kind.value, experiment: Object.fromEntries(experimentFields.map(([key]) => [key, byId(`idea-experiment-${key}`).value])) });
       if (current !== epoch) return;
       operation = preview.operation; byId('idea-destination').value = preview.destination; byId('idea-markdown').value = preview.text;
       byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false;

@@ -83,11 +83,18 @@ class Ideas {
     const { vault, record, request } = await this.origin(input);
     for (const field of ['title', 'explanation', 'limitations']) if (typeof input[field] !== 'string' || !input[field].trim()) throw Error(`Enter the idea ${field} before previewing.`);
     if (/[\r\n]/.test(input.title)) throw Error('Use a title on one line.');
+    const kind = input.kind ?? 'observation';
+    if (!['observation', 'failed_analogy', 'experiment_proposal'].includes(kind)) throw Error('Choose a supported saved idea kind.');
+    const experimentLabels = { hypothesis: 'Hypothesis', borrowed_mechanism: 'Borrowed mechanism', project_application: 'Project application', smallest_test: 'Smallest test', observable_result: 'Observable result' };
+    const experiment = Object.fromEntries(Object.keys(experimentLabels).map(key => [key, input.experiment?.[key] ?? '']));
+    if (kind === 'experiment_proposal') for (const [key, label] of Object.entries(experimentLabels)) {
+      if (typeof experiment[key] !== 'string' || !experiment[key].trim()) throw Error(`Enter the experiment ${label} before previewing.`);
+    }
     const brief = await new Briefs(vault).pinned(record.brief.version);
     if (brief.id !== record.brief.id || brief.digest !== record.brief.digest) throw Error('The exact conversation brief is unavailable.');
     // An unchanged proposal keeps the same immutable identity and creation instant
     // when the user cancels and reviews it again. Confirmation never regenerates it.
-    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations }));
+    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment }));
     const retained = [...this.previews.values()].find(preview => preview.proposalKey === proposalKey);
     if (retained) {
       this.guard(vault);
@@ -96,9 +103,10 @@ class Ideas {
     const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => ({ capture_id: dep.captureId || dep.key.slice(8), ...(dep.revisionId ? { revision_id: dep.revisionId } : { content_sha256: dep.digest }) }));
     const unsupported = request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
     const id = randomUUID(), operation = randomUUID();
-    const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: this.clock().now, idea_kind: 'observation', source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations: [], origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
+    const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations: [], origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
     const disclosure = 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
-    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n\n## Supporting references\n\n${disclosure}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
+    const experimentText = kind === 'experiment_proposal' ? `\n# Experiment Proposal\n\n${Object.entries(experimentLabels).map(([key, label]) => `## ${label}\n\n${experiment[key]}`).join('\n\n')}\n` : '';
+    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
     const slug = fields.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Idea';
     const destination = path.join(vault.root, 'Ideas', `${slug}--${id}.md`);
     this.guard(vault);
