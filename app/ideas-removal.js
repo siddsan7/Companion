@@ -78,6 +78,16 @@ class IdeasRemoval {
         add(stage, 'stage', value.operation, loaded);
       }
     }
+    for (const name of fs.readdirSync(directory).sort()) {
+      if (!name.endsWith('.md.pending')) continue;
+      const operation = name.slice(0, -'.md.pending'.length);
+      if (intents.has(operation)) continue;
+      const loaded = this.read(vault, path.join(directory, name), parents);
+      let fields; try { fields = metadata(loaded.text); } catch { continue; }
+      // Identity/body similarity cannot authorize an orphan's deletion. Its
+      // presence instead holds removal until the unknown writing is resolved.
+      if (fields?.companion_id === id) held();
+    }
     for (const receipt of receipts) {
       const value = intents.get(receipt.value.operation); if (!value) held();
       this.ideas.checkReceipt(receipt.value, value);

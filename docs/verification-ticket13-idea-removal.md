@@ -13,6 +13,8 @@ The root agent ran the normal Electron UI with isolated persisted files and cont
 - Crash/Context RED: the next single case failed in 42.5 seconds after actual Electron `app.exit(77)` and restart. All selected copies remained behind the durable marker. The selected idea still appeared once in the manual Context options; zero was required. The other idea remained eligible. The root retained the actual 190-byte process/exit record under `companion-ticket13-idea-context-red-20261109`.
 - Crash/Context GREEN: the unchanged case passed in 39.7 seconds (case: 39.3 seconds). Before cleanup, the selected note still existed but was absent from manual Context options and discovery candidates; the other idea stayed eligible. Explicit recovery removed exactly the committed copies, retained a one-link permanent marker and preserved source/history and the other idea's bytes.
 - Syntax checks also passed for the focused `context.js` and `main.js` changes. Context uses the existing Ideas guard and removal fence through a production callback, including the shared store anchor. Direct Context callers have a raw marker check. Eligibility is checked again after asynchronous corpus reads, before returning eligible ideas.
+- Orphan-stage RED: one focused case failed in 32.7 seconds. Its durable result record showed a new matching-identity stage remained, the selected note was removed and a marker existed with a false completion message. The root retained this actual diagnostic under `companion-ticket13-idea-orphan-red-20261109`.
+- Orphan-stage GREEN: the unchanged case passed in 33.1 seconds (case: 32.7 seconds). A pending stage added after preview, without its own exact validated intent binding, now holds before any marker or unlink. The whole vault and history remain byte-exact. The raw stage inspection adds no deletion authority: matching body or UUID alone never enrolls an unknown copy for deletion. The helper syntax and whitespace checks passed.
 
 ## Approved authority protocol
 
@@ -26,6 +28,6 @@ Ideas guards retain each observed `.ideas` directory identity for the process li
 
 ## Remaining checks
 
-- Unknown orphan stages, changed scope, unknown hardlink peers and stale operation publication need focused regression evidence. Static review found that a selected-identity orphan stage without its own validated intent is not yet detected by the removal scope scan.
+- Additional changed-file and unknown-hardlink cases, stale operation publication and same-session store replacement still need focused regression evidence. The demonstrated changed-scope case covers a new orphan stage after preview.
 - Pending-only proposals need their own explicit removal control and desktop evidence; the current visible removal action starts from saved-note rows.
 - Full ticket review, integration, release checks and live provider/isolation checks remain with the root agent. No live provider, authentication, merge or deployment was performed by this worker.
