@@ -772,6 +772,75 @@ test('beyond-evidence speculation requires a fresh explicit review for permissio
   expect(submissions.map(call => call.text)).toEqual([allowed, disallowed]);
 });
 
+test('producer rejection excludes directly and transitively derived dialogue while independent selected evidence remains usable', async () => {
+  test.setTimeout(90000);
+  const producer = path.join(root, 'producer');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic REJECT_DIRECT_REPLY_CANARY based on both selected sources.' }));
+  await prepareConversation();
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(producer);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  const check = async instant => {
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · complete`);
+  };
+  await check('2026-11-08T12:00:01Z');
+  await page.getByLabel('Context question', { exact: true }).fill('How could synthetic review and spaced retrieval inform MyTune?');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: 'Human review: accept' }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Authored synthetic review fixture only\./);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Spaced retrieval revisits/);
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const first = await onlyConversation();
+  expect(first.requests[0].package.dependencies.filter(dep => dep.key.startsWith('capture:'))).toHaveLength(2);
+  const independent = first.requests[0].package.dependencies.find(dep => dep.key.startsWith('capture:') && !dep.revisionId);
+  expect(independent).toBeTruthy();
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('REJECT_DIRECT_REPLY_CANARY');
+  await page.getByLabel('Context question', { exact: true }).fill('What limitations follow from that prior reasoning?');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REJECT_DIRECT_REPLY_CANARY/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic REJECT_TRANSITIVE_REPLY_CANARY based on the included dialogue.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('REJECT_TRANSITIVE_REPLY_CANARY');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/reject'), path.join(producer, 'reject'), { recursive: true });
+  await check('2026-11-08T12:00:02Z');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: reject' }).getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  await page.getByLabel('Context question', { exact: true }).fill('What does independent spaced retrieval evidence support for MyTune?');
+  await selectCapture();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  const reviewed = page.getByLabel('Reviewed conversation package', { exact: true });
+  await expect(reviewed).toHaveValue(/Spaced retrieval revisits/);
+  await expect(reviewed).not.toHaveValue(/Authored synthetic review fixture only\.|REJECT_DIRECT_REPLY_CANARY|REJECT_TRANSITIVE_REPLY_CANARY/);
+  await expect(page.locator('#conversation-summary')).toContainText(/rejected|unavailable/);
+  await expect(page.locator('#conversation-history .history-exclusion')).toHaveCount(2);
+  await expect(page.locator('#conversation-history')).toContainText('REJECT_DIRECT_REPLY_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('REJECT_TRANSITIVE_REPLY_CANARY');
+  const exact = await reviewed.inputValue();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic independent evidence remains usable after producer rejection.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('independent evidence remains usable after producer rejection.');
+  await expect(page.locator('#conversation-history article')).toHaveCount(3);
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const saved = await onlyConversation();
+  expect(saved.requests[1].package.historyIds).toEqual([saved.requests[0].id]);
+  expect(saved.requests[2].package.historyIds).toEqual([]);
+  expect(saved.requests[2].package.dependencies.filter(dep => dep.key.startsWith('capture:'))).toEqual([independent]);
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions).toHaveLength(3); expect(submissions[1].text).toContain('REJECT_DIRECT_REPLY_CANARY');
+  expect(submissions[2].text).toBe(exact); expect(submissions[2].text).not.toMatch(/Authored synthetic review fixture only\.|REJECT_DIRECT_REPLY_CANARY|REJECT_TRANSITIVE_REPLY_CANARY/);
+  await page.getByLabel('Thought or link', { exact: true }).fill('Capture remains usable after producer rejection.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+});
+
 // Authored main-process capacity evidence is a controlled boundary, never live readiness.
 const capacityEvidence = () => ({
   capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'Authored synthetic capacity proof v1', harnessAndOutputEvidence: 'Authored synthetic harness and output proof v1' },
