@@ -56,7 +56,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       const identity = { threadId: active.threadId, turnId: active.turnId };
       const item = agentItem(itemId, message.text, message.phase, message.memoryCitation);
       if (!message.omitIndividualEvents) {
-        notify('item/started', { ...identity, item: agentItem(itemId, '', message.phase, message.memoryCitation), startedAtMs: 1794139200000 + index });
+        notify('item/started', { ...identity, item: agentItem(itemId, '', message.phase, message.citationAtCompletion ? null : message.memoryCitation), startedAtMs: 1794139200000 + index });
         notify('item/agentMessage/delta', { ...identity, itemId, delta: message.delta === undefined ? message.text : message.delta });
         if (scenario.turn !== 'pending' && !message.omitCompletedEvent) notify('item/completed', { ...identity, item, completedAtMs: 1794139200000 + index });
       }

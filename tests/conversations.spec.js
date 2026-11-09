@@ -468,3 +468,41 @@ for (const boundary of ['memory citation', 'terminal-only command', 'unconfirmed
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   });
 }
+
+test('a late memory citation removes the offending item from retained partial text and future context', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ messages: [
+    { text: 'Authored synthetic SAFE_EARLIER_ITEM_CANARY.', phase: 'partial_answer' },
+    { text: 'UNSELECTED_LATE_MEMORY_CANARY', phase: 'final_answer', citationAtCompletion: true, memoryCitation: { entries: [{ path: 'UNSELECTED_LATE_MEMORY_PATH_CANARY.md', lineStart: 1, lineEnd: 1, note: 'Authored synthetic unselected memory' }], threadIds: ['UNSELECTED_LATE_MEMORY_THREAD_CANARY'] } }
+  ] }));
+  await prepareConversation(); await observeConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(/unselected memory/i);
+  await expect(page.locator('#conversation-history')).toContainText('incomplete');
+  await expect(page.locator('#conversation-history')).toContainText('SAFE_EARLIER_ITEM_CANARY');
+  // Previously displayed provisional bytes cannot be unseen. Current retained output must be safe.
+  await expect(page.locator('#conversation-history')).not.toContainText('UNSELECTED_LATE_MEMORY_CANARY');
+  const files = await fs.readdir(path.join(root, 'conversations'));
+  const savedFile = path.join(root, 'conversations', files.find(name => name.endsWith('.json')));
+  const savedText = await fs.readFile(savedFile, 'utf8'), saved = JSON.parse(savedText);
+  expect(['failed', 'interrupted']).toContain(saved.requests[0].status);
+  expect(saved.requests[0].reply).toBe('Authored synthetic SAFE_EARLIER_ITEM_CANARY.');
+  expect(savedText).not.toMatch(/UNSELECTED_LATE_MEMORY_/);
+  expect(saved.requests[0].messages).toHaveLength(1);
+  await page.getByLabel('Context question', { exact: true }).fill('What is supported by the selected source and project alone?');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/What is supported/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/SAFE_EARLIER_ITEM_CANARY|UNSELECTED_LATE_MEMORY_/);
+  await expect(page.locator('#conversation-summary')).toContainText('Excluded incomplete historical request');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic clean next reply.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('clean next reply');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8'), submissions = calls.trim().split('\n').map(line => JSON.parse(line));
+  expect(submissions).toHaveLength(2);
+  expect(submissions[1].text).not.toMatch(/SAFE_EARLIER_ITEM_CANARY|UNSELECTED_LATE_MEMORY_/);
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('SAFE_EARLIER_ITEM_CANARY');
+  await expect(page.locator('#conversation-history')).not.toContainText('UNSELECTED_LATE_MEMORY_CANARY');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
