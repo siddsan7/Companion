@@ -1496,3 +1496,97 @@ test('a copied transcript cannot bypass source eligibility through context or br
   expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
+
+test('history archives roundtrip qualified foreign references and reject malformed reference authority without replay', async () => {
+  test.setTimeout(150000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'ARCHIVE_FOREIGN_A_12_CANARY: authored synthetic historical discussion.' }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_FOREIGN_A_12_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const firstName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const first = JSON.parse(await fs.readFile(path.join(root, 'conversations', firstName), 'utf8'));
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('ARCHIVE_FOREIGN_A_12_CANARY');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: 'ARCHIVE_FOREIGN_A_12_CANARY' }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Use the selected dialogue to propose a cautious application.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/ARCHIVE_FOREIGN_A_12_CANARY/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'ARCHIVE_FOREIGN_B_12_CANARY: a proposed application remains unverified.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_FOREIGN_B_12_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Keep this turn omitted from future context.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Keep this turn omitted/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_FOREIGN_A_12_CANARY|ARCHIVE_FOREIGN_B_12_CANARY/);
+  const historyDirectory = path.join(root, 'conversations'), histories = {}, records = [];
+  for (const name of (await fs.readdir(historyDirectory)).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) { histories[name] = await fs.readFile(path.join(historyDirectory, name), 'utf8'); records.push(JSON.parse(histories[name])); }
+  const second = records.find(record => record.id !== first.id);
+  expect(second.requests[0].package.historyRefs).toEqual([expect.objectContaining({ conversationId: first.id, requestId: first.requests[0].id, digest: expect.stringMatching(/^[a-f0-9]{64}$/) })]);
+  expect(second.scope.excludedHistory).toEqual([second.requests[0].id]);
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  const destination = path.join(root, 'qualified-history-roundtrip.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination, open: destination }), 'utf8');
+  let region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+  await expect(region).toContainText('2 conversations');
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(region).toContainText('Archive exported');
+  const archiveText = await fs.readFile(destination, 'utf8'), archive = JSON.parse(archiveText);
+  expect(archive.payload.conversations.sort((a, b) => a.id.localeCompare(b.id))).toEqual(records.sort((a, b) => a.id.localeCompare(b.id)));
+
+  // Recompute the documented archive integrity so each refusal must come from strict reference validation.
+  const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
+  const variants = [
+    ref => { ref.conversationId = 'unknown-conversation'; },
+    ref => { ref.requestId = 'unknown-request'; },
+    ref => { ref.digest = 'not-a-literal-sha256'; },
+    ref => { ref.unrecognizedAuthority = true; },
+    (ref, refs) => { refs.push({ ...ref }); }
+  ];
+  for (const [index, mutate] of variants.entries()) {
+    const invalid = JSON.parse(archiveText), refs = invalid.payload.conversations.find(record => record.id === second.id).requests[0].package.historyRefs;
+    mutate(refs[0], refs);
+    invalid.integrity.digest = require('node:crypto').createHash('sha256').update(canonical(invalid.payload)).digest('hex');
+    const invalidFile = path.join(root, `invalid-history-reference-${index}.json`);
+    await fs.writeFile(invalidFile, JSON.stringify(invalid), 'utf8');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: invalidFile }), 'utf8');
+    await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+    await expect(region.getByRole('button', { name: 'Inspect history archive', exact: true })).toBeEnabled();
+    await expect(page.locator('#archive-restore-summary')).toContainText(/unsupported data/i);
+    await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+    for (const [name, text] of Object.entries(histories)) expect(await fs.readFile(path.join(historyDirectory, name), 'utf8')).toBe(text);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  }
+  await app.close(); app = null;
+  for (const name of Object.keys(histories)) await fs.unlink(path.join(historyDirectory, name));
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: destination }), 'utf8');
+  await launch(false);
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await expect(page.locator('#archive-restore-summary')).toContainText('2 missing conversations');
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Missing history may have been deleted intentionally');
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Restored 2 conversations');
+  for (const record of records) expect(JSON.parse(await fs.readFile(path.join(historyDirectory, `${record.id}.json`), 'utf8'))).toEqual(record);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(second.id);
+  await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_FOREIGN_B_12_CANARY');
+  await page.getByLabel('Context question', { exact: true }).fill('Continue respecting the restored historical omission.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/restored historical omission/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/ARCHIVE_FOREIGN_A_12_CANARY|ARCHIVE_FOREIGN_B_12_CANARY/);
+  await expect(page.locator('#conversation-history .history-exclusion')).toContainText('Excluded from next request');
+  expect(await fs.readFile(destination, 'utf8')).toBe(archiveText);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
