@@ -269,6 +269,37 @@ test('duplicate identities preserve both files until explicit selection while in
   await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
 });
 
+test('a missing canonical capture never promotes its recorded excluded copy during intake', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  const base = path.join(root, 'vault', 'Companion'), dir = path.join(base, 'Captures');
+  const name = (await fs.readdir(dir)).find(file => file.endsWith('.md'));
+  const original = path.join(dir, name), before = await fs.readFile(original, 'utf8');
+  const copy = path.join(root, 'vault', 'Projects', 'Excluded capture.md');
+  await fs.mkdir(path.dirname(copy), { recursive: true }); await fs.writeFile(copy, before);
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
+  await page.getByRole('button', { name: `Use this file: Companion/Captures/${name}`, exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Identity selection saved');
+  await fs.unlink(original);
+  await artifact('next', '2'.repeat(32));
+  const independent = await artifact('independent', '3'.repeat(32));
+  const run = JSON.parse(await fs.readFile(path.join(independent, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
+  await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify(run));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  expect(await fs.readFile(copy, 'utf8')).toBe(before);
+  await expect(page.getByRole('button', { name: 'Use this file: Projects/Excluded capture.md', exact: true })).toBeVisible();
+  await expect(page.locator('#captures article')).toHaveCount(2);
+  await app.close(); app = null; await launch();
+  expect(await fs.readFile(copy, 'utf8')).toBe(before);
+  await page.getByRole('button', { name: 'Use this file: Projects/Excluded capture.md', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Identity selection saved');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  expect(await fs.readFile(copy, 'utf8')).not.toBe(before);
+  expect(await fs.readFile(original, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+});
+
 test('missing captures pause until explicit restore or confirmed intake removal with retained history', async () => {
   await artifact(); await launch(); await setup(); await connect(true);
   const base = path.join(root, 'vault', 'Companion'), dir = path.join(base, 'Captures'), name = (await fs.readdir(dir)).find(x => x.endsWith('.md')), file = path.join(dir, name);

@@ -6,6 +6,7 @@ const { CodexSetup } = require('./codex');
 const { Intake } = require('./intake');
 const { Schedule } = require('./schedule');
 const { installBriefs } = require('./briefs-ipc');
+const { installContext } = require('./context');
 let codex;
 const testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
@@ -62,7 +63,8 @@ app.whenReady().then(async () => {
     let intake = null, captures = [], vaultError;
     try { intake = vault ? await new Intake(vault).info() : null; captures = vault ? await vault.list() : []; }
     catch (error) { vaultError = error.message; }
-    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => note.type !== 'reel_import' || Object.values(intake?.captures || {}).some(x => x.id === note.id && !x.removed)), warnings: [...(vault?.warnings || []), ...(vaultError ? [vaultError] : [])], intake, vaultError, schedule: await schedule().info(clock().now) };
+    const imported = new Map(Object.values(intake?.captures || {}).map(capture => [capture.id, capture]));
+    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings: [...(vault?.warnings || []), ...(vaultError ? [vaultError] : [])], intake, vaultError, schedule: await schedule().info(clock().now) };
   });
   ipcMain.handle('capture', async (_, input) => { if (!vault) throw Error('Choose a vault first.'); return vault.capture(input, clock().now); });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
@@ -85,6 +87,7 @@ app.whenReady().then(async () => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri); else await shell.openExternal(uri);
   });
   installBriefs({ ipcMain, dialog, fs, path, testRoot, getVault: () => vault, clock });
+  installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData') });
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

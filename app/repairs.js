@@ -16,20 +16,23 @@ function install(Intake, { hash, read, noteText }) {
     const notes = await this.vault.scan(), annotations = await this.annotations(), ledger = await this.load();
     ledger.identityIssues = {}; ledger.identityChoices ||= {}; this.vault.identityPaths = new Map();
     const groups = new Map(); for (const note of notes) { if (!groups.has(note.id)) groups.set(note.id, []); groups.get(note.id).push(note); }
-    for (const [id, matches] of groups) if (matches.length > 1) {
+    for (const [id, matches] of groups) {
+      const choice = ledger.identityChoices[id];
+      if (matches.length === 1 && !choice?.copies.some(copy => copy.file === path.relative(this.vault.vault, matches[0].file))) continue;
       const files = matches.map(note => ({ file: path.relative(this.vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
-      const choice = ledger.identityChoices[id], copies = choice && files.filter(item => item.file !== choice.file);
+      const copies = choice && files.filter(item => item.file !== choice.file);
       if (choice && files.some(item => item.file === choice.file) && JSON.stringify(copies) === JSON.stringify(choice.copies)) this.vault.identityPaths.set(id, path.join(this.vault.vault, choice.file));
       else { ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity. Both files are preserved; choose the managed file explicitly. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) }; this.vault.identityPaths.set(id, null); }
     }
     const annotationGroups = new Map(), annotationPaths = new Set();
     for (const annotation of annotations) { if (!annotationGroups.has(annotation.id)) annotationGroups.set(annotation.id, []); annotationGroups.get(annotation.id).push(annotation); }
     for (const [annotationId, matches] of annotationGroups) {
-      if (matches.length === 1) { annotationPaths.add(matches[0].file); continue; }
       // Annotation choices never confer authority over a capture with the same UUID.
       const id = 'annotation:' + annotationId;
+      const choice = ledger.identityChoices[id];
+      if (matches.length === 1 && !choice?.copies.some(copy => copy.file === path.relative(this.vault.vault, matches[0].file))) { annotationPaths.add(matches[0].file); continue; }
       const files = matches.map(note => ({ file: path.relative(this.vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
-      const choice = ledger.identityChoices[id], copies = choice && files.filter(item => item.file !== choice.file);
+      const copies = choice && files.filter(item => item.file !== choice.file);
       if (choice && files.some(item => item.file === choice.file) && JSON.stringify(copies) === JSON.stringify(choice.copies)) annotationPaths.add(path.join(this.vault.vault, choice.file));
       else ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) };
     }
