@@ -1124,3 +1124,100 @@ test('explicit metadata-only restore preserves inert cadence and Codex hints wit
     root = sourceRoot;
   }
 });
+
+test('third-installation vault matching reconnects only inherited cadence bound to the selected archived vault', async () => {
+  test.setTimeout(150000);
+  const crypto = require('node:crypto'), sourceRoot = root;
+  let middleRoot, targetRoot;
+  try {
+    await launch();
+    await page.getByLabel('Draft source folder', { exact: true }).fill(path.resolve('tests/fixtures/reel-draft'));
+    await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+    const originalTask = await fs.readFile(path.join(root, 'scheduler-task.json'), 'utf8');
+    const archiveAFile = path.join(root, 'installation-a.json');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archiveAFile }), 'utf8');
+    const exportArchive = async () => {
+      const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+      await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+      await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+      await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+      await expect(region.locator('#archive-summary')).toContainText('Archive exported');
+    };
+    await exportArchive();
+    const archiveA = JSON.parse(await fs.readFile(archiveAFile, 'utf8'));
+    await app.close(); app = null;
+    const importMatched = async (file, archivedRoot) => {
+      await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: file }), 'utf8');
+      const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+      await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+      await expect(region).toContainText('Integrity and version validated');
+      await region.getByLabel('Archive vault to match', { exact: true }).selectOption(archivedRoot);
+      await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+      await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+      await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+      await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+      await expect(region).toContainText('Restored 0 conversations');
+      return region;
+    };
+    middleRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-installation-b-')); root = middleRoot;
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-13T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
+    await fs.cp(path.join(sourceRoot, 'vault'), path.join(root, 'vault'), { recursive: true });
+    await launch();
+    await importMatched(archiveAFile, path.join(sourceRoot, 'vault', 'Companion'));
+    for (const name of ['schedule.json', 'scheduler-task.json']) expect(await fs.access(path.join(root, name)).then(() => true, () => false)).toBe(false);
+    const unrelated = { schema: 1, archiveId: crypto.randomUUID(), sourceRoot: path.join(sourceRoot, 'unrelated-source', 'Companion'), targetRoot: path.join(sourceRoot, 'unrelated-target', 'Companion'), intent: { ...archiveA.payload.scheduleIntent, id: crypto.randomUUID(), vault: path.join(sourceRoot, 'unrelated-source') } };
+    const unrelatedName = `archive-intent-${unrelated.archiveId}-${crypto.createHash('sha256').update(unrelated.sourceRoot + '\n' + unrelated.targetRoot).digest('hex')}.json`;
+    // Ordinary durable metadata fixture for an unrelated archived vault; it has no matching consent at C.
+    await fs.writeFile(path.join(root, unrelatedName), JSON.stringify(unrelated), 'utf8');
+    const middleIntents = Object.fromEntries(await Promise.all((await fs.readdir(root)).filter(name => name.startsWith('archive-intent-') && name.endsWith('.json')).map(async name => [name, await fs.readFile(path.join(root, name), 'utf8')])));
+    const archiveBFile = path.join(root, 'installation-b-inherited.json');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archiveBFile }), 'utf8');
+    await exportArchive();
+    const archiveB = JSON.parse(await fs.readFile(archiveBFile, 'utf8'));
+    expect(archiveB.payload.scheduleIntent).toBeNull();
+    expect(archiveB.payload.settings.inactiveScheduleIntents).toEqual(expect.arrayContaining([expect.objectContaining({ archiveId: archiveA.id, targetRoot: path.join(middleRoot, 'vault', 'Companion') }), unrelated]));
+    await app.close(); app = null;
+    targetRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-installation-c-')); root = targetRoot;
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-14T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
+    await fs.cp(path.join(middleRoot, 'vault'), path.join(root, 'vault'), { recursive: true });
+    await launch();
+    const before = await archiveSafetyState();
+    const region = await importMatched(archiveBFile, path.join(middleRoot, 'vault', 'Companion'));
+    await expect(region).toContainText('Imported daily intake intent is inactive');
+    expect(await archiveSafetyState()).toEqual(before);
+    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(unrelated.archiveId);
+    await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
+    await expect(region.locator('#archive-reconnect-summary')).toContainText('Select exactly one imported cadence matched to the current vault');
+    await expect(region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true })).toBeDisabled();
+    expect(await archiveSafetyState()).toEqual(before);
+    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(archiveA.id);
+    await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
+    await expect(region.locator('#archive-reconnect-summary')).toContainText(`Original anchor: ${archiveA.payload.scheduleIntent.anchor}`);
+    const reconnect = region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true });
+    await expect(reconnect).toBeEnabled();
+    expect(await archiveSafetyState()).toEqual(before);
+    const inheritedAtC = await Promise.all((await fs.readdir(root)).filter(name => name.startsWith('archive-intent-') && name.endsWith('.json')).map(async name => JSON.parse(await fs.readFile(path.join(root, name), 'utf8'))));
+    expect(inheritedAtC.find(record => record.archiveId === archiveA.id)).toMatchObject({ sourceRoot: path.join(sourceRoot, 'vault', 'Companion'), targetRoot: path.join(targetRoot, 'vault', 'Companion') });
+    expect(inheritedAtC.find(record => record.archiveId === unrelated.archiveId)).toEqual(unrelated);
+    await reconnect.click();
+    await expect(region.locator('#archive-reconnect-summary')).toContainText('Imported daily intake connected');
+    const connected = JSON.parse(await fs.readFile(path.join(root, 'schedule.json'), 'utf8'));
+    const task = JSON.parse(await fs.readFile(path.join(root, 'scheduler-task.json'), 'utf8'));
+    expect(connected.id).not.toBe(archiveA.payload.scheduleIntent.id);
+    expect(connected).toMatchObject({ anchor: archiveA.payload.scheduleIntent.anchor, handledSlot: 5, vault: path.join(targetRoot, 'vault'), mode: 'enabled' });
+    expect(task.name).toBe(`Companion-${connected.id}`); expect(task.arguments).toContain(path.join(targetRoot, 'schedule.json'));
+    expect(await fs.readFile(path.join(sourceRoot, 'scheduler-task.json'), 'utf8')).toBe(originalTask);
+    for (const [name, bytes] of Object.entries(middleIntents)) expect(await fs.readFile(path.join(middleRoot, name), 'utf8')).toBe(bytes);
+    for (const name of ['schedule.json', 'scheduler-task.json']) expect(await fs.access(path.join(middleRoot, name)).then(() => true, () => false)).toBe(false);
+    expect(await fs.access(path.join(targetRoot, 'conversation-submissions.jsonl')).then(() => true, () => false)).toBe(false);
+    expect(await tree(path.join(targetRoot, 'vault'))).toEqual(before.vault);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (targetRoot) await fs.rm(targetRoot, { recursive: true, force: true });
+    if (middleRoot) await fs.rm(middleRoot, { recursive: true, force: true });
+    root = sourceRoot;
+  }
+});
