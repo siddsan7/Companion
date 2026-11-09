@@ -4,7 +4,20 @@ const os = require('node:os');
 const path = require('node:path');
 let root, app, page, checks;
 test.beforeEach(async () => { checks = 0; root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-reviews-')); });
-test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.afterEach(async ({}, testInfo) => {
+  if (testInfo.status !== testInfo.expectedStatus) {
+    const lastCheck = await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8').then(text => {
+      const value = JSON.parse(text).lastCheck;
+      return value ? { at: value.at, trigger: value.trigger, status: value.status } : null;
+    }).catch(error => ({ unavailable: error.code || error.name }));
+    const visible = page ? await page.evaluate(() => ({
+      status: document.querySelector('[role="status"]')?.textContent?.slice(0, 500),
+      timezone: document.getElementById('timezone')?.textContent?.slice(0, 200)
+    })).catch(() => ({ unavailable: true })) : { unavailable: true };
+    console.log('Review restart failure evidence: ' + JSON.stringify({ title: testInfo.title, status: testInfo.status, expectedStatus: testInfo.expectedStatus, lastCheck, visible }));
+  }
+  if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true });
+});
 async function bundle(name = 'accept') {
   const dir = path.join(root, 'producer', name);
   await fs.cp(path.join(__dirname, 'fixtures/reel-review', name), dir, { recursive: true });
