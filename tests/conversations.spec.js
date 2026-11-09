@@ -1182,3 +1182,55 @@ test('prior conversation search is opt-in and selected excerpts are labelled his
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Use only current project context/);
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/HISTORICAL_DIALOGUE_12_CANARY|revisit one chord after a delay/);
 });
+
+test('omitting prior dialogue retains dependency authority without resending unselected raw ancestor text', async () => {
+  test.setTimeout(120000);
+  const ancestor = 'RAW_ANCESTOR_ONLY_12_CANARY', derived = 'DERIVED_REPLY_ONLY_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${ancestor}: a private prior-dialogue detail.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText(ancestor);
+  const firstName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const first = JSON.parse(await fs.readFile(path.join(root, 'conversations', firstName), 'utf8'));
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`Consider the historical discussion ${ancestor}.`);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: ancestor }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Apply the selected historical discussion to a controlled test.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/a private prior-dialogue detail/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${derived}: the proposed application needs a controlled test.` }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(derived);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+
+  // A fresh request allows B's own dialogue after explicitly removing raw A.
+  await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Continue with the proposed controlled test.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/the proposed application needs a controlled test/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/RAW_ANCESTOR_ONLY_12_CANARY|a private prior-dialogue detail/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic continuing the controlled test without quoting its ancestor.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('continuing the controlled test without quoting its ancestor');
+  const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+  const second = records.find(record => record.id !== first.id);
+  expect(second.requests).toHaveLength(2);
+  expect(second.requests[1].package.historyRefs).toContainEqual(expect.objectContaining({ conversationId: first.id, requestId: first.requests[0].id }));
+  for (const dependency of first.requests[0].package.dependencies) expect(second.requests[1].package.dependencies).toContainEqual(dependency);
+  expect(second.requests[1].package.text).not.toContain('a private prior-dialogue detail');
+
+  // Explicitly selecting derived B in C permits B's actual turn, not its unselected raw ancestry.
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`Inspect ${derived}.`);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  const result = page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: derived });
+  await expect(result).toHaveCount(1);
+  await result.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/the proposed application needs a controlled test/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/RAW_ANCESTOR_ONLY_12_CANARY|a private prior-dialogue detail/);
+  expect((await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue())).toContain(first.id);
+});
