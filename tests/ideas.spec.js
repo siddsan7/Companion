@@ -24,7 +24,7 @@ async function launch(configure = true) {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation({ imported = false } = {}) {
+async function completedConversation({ imported = false, twoCaptures = false } = {}) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
   await launch();
   if (imported) {
@@ -38,6 +38,11 @@ async function completedConversation({ imported = false } = {}) {
     await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
     await page.getByRole('button', { name: 'Save capture', exact: true }).click();
     await expect(page.getByRole('status')).toContainText('Capture saved.');
+    if (twoCaptures) {
+      await page.getByLabel('Thought or link', { exact: true }).fill('A practice queue makes a delayed revisit visible.');
+      await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+      await expect(page.locator('#captures').getByRole('heading', { name: 'A practice queue makes a delayed revisit visible.', exact: true })).toBeVisible();
+    }
   }
   const readme = path.join(root, 'README.md');
   await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
@@ -50,6 +55,10 @@ async function completedConversation({ imported = false } = {}) {
   await page.getByLabel('Context question', { exact: true }).fill(question);
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
   await page.locator('#context-results article').filter({ hasText: imported ? 'Authored synthetic review' : 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  if (twoCaptures) {
+    await page.getByLabel('Manual context source', { exact: true }).selectOption({ label: 'A practice queue makes a delayed revisit visible.' });
+    await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  }
   await page.getByLabel('Conversation brief version', { exact: true }).fill('1');
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(imported ? 'synthetic review support' : 'How could retrieval help MyTune\\?'));
@@ -243,4 +252,53 @@ test('citation inspection ignores damaged uncited revisions and reports a damage
   await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveCount(0);
   await expect(page.locator('#idea-evidence')).not.toContainText('Authored synthetic corrected review');
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+});
+
+test('two captures can support multiple independent saved interpretations that remain eligible for explicit context selection', async () => {
+  test.setTimeout(120000);
+  await completedConversation({ twoCaptures: true });
+  const vault = path.join(root, 'vault', 'Companion'), ideas = path.join(vault, 'Ideas');
+  const originals = await markdownSnapshot(path.join(vault, 'Captures'));
+  const captureIds = Object.values(originals).map(text => YAML.parse(text.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id).sort();
+  expect(captureIds).toHaveLength(2);
+  const historyName = (await fs.readdir(path.join(root, 'conversations'))).find(name => name.endsWith('.json'));
+  const historyFile = path.join(root, 'conversations', historyName), historyBytes = await fs.readFile(historyFile, 'utf8');
+  const history = JSON.parse(historyBytes);
+  expect(history.requests[0].package.dependencies.filter(dep => dep.key.startsWith('capture:'))).toHaveLength(2);
+  const titles = ['A joint observation from two captures', 'A failed analogy from the same captures'];
+  const destinations = [], saved = [];
+  for (const [index, title] of titles.entries()) {
+    await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+    await page.getByLabel('Idea title', { exact: true }).fill(title);
+    await page.getByLabel('Idea explanation', { exact: true }).fill(index === 0 ? 'eligibilitysignal: the two captures suggest making a delayed revisit visible in the practice queue.' : 'eligibilitysignal: the same captures do not show that a queue guarantees retrieval or better learning. The analogy fails at that assumption.');
+    await page.getByLabel('Idea limitations', { exact: true }).fill('User interpretation of two ordinary captures; no independent verification or observed result.');
+    await page.getByLabel('Saved idea kind', { exact: true }).selectOption({ label: index === 0 ? 'Observation' : 'Failed analogy' });
+    await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+    await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(`# ${title}`));
+    const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+    const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+    const fields = YAML.parse(proposed.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+    expect(fields.source_dependencies.map(dep => dep.capture_id).sort()).toEqual(captureIds);
+    expect(fields.source_dependencies.every(dep => /^[a-f0-9]{64}$/.test(dep.content_sha256))).toBe(true);
+    expect(fields.project_brief).toEqual(history.brief);
+    expect(fields.idea_kind).toBe(index === 0 ? 'observation' : 'failed_analogy');
+    expect(fields.experiment).toBeUndefined();
+    expect(fields.support_attribution_unavailable).toBe(false);
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect(page.locator('#saved-ideas').getByRole('heading', { name: title, exact: true })).toBeVisible();
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    destinations.push(destination); saved.push(proposed);
+  }
+  expect(new Set(destinations).size).toBe(2);
+  expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(2);
+  expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(originals);
+  expect(await fs.readFile(historyFile, 'utf8')).toBe(historyBytes);
+  await page.getByLabel('Context question', { exact: true }).fill('eligibilitysignal');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  for (const title of titles) await expect(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toBeVisible();
+  await page.locator('#context-results article').filter({ hasText: titles[0] }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(/eligibilitysignal: the two captures suggest/);
+  for (const [index, destination] of destinations.entries()) expect(await fs.readFile(destination, 'utf8')).toBe(saved[index]);
+  expect(await fs.readFile(historyFile, 'utf8')).toBe(historyBytes);
 });
