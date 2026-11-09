@@ -1023,3 +1023,86 @@ test('archive preserves only inert Codex setup preferences and inherited hints w
     root = sourceRoot;
   }
 });
+
+test('explicit metadata-only restore preserves inert cadence and Codex hints without adding conversations or activating settings', async () => {
+  test.setTimeout(120000);
+  const sourceRoot = root;
+  let targetRoot;
+  try {
+    await launch();
+    await page.getByLabel('Draft source folder', { exact: true }).fill(path.resolve('tests/fixtures/reel-draft'));
+    await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+    const originalTask = await fs.readFile(path.join(root, 'scheduler-task.json'), 'utf8');
+    const preferences = { executable: path.join(root, 'metadata-only-codex.exe'), project: path.join(root, 'metadata-only-project'), vault: path.join(root, 'vault', 'Companion'), sandbox: 'elevated' };
+    await fs.mkdir(path.join(root, 'codex'), { recursive: true });
+    await fs.writeFile(path.join(root, 'codex', 'setup.json'), JSON.stringify(preferences), 'utf8');
+    const archiveFile = path.join(root, 'metadata-only-archive.json');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archiveFile }), 'utf8');
+    const sourceRegion = page.getByRole('region', { name: 'Local history archive', exact: true });
+    await sourceRegion.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+    await expect(sourceRegion.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+    await sourceRegion.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+    await expect(sourceRegion.locator('#archive-summary')).toContainText('Archive exported');
+    const exported = JSON.parse(await fs.readFile(archiveFile, 'utf8'));
+    expect(exported.payload.conversations).toEqual([]);
+    expect(exported.payload.settings.codexReconnectHints).toEqual({ ...preferences, reapprovalRequired: true });
+    expect(exported.payload.scheduleIntent).toMatchObject({ mode: 'enabled', reconnectRequired: true });
+    await app.close(); app = null;
+    targetRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-metadata-only-')); root = targetRoot;
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
+    await fs.cp(path.join(sourceRoot, 'vault'), path.join(root, 'vault'), { recursive: true });
+    await fs.mkdir(path.join(root, 'codex'));
+    const targetSetup = path.join(root, 'codex', 'setup.json');
+    await fs.writeFile(targetSetup, JSON.stringify({ executable: path.join(root, 'keep-local.exe'), project: path.join(root, 'keep-local-project'), vault: path.join(root, 'vault', 'Companion'), sandbox: 'mxc' }), 'utf8');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: archiveFile }), 'utf8');
+    await launch();
+    const before = { authority: await archiveSafetyState(), setup: await fs.readFile(targetSetup, 'utf8') };
+    const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+    const matchedPreview = async () => {
+      await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+      await expect(region).toContainText('Integrity and version validated');
+      await region.getByLabel('Archive vault to match', { exact: true }).selectOption(preferences.vault);
+      await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+      await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+    };
+    await matchedPreview();
+    await expect(region).toContainText('0 missing conversations');
+    await expect(region).toContainText('2 inert settings records to preserve');
+    await expect(region).toContainText('No conversations will be added; current settings stay active');
+    const confirm = region.getByRole('button', { name: 'Restore reviewed additions', exact: true });
+    await expect(confirm).toBeEnabled();
+    expect(await archiveSafetyState()).toEqual(before.authority);
+    expect(await fs.readFile(targetSetup, 'utf8')).toBe(before.setup);
+    await confirm.click();
+    await expect(region).toContainText('Restored 0 conversations');
+    await expect(region).toContainText('Preserved 2 inert settings records');
+    await expect(region).toContainText('Imported daily intake intent is inactive');
+    await expect(region).toContainText('Archived Codex preferences are inert reconnection hints');
+    expect(await archiveSafetyState()).toEqual(before.authority);
+    expect(await fs.readFile(targetSetup, 'utf8')).toBe(before.setup);
+    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(exported.id);
+    await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
+    await expect(region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true })).toBeEnabled();
+    expect(await archiveSafetyState()).toEqual(before.authority);
+    await matchedPreview();
+    await expect(region).toContainText('0 inert settings records to preserve');
+    await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+    await app.close(); app = null;
+    app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Local history archive', exact: true })).toContainText('Imported daily intake intent is inactive');
+    await expect(page.getByRole('region', { name: 'Local history archive', exact: true })).toContainText(preferences.project);
+    expect(await archiveSafetyState()).toEqual(before.authority);
+    expect(await fs.readFile(targetSetup, 'utf8')).toBe(before.setup);
+    expect(await fs.readFile(path.join(sourceRoot, 'scheduler-task.json'), 'utf8')).toBe(originalTask);
+    await expect(page.getByRole('combobox', { name: /^Windows isolation/ })).toHaveValue('mxc');
+    for (const name of ['codex-requests.jsonl', 'conversation-submissions.jsonl', 'schedule.json', 'scheduler-task.json']) expect(await fs.access(path.join(root, name)).then(() => true, () => false)).toBe(false);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (targetRoot) await fs.rm(targetRoot, { recursive: true, force: true });
+    root = sourceRoot;
+  }
+});
