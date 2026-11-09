@@ -20,8 +20,8 @@ These are controlled acceptance results, not actual inference or reasoning-quali
 | Selected brief input changes before dispatch | Passed, 14.9 seconds; zero provider thread/turn starts, original brief snapshot retained, capture usable | Test `c735a4a`; existing runtime unchanged |
 | Actual comparison-directory junction and history-leaf hardlink | Both passed, 15.7 and 15.5 seconds, 31.7 seconds total; outside canary not exposed, outside bytes unchanged, capture usable | Test `a1811f0`; existing runtime unchanged |
 | Abrupt actual Electron main exit during a partial comparison | Passed, 13.9 seconds; actual main PID absent, interrupted text retained, elapsed unavailable, no replay or reuse of process proof | Test `aed7a13`; existing runtime unchanged |
-| Final comparisons, Codex and conversations coupled gate | Pending root result when this record was written; no passing claim | Synchronized candidate `2bafa3e`, preserving upstream `52488c9` |
-| Exact-tip independent review and ticket integration | Pending | Root-owned next step |
+| Final comparisons, Codex and conversations coupled gate | All 52 passed, no skips, exit 0, 20.0 minutes | Frozen `2dc4c2b`; production/test tree unchanged from synchronized `2bafa3e`, preserving upstream `52488c9` |
+| Exact-tip independent review and ticket integration | Independent Standards and Spec approved `2dc4c2b`; final documentation/planning synchronization must receive exact-tip approval before integration | Final approval and preserving merge are recorded in ticket #15 comments |
 
 Earlier missing-control REDs preceded implementation. One dispatch observation initially failed after 10.8 seconds because the test read the package immediately after an asynchronous Preview click. The test now waits for the actual package text and enabled Send control before reading it. No runtime change or sleep was used for that correction. The original failed observation is not called a pass.
 
@@ -87,4 +87,16 @@ Explicit local Save reads the ordinary existing file through the same guard and 
 
 Managed sign-in and actual model interaction, effective prompt/tool inventory and independent model/settings/input/harness/output capacity proof remain explicitly deferred. Authored fixture transport, schema inspection and closed-gate checks do not pass those live gates or establish useful reasoning/guitar outcomes. Real Reel to MD import-to-saved-proposal/Obsidian acceptance remains separate #16 work. Hosted CI was blocked by billing and user-waived, not passed. No deployment or release-ready claim is made.
 
-The final synchronized comparisons/Codex/conversations result and exact-tip independent review must be recorded by root before ticket completion. #16 still requires the complete-PR release gate and its separate real-gate status report.
+The synchronized comparisons/Codex/conversations gate passed all 52 cases. The independent reviews below cover the frozen runtime and tests. Root records final-tip approval and integration in ticket #15 before completion. #16 still requires the complete-PR release gate and its separate real-gate status report.
+
+## Standards
+
+Independent reviewer `review15_standards` approved exact tip `2dc4c2b268d01e9267eb8c64a09696b2f6078a8c`. No blocking documented-standard violations or correctness, data-safety, private-proof exposure, or shared-transport regression were found. Main-process authority, narrow IPC, fresh restricted threads, application-data ownership and explicit evidence whitelists follow the documented ADRs.
+
+One low, nonblocking heuristic: `app/comparisons.js` repeats the feedback-binding digest in scoring projection and reveal eligibility. A shared `candidateDigest(slot)` helper could prevent future drift. The expressions currently agree for eligible candidates; this is optional maintainability advice. The reviewer considered the complete smell baseline with repository overrides and performed no edits or tests.
+
+## Spec
+
+Independent reviewer `review15_spec` approved the same exact tip with no blocking findings or material scope creep. Matched package/model/settings pins, durable one-attempt slots, retained full outcomes and qualified effort, separate blind mapping, candidate-bound four-dimension feedback and explicit reveal satisfy D21, D34 and D39. Versioned prompts share grounding/output requirements; only analogy requests mapping. Active writer baselines and guarded local recovery preserve external edits without generation replay.
+
+These are ticket approvals. They do not establish live inference, reasoning quality, release readiness or final whole-PR approval. Review totals: Standards zero hard violations and one low heuristic; Spec zero findings.
