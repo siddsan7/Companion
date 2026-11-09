@@ -4,7 +4,7 @@
   document.getElementById('conversation-section').after(section);
   const byId = id => document.getElementById(id);
   const refreshSupport = document.createElement('button'), supportStatus = document.createElement('p');
-  refreshSupport.textContent = 'Refresh saved idea support'; supportStatus.id = 'idea-support-status';
+  refreshSupport.textContent = 'Refresh saved idea support'; refreshSupport.disabled = true; supportStatus.id = 'idea-support-status';
   byId('saved-ideas').before(refreshSupport, supportStatus);
   const kindLabel = document.createElement('label'), kind = document.createElement('select');
   kindLabel.htmlFor = 'idea-kind'; kindLabel.textContent = 'Saved idea kind'; kind.id = 'idea-kind';
@@ -22,7 +22,7 @@
   byId('idea-preview-button').before(references);
   const evidenceView = document.createElement('div'); evidenceView.id = 'idea-evidence'; section.append(evidenceView);
   const pendingView = document.createElement('div'); pendingView.id = 'pending-ideas'; section.append(pendingView);
-  let origin = null, operation = null, epoch = 0, listEpoch = 0, vaultEpoch = 0;
+  let origin = null, operation = null, epoch = 0, listEpoch = 0, vaultEpoch = 0, initialSupportPending = true;
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
   for (const field of ['title', 'explanation', 'limitations']) byId(`idea-${field}`).oninput = invalidate;
   for (const [key] of experimentFields) byId(`idea-experiment-${key}`).oninput = invalidate;
@@ -126,8 +126,16 @@
     finally { byId('idea-confirm').disabled = false; }
   };
   refreshSupport.onclick = () => list();
-  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
-  window.addEventListener('companion-vault-configured', () => list());
+  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
+  function inspectInitialSupport(event) {
+    if (configurationBusy || event?.detail && event.detail.configurationEpoch !== configurationEpoch) return;
+    refreshSupport.disabled = false;
+    if (!initialSupportPending) return;
+    initialSupportPending = false; list();
+  }
+  // Support inspection can reconcile intake. Start it only after the real base
+  // refresh (including repairs) succeeds, rather than competing with startup.
+  window.addEventListener('companion-base-refreshed', inspectInitialSupport);
   for (const [id, event] of [['conversation-new', 'click'], ['conversation-select', 'change']]) document.getElementById(id).addEventListener(event, () => { listEpoch++; supportStatus.textContent = ''; });
-  list();
+  if (byId('timezone').textContent) inspectInitialSupport();
 })();

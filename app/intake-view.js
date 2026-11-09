@@ -8,10 +8,17 @@ window.intakeView = {
     for (const capture of Object.values(intake.captures).filter(item => item.reviewChoices?.length)) { const p = document.createElement('p'); p.textContent = `${capture.title} — Choose the current reviewed revision in Inspect source. All revisions are retained; supporting evidence is paused until this choice.`; held.append(p); }
     if (!held.children.length) held.textContent = 'No held imports.';
   },
-  async repairs() {
-    const section = document.getElementById('vault-repairs'); section.replaceChildren();
+  async repairs(owned = () => true) {
+    const section = document.getElementById('vault-repairs'), location = state.location;
+    if (!owned()) return;
+    if (this.repairsLocation !== location) { section.replaceChildren(); this.repairsLocation = location; }
     if (!state.configured || !state.intake) return;
-    const repairs = await window.companion['vault-repairs']();
+    let repairs;
+    try { repairs = await window.companion['vault-repairs'](); }
+    catch (error) { if (!owned() || state.location !== location) return; throw error; }
+    if (!owned() || state.location !== location) return;
+    // A transient busy/error response must not erase the last successful same-vault view.
+    section.replaceChildren();
     for (const item of repairs) {
       if (item.kind === 'annotation-link') {
         const article = document.createElement('article'), reason = document.createElement('p'), retry = document.createElement('button');
