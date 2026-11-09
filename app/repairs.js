@@ -33,7 +33,7 @@ function install(Intake, { hash, read, noteText }) {
       if (choice && files.some(item => item.file === choice.file) && JSON.stringify(copies) === JSON.stringify(choice.copies)) annotationPaths.add(path.join(this.vault.vault, choice.file));
       else ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) };
     }
-    for (const capture of Object.values(ledger.captures)) {
+    for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
       if (capture.removed) continue;
       if (ledger.identityIssues[capture.id]) { capture.identityIssue = ledger.identityIssues[capture.id].reason; continue; }
       delete capture.identityIssue;
@@ -44,8 +44,10 @@ function install(Intake, { hash, read, noteText }) {
         continue;
       }
       if (matches.length !== 1) continue;
-      const note = matches[0]; await this.ownedFile(note.file, [], 'Moved capture');
+      const note = matches[0];
       capture.relative = path.relative(this.vault.vault, note.file);
+      await this.detachRestoredBackup(note, sourceHash, capture, ledger);
+      await this.ownedFile(note.file, [], 'Moved capture');
       for (const annotation of annotations.filter(item => item.captureId === capture.id)) {
         if (!annotationPaths.has(annotation.file) || ledger.linkHolds?.[annotation.id]) continue;
         const relative = path.relative(path.dirname(annotation.file), note.file), content = sourceLink(annotation.content, relative);
