@@ -446,3 +446,68 @@ test('an unknown outside hardlink to a staged proposal blocks publication before
   await expect(page.getByLabel('Idea explanation', { exact: true })).toHaveValue(explanation);
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
 });
+
+for (const [boundary, receiptExists] of [['idea-after-publication', false], ['idea-after-receipt', true]]) {
+  test(`a process exit at ${boundary} retains one owned note and explicit recovery completes it without resurrection`, async ({}, testInfo) => {
+    test.setTimeout(120000);
+    await completedConversation();
+    const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas'), ideas = path.join(vault, 'Ideas');
+    const sources = await markdownSnapshot(path.join(vault, 'Captures'));
+    const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    const title = `Retain publication at ${boundary}`;
+    await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+    await page.getByLabel('Idea title', { exact: true }).fill(title);
+    await page.getByLabel('Idea explanation', { exact: true }).fill('crashwriting: this exact independent interpretation must survive without another publication or model request.');
+    await page.getByLabel('Idea limitations', { exact: true }).fill('Unverified interpretation; the application can exit before publication acknowledgement.');
+    await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+    await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/crashwriting/);
+    const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+    const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect.poll(async () => {
+      try { return await fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8'); }
+      catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    }).toBe(boundary);
+    const intentName = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
+    const intentFile = path.join(directory, intentName), intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
+    const stage = path.join(directory, `${intent.operation}.md.pending`), receipt = path.join(directory, `${intent.operation}.published.json`);
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect((await fs.stat(destination)).nlink).toBe(2);
+    expect((await fs.readdir(directory)).includes(path.basename(receipt))).toBe(receiptExists);
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+    const evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    evidence.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await testInfo.attach('crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+    app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch(false);
+    const pending = page.locator('#pending-ideas article').filter({ hasText: title });
+    await expect(pending).toBeVisible();
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
+    expect((await fs.stat(destination)).nlink).toBe(2);
+    await pending.getByRole('button', { name: 'Resume proposed idea', exact: true }).click();
+    await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
+    await expect(page.getByLabel('Proposed idea destination', { exact: true })).toHaveValue(destination);
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect(page.locator('#saved-ideas').getByRole('heading', { name: title, exact: true })).toBeVisible();
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect((await fs.stat(destination)).nlink).toBe(1);
+    expect(await fs.lstat(stage).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+    expect(JSON.parse(await fs.readFile(receipt, 'utf8')).id).toBe(intent.id);
+    expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+    expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(sources);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+    await app.close(); app = null;
+    await fs.unlink(destination);
+    await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.locator('#pending-ideas article')).toHaveCount(0);
+    await expect(page.locator('#saved-ideas article')).toHaveCount(0);
+    expect(await fs.readdir(ideas)).toEqual([]);
+    expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  });
+}
