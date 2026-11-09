@@ -58,7 +58,11 @@ class IdeasRemoval {
       let value; try { value = JSON.parse(loaded.text); } catch { held(); }
       if (value.id !== id) continue;
       if (!uuid(match[1]) || value.schema !== 1 || value.operation !== match[1]) held();
-      if (match[2] === 'published') { receipts.push({ file, loaded, value }); continue; }
+      if (match[2] === 'published') {
+        if (!keys(value, ['schema', 'operation', 'id', 'digest', 'dev', 'ino'])) held();
+        receipts.push({ file, loaded, value }); continue;
+      }
+      if (!keys(value, ['schema', 'operation', 'id', 'vault', 'destination', 'text', 'digest', 'proposalKey', 'warnings', 'input', 'referenceBindings', 'supportState'])) held();
       let fields; try { fields = metadata(value.text); } catch { held(); }
       if (value.vault !== vault.root || typeof value.text !== 'string' || digest(value.text) !== value.digest || !fields || fields.artifact_type !== 'saved_idea' || fields.schema_version !== 1 || fields.companion_id !== id || path.dirname(value.destination || '') !== path.join(vault.root, 'Ideas') || !path.basename(value.destination).endsWith(`--${id}.md`) || value.input?.conversationId !== fields.origin?.conversation_id || value.input?.requestId !== fields.origin?.request_id) held();
       intents.set(value.operation, value); add(file, 'intent', value.operation, loaded);

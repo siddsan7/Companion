@@ -17,6 +17,8 @@ The root agent ran the normal Electron UI with isolated persisted files and cont
 - Orphan-stage GREEN: the unchanged case passed in 33.1 seconds (case: 32.7 seconds). A pending stage added after preview, without its own exact validated intent binding, now holds before any marker or unlink. The whole vault and history remain byte-exact. The raw stage inspection adds no deletion authority: matching body or UUID alone never enrolls an unknown copy for deletion. The helper syntax and whitespace checks passed.
 - Pending-only RED: one case failed after 1.0 minute at the missing pending-row removal action. The normal save workflow had retained its unpublished proposal as an exact intent/stage pair.
 - Pending-only GREEN: the unchanged case passed in 41.8 seconds (case: 41.4 seconds). The pending result now exposes its existing idea UUID and the explicit pending-row action reuses the saved-note removal preview. Preview/cancel preserved exact bytes; confirmation removed only the intent/stage pair without publishing the destination. Sources, history and the other saved idea survived restart unchanged. Syntax and whitespace checks passed for the two focused UI/store changes.
+- Outer-journal RED: the next case failed in 38.0 seconds at its first intent subcase. Unknown independent outer writing was present, yet removal preview was offered. No erase was attempted; the receipt subcase was not reached. The root retained the actual diagnostic under `companion-ticket13-idea-strict-red-20261109`.
+- Outer-journal GREEN: the unchanged case passed in 33.6 seconds (case: 33.2 seconds), reaching both intent and receipt subcases. The removal collector now requires the actual schema-1 writer's exact 12 intent and six receipt outer fields. Unknown writing and all other bytes remained exact, with no removal marker or unlink. These guards apply only to selected removal copies; normal save/resume behavior is unchanged. The helper syntax and whitespace checks passed.
 
 ## Approved authority protocol
 
@@ -31,6 +33,6 @@ Ideas guards retain each observed `.ideas` directory identity for the process li
 ## Remaining checks
 
 - Additional changed-file and unknown-hardlink cases, stale operation publication and same-session store replacement still need focused regression evidence. The demonstrated changed-scope case covers a new orphan stage after preview.
-- Unknown outer fields in selected idea journals still need a strict-shape guard and focused desktop regression. The removal preview currently reuses validators that allow extra journal fields.
+- Nested intent envelopes still need the bounded known-field closure and focused desktop regression. The planned check covers unknown writing in author input and recorded source authority, while preserving legacy support-state records without generation fields.
 - A same-session observed-marker loss needs a bounded public stale-save check and refusal cache. Such a cache must never authorize unlink or reconstruct missing authority; fresh UUIDs remain allowed.
 - Full ticket review, integration, release checks and live provider/isolation checks remain with the root agent. No live provider, authentication, merge or deployment was performed by this worker.
