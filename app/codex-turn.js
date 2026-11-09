@@ -84,6 +84,9 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
         messages.clear(); for (const message of ordered) messages.set(message.id, message);
         preserveMessages();
       } else for (const item of params.turn.items) if (!validateItem(item)) return;
+      if (params.turn.status === 'completed' && [...messages.values()].some(message => !message.completed)) {
+        rejectContext('Codex reported completion without authoritative assistant message completion. The retained reply is incomplete.'); return;
+      }
       setup.settleTurn(params.turn.status);
     }
     if (method === 'error' && params.willRetry !== true) {
