@@ -3,7 +3,7 @@
   section.innerHTML = '<h2>Reasoning comparison</h2><p>Inspect three authored synthetic cases against one approved MyTune brief. Creating a comparison makes no model request.</p><label>Comparison brief version<input id="comparison-brief" type="number" min="1" value="1"></label><button id="comparison-create">Create comparison</button><label for="comparison-select">Retained comparison</label><select id="comparison-select"><option value="">Choose comparison</option></select><p id="comparison-error" role="alert"></p><p id="comparison-notice"></p><div id="comparison-cases"></div><label>Reviewed comparison package<textarea id="comparison-package" rows="12" readonly></textarea></label><p id="comparison-preview-summary"></p><button id="comparison-send" disabled>Send reviewed comparison slot</button><div id="comparison-slots"></div>';
   document.querySelector('main').append(section);
   const scoring = document.createElement('div'); scoring.id = 'comparison-score-panel'; scoring.hidden = true;
-  scoring.innerHTML = '<h3>Blind scoring</h3><p id="comparison-score-notice"></p><div id="comparison-rubric"></div><div id="comparison-score"></div><button id="comparison-inspect">Inspect comparison</button>';
+  scoring.innerHTML = '<h3>Blind scoring</h3><p id="comparison-score-notice"></p><div id="comparison-rubric"></div><div id="comparison-score"></div><button id="comparison-reveal-button" disabled>Reveal methods and effort</button><div id="comparison-reveal"></div><button id="comparison-inspect">Inspect comparison</button>';
   section.append(scoring);
   const startScoring = document.createElement('button'); startScoring.id = 'comparison-score-start'; startScoring.textContent = 'Start blind scoring';
   document.getElementById('comparison-notice').after(startScoring);
@@ -64,6 +64,7 @@
     catch (error) { byId('comparison-error').textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   }
   function renderScores(result) {
+    byId('comparison-reveal').replaceChildren(); byId('comparison-reveal-button').disabled = !result.canReveal;
     byId('comparison-score-notice').textContent = `${result.notice}${result.storageWarning ? ` ${result.storageWarning}` : ''}`;
     byId('comparison-rubric').replaceChildren();
     const note = document.createElement('p'); note.textContent = result.rubric.note; byId('comparison-rubric').append(note);
@@ -104,7 +105,7 @@
         try {
           const saved = await window.companion['comparison-rate']({ id: result.id, displayId: output.displayId, candidateDigest: output.candidateDigest, expectedRevision: output.rating?.revision || null, rating });
           if (observedEpoch !== epoch) return;
-          output.rating = saved.outputs[output.displayIndex].rating; draft.values = { ...output.rating }; feedback.textContent = 'Feedback saved';
+          output.rating = saved.outputs[output.displayIndex].rating; draft.values = { ...output.rating }; feedback.textContent = 'Feedback saved'; byId('comparison-reveal-button').disabled = !saved.canReveal;
         } finally { if (observedEpoch === epoch) save.disabled = false; }
       });
       article.append(save, feedback); byId('comparison-score').append(article);
@@ -118,6 +119,24 @@
     scoreMode(true); renderScores(result);
   });
   byId('comparison-inspect').onclick = () => { if (current && records.has(current)) show(records.get(current)); };
+  byId('comparison-reveal-button').onclick = () => perform(async () => {
+    const observedEpoch = epoch, id = current; byId('comparison-reveal-button').disabled = true;
+    try {
+      const result = await window.companion['comparison-reveal']({ id });
+      if (observedEpoch !== epoch || current !== id) return;
+      byId('comparison-reveal').replaceChildren();
+      const notice = document.createElement('p'); notice.textContent = `${result.notice} First revealed: ${result.revealedAt}.`;
+      byId('comparison-reveal').append(notice);
+      for (const output of result.outputs) {
+        const article = document.createElement('article'), heading = document.createElement('h4'), details = document.createElement('pre'), prompt = document.createElement('pre'), raw = document.createElement('pre');
+        heading.textContent = output.label; prompt.textContent = output.package.text; raw.textContent = output.reply;
+        const { package: packet, reply, ...metadata } = output;
+        details.textContent = JSON.stringify({ ...metadata, packageIdentity: { digest: packet.digest, sharedInputDigest: packet.sharedInputDigest, count: packet.count }, brief: result.brief, capacity: result.capacity, settingsEvidence: result.settingsEvidence }, null, 2);
+        article.append(heading, details, prompt, raw); byId('comparison-reveal').append(article);
+      }
+      byId('comparison-score-notice').textContent = result.notice;
+    } finally { if (observedEpoch === epoch) byId('comparison-reveal-button').disabled = false; }
+  });
   byId('comparison-create').onclick = () => perform(async () => {
     byId('comparison-create').disabled = true;
     try { const record = await window.companion['comparison-create']({ briefVersion: Number(byId('comparison-brief').value) }); records.set(record.id, record); choices(); show(record); }

@@ -226,13 +226,19 @@ class Comparisons {
     });
   }
   scoreProjection(record) {
-    return { id: record.id, rubric, storageWarning: record.storageWarning || null,
-      notice: 'Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.',
+    return { id: record.id, rubric, storageWarning: record.storageWarning || null, canReveal: this.completeFeedback(record), revealedAt: record.revealedAt || null,
+      notice: `Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.${record.revealedAt ? ' Methods were already revealed; subsequent judgments are not blinded.' : ''}`,
       outputs: record.blindOrder.map((entry, index) => {
         const slot = record.slots.find(item => item.id === entry.slotId);
         const candidateDigest = hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
         return { displayIndex: index, displayId: entry.label, status: slot.status, candidate: slot.candidate || null, candidateDigest, error: slot.error || null, rating: slot.rating || null };
       }) };
+  }
+  completeFeedback(record) {
+    return !record.storageWarning && record.slots.every(slot => {
+      const rating = slot.rating;
+      return ['completed', 'failed', 'interrupted'].includes(slot.status) && slot.candidate && rating && rubric.dimensions.every(dimension => Number.isSafeInteger(rating[dimension.key]) && rating[dimension.key] >= 1 && rating[dimension.key] <= 5) && typeof rating.reason === 'string' && !!rating.reason.trim() && typeof rating.materialError === 'boolean' && rating.rubricVersion === rubric.version && rating.candidateDigest === hash(JSON.stringify({ status: slot.status, candidate: slot.candidate, error: slot.error || null }));
+    });
   }
   async scoreView(input) {
     return this.lock(async () => {
@@ -272,6 +278,25 @@ class Comparisons {
       await this.write(record); return this.scoreProjection(record);
     });
   }
+  async reveal(input) {
+    return this.lock(async () => {
+      const record = await this.read(input?.id);
+      if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output.');
+      if (!record.blindOrder || !this.completeFeedback(record)) throw Error('All six outcomes require complete feedback bound to their retained candidates before method reveal.');
+      if (!record.revealedAt) { record.revealedAt = this.clock().now; await this.write(record); }
+      // Explicit disclosure returns only known comparison-owned fields. No
+      // setup certificate, account data or private proof object is stored here.
+      return { id: record.id, revealedAt: record.revealedAt,
+        notice: 'No equal consumption, statistical reliability or numerical release threshold is established. These are authored synthetic cases and controlled outputs where labeled. Inspect every result and generation-effort difference independently. Revealed methods make subsequent judgments unblinded.',
+        brief: record.brief, capacity: record.generationPin?.capacity || null, settingsEvidence: record.generationPin?.settings || null,
+        outputs: record.blindOrder.map(entry => {
+          const slot = record.slots.find(item => item.id === entry.slotId);
+          return { label: entry.label, method: slot.method, fixture: record.fixtures.find(fixture => fixture.id === slot.fixtureId), prompt: slot.prompt, package: slot.package, status: slot.status,
+            reply: slot.reply, messages: slot.messages || [], candidate: slot.candidate, requested: slot.requested || null, effective: slot.effective || null, evidence: slot.evidence || 'Provider evidence unavailable: no response metadata retained.',
+            error: slot.error || null, elapsedMs: slot.elapsedMs, elapsedBoundary: slot.elapsedBoundary || null, usage: slot.usage, usageEvidence: slot.usageEvidence, rating: slot.rating };
+        }) };
+    });
+  }
 }
 function installComparisons({ ipcMain, ...options }) {
   const store = new Comparisons(options);
@@ -281,6 +306,7 @@ function installComparisons({ ipcMain, ...options }) {
   ipcMain.handle('comparison-send', (_, input) => store.send(input));
   ipcMain.handle('comparison-score-view', (_, input) => store.scoreView(input));
   ipcMain.handle('comparison-rate', (_, input) => store.rate(input));
+  ipcMain.handle('comparison-reveal', (_, input) => store.reveal(input));
   return store;
 }
 module.exports = { installComparisons };
