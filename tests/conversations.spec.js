@@ -1751,3 +1751,146 @@ for (const [boundary, receiptExists] of [['transcript-after-link', false], ['tra
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   });
 }
+
+async function guardedTranscript(label) {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `TRANSCRIPT_GUARD_${label}: authored synthetic retained writing.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(`TRANSCRIPT_GUARD_${label}`);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const historyDirectory = path.join(root, 'conversations'), historyName = (await fs.readdir(historyDirectory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), historyFile = path.join(historyDirectory, historyName);
+  const history = await fs.readFile(historyFile, 'utf8'), record = JSON.parse(history);
+  const outputDirectory = path.join(root, 'vault', 'Exports'); await fs.mkdir(outputDirectory);
+  const destination = path.join(outputDirectory, 'Guarded transcript.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+  const proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+  return { destination, outputDirectory, proposed, historyFile, history, record, directory: path.join(root, 'vault', 'Companion', '.transcripts'), calls: await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8') };
+}
+
+for (const area of ['destination parent', 'private journal']) {
+  test(`transcript guards preserve writing when the actual ${area} is replaced by a junction`, async () => {
+    test.setTimeout(90000);
+    const fixture = await guardedTranscript(area.replaceAll(' ', '_'));
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+    const intentName = (await fs.readdir(fixture.directory)).find(name => name.endsWith('.intent.json'));
+    const intentBytes = await fs.readFile(path.join(fixture.directory, intentName), 'utf8'), intent = JSON.parse(intentBytes);
+    const original = area === 'destination parent' ? fixture.outputDirectory : fixture.directory;
+    const retained = path.join(root, 'retained-original-directory'), outside = path.join(root, 'outside-vault-directory');
+    await fs.mkdir(outside);
+    const canaryFile = path.join(outside, 'OUTSIDE_TRANSCRIPT_CANARY.md'), canary = '# OUTSIDE_TRANSCRIPT_PRIVATE_CANARY\n\nIndependent writing must stay unchanged.\n';
+    await fs.writeFile(canaryFile, canary, 'utf8');
+    let redirected = false, moved = false;
+    try {
+      await fs.rename(original, retained); moved = true;
+      await fs.symlink(outside, original, process.platform === 'win32' ? 'junction' : 'dir'); redirected = true;
+      await fs.writeFile(path.join(root, 'release.txt'), 'release after actual parent replacement', 'utf8');
+      await expect(page.locator('#transcript-status')).toContainText(/ordinary|folder|identity|contained/i);
+      await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
+      await expect(page.locator('#conversation-section')).not.toContainText('OUTSIDE_TRANSCRIPT_PRIVATE_CANARY');
+      expect(await fs.readdir(outside)).toEqual(['OUTSIDE_TRANSCRIPT_CANARY.md']);
+      expect(await fs.readFile(canaryFile, 'utf8')).toBe(canary);
+      const journal = area === 'private journal' ? retained : fixture.directory;
+      expect(await fs.readFile(path.join(journal, intentName), 'utf8')).toBe(intentBytes);
+      expect(await fs.readFile(path.join(journal, `${intent.operation}.md.pending`), 'utf8')).toBe(fixture.proposed);
+      expect((await fs.readdir(journal)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+      expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+      expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(fixture.history);
+      expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+    } finally {
+      if (app) { await app.close(); app = null; }
+      if (redirected) await fs.unlink(original);
+      if (moved) await fs.rename(retained, original);
+    }
+  });
+}
+
+test('transcript guards reject an unknown hardlink peer before publishing any destination', async () => {
+  test.setTimeout(90000);
+  const fixture = await guardedTranscript('UNKNOWN_PEER');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+  const stageName = (await fs.readdir(fixture.directory)).find(name => name.endsWith('.md.pending'));
+  const stage = path.join(fixture.directory, stageName), peer = path.join(root, 'unknown-outside-stage-peer.md');
+  await fs.link(stage, peer);
+  await fs.writeFile(path.join(root, 'release.txt'), 'release unknown peer', 'utf8');
+  await expect(page.locator('#transcript-status')).toContainText(/linked|nonordinary|identity|peer/i);
+  expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+  expect((await fs.stat(stage)).nlink).toBe(2); expect((await fs.stat(peer)).nlink).toBe(2);
+  expect(await fs.readFile(stage, 'utf8')).toBe(fixture.proposed); expect(await fs.readFile(peer, 'utf8')).toBe(fixture.proposed);
+  expect((await fs.readdir(fixture.directory)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
+  const pending = page.getByRole('region', { name: 'Pending transcript exports', exact: true });
+  await expect(pending.getByRole('button', { name: 'Resume transcript export', exact: true })).toBeDisabled();
+  expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(fixture.history);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+for (const change of ['destination collision', 'origin record change']) {
+  test(`transcript guards reject a ${change} after preview without overwriting independent writing`, async () => {
+    test.setTimeout(90000);
+    const fixture = await guardedTranscript(change.replaceAll(' ', '_'));
+    const editorWriting = '# Explicit external edit\n\nPreserve this exact independent writing.\n';
+    let expectedHistory = fixture.history;
+    if (change === 'destination collision') await fs.writeFile(fixture.destination, editorWriting, 'utf8');
+    else {
+      const changed = JSON.parse(fixture.history); changed.requests[0].question += '\nEXTERNAL_ORIGIN_EDIT_AFTER_TRANSCRIPT_PREVIEW';
+      expectedHistory = JSON.stringify(changed, null, 2); await fs.writeFile(fixture.historyFile, expectedHistory, 'utf8');
+    }
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect(page.locator('#transcript-status')).toContainText(change === 'destination collision' ? /already exists|preserved/i : /changed|preview/i);
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
+    if (change === 'destination collision') expect(await fs.readFile(fixture.destination, 'utf8')).toBe(editorWriting);
+    else expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+    expect((await fs.readdir(fixture.directory)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+    expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(expectedHistory);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  });
+}
+
+for (const operation of ['preview', 'confirm']) {
+  test(`transcript guards keep the selected B view when an earlier A ${operation} completes`, async () => {
+    test.setTimeout(120000);
+    const fixture = await guardedTranscript(`LATE_A_${operation}`);
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await page.getByLabel('Context question', { exact: true }).fill('Independent B conversation question for view ownership.');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_VIEW_B_ONLY: authored synthetic separate B writing.' }), 'utf8');
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_VIEW_B_ONLY');
+    await expect(page.locator('#conversation-history')).toContainText('completed');
+    const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+    const second = records.find(record => record.id !== fixture.record.id), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    await page.getByLabel('Retained conversation', { exact: true }).selectOption(fixture.record.id);
+    await expect(page.locator('#conversation-history')).toContainText(`TRANSCRIPT_GUARD_LATE_A_${operation}`);
+    if (operation === 'preview') {
+      // Both actions use public controls in one renderer task; A's async IPC cannot finish first.
+      await page.evaluate(secondId => {
+        document.getElementById('transcript-preview').click();
+        const select = document.getElementById('conversation-select'); select.value = secondId; select.dispatchEvent(new Event('change', { bubbles: true }));
+      }, second.id);
+      await expect(page.locator('#transcript-status')).toContainText(/Inspect the exact historical copy|ignored|conversation changed|preview required/i);
+      expect(await fs.stat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+    } else {
+      await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+      await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+      await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+      await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+      await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+      await page.getByLabel('Retained conversation', { exact: true }).selectOption(second.id);
+      await fs.writeFile(path.join(root, 'release.txt'), 'finish already-authorized A publication after selecting B', 'utf8');
+      await expect.poll(() => fs.readFile(fixture.destination, 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toContain('TRANSCRIPT_GUARD_LATE_A_confirm');
+      await expect(page.locator('#transcript-confirm')).toBeEnabled();
+      await expect(page.locator('#transcript-status')).not.toContainText('Transcript exported:');
+    }
+    await expect(page.getByLabel('Retained conversation', { exact: true })).toHaveValue(second.id);
+    await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_VIEW_B_ONLY');
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).not.toBeVisible();
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  });
+}
