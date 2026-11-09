@@ -261,6 +261,6 @@ function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvid
     await (await store()).include(files); return true;
   }));
   ipcMain.handle('context-exclude', (_, key) => serial(async () => (await store()).exclude(key)));
-  return { store };
+  return { store, clearApprovals: () => approvals.clear() };
 }
 module.exports = { Context, installContext, validateDependencies };
