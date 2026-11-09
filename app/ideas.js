@@ -276,11 +276,12 @@ class Ideas {
     let receipt;
     try { receipt = JSON.parse((await this.readFile(vault, path.join(vault.root, '.ideas', `${operation}.published.json`), parents)).text); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (receipt) {
-      this.checkReceipt(receipt, value);
-      if (!await this.knownPublication(value, vault, parents, receipt)) throw Error('This operation already published a saved idea. It will not create another note.');
+    if (receipt) this.checkReceipt(receipt, value);
+    const alreadyPublished = await this.knownPublication(value, vault, parents, receipt);
+    if (receipt && !alreadyPublished) throw Error('This operation already published a saved idea. It will not create another note.');
+    if (alreadyPublished) {
       this.previews.set(operation, value);
-      return { operation, text: value.text, destination: value.destination, input: value.input, references: [], warnings: ['The exact note is already published. Confirmation only completes local staging cleanup; it does not publish another note.'], blocked: false, cleanup: true };
+      return { operation, text: value.text, destination: value.destination, input: value.input, references: [], warnings: ['The exact note is already published. Confirmation only acknowledges that publication and completes local staging cleanup; current supporting-context eligibility remains separate.'], blocked: false, cleanup: !!receipt, acknowledgement: !receipt };
     }
     const ids = value.input.referenceIds || [], bindings = value.referenceBindings || [];
     if (!Array.isArray(ids) || !Array.isArray(bindings) || ids.length !== bindings.length || ids.some(id => !uuid(id)) || bindings.some(binding => !ids.includes(binding.referenceId) || binding.conversationId !== value.input.conversationId || binding.requestId !== value.input.requestId)) throw Error('Retained citation identity is unavailable. Preserve the proposed writing and review new references.');
@@ -308,6 +309,22 @@ class Ideas {
     if (!same(stat, staged.stat) || !same(staged.stat, destination.stat) || staged.text !== value.text || destination.text !== value.text) throw Error('Retained publication is not the exact known stage and destination pair. Preserve all files for repair.');
     if (receipt && (destination.stat.dev.toString() !== receipt.dev || destination.stat.ino.toString() !== receipt.ino)) throw Error('Completed publication ownership changed. Nothing was republished or cleaned.');
     return true;
+  }
+  async acknowledgePublication(value, vault, parents, exclusive) {
+    const directory = path.join(vault.root, '.ideas'), stage = path.join(directory, `${value.operation}.md.pending`);
+    const intent = path.join(directory, `${value.operation}.intent.json`), receipt = path.join(directory, `${value.operation}.published.json`);
+    // This operation acknowledges bytes already published. It neither links a new
+    // destination nor authorizes their use as current supporting context.
+    if ((await this.readFile(vault, intent, parents)).text !== JSON.stringify(value, null, 2) || !await this.knownPublication(value, vault, parents)) throw Error('Published idea ownership changed. Existing writing was preserved.');
+    const published = await this.readFile(vault, value.destination, parents, 2);
+    const record = { schema: 1, operation: value.operation, id: value.id, digest: value.digest, dev: published.stat.dev.toString(), ino: published.stat.ino.toString() };
+    await exclusive(receipt, JSON.stringify(record));
+    await this.checkpoint('idea-after-receipt');
+    if ((await this.readFile(vault, intent, parents)).text !== JSON.stringify(value, null, 2) || !await this.knownPublication(value, vault, parents, record)) throw Error('Published idea ownership changed before cleanup. Existing writing was preserved.');
+    this.guard(vault, parents);
+    const staged = local.lstatSync(stage, { bigint: true }), destination = local.lstatSync(value.destination, { bigint: true });
+    if (!staged.isFile() || staged.isSymbolicLink() || !destination.isFile() || destination.isSymbolicLink() || staged.nlink !== 2n || destination.nlink !== 2n || !same(staged, destination) || !same(destination, published.stat)) throw Error('Published idea peer identity changed. No stage was removed.');
+    local.unlinkSync(stage);
   }
   async confirm({ operation }) {
     const preview = this.previews.get(operation), vault = this.getVault();
@@ -339,6 +356,10 @@ class Ideas {
         if (current.text !== preview.text || current.stat.ino.toString() !== prior.ino || current.stat.dev.toString() !== prior.dev) throw Error('The saved idea was edited or replaced. Existing content was preserved.');
         return { id: preview.id, destination: preview.destination };
       }
+      if (await this.knownPublication(preview, vault, parents)) {
+        await this.acknowledgePublication(preview, vault, parents, exclusive);
+        return { id: preview.id, destination: preview.destination };
+      }
       try { await exclusive(stage, preview.text); }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
       const links = local.lstatSync(stage).nlink;
@@ -366,9 +387,7 @@ class Ideas {
       await this.checkpoint('idea-after-publication');
       const published = await this.readFile(vault, preview.destination, parents, 2);
       if (!same(staged.stat, published.stat) || published.text !== preview.text) throw Error('Saved idea changed during publication. Preserve the proposal and inspect the note.');
-      await exclusive(receipt, JSON.stringify({ schema: 1, operation, id: preview.id, digest: preview.digest, dev: published.stat.dev.toString(), ino: published.stat.ino.toString() }));
-      await this.checkpoint('idea-after-receipt');
-      this.guard(vault, parents); await fs.unlink(stage);
+      await this.acknowledgePublication(preview, vault, parents, exclusive);
       return { id: preview.id, destination: preview.destination };
     });
   }
