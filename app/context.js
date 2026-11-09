@@ -154,6 +154,7 @@ class Context {
         if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('unsupported saved-idea file');
         const content = await fs.readFile(file, 'utf8'), match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/), metadata = match && YAML.parse(match[1]);
         if (metadata?.artifact_type !== 'saved_idea' || metadata.schema_version !== 1 || !/^[a-f0-9-]{36}$/.test(metadata.companion_id)) throw Error('unsupported saved-idea record');
+        if (metadata.support_attribution_unavailable === true) throw Error('additional source dependency attribution is unavailable');
         const associatedIds = await this.dependencyValidator(metadata.source_dependencies, async dependency => {
           const source = eligible.get(dependency.capture_id); if (!source) return false;
           if (dependency.revision_id !== undefined) {
@@ -164,6 +165,12 @@ class Context {
         });
         const project = metadata.project_brief_version;
         if (project !== undefined && !approvedVersions.has(project)) throw Error('project brief dependency is unavailable');
+        // Legacy provisional records have only a numeric version. New writer records
+        // additionally bind the exact approval; neither form loses its dependency.
+        if (metadata.project_brief !== undefined) {
+          const pin = project !== undefined && await new Briefs(this.vault).pinned(project);
+          if (!pin || metadata.project_brief.id !== pin.id || metadata.project_brief.version !== pin.version || metadata.project_brief.digest !== pin.digest) throw Error('exact project brief dependency is unavailable');
+        }
         const dependencyText = metadata.source_dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact imported revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}`).join('; ');
         all.push({ key: `idea:${metadata.companion_id}`, title: metadata.title || `Saved idea ${metadata.companion_id}`, text: body(content), provenance: `Saved idea ${metadata.companion_id}; user interpretation, not independently verified; content sha256 ${digest(content)}; dependencies: ${dependencyText || 'explicitly independent user writing'}${project === undefined ? '' : `; approved project brief version ${project}`}`, digest: digest(content + associatedIds.map(id => eligible.get(id).digest).join('') + (project === undefined ? '' : all.find(item => item.key === `brief:${project}`).digest)), associatedIds, projectVersion: project });
       } catch (error) { issues.push(`Saved idea unavailable: ${entry.name}; ${error.message}`); }
