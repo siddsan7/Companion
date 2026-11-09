@@ -115,3 +115,66 @@ test('explicit removal previews one saved idea and its managed copies, cancels w
   expect(await bytesIn(path.join(root, 'conversations'))).toEqual(historyBytes);
 });
 
+test('a confirmed removal survives actual exit and excludes its still-present saved idea from context before explicit recovery', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  await completedConversation();
+  const title = 'Selected removal context before recovery', retainedTitle = 'Retained eligible idea after removal exit';
+  const selected = await saveIdea(title), retained = await saveIdea(retainedTitle);
+  const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+  const selectedBytes = await fs.readFile(selected, 'utf8'), retainedBytes = await fs.readFile(retained, 'utf8');
+  const metadata = YAML.parse(selectedBytes.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  const sources = await bytesIn(path.join(vault, 'Captures')), history = await bytesIn(path.join(root, 'conversations'));
+  const selectedCopies = [selected];
+  for (const name of await fs.readdir(directory)) {
+    if (!name.endsWith('.json')) continue;
+    const file = path.join(directory, name), value = JSON.parse(await fs.readFile(file, 'utf8'));
+    if (value.id === metadata.companion_id) selectedCopies.push(file);
+  }
+  expect(selectedCopies).toHaveLength(3);
+  await page.getByLabel('Context question', { exact: true }).fill(title);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByLabel('Manual context source', { exact: true }).locator('option').filter({ hasText: title })).toHaveCount(1);
+  await page.locator('#saved-ideas article').filter({ hasText: title }).getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'idea-removal-after-marker' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm saved idea removal', exact: true }).click();
+  await expect.poll(async () => {
+    try { return await fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }).toBe('idea-removal-after-marker');
+  for (const file of selectedCopies) expect(await fs.lstat(file)).toBeTruthy();
+  expect(await fs.readFile(selected, 'utf8')).toBe(selectedBytes);
+  const marker = path.join(directory, `${metadata.companion_id}.removed.json`), markerBytes = await fs.readFile(marker, 'utf8');
+  expect(JSON.parse(markerBytes).ideaId).toBe(metadata.companion_id);
+  expect(markerBytes).not.toContain('Independent authored writing for');
+  const markerStat = await fs.stat(marker), stageStat = await fs.stat(`${marker}.pending`);
+  expect(markerStat.nlink).toBe(2); expect(stageStat.ino).toBe(markerStat.ino);
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  const wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  const exitEvidence = testInfo.outputPath('idea-removal-exit.json');
+  await fs.writeFile(exitEvidence, JSON.stringify({ wrapperPid: child.pid, mainPid, wrapperExit, boundary: 'idea-removal-after-marker', exitBoundary: 'Electron app.exit(77)' }, null, 2), 'utf8');
+  await testInfo.attach('idea-removal-exit.json', { path: exitEvidence, contentType: 'application/json' });
+  app = null;
+  await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch(false);
+  await expect(page.locator('#idea-removal-recovery')).toContainText(metadata.companion_id);
+  for (const file of selectedCopies) expect(await fs.lstat(file)).toBeTruthy();
+  expect(await fs.readFile(selected, 'utf8')).toBe(selectedBytes);
+  await page.getByLabel('Context question', { exact: true }).fill(title);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const options = page.getByLabel('Manual context source', { exact: true }).locator('option');
+  await expect(options.filter({ hasText: retainedTitle })).toHaveCount(1);
+  await expect(options.filter({ hasText: title })).toHaveCount(0);
+  await expect(page.locator('#context-results article').filter({ hasText: title })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Recover confirmed saved idea removal', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea removal complete.');
+  for (const file of selectedCopies) expect(await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  expect(await fs.readFile(marker, 'utf8')).toBe(markerBytes);
+  expect((await fs.stat(marker)).nlink).toBe(1);
+  expect(await fs.lstat(`${marker}.pending`).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+  expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+  expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+});
+
