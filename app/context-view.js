@@ -6,7 +6,8 @@
   let conversationId = null, conversationToken = null, conversationGeneration = 0;
   let displayedHistory = '';
   let historyExclusions = [];
-  const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; };
+  const excludedHistory = new Set();
+  const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
   function warnHistory() {
     for (const warning of byId('conversation-history').querySelectorAll('.history-exclusion')) warning.remove();
     for (const article of byId('conversation-history').children) {
@@ -19,7 +20,10 @@
     const revision = JSON.stringify(record.requests);
     if (revision !== displayedHistory) { invalidateConversation(); displayedHistory = revision; }
     conversationId = record.id; byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
-    if (firstDisplay) historyExclusions = record.requests.at(-1)?.package?.historyExclusions || [];
+    if (firstDisplay) {
+      historyExclusions = record.requests.at(-1)?.package?.historyExclusions || [];
+      excludedHistory.clear(); for (const id of record.requests.at(-1)?.package?.excludedHistory || []) excludedHistory.add(id);
+    }
     byId('conversation-error').textContent = record.storageWarning || '';
     byId('conversation-history').replaceChildren();
     for (const request of record.requests) {
@@ -27,6 +31,13 @@
       article.dataset.requestId = request.id;
       state.textContent = `${request.status}${request.status === 'completed' ? '' : ' — incomplete'} · ${request.evidence || 'provider evidence unavailable'} · ${request.id}${request.error ? ` · ${request.error}` : ''}`;
       question.textContent = request.question; reply.textContent = request.reply; article.append(state, question, reply); byId('conversation-history').append(article);
+      const includeLabel = document.createElement('label'), include = document.createElement('input');
+      include.type = 'checkbox'; include.checked = request.status === 'completed' && !excludedHistory.has(request.id); include.disabled = request.status !== 'completed';
+      includeLabel.append(include, document.createTextNode('Include request in next context'));
+      include.onchange = () => { if (include.checked) excludedHistory.delete(request.id); else excludedHistory.add(request.id); invalidateConversation(); };
+      const contextDetails = document.createElement('details'), contextTitle = document.createElement('summary'), contextLabel = document.createElement('label'), contextText = document.createElement('textarea');
+      contextTitle.textContent = 'Inspect approved context'; contextLabel.textContent = 'Saved approved context'; contextText.readOnly = true; contextText.rows = 8; contextText.value = request.package?.text || 'Saved context is unavailable.';
+      contextLabel.append(contextText); contextDetails.append(contextTitle, contextLabel); article.append(includeLabel, contextDetails);
       if (request.status === 'failed' || request.status === 'interrupted') {
         const retry = document.createElement('button'); retry.textContent = 'Retry or edit request';
         retry.onclick = () => {
@@ -121,7 +132,7 @@
   byId('conversation-preview').onclick = async () => {
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
-      const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
+      const preview = await window.companion['conversation-preview']({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
       if (version !== conversationGeneration) return;
       conversationToken = preview.packageId; byId('conversation-package').value = preview.text;
       historyExclusions = preview.historyExclusions; warnHistory();
