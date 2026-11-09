@@ -24,6 +24,8 @@ const archiveRestore = document.getElementById('archive-restore');
 const archiveRestoreSummary = document.getElementById('archive-restore-summary');
 const archiveConflicts = document.getElementById('archive-conflicts');
 const archiveSource = document.getElementById('archive-source');
+const archiveSettings = document.getElementById('archive-settings');
+const archiveNotes = document.getElementById('archive-notes');
 const archiveIntentSummary = document.getElementById('archive-intents');
 const archiveCadence = document.getElementById('archive-cadence');
 const archiveReconnectPreview = document.getElementById('archive-reconnect-preview');
@@ -31,13 +33,15 @@ const archiveReconnectConfirm = document.getElementById('archive-reconnect');
 const archiveReconnectSummary = document.getElementById('archive-reconnect-summary');
 let archiveReconnectToken;
 let archiveInspection, archiveRestoreToken, archiveMissing = 0;
-function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; archiveConflicts.replaceChildren(); }
+function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; archiveConflicts.replaceChildren(); archiveNotes.replaceChildren(); }
 function restoreChoices() { return [...archiveConflicts.querySelectorAll('select')].map(select => ({ id: select.dataset.conversationId, choice: select.value })); }
-function updateRestoreConfirmation() { archiveRestore.disabled = !archiveRestoreToken || archiveMissing === 0 || restoreChoices().some(resolution => resolution.choice !== 'keep-current'); }
+function selectedArchiveNotes() { return [...archiveNotes.querySelectorAll('input:checked')].map(input => input.dataset.noteFile); }
+function updateRestoreConfirmation() { archiveRestore.disabled = !archiveRestoreToken || archiveMissing === 0 && selectedArchiveNotes().length === 0 || restoreChoices().some(resolution => resolution.choice !== 'keep-current'); }
 archiveMatch.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; };
 archiveSource.onchange = () => { archiveMatch.checked = false; invalidateRestore(); archiveMatchPreview.disabled = true; };
+archiveSettings.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; };
 archiveInspect.onclick = async () => {
-  archiveInspection = null; invalidateRestore(); archiveMatch.checked = false; archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
+  archiveInspection = null; invalidateRestore(); archiveMatch.checked = false; archiveSettings.value = 'keep-current'; archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
   try {
     const result = await window.companion['archive-inspect']();
     if (result.cancelled) { archiveRestoreSummary.textContent = 'Inspection cancelled. Nothing was restored.'; return; }
@@ -52,9 +56,10 @@ archiveInspect.onclick = async () => {
 archiveMatchPreview.onclick = async () => {
   invalidateRestore(); archiveMatchPreview.disabled = true;
   try {
-    const result = await window.companion['archive-match']({ id: archiveInspection, matched: archiveMatch.checked, sourceRoot: archiveSource.value });
+    const result = await window.companion['archive-match']({ id: archiveInspection, matched: archiveMatch.checked, sourceRoot: archiveSource.value, settingsMode: archiveSettings.value });
     archiveRestoreToken = result.token; archiveMissing = result.missing;
     archiveRestoreSummary.textContent = `Matched restore preview: ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Missing history may have been deleted intentionally. Confirm only if you want to add these archived conversations. Current settings and source exclusions remain authoritative. Existing history and vault files stay unchanged. Exact retained brief pins match; original external documents may be unavailable or outdated. Historical restore does not refresh them. Schedule intent remains inactive; task reconnection is separate. Historic packages, capacity bindings and provider IDs do not prove current eligibility or readiness.`;
+    archiveRestoreSummary.textContent += ` Current vault configuration is kept: ${result.currentVault.vault}; managed folder ${result.currentVault.managedRoot}. Archived hints: ${result.archivedVault.vault || 'unavailable'}; managed folder ${result.archivedVault.managedRoot}. Use Choose vault to change configuration. Note inclusions change only for individually checked current text below; conversation exclusions remain authoritative.`;
     for (const conflict of result.conflictRecords) {
       const row = document.createElement('div'), details = document.createElement('p'), label = document.createElement('label'), select = document.createElement('select');
       details.textContent = `Conversation ${conflict.id}: current ${conflict.currentRequests} requests and ${conflict.currentExclusions} omitted requests; archive ${conflict.archivedRequests} requests and ${conflict.archivedExclusions} omitted requests. Keep current preserves all current text and source scope. This restore adds missing history and keeps existing conflicts; it does not overwrite or merge them.`;
@@ -63,15 +68,28 @@ archiveMatchPreview.onclick = async () => {
       for (const [value, text] of [['', 'Choose a resolution'], ['keep-current', 'Keep current']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option); }
       select.onchange = updateRestoreConfirmation; row.append(details, label, select); archiveConflicts.append(row);
     }
+    for (const [index, candidate] of result.noteCandidates.entries()) {
+      const row = document.createElement('div');
+      if (candidate.unavailable) row.textContent = `Archived note unavailable: ${candidate.original}. ${candidate.reason} Nothing will be included.`;
+      else {
+        const label = document.createElement('label'), input = document.createElement('input'), details = document.createElement('details'), summary = document.createElement('summary'), text = document.createElement('pre');
+        input.type = 'checkbox'; input.id = `archive-note-${index}`; input.dataset.noteFile = candidate.file;
+        label.htmlFor = input.id; label.textContent = `Restore note inclusion ${candidate.file}`;
+        summary.textContent = `Review exact current note text; SHA256 ${candidate.digest}`; text.textContent = candidate.text; details.append(summary, text);
+        input.onchange = updateRestoreConfirmation; row.append(label, input, details);
+      }
+      archiveNotes.append(row);
+    }
     updateRestoreConfirmation();
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; }
 };
 archiveRestore.onclick = async () => {
-  const token = archiveRestoreToken, resolutions = restoreChoices(); invalidateRestore(); archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
+  const token = archiveRestoreToken, resolutions = restoreChoices(), noteFiles = selectedArchiveNotes(); invalidateRestore(); archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
   try {
-    const result = await window.companion['archive-restore']({ token, resolutions }); archiveInspection = null; archiveMatch.checked = false;
+    const result = await window.companion['archive-restore']({ token, resolutions, noteFiles }); archiveInspection = null; archiveMatch.checked = false;
     archiveRestoreSummary.textContent = `Restored ${result.restored} conversation${result.restored === 1 ? '' : 's'}. ${result.equal} equal records left unchanged. No task was connected. Reopen a retained conversation to inspect its exact historical context; a new turn requires current review.`;
+    if (result.restoredNotes) archiveRestoreSummary.textContent += ` Restored ${result.restoredNotes} reviewed note inclusion${result.restoredNotes === 1 ? '' : 's'}. Existing conversation exclusions remain unchanged.`;
     await showArchiveIntents();
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); archiveInspection = null; }
   finally { archiveInspect.disabled = false; }

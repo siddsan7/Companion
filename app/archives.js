@@ -4,6 +4,8 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent } = require('./archive-format');
 const { Briefs } = require('./briefs');
+const { Context } = require('./context');
+const { withBriefMutation } = require('./briefs-lock');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
@@ -139,9 +141,12 @@ class Archives {
     if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === sourceRoot)) throw Error('Choose an archived vault and explicitly match the current vault; nothing was restored.');
     await this.validatePins(reviewed.archive, sourceRoot, vault);
     const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root);
+    const settingsMode = input.settingsMode || 'keep-current';
+    if (!['keep-current', 'review-note-inclusions'].includes(settingsMode)) throw Error('Choose an explicit settings restoration policy.');
+    const noteCandidates = settingsMode === 'review-note-inclusions' ? await this.noteCandidates(reviewed.archive, sourceRoot, vault) : [];
     const token = randomUUID();
-    reviewed.matched = { token, root, sourceRoot, snapshot: current, plan };
-    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, conflictRecords: plan.conflicts.map(id => {
+    reviewed.matched = { token, root, sourceRoot, snapshot: current, plan, settingsMode, noteCandidates };
+    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
       const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
       return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
     }) };
@@ -157,7 +162,10 @@ class Archives {
       const plan = this.restorePlan(reviewed.archive, current, matched.sourceRoot, matched.root);
       const resolutions = input.resolutions === undefined ? [] : input.resolutions;
       if (!Array.isArray(resolutions) || resolutions.length !== plan.conflicts.length || resolutions.some(choice => !choice || typeof choice !== 'object' || Array.isArray(choice) || Object.keys(choice).some(key => !['id', 'choice'].includes(key)) || !plan.conflicts.includes(choice.id) || choice.choice !== 'keep-current') || new Set(resolutions.map(choice => choice.id)).size !== plan.conflicts.length) throw Error('Every conflicting conversation requires an explicit Keep current choice. Existing history was preserved.');
-      let restored = 0;
+      const noteFiles = input.noteFiles === undefined ? [] : input.noteFiles;
+      if (!Array.isArray(noteFiles) || new Set(noteFiles).size !== noteFiles.length || noteFiles.some(file => typeof file !== 'string' || matched.settingsMode !== 'review-note-inclusions' || !matched.noteCandidates.some(candidate => !candidate.unavailable && candidate.file === file))) throw Error('Select only individually reviewed available note inclusions.');
+      for (const file of noteFiles) { const actual = await this.noteSnapshot(file, this.history.getVault()), approved = matched.noteCandidates.find(candidate => candidate.file === file); if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('A reviewed note changed. Preview its current bytes again; nothing was restored.'); }
+      let restored = 0, restoredNotes = 0;
       try {
         await this.retainIntents(reviewed.archive, matched.sourceRoot, matched.root);
         for (const original of plan.additions) {
@@ -165,8 +173,68 @@ class Archives {
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
           await this.publishAddition(record); restored++;
         }
-      } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing content was preserved. Inspect again to review remaining additions; no automatic retry occurs.`); }
-      return { restored, equal: plan.equal.length, inactiveIntents: (await this.inactiveIntents()).length };
+        if (noteFiles.length) restoredNotes = await this.includeReviewedNotes(noteFiles, matched);
+      } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing conversations were preserved. ${noteFiles.length ? 'Reviewed note settings may have been published; inspect the current inclusions before retrying. ' : ''}Inspect again to review remaining additions; no automatic retry occurs.`); }
+      return { restored, restoredNotes, equal: plan.equal.length, inactiveIntents: (await this.inactiveIntents()).length };
+    });
+  }
+  async noteSnapshot(file, vault) {
+    const base = path.resolve(vault.vault), relative = path.relative(base, file);
+    if (!path.isAbsolute(file) || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw Error('Archived note is outside the matched vault.');
+    const directories = [base]; let current = base;
+    for (const segment of path.dirname(relative).split(path.sep).filter(segment => segment && segment !== '.')) { current = path.join(current, segment); directories.push(current); }
+    const identities = directories.map(directory => local.lstatSync(directory, { bigint: true }));
+    const guard = () => {
+      this.guard();
+      directories.forEach((directory, index) => { const stat = local.lstatSync(directory, { bigint: true }); if (!stat.isDirectory() || stat.isSymbolicLink() || !same(stat, identities[index]) || local.realpathSync(directory) !== directory) throw Error('Reviewed note path changed or contains an alias.'); });
+    };
+    guard(); const stat = await fs.lstat(file); guard();
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 2 * 1024 * 1024) throw Error('Choose an ordinary unlinked note no larger than 2 MiB.');
+    const context = new Context(vault), note = await context.note(file); guard();
+    // Re-open a pinned descriptor and compare the current exact bytes with the eligibility reader.
+    let handle;
+    try {
+      handle = await fs.open(file, local.constants.O_RDONLY | (local.constants.O_NOFOLLOW || 0)); guard();
+      const opened = await handle.stat(), bytes = await handle.readFile(); guard();
+      const leaf = await fs.lstat(file), after = await handle.stat(); guard();
+      if (!same(stat, opened) || !same(opened, leaf) || !leaf.isFile() || leaf.isSymbolicLink() || leaf.nlink !== 1 || opened.size !== after.size || opened.mtimeMs !== after.mtimeMs || bytes.length > 2 * 1024 * 1024) throw Error('Reviewed note changed. Preview again.');
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      if (text !== note.text) throw Error('Reviewed note changed. Preview again.');
+      return { file, title: note.title, digest: hash(bytes), text };
+    } finally { await handle?.close(); }
+  }
+  async noteCandidates(archive, sourceRoot, vault) {
+    const binding = archive.payload.vaultBindings.find(item => item.managedRoot === sourceRoot), candidates = [];
+    const files = archive.payload.contextScopes.find(scope => scope.binding === hash(sourceRoot))?.files || [];
+    for (const original of [...new Set(files)]) {
+      try {
+        if (!binding.vault || !path.isAbsolute(binding.vault)) throw Error('Archived vault directory hint is unavailable.');
+        const relative = path.relative(binding.vault, original);
+        if (!path.isAbsolute(original) || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw Error('Archived note is outside its declared vault.');
+        const file = path.resolve(vault.vault, relative);
+        candidates.push({ ...(await this.noteSnapshot(file, vault)), original });
+      } catch (error) { candidates.push({ original, unavailable: true, reason: error.message }); }
+    }
+    return candidates;
+  }
+  async includeReviewedNotes(files, matched) {
+    const vault = this.history.getVault(), directory = path.join(this.history.dataRoot, `context-settings-${hash(vault.root)}`), file = path.join(directory, 'notes.json');
+    this.guard(); try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } this.guard();
+    const guard = this.directoryGuard(directory);
+    return withBriefMutation(directory, async () => {
+      guard(); const current = await this.json(file, guard, true);
+      if ((current?.digest || null) !== (matched.snapshot.fingerprints[file] || null)) throw Error('Current note inclusions changed. Preview settings again.');
+      const existing = current?.value.files || [];
+      for (const chosen of files) { const actual = await this.noteSnapshot(chosen, vault), approved = matched.noteCandidates.find(candidate => candidate.file === chosen); if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.'); }
+      const next = [...new Set([...existing, ...files])], stage = path.join(directory, `notes-${randomUUID()}.tmp`); let handle;
+      try {
+        handle = await fs.open(stage, 'wx'); guard(); await handle.writeFile(JSON.stringify({ schema: 1, files: next }, null, 2), 'utf8'); guard(); await handle.sync(); await handle.close(); handle = null;
+        const latest = await this.json(file, guard, true);
+        if ((latest?.digest || null) !== (current?.digest || null)) throw Error('Note inclusion settings changed before publication. Existing scope was preserved.');
+        guard(); if (current) await fs.rename(stage, file); else await fs.link(stage, file); guard();
+        this.history.tokens.clear(); this.invalidateContextApprovals();
+        return next.length - existing.length;
+      } finally { await handle?.close(); guard(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
     });
   }
   async validatePins(archive, sourceRoot, vault) {
