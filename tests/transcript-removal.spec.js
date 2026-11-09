@@ -79,7 +79,7 @@ test('separately selected transcript removal previews every managed copy, cancel
   const before = await files(vault), history = await files(path.join(root, 'conversations'));
   const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
 
-  await page.getByLabel('Retained transcript export', { exact: true }).selectOption(intent.operation);
+  await page.getByRole('combobox', { name: 'Retained transcript export', exact: true }).selectOption(intent.operation);
   await page.getByRole('button', { name: 'Preview transcript removal', exact: true }).click();
   const review = page.getByRole('region', { name: 'Transcript removal review', exact: true });
   await expect(review).toBeVisible();
