@@ -3,15 +3,16 @@ const path = require('node:path');
 const YAML = require('yaml');
 const { randomUUID } = require('node:crypto');
 const { Intake, noteText } = require('./intake');
-const { hash } = require('./intake-producer');
+const { hash, readDraft } = require('./intake-producer');
+const { readReview } = require('./intake-review');
 const { intakeLock } = require('./intake-lock');
-const { validateAuthority, uuid } = require('./source-authority');
+const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
 const { parse } = require('./vault');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 const changed = () => Error('Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.');
 
 class CaptureDeletion {
-  constructor({ getVault, conversations, clearApprovals }) { Object.assign(this, { getVault, conversations, clearApprovals }); this.previews = new Map(); }
+  constructor({ getVault, conversations, clearApprovals, clock }) { Object.assign(this, { getVault, conversations, clearApprovals, clock }); this.previews = new Map(); this.restorations = new Map(); }
   async directory(vault, file) {
     const stat = await fs.lstat(file, { bigint: true }); await vault.contained(file);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw changed();
@@ -29,7 +30,7 @@ class CaptureDeletion {
     if (!uuid(id)) throw Error('Choose a capture to delete.');
     const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
     const intake = new Intake(vault), ledger = await intake.load(); validateAuthority(ledger);
-    if (ledger.sourceAuthority?.[id]) throw Error('This capture already has a deletion operation.');
+    if (ledger.sourceAuthority?.[id] && ledger.sourceAuthority[id].phase !== 'active') throw Error('This capture already has a deletion operation.');
     const entry = Object.entries(ledger.captures).find(([, capture]) => capture.id === id);
     if (!entry) throw Error('Choose an imported capture to delete.');
     const [sourceHash, capture] = entry, notes = (await vault.scan()).filter(note => note.id === id);
@@ -38,7 +39,7 @@ class CaptureDeletion {
     for (const revisionId of capture.revisions) {
       if (!uuid(revisionId)) throw changed();
       const file = path.join(vault.root, 'Revisions', revisionId + '.json'), target = await this.target(vault, file, 'snapshot');
-      const admission = Object.values(ledger.attempts).find(item => item.revision === revisionId);
+      const admission = revisionAdmission(ledger, revisionId);
       if (!admission || admission.snapshotHash !== target.sha256) throw changed();
       const revision = JSON.parse(await fs.readFile(file, 'utf8'));
       if (revision.id !== revisionId || revision.captureId !== id || revision.sourceHash !== sourceHash) throw changed();
@@ -74,6 +75,50 @@ class CaptureDeletion {
     return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations };
   }
   cancel(token) { this.previews.delete(token); }
+  async suppressed() {
+    const vault = this.getVault(); if (!vault) return [];
+    const ledger = await new Intake(vault).load();
+    return Object.entries(ledger.sourceAuthority || {}).filter(([, authority]) => authority.phase === 'deleted').map(([id, authority]) => ({ id, title: ledger.captures[authority.sourceHash]?.title || id }));
+  }
+  async restorationInput(input) {
+    const vault = this.getVault();
+    if (!vault || !uuid(input?.id) || typeof input.folder !== 'string' || !path.isAbsolute(input.folder) || !['draft', 'review'].includes(input.kind)) throw Error('Choose one complete producer artifact folder and its kind.');
+    const intake = new Intake(vault), ledger = await intake.load(), authority = ledger.sourceAuthority?.[input.id];
+    if (authority?.phase !== 'deleted' || !ledger.suppressed.includes(authority.sourceHash)) throw Error('Choose a deliberately deleted source.');
+    const folder = await fs.lstat(input.folder, { bigint: true });
+    if (!folder.isDirectory() || folder.isSymbolicLink()) throw Error('Choose an ordinary producer artifact folder.');
+    const draft = await (input.kind === 'review' ? readReview(input.folder) : readDraft(input.folder));
+    const accepted = ledger.attempts[draft.identity];
+    if (draft.sourceHash !== authority.sourceHash || accepted && (accepted.fingerprint !== draft.fingerprint || accepted.captureId !== input.id || accepted.sourceHash !== authority.sourceHash)) throw Error('The selected artifact does not match this source or its immutable producer identity.');
+    const capture = ledger.captures[authority.sourceHash];
+    if (!capture || capture.id !== input.id || !capture.removed || await fs.access(intake.destination(capture)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) throw changed();
+    return { input: { id: input.id, folder: input.folder, kind: input.kind }, vault: vault.root, directory: { realpath: await fs.realpath(input.folder), dev: String(folder.dev), ino: String(folder.ino) }, authority, capture, draft };
+  }
+  async previewRestoration(input) {
+    const selected = await this.restorationInput(input), token = randomUUID(); this.restorations.set(token, selected);
+    return { token, id: input.id, title: selected.capture.title, identity: selected.draft.identity, fingerprint: selected.draft.fingerprint, text: selected.draft.text, review: selected.draft.humanReview };
+  }
+  async confirmRestoration(token) {
+    const selected = this.restorations.get(token); if (!selected) throw Error('Preview the selected source restoration again.');
+    const vault = this.getVault();
+    return this.conversations.lock(() => intakeLock(vault.root, async () => {
+      const fresh = await this.restorationInput(selected.input);
+      if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw Error('Selected restoration material changed. Preview it again.');
+      const intake = new Intake(vault), ledger = await intake.load(), operationId = randomUUID(), generation = randomUUID(), revisionId = randomUUID(), now = this.clock().now;
+      const revision = { schema: 1, id: revisionId, captureId: selected.input.id, importedAt: now, ...selected.draft };
+      const capture = { id: selected.capture.id, file: selected.capture.file, ...(selected.capture.relative ? { relative: selected.capture.relative } : {}), capturedAt: selected.capture.capturedAt, title: selected.capture.title, currentRevision: revisionId, currentHash: '', reviewed: !!revision.review, rejected: revision.humanReview === 'reject', supportEligible: revision.supportEligible !== false, revisions: [revisionId], updatedAt: now };
+      const content = noteText(capture, revision); capture.currentHash = hash(content);
+      const tx = { schema: 1, restore: true, restoreOperation: operationId, sourceGeneration: generation, key: `${ledger.sources[0]?.id || randomUUID()}:restoration-${operationId}`, sourceHash: selected.authority.sourceHash, capture, revision, content, previousHash: null, previous: null, backup: `${capture.id}-${revisionId}.before.md` };
+      intake.validateTransaction(tx);
+      const journal = `restoration-${operationId}.json`, bytes = JSON.stringify(tx);
+      await intake.publishJournal(path.join(intake.dir, journal), tx);
+      const { history, ...prior } = selected.authority;
+      ledger.sourceAuthority[capture.id] = { ...selected.authority, phase: 'restoring', operationId, generation, history: [...(history || []), prior], restoration: { journal, revision: revisionId, sha256: hash(bytes) } };
+      await intake.save(ledger); this.restorations.delete(token); this.clearApprovals();
+      await vault.checkpoint('capture-restoration-authorized');
+      await finishRestoration(intake, ledger, capture.id); return true;
+    }));
+  }
   async pending() {
     const vault = this.getVault(); if (!vault) return [];
     const intake = new Intake(vault), ledger = await intake.load(), result = [];
@@ -105,7 +150,7 @@ class CaptureDeletion {
         if (JSON.stringify(await this.inventory(selected.id)) !== JSON.stringify(selected)) throw changed();
         const intake = new Intake(vault), ledger = await intake.load();
         ledger.sourceAuthority ||= {};
-        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId: randomUUID(), sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories };
+        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId: randomUUID(), sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}) };
         ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])];
         ledger.captures[fresh.sourceHash].removed = true;
         await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
@@ -151,7 +196,7 @@ async function inspectDeletion(intake, ledger, id) {
       if (JSON.stringify(await deletion.target(vault, file, target.kind)) !== JSON.stringify(target)) throw changed();
       const text = await fs.readFile(file, 'utf8');
       if (target.kind === 'snapshot') {
-        const revision = JSON.parse(text), known = Object.values(ledger.attempts).find(item => item.revision === revision.id);
+        const revision = JSON.parse(text), known = revisionAdmission(ledger, revision.id);
         if (!uuid(revision.id) || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || !capture.revisions.includes(revision.id) || !known || known.captureId !== id || known.sourceHash !== authority.sourceHash || known.snapshotHash !== target.sha256 || file !== path.join(vault.root, 'Revisions', revision.id + '.json')) throw changed();
       } else {
         const note = parse(text), metadata = YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] || '');
@@ -182,5 +227,36 @@ function installCaptureDeletion({ ipcMain, ...options }) {
   ipcMain.handle('capture-delete-confirm', (_, input) => store.confirm(input?.token));
   ipcMain.handle('capture-delete-pending', () => store.pending());
   ipcMain.handle('capture-delete-resume', (_, input) => store.resume(input));
+  ipcMain.handle('capture-delete-suppressed', () => store.suppressed());
+  ipcMain.handle('capture-delete-restoration-preview', (_, input) => store.previewRestoration(input));
+  ipcMain.handle('capture-delete-restoration-confirm', (_, input) => store.confirmRestoration(input?.token));
 }
-module.exports = { CaptureDeletion, finishDeletion, installCaptureDeletion };
+async function finishRestoration(intake, ledger, id) {
+  validateAuthority(ledger);
+  const authority = ledger.sourceAuthority[id], vault = intake.vault;
+  if (authority?.phase !== 'restoring') return;
+  if (await fs.realpath(vault.vault) !== authority.root || !ledger.suppressed.includes(authority.sourceHash)) throw Error('Restoration authority changed. Suppression remains.');
+  const journal = path.join(intake.dir, authority.restoration.journal), transaction = path.join(intake.dir, 'transaction.json');
+  if (!authority.restoration.published) {
+    await intake.ownedFile(journal, transaction, 'Selected restoration journal');
+    const bytes = await fs.readFile(journal, 'utf8'); if (hash(bytes) !== authority.restoration.sha256) throw Error('Selected restoration journal changed. Suppression remains.');
+    const tx = JSON.parse(bytes); intake.validateTransaction(tx);
+    if (tx.restoreOperation !== authority.operationId || tx.sourceGeneration !== authority.generation || tx.revision.id !== authority.restoration.revision || tx.capture.id !== id || tx.sourceHash !== authority.sourceHash) throw Error('Selected restoration identity changed.');
+    await intake.ownedFile(transaction, journal, 'Active restoration journal');
+    try { await fs.link(journal, transaction); } catch (error) { if (error.code !== 'EEXIST' || await fs.readFile(transaction, 'utf8') !== bytes) throw Error('Another source journal needs explicit recovery.'); }
+    await intake.finish(tx, ledger);
+    authority.restoration.published = true; await intake.save(ledger);
+  }
+  const capture = ledger.captures[authority.sourceHash], admission = revisionAdmission(ledger, authority.restoration.revision);
+  const snapshot = path.join(vault.root, 'Revisions', authority.restoration.revision + '.json');
+  await intake.ownedFile(snapshot, [], 'Restored revision'); await intake.ownedFile(intake.destination(capture), [], 'Restored capture');
+  const snapshotBytes = await fs.readFile(snapshot, 'utf8'), revision = JSON.parse(snapshotBytes), content = await fs.readFile(intake.destination(capture), 'utf8');
+  if (!admission || admission.sourceGeneration !== authority.generation || admission.captureId !== id || hash(snapshotBytes) !== admission.snapshotHash || capture.currentRevision !== revision.id || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || hash(content) !== capture.currentHash || content !== noteText(capture, revision)) throw Error('Restored publication changed. Suppression remains.');
+  const remaining = await intake.ownedFile(journal, [], 'Selected restoration journal');
+  if (remaining) { if (hash(await fs.readFile(journal)) !== authority.restoration.sha256) throw Error('Selected restoration journal changed.'); await fs.unlink(journal); }
+  await vault.checkpoint('capture-restoration-published');
+  authority.phase = 'active'; delete authority.restoration;
+  ledger.suppressed = ledger.suppressed.filter(item => item !== authority.sourceHash);
+  await intake.save(ledger);
+}
+module.exports = { CaptureDeletion, finishDeletion, finishRestoration, installCaptureDeletion };

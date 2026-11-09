@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const { revisionAdmission } = require('./source-authority');
 const local = require('node:fs');
 const path = require('node:path');
 const YAML = require('yaml');
@@ -151,7 +152,7 @@ class Ideas {
     const entries = Object.entries(ledger.captures).filter(([, item]) => item.id === captureId);
     if (entries.length !== 1) throw Error('Cited capture admission is unavailable.');
     const [sourceHash, capture] = entries[0];
-    const attempts = Object.values(ledger.attempts).filter(item => item.revision === revisionId);
+    const admitted = revisionAdmission(ledger, revisionId), attempts = admitted ? [admitted] : [];
     if (!capture.revisions.includes(revisionId) || !attempts.length || attempts.some(item => item.captureId !== captureId || item.sourceHash !== sourceHash || !/^[a-f0-9]{64}$/.test(item.snapshotHash) || item.snapshotHash !== attempts[0].snapshotHash)) throw Error('Exact cited revision was not admitted for this capture.');
     const { text } = await this.readFile(vault, revisionFile, parents), snapshotHash = hash(text);
     if (snapshotHash !== attempts[0].snapshotHash) throw Error('Exact cited revision is damaged. No newer revision was substituted.');

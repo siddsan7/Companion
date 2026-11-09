@@ -101,7 +101,7 @@ app.whenReady().then(async () => {
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
   const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
-  installCaptureDeletion({ ipcMain, getVault: () => vault, conversations, clearApprovals: context.clearApprovals });
+  installCaptureDeletion({ ipcMain, getVault: () => vault, conversations, clearApprovals: context.clearApprovals, clock });
   installTranscripts({ ipcMain, conversations, getVault: () => vault, getContext: context.store, clock, checkpoint, choose: async selected => {
     const selection = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'transcript-selection.json'), 'utf8')) : await dialog.showSaveDialog({ title: 'Export readable conversation transcript', defaultPath: path.join(selected.vault, 'Conversation transcript.md'), filters: [{ name: 'Markdown transcript', extensions: ['md'] }] });
     return selection.canceled ? null : selection.filePath;

@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { parseAnnotation } = require('./vault');
+const { revisionAdmission, activeAdmission } = require('./source-authority');
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
 function sourceLink(content, relative) {
@@ -68,11 +69,11 @@ function install(Intake, { hash, read, noteText }) {
       await this.syncMoves(); const ledger = await this.load(), issue = ledger.identityIssues[id];
       if (issue?.kind !== 'missing' || issue.token !== token) throw Error('Missing-note state changed. Refresh before restoring.');
       const previous = ledger.captures[issue.sourceHash], bytes = await read(path.join(this.vault.root, 'Revisions', previous.currentRevision + '.json'));
-      const known = Object.values(ledger.attempts).find(item => item.revision === previous.currentRevision);
+      const known = revisionAdmission(ledger, previous.currentRevision);
       if (bytes === null || !known || hash(bytes) !== known.snapshotHash) throw Error('The last managed revision is unavailable or changed. Restore a vault backup; no note was recreated.');
       const revision = JSON.parse(bytes), capture = { ...previous, restoredAt: now }; delete capture.identityIssue;
       const content = noteText(capture, revision); capture.currentHash = hash(content);
-      const resolution = randomUUID(), tx = { schema: 1, restore: true, resolution, key: ledger.sources[0].id + ':restore-' + id, sourceHash: issue.sourceHash, capture, revision, content, previousHash: null, previous: null, backup: id + '-' + revision.id + '.before-' + resolution + '.md' };
+      const resolution = randomUUID(), tx = { schema: 1, restore: true, resolution, key: ledger.sources[0].id + ':restore-' + id, sourceHash: issue.sourceHash, capture, revision, content, previousHash: null, previous: null, backup: id + '-' + revision.id + '.before-' + resolution + '.md', ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
       if (await read(this.destination(capture)) !== null) throw Error('The destination now exists. Refresh before restoring; its content was preserved.');
       await this.publishJournal(path.join(this.dir, 'transaction.json'), tx);
       try { await this.finish(tx, ledger); } catch (error) {
@@ -197,7 +198,7 @@ function install(Intake, { hash, read, noteText }) {
       if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id) || typeof text !== 'string' || !text.trim()) throw Error('Enter annotation text before saving.');
       const ledger = await this.load(), capture = Object.values(ledger.captures).find(x => x.id === captureId);
       if (!capture) throw Error('Choose an imported capture before adding an annotation.');
-      const annotation = '---\ncompanion_id: ' + JSON.stringify(id) + '\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ' + JSON.stringify(captureId) + '\ncreated_at: ' + JSON.stringify(now) + '\n---\n\n# Annotation\n\nSource: [Capture](' + urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture))) + ')\n\n' + text + '\n';
+      const annotation = '---\ncompanion_id: ' + JSON.stringify(id) + '\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ' + JSON.stringify(captureId) + (ledger.sourceAuthority?.[captureId]?.phase === 'active' ? '\nsource_generation: ' + JSON.stringify(ledger.sourceAuthority[captureId].generation) : '') + '\ncreated_at: ' + JSON.stringify(now) + '\n---\n\n# Annotation\n\nSource: [Capture](' + urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture))) + ')\n\n' + text + '\n';
       await this.publishJournal(path.join(this.dir, 'annotation-intent.json'), { schema: 1, id, captureId, annotation });
       await this.finishAnnotation();
     });
@@ -305,7 +306,7 @@ function install(Intake, { hash, read, noteText }) {
     if (await read(file) !== intent.annotation) throw Error('Annotation changed. Incoming source remains paused; preserve both versions.');
     await this.vault.checkpoint('repair-annotation-published');
     const ledger = await this.load();
-    if (!ledger.attempts[tx.revision.identity] || ledger.captures[tx.sourceHash]?.currentRevision !== tx.capture.currentRevision || ledger.captures[tx.sourceHash]?.currentHash !== tx.capture.currentHash) {
+    if (activeAdmission(ledger, tx.revision.identity, tx.capture.id)?.revision !== tx.revision.id || ledger.captures[tx.sourceHash]?.currentRevision !== tx.capture.currentRevision || ledger.captures[tx.sourceHash]?.currentHash !== tx.capture.currentHash) {
       const journal = path.join(this.dir, 'transaction.json');
       if (await read(journal) === null) await this.publishJournal(journal, tx);
       else if (await read(journal) !== JSON.stringify(tx)) throw Error('Another source publication needs recovery before this repair.');

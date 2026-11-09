@@ -135,7 +135,7 @@
       proposal(); state.textContent = source.approval ? 'Shortening approved. Preview the complete package.' : 'Inspect the exact proposed outgoing selection, then approve it to use it in the package.';
       editor.oninput = () => { delete source.approval; delete source.approvedText; delete source.approvalLabel; state.textContent = 'Shortening needs explicit approval.'; proposal(); clearPreview(); };
       approve.textContent = 'Approve shorter passage'; approve.onclick = () => run(async () => {
-        const approved = await window.companion['context-shorten']({ key: source.key, digest: source.digest, text: editor.value });
+        const approved = await window.companion['context-shorten']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, text: editor.value });
         source.approval = approved.approval; source.approvedText = approved.text; source.approvalLabel = 'Explicitly shortened passage'; state.textContent = 'Shortening approved. Preview the complete package.'; clearPreview();
       });
       const full = document.createElement('button'); full.textContent = 'Use full source'; full.onclick = () => { delete source.approval; delete source.approvedText; delete source.approvalLabel; selected(); clearPreview(); };
@@ -158,7 +158,7 @@
       for (const match of source.passages || []) {
         const row = document.createElement('div'), anchor = document.createElement('p'), excerpt = document.createElement('pre'), choose = document.createElement('button'); row.className = 'context-passage';
         anchor.textContent = `Matching passage lines ${match.start}-${match.end}; Text match: ${match.matched.join(', ')}; source sha256 ${source.digest}`; excerpt.textContent = match.text; choose.textContent = 'Add passage';
-        choose.onclick = () => run(async () => { const approved = await window.companion['context-passage']({ key: source.key, digest: source.digest, start: match.start, end: match.end }); add({ ...source, approval: approved.approval, approvedText: approved.text, approvalLabel: approved.label }); });
+        choose.onclick = () => run(async () => { const approved = await window.companion['context-passage']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, start: match.start, end: match.end }); add({ ...source, approval: approved.approval, approvedText: approved.text, approvalLabel: approved.label }); });
         row.append(anchor, excerpt, choose); article.append(row);
       }
       const full = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Inspect full eligible source'; full.append(summary, passage); article.append(full, button); byId('context-results').append(article);
@@ -179,7 +179,7 @@
       return true;
     };
     try {
-      const preview = await window.companion['context-preview']({ question: byId('context-question').value, excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
+      const preview = await window.companion['context-preview']({ question: byId('context-question').value, excludedSources: [...excluded], selections: selections.map(({key,digest,approval,sourceGenerations}) => ({key,digest,...(sourceGenerations ? {sourceGenerations} : {}),...(approval ? {approval} : {})})) });
       if (outdated()) return;
       byId('context-package').value = preview.text;
       byId('context-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized: remove sources or explicitly shorten a selection.' : 'Within limit'} · Application cap: 32000. Serialized line endings: LF. ${preview.boundEvidence} Local preview only; chat readiness is separate. ${(preview.warnings || []).join(' ')}`;
@@ -190,7 +190,7 @@
   };
   byId('conversation-brief').oninput = invalidateConversation;
   byId('conversation-speculation').onchange = invalidateConversation;
-  const conversationInput = () => ({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})), historySelections: [...historySelections.values()].map(({conversationId,requestId,digest}) => ({conversationId,requestId,digest})) });
+  const conversationInput = () => ({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval,sourceGenerations}) => ({key,digest,...(sourceGenerations ? {sourceGenerations} : {}),...(approval ? {approval} : {})})), historySelections: [...historySelections.values()].map(({conversationId,requestId,digest}) => ({conversationId,requestId,digest})) });
   function selectedHistory() {
     byId('history-selected').replaceChildren();
     for (const [key, item] of historySelections) {
