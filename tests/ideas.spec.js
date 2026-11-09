@@ -54,6 +54,10 @@ async function markdownSnapshot(directory) {
   }
   return result;
 }
+async function dispatchedUri() {
+  try { return await fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+}
 
 test('a completed conversation result becomes a standalone saved idea only after visible preview and confirmation', async () => {
   test.setTimeout(90000);
@@ -90,14 +94,14 @@ test('a completed conversation result becomes a standalone saved idea only after
   expect(proposed).toContain('The transfer is unverified; no outcome has been measured.');
   expect(proposed).not.toContain('# Experiment Proposal');
   await page.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
-  await expect.poll(() => fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8')).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
   for (const [file, content] of Object.entries(originals)) expect(await fs.readFile(file, 'utf8')).toBe(content);
   expect(await fs.readFile(historyFile, 'utf8')).toBe(history);
 
   await app.close(); app = null; await launch(false);
   await expect(page.locator('#saved-ideas')).toContainText('A useful retrieval observation');
   await page.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
-  await expect.poll(() => fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8')).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
   expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
