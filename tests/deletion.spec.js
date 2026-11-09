@@ -109,6 +109,7 @@ test('a confirmed purge survives process exit, holds changed files and resumes o
   await expect(recovery).toContainText(capture.id);
   await expect(recovery).toContainText('changed');
   await recovery.getByRole('button', { name: 'Resume confirmed capture deletion', exact: true }).click();
+  await expect(recovery.getByRole('button', { name: 'Resume confirmed capture deletion', exact: true })).toBeEnabled();
   await expect(page.getByRole('status')).toContainText('changed');
   expect(await fs.readFile(captureFile)).toEqual(content);
   expect(await fs.readFile(snapshotFile)).toEqual(changedSnapshot);
