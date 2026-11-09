@@ -41,6 +41,13 @@
     for (const file of preview.files) { const line = document.createElement('p'); line.textContent = `${file.kind}: ${file.path}`; removalFiles.append(line); }
     removalWarnings.textContent = preview.warnings.join(' '); removalPreview.hidden = false;
   }
+  async function previewRemoval(id) {
+    closeRemoval(); const attempt = removalEpoch, selectedVault = vaultEpoch;
+    try {
+      const preview = await window.companion['idea-removal-preview']({ id });
+      if (attempt === removalEpoch && selectedVault === vaultEpoch) showRemoval(preview);
+    } catch (error) { if (attempt === removalEpoch && selectedVault === vaultEpoch) byId('idea-status').textContent = error.message; }
+  }
   removalCancel.onclick = async () => {
     const approved = removalOperation; closeRemoval();
     if (approved) try { await window.companion['idea-removal-cancel']({ operation: approved }); } catch (error) { byId('idea-status').textContent = error.message; }
@@ -122,13 +129,7 @@
         open.onclick = async () => { try { await window.companion['idea-open'](note.id); } catch (error) { if (current()) byId('idea-status').textContent = error.message; } };
         article.append(title, open); byId('saved-ideas').append(article);
         const remove = document.createElement('button'); remove.textContent = 'Preview saved idea removal'; remove.disabled = note.unavailable;
-        remove.onclick = async () => {
-          closeRemoval(); const attempt = removalEpoch, selectedVault = vaultEpoch;
-          try {
-            const preview = await window.companion['idea-removal-preview']({ id: note.id });
-            if (attempt === removalEpoch && selectedVault === vaultEpoch) showRemoval(preview);
-          } catch (error) { if (attempt === removalEpoch && selectedVault === vaultEpoch) byId('idea-status').textContent = error.message; }
-        }; article.append(remove);
+        remove.onclick = () => previewRemoval(note.id); article.append(remove);
         if (note.reviewSupport) {
           const warning = document.createElement('p'); warning.textContent = `Review support. ${note.supportWarnings.join(' ')} Independent writing remains available; this inspection does not rewrite it.`; article.append(warning);
         }
@@ -167,7 +168,9 @@
           } catch (error) { if (ownsEditorLoad(owner)) byId('idea-status').textContent = error.message; }
           finally { finishEditorLoad(owner); }
         };
-        article.append(title, resume); pendingView.append(article);
+        const remove = document.createElement('button'); remove.textContent = 'Preview proposed idea removal';
+        remove.onclick = () => previewRemoval(proposal.id);
+        article.append(title, resume, remove); pendingView.append(article);
       }
       supportStatus.textContent = 'Current support inspected. Warnings do not change note ownership or independently verify claims.';
     } catch (error) {

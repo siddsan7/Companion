@@ -311,7 +311,7 @@ class Ideas {
       if (receipt) this.checkReceipt(receipt, value);
       const hasPublication = await this.knownPublication(value, vault, parents, receipt);
       if (receipt && !hasPublication) continue;
-      proposals.push({ operation: value.operation, title: fields.title, destination: value.destination, hasPublication, cleanup: !!receipt });
+      proposals.push({ id: value.id, operation: value.operation, title: fields.title, destination: value.destination, hasPublication, cleanup: !!receipt });
     }
     return proposals;
   }
