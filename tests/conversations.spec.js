@@ -1395,6 +1395,7 @@ test('transcript export is explicitly previewed and cancelled before exact reada
   const destination = path.join(destinationDir, 'Chosen readable conversation.md');
   await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: destination }), 'utf8');
   await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
   await expect(page.getByLabel('Transcript destination', { exact: true })).toHaveValue(destination);
   await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(/TRANSCRIPT_COMMENTARY_12/);
   let proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
@@ -1423,6 +1424,7 @@ test('transcript export is explicitly previewed and cancelled before exact reada
   expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
 
   await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
   await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(/TRANSCRIPT_FINAL_12/);
   proposed = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
   await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
