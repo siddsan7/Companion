@@ -154,7 +154,7 @@ test('returned comparison settings mismatch consumes the failed slot before turn
   expect(await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).toBe(requests);
 });
 
-test('six explicit paired attempts retain all outcomes and one independent blind feedback across restart', async () => {
+test('independent blind aliases bind feedback to actual shown candidates across restart', async () => {
   test.setTimeout(180000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
@@ -209,22 +209,42 @@ test('six explicit paired attempts retain all outcomes and one independent blind
   await expect(page.locator('#comparison-score')).not.toContainText('sharedInputDigest');
   await expect(page.locator('#comparison-rubric')).toContainText('No concrete project decision is helped');
   await expect(page.locator('#comparison-rubric')).toContainText('Claims and transfer follow');
-  await page.getByLabel('Output 1 Usefulness', { exact: true }).fill('3');
-  await page.getByLabel('Output 1 Surprise', { exact: true }).fill('5');
-  await page.getByLabel('Output 1 Grounding', { exact: true }).fill('1');
-  await page.getByLabel('Output 1 Ease of testing', { exact: true }).fill('2');
-  await page.getByLabel('Output 1 Rating reason', { exact: true }).fill('High surprise does not excuse an unsupported claim. This authored score is a UI fixture.');
-  await page.getByLabel('Output 1 Material error', { exact: true }).check();
-  await page.getByRole('button', { name: 'Save feedback Output 1', exact: true }).click();
+  const blindLabels = await page.locator('#comparison-score article h4').allTextContents();
+  expect(blindLabels).toHaveLength(6);
+  expect(blindLabels.every(label => /^Sample [a-f0-9]{8}$/.test(label))).toBe(true);
+  const firstLabel = blindLabels[0];
+  const shownCandidate = await page.locator('#comparison-score article').first().locator('pre').innerText();
+  expect(shownCandidate).not.toBe('');
+  await expect(page.locator('#comparison-cases')).toBeHidden();
+  await expect(page.locator('#comparison-slots')).toBeHidden();
+  await expect(page.getByLabel('Reviewed comparison package', { exact: true })).toBeHidden();
+  const blind = await page.evaluate(id => window.companion['comparison-score-view']({ id }), generated.id);
+  const blindJson = JSON.stringify(blind);
+  for (const slot of generated.slots) expect(blindJson).not.toContain(slot.id);
+  expect(blindJson).not.toContain('Output 1');
+  for (const output of blind.outputs) {
+    for (const field of ['slotId', 'method', 'package', 'prompt', 'requested', 'effective', 'usage', 'elapsedMs', 'capacity', 'generationPin']) expect(output).not.toHaveProperty(field);
+  }
+  await page.getByLabel(firstLabel + ' Usefulness', { exact: true }).fill('3');
+  await page.getByLabel(firstLabel + ' Surprise', { exact: true }).fill('5');
+  await page.getByLabel(firstLabel + ' Grounding', { exact: true }).fill('1');
+  await page.getByLabel(firstLabel + ' Ease of testing', { exact: true }).fill('2');
+  await page.getByLabel(firstLabel + ' Rating reason', { exact: true }).fill('High surprise does not excuse an unsupported claim. This authored score is a UI fixture.');
+  await page.getByLabel(firstLabel + ' Material error', { exact: true }).check();
+  await page.getByRole('button', { name: 'Save feedback ' + firstLabel, exact: true }).click();
   await expect(page.locator('#comparison-score article').first()).toContainText('Feedback saved');
   const scored = await savedComparison();
-  expect(scored.slots.find(slot => slot.id === scored.displayOrder[0]).rating).toMatchObject({ usefulness: 3, surprise: 5, grounding: 1, easeOfTesting: 2, reason: 'High surprise does not excuse an unsupported claim. This authored score is a UI fixture.', materialError: true });
+  expect(scored.slots.find(slot => slot.candidate?.text === shownCandidate).rating).toMatchObject({ usefulness: 3, surprise: 5, grounding: 1, easeOfTesting: 2, reason: 'High surprise does not excuse an unsupported claim. This authored score is a UI fixture.', materialError: true });
   expect(scored.slots.filter(slot => slot.rating)).toHaveLength(1);
+  expect(scored.blindOrder.map(entry => entry.label)).toEqual(blindLabels);
+  expect(new Set(scored.blindOrder.map(entry => entry.slotId)).size).toBe(6);
   expect(scored.displayOrder).toEqual(initial.displayOrder);
   await app.close(); app = null; await launch(false);
   await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
   await expect(page.locator('#comparison-score article')).toHaveCount(6);
-  await expect(page.getByLabel('Output 1 Surprise', { exact: true })).toHaveValue('5');
-  await expect(page.getByLabel('Output 1 Material error', { exact: true })).toBeChecked();
+  expect(await page.locator('#comparison-score article h4').allTextContents()).toEqual(blindLabels);
+  expect(await page.locator('#comparison-score article').first().locator('pre').innerText()).toBe(shownCandidate);
+  await expect(page.getByLabel(firstLabel + ' Surprise', { exact: true })).toHaveValue('5');
+  await expect(page.getByLabel(firstLabel + ' Material error', { exact: true })).toBeChecked();
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
