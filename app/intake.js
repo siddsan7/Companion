@@ -3,7 +3,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { readDraft, hash } = require('./intake-producer');
 const { readReview } = require('./intake-review');
-const { intakeLock } = require('./intake-lock');
+const { sourceMutation } = require('./source-mutation');
 const { withTitle, captureHeading } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission } = require('./source-authority');
 const { IntakeLedger } = require('./intake-ledger');
@@ -38,7 +38,7 @@ class Intake {
     await fs.link(stage, file); await fs.unlink(stage);
   }
   async locked(work) {
-    await this.setup(); return intakeLock(this.vault.root, async () => { await this.recover(); return work(); });
+    await this.setup(); return sourceMutation(this.vault.root, async () => { await this.recover(); return work(); });
   }
   async info() {
     await this.setup();

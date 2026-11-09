@@ -5,7 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { Intake, noteText } = require('./intake');
 const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
-const { intakeLock } = require('./intake-lock');
+const { sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
 const { parse } = require('./vault');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
@@ -102,7 +102,7 @@ class CaptureDeletion {
   async confirmRestoration(token) {
     const selected = this.restorations.get(token); if (!selected) throw Error('Preview the selected source restoration again.');
     const vault = this.getVault();
-    return this.conversations.lock(() => intakeLock(vault.root, async () => {
+    return this.conversations.lock(() => sourceMutation(vault.root, async () => {
       const fresh = await this.restorationInput(selected.input);
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw Error('Selected restoration material changed. Preview it again.');
       const intake = new Intake(vault), ledger = await intake.load(), operationId = randomUUID(), generation = randomUUID(), revisionId = randomUUID(), now = this.clock().now;
@@ -135,7 +135,7 @@ class CaptureDeletion {
   async resume(input) {
     if (!uuid(input?.id) || !uuid(input?.operationId)) throw Error('Review the confirmed deletion operation again.');
     const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
-    return this.conversations.lock(() => intakeLock(vault.root, async () => {
+    return this.conversations.lock(() => sourceMutation(vault.root, async () => {
       const intake = new Intake(vault), ledger = await intake.load(), authority = ledger.sourceAuthority?.[input.id];
       if (!authority || authority.operationId !== input.operationId || authority.phase !== 'deleting') throw Error('The confirmed deletion operation changed. Review recovery again.');
       await finishDeletion(intake, ledger, input.id); return true;
@@ -144,7 +144,7 @@ class CaptureDeletion {
   async confirm(token) {
     const selected = this.previews.get(token); if (!selected) throw Error('Preview capture deletion again.');
     const vault = this.getVault();
-    return this.conversations.lock(() => intakeLock(vault.root, async () => {
+    return this.conversations.lock(() => sourceMutation(vault.root, async () => {
       const fresh = await this.inventory(selected.id);
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw changed();
       const acquired = [];

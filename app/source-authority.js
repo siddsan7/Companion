@@ -4,7 +4,7 @@ const fields = (value, names) => value && typeof value === 'object' && !Array.is
 function validateAuthority(ledger) {
   if (ledger.sourceAuthority !== undefined && (!ledger.sourceAuthority || typeof ledger.sourceAuthority !== 'object' || Array.isArray(ledger.sourceAuthority))) throw Error('Source authority needs repair.');
   for (const [id, value] of Object.entries(ledger.sourceAuthority || {})) {
-    if (!uuid(id) || !fields(value, ['generation', 'phase', 'operationId', 'sourceHash', 'targets', 'root', 'directories', 'history', 'restoration']) || !uuid(value.generation) || !uuid(value.operationId) || !['deleting', 'deleted', 'restoring', 'active'].includes(value.phase) || !sha(value.sourceHash) || !Array.isArray(value.targets) || !Array.isArray(value.directories) || typeof value.root !== 'string') throw Error('Source authority needs repair. Nothing can be published.');
+    if (!uuid(id) || !fields(value, ['generation', 'phase', 'operationId', 'sourceHash', 'targets', 'root', 'directories', 'history', 'restoration', 'manual']) || !uuid(value.generation) || !uuid(value.operationId) || !['deleting', 'deleted', 'restoring', 'active'].includes(value.phase) || !(value.sourceHash === null ? validManual(value.manual, id) : sha(value.sourceHash) && value.manual === undefined) || !Array.isArray(value.targets) || !Array.isArray(value.directories) || typeof value.root !== 'string') throw Error('Source authority needs repair. Nothing can be published.');
     const paths = new Set();
     for (const target of value.targets) {
       if (!fields(target, ['file', 'sha256', 'dev', 'ino', 'bytes', 'kind']) || typeof target.file !== 'string' || !target.file || /[\\]/.test(target.file) || target.file.split('/').some(part => !part || part === '.' || part === '..' || part.includes(':')) || paths.has(target.file) || !sha(target.sha256) || !['capture', 'snapshot', 'source-backup'].includes(target.kind) || ![target.dev, target.ino, target.bytes].every(item => typeof item === 'string' && /^[0-9]+$/.test(item))) throw Error('Source deletion manifest needs repair. All files were preserved.');
@@ -20,7 +20,8 @@ function validateAuthority(ledger) {
     }
     if (value.phase === 'restoring') {
       const item = value.restoration;
-      if (!fields(item, ['journal', 'revision', 'sha256', 'published']) || !uuid(item.revision) || !sha(item.sha256) || item.journal !== `restoration-${value.operationId}.json` || item.published !== undefined && item.published !== true) throw Error('Source restoration authority needs repair.');
+      if (!fields(item, ['journal', 'revision', 'sha256', 'published', 'publication']) || !(value.manual ? item.revision === null : uuid(item.revision)) || !sha(item.sha256) || item.journal !== `restoration-${value.operationId}.json` || item.published !== undefined && item.published !== true) throw Error('Source restoration authority needs repair.');
+      if (value.manual && item.published === true ? !fields(item.publication, ['dev', 'ino', 'bytes']) || ![item.publication.dev, item.publication.ino, item.publication.bytes].every(part => typeof part === 'string' && /^[0-9]+$/.test(part)) : item.publication !== undefined) throw Error('Manual restoration publication needs repair.');
     } else if (value.restoration !== undefined) throw Error('Unexpected source restoration authority.');
   }
   if (ledger.admissions !== undefined) {
@@ -31,6 +32,10 @@ function validateAuthority(ledger) {
       if (!accepted || accepted.fingerprint !== item.fingerprint || accepted.captureId !== item.captureId || accepted.sourceHash !== item.sourceHash) throw Error('Revision admission disagrees with the original producer acceptance.');
     }
   }
+}
+function validManual(value, id) {
+  const safe = file => typeof file === 'string' && !!file && !/[\\:]/.test(file) && file.split('/').every(part => part && part !== '.' && part !== '..');
+  return fields(value, ['captureId', 'type', 'capturedAt', 'currentHash', 'file', 'relative']) && value.captureId === id && ['thought', 'link'].includes(value.type) && typeof value.capturedAt === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(value.capturedAt) && Number.isFinite(Date.parse(value.capturedAt)) && sha(value.currentHash) && safe(value.file) && !value.file.includes('/') && value.file.endsWith('.md') && safe(value.relative) && (value.relative === value.file || value.relative.endsWith('/' + value.file));
 }
 function assertPublication(ledger, id, transaction = {}) {
   validateAuthority(ledger);
