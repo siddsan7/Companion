@@ -110,6 +110,7 @@ test('moved annotations enter context only through the canonical copy and preser
   expect(await fs.readFile(moved, 'utf8')).toBe(custom); expect(await fs.readFile(copy, 'utf8')).toBe(copied);
   await fs.appendFile(copy, '\nChanged preserved copy.\n');
   await app.close(); app = null; await launch(false);
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
   await search('MOVEDANNOTATION'); await expect(page.locator('#context-results article').filter({ hasText: 'Independent user annotation' })).toHaveCount(0);
   await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
   expect(await fs.readFile(moved, 'utf8')).toBe(custom);
