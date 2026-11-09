@@ -318,14 +318,23 @@ async function restoreManualConversation(fixture) {
   const ledger = JSON.parse(await fs.readFile(path.join(fixture.base, '.intake', 'ledger.json'), 'utf8'));
   return ledger.sourceAuthority[fixture.id].generation;
 }
-async function previewManualIdea(title, origin = 'last') {
+async function previewManualIdea(title, origin = 'last', cite = false, testInfo) {
+  const referenceState = () => page.locator('#idea-references input[type=checkbox]').evaluateAll(inputs => inputs.map(input => ({ id: input.id, value: input.value, checked: input.checked, disabled: input.disabled, labels: [...input.labels].map(label => label.textContent) })));
+  const priorReferences = testInfo ? await referenceState() : undefined;
   const drafts = page.getByRole('button', { name: 'Draft saved idea', exact: true });
   await (origin === 'first' ? drafts.first() : drafts.last()).click();
   await page.getByLabel('Idea title', { exact: true }).fill(title);
   await page.getByLabel('Idea explanation', { exact: true }).fill('Independent writing: retrieval may inform a practice queue. The transfer has not been tested.');
   await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic evidence; no outcome was measured.');
+  if (cite) await page.getByRole('checkbox', { name: /^Cite evidence a1 from / }).check();
   await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Confirm saved idea', exact: true })).toBeVisible();
+  try { await expect(page.getByRole('button', { name: 'Confirm saved idea', exact: true })).toBeVisible(); }
+  catch (error) {
+    if (!testInfo) throw error;
+    const diagnostic = { title, selectedOrigin: origin, publicStatus: await page.locator('#idea-status').innerText(), editorTitle: await page.getByLabel('Idea title', { exact: true }).inputValue(), priorReferences, currentReferences: await referenceState() };
+    await fs.writeFile(testInfo.outputPath(`idea-preview-diagnostic-${title.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.json`), JSON.stringify(diagnostic, null, 2), 'utf8');
+    throw Error(`Saved idea preview did not become available. Public idea status: ${diagnostic.publicStatus || '<empty>'}. Editor title: ${diagnostic.editorTitle}. See persisted public UI reference diagnostic.`, { cause: error });
+  }
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/^---\r?\n/);
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(title));
   const text = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
@@ -572,6 +581,94 @@ test('same-byte restoration revokes a two-hop foreign history closure and its st
   const calls = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
   expect(calls).toHaveLength(5); expect(calls.at(-1).text).toBe(reviewed);
   for (const [name, bytes] of Object.entries(originals)) expect((await fs.readFile(path.join(historyDirectory, name))).toString('base64')).toBe(bytes);
+});
+
+test('restored imported citations bind the fresh admitted revision and preserve unavailable earlier citations without substitution', async ({}, testInfo) => {
+  test.setTimeout(180000);
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'OLDCITATIONGENERATION authored synthetic interpretation.' }), 'utf8');
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#captures article')).toContainText('Authored synthetic review');
+  const base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json'), original = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  const [sourceHash, capture] = Object.entries(original.captures)[0];
+  const readme = path.join(root, 'README.md'); await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
+  await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]), 'utf8');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  await page.getByLabel('Context question', { exact: true }).fill('Inspect this authored synthetic review for MyTune.');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.getByLabel('Manual context source', { exact: true }).selectOption('capture:' + capture.id);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('OLDCITATIONGENERATION');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const old = await previewManualIdea('Earlier exact imported citation', 'last', true, testInfo);
+  expect(old.metadata.citations[0].revision_id).toBe(capture.currentRevision);
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#saved-ideas')).toContainText('Earlier exact imported citation');
+  let firstRestoration;
+  for (let cycle = 0; cycle < 2; cycle++) {
+    await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+    await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture deleted');
+    await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+    const restoration = page.getByLabel('Source restoration');
+    await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(root, 'producer', 'accept'));
+    const kind = restoration.getByRole('combobox', { name: /^Selected producer artifact kind/ });
+    await expect(kind).toBeVisible(); await kind.selectOption('review');
+    await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+    await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source restored');
+    const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), current = ledger.captures[sourceHash], generation = ledger.sourceAuthority[capture.id].generation;
+    expect(ledger.attempts).toEqual(original.attempts);
+    expect(ledger.admissions[current.currentRevision].sourceGeneration).toBe(generation);
+    expect(ledger.admissions[current.currentRevision].sourceHash).toBe(sourceHash);
+    if (cycle === 0) {
+      await page.getByRole('button', { name: 'Find context', exact: true }).click();
+      await page.getByLabel('Manual context source', { exact: true }).selectOption('capture:' + capture.id);
+      await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+      await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+      await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+      await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'FRESHCITATIONGENERATION authored synthetic interpretation.' }), 'utf8');
+      await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+      await expect(page.locator('#conversation-history')).toContainText('FRESHCITATIONGENERATION');
+      await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+      const fresh = await previewManualIdea('Fresh exact imported citation', 'last', true, testInfo);
+      expect(fresh.metadata.source_dependencies).toEqual([{ capture_id: capture.id, revision_id: current.currentRevision, source_generation: generation }]);
+      expect(fresh.metadata.support_attribution_unavailable).toBe(false);
+      expect(fresh.metadata.citations[0]).toMatchObject({ capture_id: capture.id, revision_id: current.currentRevision, snapshot_sha256: ledger.admissions[current.currentRevision].snapshotHash, evidence_id: 'a1' });
+      await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+      const article = page.locator('#saved-ideas article').filter({ hasText: 'Fresh exact imported citation' });
+      await expect(article).toBeVisible();
+      await article.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+      const revision = JSON.parse(await fs.readFile(path.join(base, 'Revisions', current.currentRevision + '.json'), 'utf8'));
+      await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(revision.text.replace(/\r\n?/g, '\n'));
+      firstRestoration = { fresh, revision: current.currentRevision, generation };
+    } else {
+      expect(generation).not.toBe(firstRestoration.generation); expect(current.currentRevision).not.toBe(firstRestoration.revision);
+      const article = page.locator('#saved-ideas article').filter({ hasText: 'Fresh exact imported citation' });
+      await article.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+      await expect(page.locator('#idea-evidence')).toContainText(firstRestoration.revision);
+      await expect(page.locator('#idea-evidence')).toContainText('No newer revision was substituted');
+      await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveCount(0);
+      expect(await fs.readFile(firstRestoration.fresh.file, 'utf8')).toBe(firstRestoration.fresh.text);
+    }
+    await page.locator('#saved-ideas article').filter({ hasText: 'Earlier exact imported citation' }).getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+    await expect(page.locator('#idea-evidence')).toContainText(capture.currentRevision);
+    await expect(page.locator('#idea-evidence')).toContainText('No newer revision was substituted');
+    expect(await fs.readFile(old.file, 'utf8')).toBe(old.text);
+  }
 });
 
 async function pauseManualRestoration(boundary) {
