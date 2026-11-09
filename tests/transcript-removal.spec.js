@@ -8,6 +8,140 @@ test.beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-transcript-removal-'));
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T12:00:00Z', timezone: 'America/Phoenix' }));
 });
+
+async function transcriptProtocolFixture(selectedFailure) {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_PROTOCOL_13: authored historical writing stays in its origin conversation.' }));
+  await launch();
+  await page.getByLabel('Thought or link', { exact: true }).fill('Transcript protocol recovery preserves this independent source capture.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  const readme = path.join(root, 'README.md'); await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
+  await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]));
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  await page.getByLabel('Context question', { exact: true }).fill('Keep this conversation independent of both exported transcripts.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_PROTOCOL_13');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const vault = path.join(root, 'vault'), directory = path.join(vault, 'Companion', '.transcripts');
+  const selected = path.join(vault, 'Selected protocol transcript.md'), other = path.join(vault, 'Other protocol transcript.md');
+  let selectedBytes;
+  for (const file of [other, selected]) {
+    await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: file }));
+    await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+    await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toBeVisible();
+    if (file === selected) {
+      selectedBytes = await page.getByLabel('Proposed transcript Markdown', { exact: true }).inputValue();
+      if (selectedFailure) await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: selectedFailure }));
+    }
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect(page.locator('#transcript-status')).toContainText(file === selected && selectedFailure ? 'Controlled filesystem boundary failure' : 'Transcript exported');
+  }
+  if (selectedFailure) await fs.writeFile(path.join(root, 'faults.json'), '{}');
+  let intent;
+  for (const name of await fs.readdir(directory)) {
+    if (!name.endsWith('.intent.json')) continue;
+    const record = JSON.parse(await fs.readFile(path.join(directory, name), 'utf8'));
+    if (record.destination === selected) intent = record;
+  }
+  expect(intent).toBeDefined();
+  const selectedCopies = [selected, path.join(directory, `${intent.operation}.intent.json`), path.join(directory, `${intent.operation}.published.json`)];
+  if (selectedFailure) selectedCopies.push(path.join(directory, `${intent.operation}.md.pending`));
+  const backup = path.join(root, 'protocol-external-backup.md'); await fs.copyFile(selected, backup);
+  return {
+    vault, directory, selected, other, selectedBytes, selectedCopies, backup, intent,
+    before: await files(vault), history: await files(path.join(root, 'conversations')),
+    calls: await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')
+  };
+}
+async function reviewProtocolRemoval(fixture) {
+  await page.getByRole('combobox', { name: 'Retained transcript export', exact: true }).selectOption(fixture.intent.operation);
+  await page.getByRole('button', { name: 'Preview transcript removal', exact: true }).click();
+  const review = page.getByRole('region', { name: 'Transcript removal review', exact: true });
+  await expect(review).toBeVisible();
+  for (const file of fixture.selectedCopies) await expect(review).toContainText(file);
+  return review;
+}
+async function expectProtocolIndependence(fixture) {
+  expect(await files(path.join(root, 'conversations'))).toEqual(fixture.history);
+  expect(await fs.readFile(fixture.backup, 'utf8')).toBe(fixture.selectedBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  const current = await files(fixture.vault);
+  for (const [file, bytes] of Object.entries(fixture.before)) if (!fixture.selectedCopies.includes(file)) expect(current[file]).toBe(bytes);
+}
+
+for (const boundary of ['transcript-remove-after-stage', 'transcript-remove-after-tombstone', 'transcript-remove-after-unlink']) {
+  test(`actual main exit at ${boundary} keeps exact transcript removal recoverable only after explicit review`, async ({}, testInfo) => {
+    test.setTimeout(150000);
+    const fixture = await transcriptProtocolFixture();
+    const review = await reviewProtocolRemoval(fixture);
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }));
+    await review.getByRole('button', { name: 'Confirm transcript removal', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+    const markerFile = path.join(fixture.directory, `${fixture.intent.id}.removed.json`), stage = `${markerFile}.pending`;
+    const markerExists = boundary !== 'transcript-remove-after-stage', stageExists = boundary !== 'transcript-remove-after-unlink';
+    expect(await fs.stat(markerFile).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(markerExists);
+    expect(await fs.stat(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(stageExists);
+    const authorityFile = markerExists ? markerFile : stage, markerBytes = await fs.readFile(authorityFile, 'utf8'), marker = JSON.parse(markerBytes);
+    expect(marker.id).toBe(fixture.intent.id); expect(marker.exportOperation).toBe(fixture.intent.operation);
+    expect(marker.targets.map(target => path.resolve(fixture.vault, target.file)).sort()).toEqual([...fixture.selectedCopies].sort());
+    expect((await fs.stat(authorityFile)).nlink).toBe(boundary === 'transcript-remove-after-tombstone' ? 2 : 1);
+    const remaining = [];
+    for (const file of fixture.selectedCopies) if (await fs.stat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) remaining.push(file);
+    expect(remaining).toHaveLength(boundary === 'transcript-remove-after-unlink' ? fixture.selectedCopies.length - 1 : fixture.selectedCopies.length);
+    await expectProtocolIndependence(fixture);
+    const crashedVault = await files(fixture.vault);
+
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+    const proof = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    proof.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    proof.mainExitObserved = true;
+    const proofFile = testInfo.outputPath('transcript-removal-exit-proof.json');
+    await fs.mkdir(path.dirname(proofFile), { recursive: true });
+    await fs.writeFile(proofFile, JSON.stringify(proof, null, 2));
+    app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}');
+
+    await launch(false);
+    const pending = page.getByRole('region', { name: 'Pending transcript removals', exact: true });
+    await expect(pending).toContainText(fixture.intent.id);
+    await expect(pending.getByRole('button', { name: 'Resume transcript removal', exact: true })).toBeEnabled();
+    expect(await files(fixture.vault)).toEqual(crashedVault);
+    await expectProtocolIndependence(fixture);
+    await pending.getByRole('button', { name: 'Resume transcript removal', exact: true }).click();
+    const recoveredReview = page.getByRole('region', { name: 'Transcript removal review', exact: true });
+    await expect(recoveredReview).toBeVisible();
+    for (const file of fixture.selectedCopies) await expect(recoveredReview).toContainText(file);
+    expect(await files(fixture.vault)).toEqual(crashedVault);
+    if (boundary === 'transcript-remove-after-stage') {
+      // Pause at final authority publication on the resumed attempt: no target can be erased first.
+      await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-remove-after-tombstone' }));
+      await recoveredReview.getByRole('button', { name: 'Confirm transcript removal', exact: true }).click();
+      await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8')).toBe('transcript-remove-after-tombstone');
+      expect(await fs.readFile(markerFile, 'utf8')).toBe(markerBytes);
+      expect((await fs.stat(markerFile)).nlink).toBe(2);
+      for (const file of fixture.selectedCopies) expect((await fs.readFile(file)).toString('base64')).toBe(fixture.before[file]);
+      await fs.writeFile(path.join(root, 'faults.json'), '{}'); await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+    } else await recoveredReview.getByRole('button', { name: 'Confirm transcript removal', exact: true }).click();
+    await expect(page.locator('#transcript-remove-status')).toContainText('Transcript removed locally');
+    expect(await fs.readFile(markerFile, 'utf8')).toBe(markerBytes);
+    expect((await fs.stat(markerFile)).nlink).toBe(1);
+    expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT');
+    for (const file of fixture.selectedCopies) expect(await fs.stat(file).catch(error => error.code)).toBe('ENOENT');
+    await expectProtocolIndependence(fixture);
+    const completedVault = await files(fixture.vault);
+    await app.close(); app = null; await launch(false);
+    await expect(page.getByRole('region', { name: 'Pending transcript removals', exact: true }).getByRole('button', { name: 'Resume transcript removal', exact: true })).toHaveCount(0);
+    expect(await files(fixture.vault)).toEqual(completedVault);
+    await expectProtocolIndependence(fixture);
+  });
+}
 test.afterEach(async () => {
   if (app) await app.close(); app = null;
   await fs.rm(root, { recursive: true, force: true });

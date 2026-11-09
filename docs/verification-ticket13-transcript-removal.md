@@ -27,7 +27,7 @@ Complete valid pending-only authority can be explicitly reviewed, revalidated an
 
 ## Remaining checks and scope
 
-The observed checks do not complete ticket 13. Required follow-up verticals include process exit around authority publication and target removal, stale export confirmations and acknowledgements, changed files, unknown aliases, and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
+The observed checks do not complete ticket 13. Required follow-up verticals include stale export confirmations and acknowledgements, changed files, unknown aliases, and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
 
 ## Retained intent with missing output
 
@@ -39,3 +39,15 @@ Root ran a second desktop/file vertical after the first implementation milestone
 - GREEN: root session `25930`, exit 0 in 27.8 seconds; case 27.4 seconds. Preview and cancel preserved exact bytes. Confirm removed the exact intent and receipt without recreating output. Origin conversation, source capture, external backup and provider submissions stayed unchanged. Restart kept the same result.
 
 The original paired-export regression then passed on the same source: root session80551, exit0,33.6 seconds (case33.3). Its exact four-copy scope, mutation-free cancellation, selected-only removal, retained origin/source/other export/backup and restart checks remained intact. These are two focused runs, not a complete release gate.
+
+## Actual main-process exit and explicit recovery
+
+Root session `85300` passed one parameterized behavior at three removal boundaries on unchanged `4021240` production: exit 0, 1.6 minutes total; cases 32.1, 31.9 and 32.0 seconds. No production change or manufactured RED was needed.
+
+- `transcript-remove-after-stage`: complete pending-only authority remained intact. Restart did not publish authority or erase targets. Explicit reviewed recovery published the final marker first; a second controlled pause proved the known marker/stage pair existed while all original selected targets remained intact.
+- `transcript-remove-after-tombstone`: the exact two-link final-marker/stage pair remained intact across process exit and restart. Recovery required explicit review and removed only the committed selected scope.
+- `transcript-remove-after-unlink`: one selected target was already absent. Restart preserved the remaining partial scope. Explicit recovery finished the same manifest once and retained the same permanent marker.
+
+Each case recorded the wrapper PID, main PID, wrapper exit result and observed main-process exit in its own `testInfo.outputPath` JSON before restarting. Root verified and copied all three distinct proof files (223, 222 and 226 bytes) to `Temp/companion-ticket13-transcript-crashes-green-20261109/`.
+
+All three cases verified no automatic mutation on restart or preview, no reconstructed output, an unchanged content-free permanent marker after completion, exact selected-file absence, and preserved originating conversation, source capture, other export, external backup and provider submissions. A second restart offered no duplicate recovery and kept the same persisted result. Stale normal-export confirmation coverage remains pending.
