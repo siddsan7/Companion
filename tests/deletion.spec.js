@@ -994,6 +994,96 @@ for (const boundary of ['capture-restoration-retirement-authorized', 'capture-re
   expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes);
 });
 
+for (const phase of ['restoring', 'deleted']) test(`legacy manual recovery folders require explicit review without adopting a replaced known parent for ${phase} controls`, async ({}, testInfo) => {
+  test.setTimeout(150000);
+  let selected;
+  if (phase === 'restoring') {
+    selected = await pauseManualRestoration('capture-restoration-admitted');
+    await exitMain('capture-restoration-admitted', testInfo, 'legacy-pending-control-processes.json');
+    await fs.unlink(selected.file);
+  } else {
+    await launch();
+    await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+    await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Vault ready.');
+    await page.getByLabel('Thought or link', { exact: true }).fill('LEGACYDELETED manual writing is restored only after a reviewed folder scope.');
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture saved.');
+    const base = path.join(root, 'vault', 'Companion'), captureName = (await fs.readdir(path.join(base, 'Captures'))).find(name => name.endsWith('.md'));
+    const file = path.join(base, 'Captures', captureName), sourceBytes = await fs.readFile(file), backup = path.join(root, 'legacy-deleted-backup.md');
+    await fs.writeFile(backup, sourceBytes);
+    const id = YAML.parse(sourceBytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id;
+    await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+    await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture deleted');
+    selected = { base, file, backup, sourceBytes, id, ledgerFile: path.join(base, '.intake', 'ledger.json') };
+    await app.close(); app = null;
+  }
+  const revisions = path.join(selected.base, 'Revisions'), relativeRevisions = path.relative(path.join(root, 'vault'), revisions).split(path.sep).join('/');
+  const ledger = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')), original = structuredClone(ledger.sourceAuthority[selected.id]);
+  expect(original.phase).toBe(phase); expect(original.targets.map(target => target.kind)).toEqual(['capture']);
+  expect(original.targets.some(target => target.file.startsWith(relativeRevisions + '/'))).toBe(false);
+  ledger.sourceAuthority[selected.id].directories = original.directories.filter(item => item.file !== relativeRevisions);
+  expect(ledger.sourceAuthority[selected.id].directories).toHaveLength(original.directories.length - 1);
+  const legacy = structuredClone(ledger.sourceAuthority[selected.id]), legacyBytes = JSON.stringify(ledger, null, 2);
+  await fs.writeFile(selected.ledgerFile, legacyBytes, 'utf8'); await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  const review = () => page.getByRole('button', { name: phase === 'restoring' ? 'Review capture deletion recovery' : 'Review suppressed captures', exact: true });
+  const view = () => page.getByLabel(phase === 'restoring' ? 'Capture deletion recovery' : 'Source restoration', { exact: true });
+  await review().click();
+  await expect(view().getByRole('button', { name: 'Review recovery folders', exact: true })).toBeVisible();
+  if (phase === 'restoring') await expect(view().getByRole('button', { name: 'Resume verified source restoration', exact: true })).toBeDisabled();
+  else {
+    await view().getByLabel('Selected manual capture file', { exact: true }).fill(selected.backup);
+    await view().getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('fresh explicit review');
+  }
+  expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id]).toEqual(legacy);
+  const before = await files(selected.base);
+  await view().getByRole('button', { name: 'Review recovery folders', exact: true }).click();
+  await expect(view().getByRole('button', { name: 'Confirm reviewed recovery folders', exact: true })).toBeVisible();
+  await expect(view()).toContainText(relativeRevisions); expect(await files(selected.base)).toEqual(before);
+  await view().getByRole('button', { name: 'Cancel recovery folder review', exact: true }).click();
+  expect(await files(selected.base)).toEqual(before);
+  await view().getByRole('button', { name: 'Review recovery folders', exact: true }).click();
+  await expect(view().getByRole('button', { name: 'Confirm reviewed recovery folders', exact: true })).toBeVisible();
+  const captures = path.join(selected.base, 'Captures'), originalCaptures = path.join(selected.base, 'Captures.original'), replacementCaptures = path.join(selected.base, 'Captures.replacement-held');
+  await fs.rename(captures, originalCaptures); await fs.mkdir(captures);
+  const sentinel = 'ONLYCOPY known-parent replacement writing must remain untouched.\n';
+  await fs.writeFile(path.join(captures, 'Independent replacement.md'), sentinel, 'utf8');
+  await view().getByRole('button', { name: 'Confirm reviewed recovery folders', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('parent identity changed');
+  expect(await fs.readFile(selected.ledgerFile, 'utf8')).toBe(legacyBytes);
+  expect(await fs.readFile(path.join(captures, 'Independent replacement.md'), 'utf8')).toBe(sentinel);
+  await view().getByRole('button', { name: 'Cancel recovery folder review', exact: true }).click();
+  await fs.rename(captures, replacementCaptures); await fs.rename(originalCaptures, captures);
+  await view().getByRole('button', { name: 'Review recovery folders', exact: true }).click();
+  await expect(view().getByRole('button', { name: 'Confirm reviewed recovery folders', exact: true })).toBeVisible();
+  await view().getByRole('button', { name: 'Confirm reviewed recovery folders', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Recovery folders reviewed');
+  const reviewed = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id], revisionIdentity = await fs.stat(revisions, { bigint: true });
+  expect(reviewed).toEqual({ ...legacy, directories: reviewed.directories });
+  expect(reviewed.directories.filter(item => item.file !== relativeRevisions).sort((a, b) => a.file.localeCompare(b.file))).toEqual([...legacy.directories].sort((a, b) => a.file.localeCompare(b.file)));
+  expect(reviewed.directories.filter(item => item.file === relativeRevisions)).toEqual([{ file: relativeRevisions, dev: String(revisionIdentity.dev), ino: String(revisionIdentity.ino) }]);
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  if (phase === 'restoring') {
+    await view().getByRole('button', { name: 'Resume verified source restoration', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Manual restoration publication is missing');
+    await view().getByLabel('Selected recovery backup file', { exact: true }).fill(selected.backup);
+    await view().getByRole('button', { name: 'Preview a new source restoration', exact: true }).click();
+    await view().getByRole('button', { name: 'Confirm new source restoration', exact: true }).click();
+  } else {
+    await view().getByLabel('Selected manual capture file', { exact: true }).fill(selected.backup);
+    await view().getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+    await view().getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  }
+  await expect(page.getByRole('status')).toContainText('Source restored');
+  const restored = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id];
+  expect(restored.phase).toBe('active'); expect(restored.manual).toEqual(original.manual);
+  expect(restored.operationId).not.toBe(original.operationId); expect(restored.generation).not.toBe(original.generation);
+  expect(await fs.readFile(selected.file)).toEqual(selected.sourceBytes); expect(await fs.readFile(selected.backup)).toEqual(selected.sourceBytes);
+  expect(await fs.readFile(path.join(replacementCaptures, 'Independent replacement.md'), 'utf8')).toBe(sentinel);
+});
+
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
   test.setTimeout(90000);
   await artifact('first', '1'); await launch();
