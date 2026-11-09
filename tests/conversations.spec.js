@@ -611,3 +611,50 @@ for (const outcome of ['completed', 'failed', 'interrupted', 'late citation']) {
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   });
 }
+
+for (const variant of ['matching updates', 'failed turn', 'unavailable']) {
+  test(`observed turn usage stays scoped and truthful: ${variant}`, async () => {
+    test.setTimeout(60000);
+    const first = { total: { totalTokens: 43, inputTokens: 32, cachedInputTokens: 16, cacheWriteInputTokens: 4, outputTokens: 11, reasoningOutputTokens: 5 }, last: { totalTokens: 19, inputTokens: 15, cachedInputTokens: 7, cacheWriteInputTokens: 0, outputTokens: 4, reasoningOutputTokens: 2 }, modelContextWindow: 16384 };
+    const observed = { total: { totalTokens: 137, inputTokens: 100, cachedInputTokens: 20, cacheWriteInputTokens: 5, outputTokens: 37, reasoningOutputTokens: 12 }, last: { totalTokens: 57, inputTokens: 40, cachedInputTokens: 10, cacheWriteInputTokens: 0, outputTokens: 17, reasoningOutputTokens: 4 }, modelContextWindow: 16384 };
+    const malformed = { ...observed, total: { ...observed.total, totalTokens: 'not-a-counter' } };
+    const usageUpdates = [
+      { otherThread: true, tokenUsage: observed },
+      ...(variant === 'unavailable' ? [] : [{ tokenUsage: first }, { tokenUsage: observed }]),
+      { otherTurn: true, tokenUsage: first },
+      { tokenUsage: malformed }
+    ];
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic observed-usage reply.', usageUpdates, ...(variant === 'failed turn' ? { turn: 'usage-limit' } : {}) }));
+    await prepareConversation(); await observeConversation();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('observed-usage reply');
+    const files = await fs.readdir(path.join(root, 'conversations'));
+    const historyFile = path.join(root, 'conversations', files.find(name => name.endsWith('.json')));
+    const terminal = variant === 'failed turn' ? 'failed' : 'completed';
+    await expect.poll(async () => JSON.parse(await fs.readFile(historyFile, 'utf8')).requests[0].status).toBe(terminal);
+    const saved = JSON.parse(await fs.readFile(historyFile, 'utf8')), request = saved.requests[0];
+    const report = JSON.parse(await fs.readFile(path.join(root, 'conversation-transport', 'readiness.json'), 'utf8'));
+    if (variant === 'unavailable') {
+      expect(request.usage).toBeNull(); expect(report.turns.at(-1).usage).toBeNull();
+      expect(request.usageEvidence).toMatch(/unavailable|not provide|not observed/i);
+    } else {
+      expect(request.usage).toEqual(observed); expect(report.turns.at(-1).usage).toEqual(observed);
+      expect(request.usageEvidence).toMatch(/observed/i); expect(request.usageEvidence).toMatch(/incomplete|not complete/i);
+    }
+    expect(report.ready).toBe(false);
+    if (variant === 'failed turn') await expect(page.locator('#conversation-history')).toContainText('usage limit');
+    await page.getByLabel('Context question', { exact: true }).fill('Keep character limits independent of observed token counters.');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Keep character limits independent/);
+    await expect(page.locator('#conversation-summary')).toContainText('/ 32000 Unicode code points');
+    await expect(page.locator('#conversation-summary')).toContainText('No verified provider input bound');
+    const rpc = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    expect(rpc.filter(call => /account\//.test(call.method))).toEqual([]);
+    const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    expect(calls.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#conversation-history')).toContainText('observed-usage reply');
+    expect(JSON.parse(await fs.readFile(historyFile, 'utf8')).requests[0].usage).toEqual(variant === 'unavailable' ? null : observed);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  });
+}

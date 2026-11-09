@@ -71,6 +71,7 @@ input.on('line', line => {
     if (scenario.terminalCommand) completedItems.push({ type: 'commandExecution', id: `fixture-unselected-command-${sequence}`, pluginId: null, scriptPath: null, command: 'SYNTHETIC_NOT_EXECUTED', cwd: process.cwd(), processId: null, source: 'agent', status: 'completed', commandActions: [], aggregatedOutput: 'UNSELECTED_COMMAND_CONTENT_CANARY', exitCode: 0, durationMs: 0 });
     const finish = () => {
       if (scenario.holdCompletion) completedItems.forEach((item, index) => notify('item/completed', { threadId: active.threadId, turnId: active.turnId, item, completedAtMs: 1794139200000 + index }));
+      for (const update of scenario.usageUpdates || []) notify('thread/tokenUsage/updated', { threadId: update.otherThread ? 'fixture-unrelated-thread' : active.threadId, turnId: update.otherTurn ? 'fixture-unrelated-turn' : active.turnId, tokenUsage: update.tokenUsage });
       if (scenario.turn === 'usage-limit') notify('error', { threadId: active.threadId, turnId: active.turnId, willRetry: false, error: { message: 'PRIVATE_PROVIDER_DETAIL', codexErrorInfo: 'usageLimitExceeded' } });
       if (scenario.turn !== 'pending') notify('turn/completed', { threadId: active.threadId, turn: turn(scenario.turn === 'usage-limit' ? 'failed' : scenario.turn || 'completed', scenario.terminalView === 'notLoaded' ? [] : completedItems, scenario.terminalView || 'full') });
     };
