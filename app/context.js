@@ -45,7 +45,7 @@ class Context {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(file));
     const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
     const metadata = match && YAML.parse(match[1]);
-    if (metadata && typeof metadata === 'object' && (Object.hasOwn(metadata, 'companion_id') || ['capture', 'annotation', 'saved_idea', 'project_brief'].includes(metadata.artifact_type))) throw Error('Managed artifact metadata cannot bypass context eligibility through note inclusion.');
+    if (metadata && typeof metadata === 'object' && (Object.hasOwn(metadata, 'companion_id') || ['capture', 'annotation', 'saved_idea', 'project_brief', 'conversation_transcript'].includes(metadata.artifact_type))) throw Error('Managed artifact metadata cannot bypass context eligibility through note inclusion.');
     return { key: `note:${digest(file)}`, title: path.basename(file), text, provenance: `Explicit vault note ${path.basename(file)}; sha256 ${digest(text)}; user selected; not independently verified`, digest: digest(text) };
   }
   async changeScope(update) {
@@ -137,7 +137,7 @@ class Context {
         // Managed captures used as project documents must not re-enter as opaque quotations.
         for (const snapshot of pin.sources) {
           const match = snapshot.text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/), metadata = match && YAML.parse(match[1]);
-          if (metadata?.companion_id || metadata?.artifact_type && ['capture', 'annotation', 'saved_idea'].includes(metadata.artifact_type)) throw Error('managed project-document dependency requires an explicit supported reference');
+          if (metadata?.companion_id || metadata?.artifact_type && ['capture', 'annotation', 'saved_idea', 'conversation_transcript'].includes(metadata.artifact_type)) throw Error('managed project-document dependency requires an explicit supported reference');
         }
         const excerpts = pin.sections.map(section => `${section.title}\n${section.text}\n${section.references.map(ref => {
           const snapshot = pin.sources[ref.source];
