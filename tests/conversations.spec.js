@@ -2415,3 +2415,94 @@ test('restoration authority guards keep an active generation usable after a fail
   expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
 });
+
+async function interruptedControlFixture(label, testInfo) {
+  const fixture = await deletionFixture(label);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-delete-after-tombstone' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('conversation-delete-after-tombstone');
+  const controlDirectory = path.join(fixture.directory, '.control'), controlFile = path.join(controlDirectory, `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8'), marker = JSON.parse(controlBytes);
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { wrapperPid: child.pid, mainPid, boundary: 'conversation-delete-after-tombstone', exitBoundary: 'Electron app.exit(77)' };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  evidence.wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  await testInfo.attach('control-guard-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+  app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+  return { ...fixture, controlDirectory, controlFile, controlBytes, marker };
+}
+
+test('local control guards explicitly finish only the exact known two-link control publication pair', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const fixture = await interruptedControlFixture('KNOWN_CONTROL_PAIR', testInfo);
+  const stage = path.join(fixture.controlDirectory, `${fixture.marker.publication}.pending`);
+  // Actual OS hardlink reproduces the exact link-before-cleanup publication state while main is absent.
+  await fs.link(fixture.controlFile, stage);
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(2); expect(await fs.readFile(stage, 'utf8')).toBe(fixture.controlBytes);
+  await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const pending = page.getByRole('region', { name: 'Pending conversation deletions', exact: true });
+  await expect(pending).toContainText(fixture.record.id);
+  await expect(pending.getByRole('button', { name: 'Resume conversation deletion', exact: true })).toBeEnabled();
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(2); expect(await fs.readFile(stage, 'utf8')).toBe(fixture.controlBytes);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  await pending.getByRole('button', { name: 'Resume conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+  const completed = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  expect(completed.phase).toBe('deleted'); expect(completed.generation).toBe(fixture.marker.generation); expect(completed.scope).toEqual(fixture.marker.scope); expect(completed.targets).toEqual(fixture.marker.targets);
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(1); expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT'); expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes); expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+test('local control guards preserve an unknown control hardlink peer and block deletion recovery', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const fixture = await interruptedControlFixture('UNKNOWN_CONTROL_PEER', testInfo), peer = path.join(root, 'unknown-control-authority-peer.json');
+  await fs.link(fixture.controlFile, peer);
+  await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const pending = page.getByRole('region', { name: 'Pending conversation deletions', exact: true });
+  await expect(pending).toContainText(fixture.record.id);
+  await expect(pending.getByRole('button', { name: 'Resume conversation deletion', exact: true })).toBeDisabled();
+  expect((await fs.stat(fixture.controlFile)).nlink).toBe(2); expect((await fs.stat(peer)).nlink).toBe(2);
+  expect(await fs.readFile(fixture.controlFile, 'utf8')).toBe(fixture.controlBytes); expect(await fs.readFile(peer, 'utf8')).toBe(fixture.controlBytes);
+  expect(await fs.stat(path.join(fixture.controlDirectory, `${fixture.marker.publication}.pending`)).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes); expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+test('local control guards reject an actual control-folder junction without exposing or modifying outside writing', async () => {
+  test.setTimeout(120000);
+  const fixture = await deletionFixture('CONTROL_JUNCTION'); await deleteHistoryForGeneration(page);
+  const controlDirectory = path.join(fixture.directory, '.control'), controlFile = path.join(controlDirectory, `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8');
+  await app.close(); app = null;
+  const retained = path.join(root, 'retained-control-folder'), outside = path.join(root, 'outside-control-folder'); await fs.mkdir(outside);
+  const outsideFile = path.join(outside, `${fixture.record.id}.json`), outsideBytes = 'OUTSIDE_CONTROL_PRIVATE_CANARY_12: independent writing must remain unchanged.\n';
+  await fs.writeFile(outsideFile, outsideBytes, 'utf8');
+  let moved = false, redirected = false;
+  try {
+    await fs.rename(controlDirectory, retained); moved = true;
+    await fs.symlink(outside, controlDirectory, process.platform === 'win32' ? 'junction' : 'dir'); redirected = true;
+    await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending conversation deletions', exact: true })).toContainText(/ordinary|folder|contained/i);
+    await expect(page.locator('#conversation-section')).not.toContainText('OUTSIDE_CONTROL_PRIVATE_CANARY_12');
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await page.getByLabel('Context question', { exact: true }).fill('Prepare project-only context while local controls require repair.');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/ordinary|folder|contained/i);
+    expect(await fs.readFile(outsideFile, 'utf8')).toBe(outsideBytes); expect(await fs.readdir(outside)).toEqual([`${fixture.record.id}.json`]);
+    expect(await fs.readFile(path.join(retained, `${fixture.record.id}.json`), 'utf8')).toBe(controlBytes);
+    expect((await fs.readdir(fixture.directory)).filter(name => /^[a-f0-9-]{36}\.json$/.test(name))).toEqual([]);
+    expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes); expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (redirected) await fs.unlink(controlDirectory);
+    if (moved) await fs.rename(retained, controlDirectory);
+  }
+});
