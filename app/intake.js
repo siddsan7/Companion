@@ -5,6 +5,7 @@ const { readDraft, hash } = require('./intake-producer');
 const { readReview } = require('./intake-review');
 const { intakeLock } = require('./intake-lock');
 const { withTitle, captureHeading } = require('./vault');
+const { validateAuthority, assertPublication } = require('./source-authority');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
 const conflict = message => Object.assign(Error(message), { intakeConflict: true });
@@ -23,7 +24,7 @@ class Intake {
     const text = await read(path.join(this.dir, 'ledger.json')); if (text === null) return empty();
     let ledger; try { ledger = JSON.parse(text); } catch { throw Error('Intake ledger is unreadable. Preserve .intake and restore a vault backup before checking sources.'); }
     if (ledger.schema !== 1 || !Array.isArray(ledger.sources) || !ledger.captures || !ledger.attempts || !ledger.blocks || !ledger.pending || !ledger.outcomes || !Array.isArray(ledger.suppressed)) throw Error('Unsupported intake ledger. Preserve it for repair.');
-    return ledger;
+    validateAuthority(ledger); return ledger;
   }
   async save(ledger) {
     await this.vault.contained(this.dir);
@@ -316,6 +317,7 @@ class Intake {
   }
   async finish(tx, ledger) {
     this.validateTransaction(tx);
+    assertPublication(ledger, tx.capture.id);
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
     const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
@@ -380,6 +382,8 @@ class Intake {
     await fs.unlink(path.join(this.dir, 'transaction.json'));
   }
   async recover() {
+    const controlled = await this.load();
+    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'deleting') await require('./capture-deletion').finishDeletion(this, controlled, id);
     await this.finishLink();
     await this.finishAnnotation();
     try { await this.finishRepair(); }
@@ -389,6 +393,7 @@ class Intake {
     let tx; try { tx = JSON.parse(text); } catch { throw Error('Unreadable intake recovery journal. Preserve .intake for repair before retrying.'); }
     this.validateTransaction(tx);
     const ledger = await this.load();
+    assertPublication(ledger, tx.capture.id);
     if (tx.externalConflict && !ledger.blocks[tx.sourceHash]) return this.archiveConflict(tx, ledger, 'Destination changed outside Companion. Both versions were preserved.');
     if (ledger.blocks[tx.sourceHash] && !tx.restore) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
     if (ledger.pending[tx.sourceHash]) return this.defer(tx, ledger, ledger.pending[tx.sourceHash].reason);
@@ -507,6 +512,7 @@ class Intake {
     const file = path.join(this.dir, 'title-intent.json'), text = await read(file); if (text === null) return true;
     let intent; try { intent = JSON.parse(text); } catch { throw Error('Unreadable imported title intent. Preserve .intake for repair.'); }
     const ledger = await this.load(), capture = Object.values(ledger.captures).find(x => x.id === intent.id);
+    assertPublication(ledger, intent.id);
     if (!capture || typeof intent.before !== 'string' || typeof intent.title !== 'string' || !intent.title.trim() || /[\r\n]/.test(intent.title) || intent.previousHash !== hash(intent.before) || intent.content !== withTitle(intent.before, intent.title) || ![intent.previousHash, hash(intent.content)].includes(capture.currentHash)) throw Error('Invalid imported title recovery intent. Files were preserved for repair.');
     let note = (await this.vault.list()).find(x => x.id === intent.id);
     if (!note || ![intent.before, intent.content].includes(note.content)) {
@@ -535,4 +541,4 @@ class Intake {
   }
 }
 require('./repairs').install(Intake, { hash, read, noteText });
-module.exports = { Intake };
+module.exports = { Intake, noteText };

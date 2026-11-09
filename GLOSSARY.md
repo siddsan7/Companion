@@ -53,6 +53,12 @@ A check of selected source locations against known import outcomes to find eligi
 **Re-import Suppression**
 The user's instruction to keep a removed capture from returning through automatic intake until explicitly restored.
 
+**Source Generation**
+An explicit period of a capture's eligibility as evidence. Restoring deleted material starts a new generation even when the text is unchanged.
+
+**Revision Admission**
+Acceptance of a particular source revision into a source generation. A restored admission does not change the original producer attempt or restore earlier citations.
+
 **Discovery Corpus**
 The material eligible for automatic context discovery. It includes Companion-managed captures, annotations, saved ideas, approved briefs, and other notes explicitly included by the user.
 

@@ -223,4 +223,4 @@ class Vault {
     }
   }
 }
-module.exports = { Vault, withTitle, captureHeading, parseAnnotation };
+module.exports = { Vault, withTitle, captureHeading, parseAnnotation, parse };

@@ -30,6 +30,10 @@ async function refresh() {
     save.onclick = () => action(async () => { await window.companion.title({ id: note.id, title: input.value }); await refresh(); status('Title saved.'); });
     open.onclick = () => action(async () => { await window.companion['open-note'](note.id); status('Requested Obsidian to open the note.'); });
     article.append(heading, details, content, label, save, open); $('captures').append(article);
+    if (note.type === 'reel_import') {
+      const remove = document.createElement('button'); remove.textContent = 'Delete capture';
+      remove.onclick = () => action(() => window.captureDeletionView.preview(note.id)); article.append(remove);
+    }
     if (note.type === 'reel_import') { const inspect = document.createElement('button'); inspect.textContent = 'Inspect source'; inspect.onclick = () => action(() => window.intakeView.inspect(note.id)); article.append(inspect); }
   }
   window.dispatchEvent(new CustomEvent('companion-base-refreshed', { detail: { configurationEpoch: owner, location: state.location } }));
