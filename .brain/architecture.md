@@ -118,3 +118,13 @@ Active/unsaved history blocks export until local recovery. Unresolved pending fi
 `Ideas.list` computes current support warnings without changing note ownership or bytes; unique independent notes remain openable. Fatal storage/list errors retain the established live diagnostic under current-view guards. Initial support inspection follows a real successful base refresh; configuration epochs reject old results and failed reads preserve only prior same-vault repair rows.
 
 Exact schemas, source-copy inventory, failed runs, focused corrections, composite verification and review status are in [verification-ticket12.md](../docs/verification-ticket12.md) and state.md. These local checks do not promote deferred production readiness. #13 must preserve current control authority and only-copy writing during capture purge; #16 owns the complete final release gate.
+
+## Active ticket 13 branches
+
+These modules are verified or under test in isolated branches; they are not yet integrated into this root checkout.
+
+- Primary ticket090169a: `source-authority.js` owns source generations and exact content-free deletion/restoration authority. `source-mutation.js` reuses the existing Intake kernel lock with bounded async ownership. `source-recovery.js` validates pending shared folder/global-journal authority before source-local manual holds. `capture-deletion.js` owns explicit scope, suppression, selected restoration and separately reviewed fresh manual retry/old-copy retirement. Published receipts make old recovery verify-only. Full mixed recovery inventory and dependent removal are still pending.
+- Ideas043e314: `ideas-removal.js` owns explicit saved-idea scope, immutable per-identity removal markers and exact cleanup under the existing Ideas writer lock. Marker presence fences stale saves and Context eligibility before cleanup. The production Context callback shares the Ideas store's observed directory identity; direct Context callers check raw markers. Originating conversations and source authority stay separate. Crash, orphan and pending-only coverage is still being completed.
+- Transcript branch: `transcript-removal.js` is an uncommitted candidate using Conversation then transcript-store locking, a permanent marker bound to its actually created inode, per-attempt identity/bytes and exact selected export copies. Its first workflow has not passed yet. It does not remove the origin conversation or external backups.
+
+Root serializes desktop verification, owns Git and independent reviews, and preserves all helper/ticket commits during integration. Read state.md for current tips and actual gate results.
