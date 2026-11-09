@@ -3,11 +3,49 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 let root, app, page;
+let diagnostic, diagnosticWatcher, diagnosticReads = Promise.resolve(), diagnosticFiles = [];
 test.beforeEach(async () => {
+  diagnostic = false; diagnosticWatcher = null; diagnosticReads = Promise.resolve(); diagnosticFiles = [];
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-conversation-'));
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T12:00:00Z', timezone: 'America/Phoenix' }));
 });
-test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.afterEach(async ({}, testInfo) => {
+  diagnosticWatcher?.close(); await diagnosticReads;
+  if (diagnostic && testInfo.status !== testInfo.expectedStatus) {
+    const destination = testInfo.outputPath('conversation-state'); await fs.mkdir(destination, { recursive: true });
+    const manifest = { title: testInfo.title, status: testInfo.status, wrapperPid: app?.process().pid, mainPid: app ? await app.evaluate(() => process.pid).catch(() => null) : null, testRoot: root, files: diagnosticFiles };
+    manifest.visible = await page.evaluate(() => ({ timeline: window.__conversationDiagnostic || [], history: document.getElementById('conversation-history')?.textContent, error: document.getElementById('conversation-error')?.textContent, status: document.querySelector('[role="status"]')?.textContent })).catch(error => ({ unavailable: error.message }));
+    const copy = async (name, target) => { try { await fs.copyFile(path.join(root, name), path.join(destination, target)); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
+    for (const name of ['conversation-provider.json', 'conversation-submissions.jsonl', 'codex-requests.jsonl', 'conversation-store-failures.jsonl', 'clock.json', 'faults.json', 'checkpoint.txt', 'release.txt']) await copy(name, name);
+    await fs.mkdir(path.join(destination, 'conversations'));
+    for (const name of await fs.readdir(path.join(root, 'conversations')).catch(() => [])) if (/^[a-f0-9-]{36}\.json$/.test(name)) await copy(path.join('conversations', name), path.join('conversations', name));
+    await fs.writeFile(path.join(destination, 'observations.json'), JSON.stringify(manifest, null, 2));
+    console.log(`Saved whitelisted conversation failure evidence: ${destination}`);
+  }
+  if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true });
+});
+async function observeConversation() {
+  diagnostic = true;
+  await page.evaluate(() => {
+    const timeline = window.__conversationDiagnostic = []; let previous;
+    const record = () => {
+      const state = { error: document.getElementById('conversation-error')?.textContent, status: document.querySelector('[role="status"]')?.textContent, requests: [...document.querySelectorAll('#conversation-history > article')].map(article => ({ state: article.querySelector('p:not(.history-exclusion)')?.textContent, replyLength: article.querySelectorAll('pre')[1]?.textContent.length })) };
+      const key = JSON.stringify(state); if (key === previous) return; previous = key;
+      timeline.push({ at: Date.now(), ...state }); if (timeline.length > 128) timeline.shift();
+    };
+    const observer = new MutationObserver(record);
+    observer.observe(document.getElementById('conversation-section'), { childList: true, subtree: true, characterData: true });
+    observer.observe(document.querySelector('[role="status"]'), { childList: true, subtree: true, characterData: true }); record();
+  });
+  diagnosticWatcher = require('node:fs').watch(path.join(root, 'conversations'), (_, name) => {
+    if (!/^[a-f0-9-]{36}\.json$/.test(String(name))) return;
+    diagnosticReads = diagnosticReads.then(async () => {
+      try { const record = JSON.parse(await fs.readFile(path.join(root, 'conversations', String(name)), 'utf8')); diagnosticFiles.push({ at: Date.now(), file: String(name), storageWarning: record.storageWarning, requests: record.requests.map(request => ({ id: request.id, status: request.status, error: request.error, replyLength: request.reply.length, messages: request.messages?.map(message => ({ id: message.id, completed: message.completed, length: message.text.length })) })) }); }
+      catch (error) { diagnosticFiles.push({ at: Date.now(), file: String(name), error: error.code || error.message }); }
+      if (diagnosticFiles.length > 128) diagnosticFiles.shift();
+    });
+  }).on('error', error => diagnosticFiles.push({ watcherError: error.code || error.message }));
+}
 async function launch(configure = true) {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
   if (configure) {
@@ -347,6 +385,7 @@ test('ordered assistant items retain every full completed message and phase acro
   ];
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ messages }));
   await prepareConversation();
+  await observeConversation();
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
   await expect(page.locator('#conversation-history')).toContainText('UNKNOWN_PHASE_COMPLETE_CANARY');
   await expect(page.locator('#conversation-history article').last()).toContainText('completed');
