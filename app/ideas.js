@@ -172,6 +172,38 @@ class Ideas {
     }
     return citations.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   }
+  async supportSnapshot({ vault, record, request }) {
+    const context = await this.conversations.getContext(), corpus = await context.corpus();
+    const ledgerFile = path.join(vault.root, '.intake', 'ledger.json');
+    const ledger = JSON.parse((await this.readFile(vault, ledgerFile, this.parents(vault, [ledgerFile]))).text);
+    const state = [], warnings = []; let unavailable = false;
+    for (const dep of request.package.dependencies) {
+      const source = corpus.all.find(item => item.key === dep.key), excluded = record.scope?.excludedSources.includes(dep.key) || false;
+      const captureId = dep.captureId || (dep.key.startsWith('capture:') ? dep.key.slice(8) : null);
+      const entries = captureId ? Object.entries(ledger.captures).filter(([, item]) => item.id === captureId) : [];
+      const entry = entries.length === 1 ? entries[0] : null, capture = entry?.[1];
+      const authorityKey = captureId || dep.key;
+      const authority = { identityChoice: ledger.identityChoices?.[authorityKey] || null, identityIssue: ledger.identityIssues?.[authorityKey] || null, ...(capture ? { sourceHash: entry[0], file: capture.relative || capture.file, currentRevision: capture.currentRevision, currentHash: capture.currentHash, removed: !!capture.removed, rejected: !!capture.rejected, supportEligible: capture.supportEligible !== false, conflict: !!capture.conflict, pending: !!ledger.pending?.[entry[0]], blocked: !!ledger.blocks?.[entry[0]], suppressed: ledger.suppressed.includes(entry[0]) } : {}) };
+      state.push({ key: dep.key, originalDigest: dep.digest, currentDigest: source?.digest || null, excluded, authority, warnings: source?.warnings || [] });
+      if (!source || excluded) {
+        unavailable = true; warnings.push(`Supporting context ${dep.key} is currently unavailable or excluded. Retained writing is independent; no current support is claimed.`);
+      } else if (source.digest !== dep.digest) {
+        // An imported citation can retain exact admitted historical evidence even
+        // after the current capture changes. Ordinary captures lack that snapshot.
+        let historical = false;
+        if (captureId && dep.revisionId) {
+          try {
+            const retained = await this.revision(vault, captureId, dep.revisionId);
+            historical = retained.warnings.length === 0;
+          } catch {}
+        }
+        if (!historical) unavailable = true;
+        warnings.push(`Supporting context ${dep.key} changed since the conversation. ${historical ? 'The exact eligible imported revision remains retained; it was not replaced by the current revision.' : 'The historical interpretation is retained with unavailable or unverified support.'}`);
+      }
+      for (const warning of source?.warnings || []) warnings.push(warning);
+    }
+    return { state, warnings, unavailable };
+  }
   async preview(input, identity) {
     const { vault, record, request } = await this.origin(input);
     const citations = await this.selectedReferences(input, { vault, record, request });
@@ -186,31 +218,32 @@ class Ideas {
     }
     const brief = await new Briefs(vault).pinned(record.brief.version);
     if (brief.id !== record.brief.id || brief.digest !== record.brief.digest) throw Error('The exact conversation brief is unavailable.');
+    const support = await this.supportSnapshot({ vault, record, request });
     // An unchanged proposal keeps the same immutable identity and creation instant
     // when the user cancels and reviews it again. Confirmation never regenerates it.
-    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, scope: record.scope, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment, citations }));
+    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, scope: record.scope, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment, citations, supportState: support.state }));
     const retained = !identity && [...this.previews.values()].find(preview => preview.proposalKey === proposalKey);
     if (retained) {
       this.guard(vault);
       return { operation: retained.operation, text: retained.text, destination: retained.destination, warnings: [...retained.warnings] };
     }
     const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => ({ capture_id: dep.captureId || dep.key.slice(8), ...(dep.revisionId ? { revision_id: dep.revisionId } : { content_sha256: dep.digest }) }));
-    const unsupported = request.status !== 'completed' || request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
+    const unsupported = support.unavailable || request.status !== 'completed' || request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
     const id = identity?.id || randomUUID(), operation = identity?.operation || randomUUID();
     const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: identity?.createdAt || this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations, origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
     const disclosure = citations.length ? 'Supporting references were explicitly selected and checked against exact admitted revisions and the original full source in the retained package. The original package had no structured passage offsets. These references do not establish sentence-level support for the explanation. Claims are not independently verified.' : 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
     const experimentText = kind === 'experiment_proposal' ? `\n# Experiment Proposal\n\n${Object.entries(experimentLabels).map(([key, label]) => `## ${label}\n\n${experiment[key]}`).join('\n\n')}\n` : '';
     const citationText = citations.map(anchor => `Capture ${anchor.capture_id}; exact revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}; evidence ${anchor.evidence_id}; ${anchor.evidence_kind}; time ${anchor.start_seconds ?? 'unknown'}–${anchor.end_seconds ?? 'unknown'} seconds.\n\n${anchor.excerpt}\n\nExcerpt sha256 ${anchor.excerpt_sha256}.`).join('\n\n');
-    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\n${citationText}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
+    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\n${support.warnings.join('\n')}\n\n${citationText}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
     const slug = fields.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Idea';
     const destination = path.join(vault.root, 'Ideas', `${slug}--${id}.md`);
     this.guard(vault);
     const referenceBindings = (input.referenceIds || []).map(referenceId => ({ referenceId, ...structuredClone(this.references.get(referenceId)) }));
-    const preview = { schema: 1, operation, id, vault: vault.root, destination, text, digest: hash(text), proposalKey, warnings: [disclosure], input: structuredClone(input), referenceBindings };
+    const preview = { schema: 1, operation, id, vault: vault.root, destination, text, digest: hash(text), proposalKey, warnings: [disclosure, ...support.warnings], input: structuredClone(input), referenceBindings, supportState: support.state };
     if (identity && (identity.text !== text || identity.destination !== destination || identity.proposalKey !== proposalKey)) throw Error('The retained proposal or supporting context changed. Review a new preview before saving; retained writing was preserved.');
     if (this.previews.size >= 64) this.previews.delete(this.previews.keys().next().value);
     this.previews.set(operation, preview);
-    return { operation, text, destination, warnings: [disclosure] };
+    return { operation, text, destination, warnings: [...preview.warnings] };
   }
   async intent(operation) {
     if (!uuid(operation)) throw Error('Proposed idea identity is invalid.');
@@ -313,7 +346,7 @@ class Ideas {
       const staged = await this.readFile(vault, stage, parents, links);
       if (staged.text !== preview.text) throw Error('Saved idea stage conflict. The proposal was preserved.');
       await this.checkpoint('idea-before-publication');
-      const currentPreview = await this.preview(preview.input);
+      const currentPreview = await this.preview(preview.input, { ...preview, createdAt: metadata(preview.text).created_at });
       if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
       const freshLinks = local.lstatSync(stage).nlink;
       if (![1, 2].includes(freshLinks)) throw Error('Saved idea stage has unknown linked copies. No destination was created.');
