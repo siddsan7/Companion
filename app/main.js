@@ -97,7 +97,7 @@ app.whenReady().then(async () => {
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
   const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
-  installIdeas({ ipcMain, getVault: () => vault, conversations, clock, open: async uri => {
+  installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });

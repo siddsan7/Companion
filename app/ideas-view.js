@@ -18,11 +18,28 @@
   const references = document.createElement('div'); references.id = 'idea-references';
   byId('idea-preview-button').before(references);
   const evidenceView = document.createElement('div'); evidenceView.id = 'idea-evidence'; section.append(evidenceView);
+  const pendingView = document.createElement('div'); pendingView.id = 'pending-ideas'; section.append(pendingView);
   let origin = null, operation = null, epoch = 0;
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
   for (const field of ['title', 'explanation', 'limitations']) byId(`idea-${field}`).oninput = invalidate;
   for (const [key] of experimentFields) byId(`idea-experiment-${key}`).oninput = invalidate;
   kind.onchange = () => { invalidate(); experiments.hidden = kind.value !== 'experiment_proposal'; };
+  function fillEditor(input, offered = [], checked = []) {
+    byId('idea-editor').hidden = false;
+    for (const key of ['title', 'explanation', 'limitations']) byId(`idea-${key}`).value = input[key] || '';
+    kind.value = input.kind || 'observation'; experiments.hidden = kind.value !== 'experiment_proposal';
+    for (const [key] of experimentFields) byId(`idea-experiment-${key}`).value = input.experiment?.[key] || '';
+    references.replaceChildren();
+    for (const reference of offered) {
+      const label = document.createElement('label'), checkbox = document.createElement('input'), excerpt = document.createElement('pre');
+      checkbox.type = 'checkbox'; checkbox.id = `idea-reference-${reference.referenceId}`; checkbox.value = reference.referenceId; checkbox.checked = checked.includes(reference.referenceId); checkbox.onchange = invalidate;
+      label.htmlFor = checkbox.id; label.textContent = reference.label; excerpt.textContent = reference.excerpt; references.append(label, checkbox, excerpt);
+    }
+  }
+  function showPreview(preview) {
+    operation = preview.blocked ? null : preview.operation; byId('idea-destination').value = preview.destination; byId('idea-markdown').value = preview.text;
+    byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false; byId('idea-confirm').disabled = !!preview.blocked;
+  }
   async function list() {
     try {
       const notes = await window.companion['idea-list'](); byId('saved-ideas').replaceChildren();
@@ -48,22 +65,29 @@
           }; article.append(inspect);
         }
       }
+      const proposals = await window.companion['idea-pending'](); pendingView.replaceChildren();
+      for (const proposal of proposals) {
+        const article = document.createElement('article'), title = document.createElement('h3'), resume = document.createElement('button');
+        title.textContent = proposal.title; resume.textContent = 'Resume proposed idea';
+        resume.onclick = async () => {
+          invalidate(); const current = epoch;
+          try {
+            const retained = await window.companion['idea-resume']({ operation: proposal.operation }); if (current !== epoch) return;
+            origin = { conversationId: retained.input.conversationId, requestId: retained.input.requestId };
+            fillEditor(retained.input, retained.references, retained.input.referenceIds); showPreview(retained);
+            byId('idea-status').textContent = retained.blocked ? 'Proposed content retained. Context changed; review a new preview before confirmation.' : 'Proposed content restored. Confirm explicitly to retry the save.';
+          } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
+        };
+        article.append(title, resume); pendingView.append(article);
+      }
     } catch (error) { byId('idea-status').textContent = error.message; }
   }
   window.addEventListener('companion-idea-draft', async event => {
     invalidate(); const current = epoch; origin = event.detail; byId('idea-status').textContent = '';
     try {
       const draft = await window.companion['idea-draft'](origin); if (current !== epoch) return;
-      byId('idea-editor').hidden = false; byId('idea-title').value = ''; byId('idea-explanation').value = draft.explanation; byId('idea-limitations').value = draft.limitations;
-      kind.value = 'observation'; experiments.hidden = true;
-      for (const [key] of experimentFields) byId(`idea-experiment-${key}`).value = '';
-      references.replaceChildren();
+      fillEditor(draft, draft.references);
       const warning = document.createElement('p'); warning.textContent = (draft.warnings || []).join('\n'); references.append(warning);
-      for (const reference of draft.references || []) {
-        const label = document.createElement('label'), checkbox = document.createElement('input'), excerpt = document.createElement('pre');
-        checkbox.type = 'checkbox'; checkbox.id = `idea-reference-${reference.referenceId}`; checkbox.value = reference.referenceId; checkbox.onchange = invalidate;
-        label.htmlFor = checkbox.id; label.textContent = reference.label; excerpt.textContent = reference.excerpt; references.append(label, checkbox, excerpt);
-      }
       byId('idea-title').focus();
     } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
   });
@@ -72,8 +96,7 @@
     try {
       const preview = await window.companion['idea-preview']({ ...origin, title: byId('idea-title').value, explanation: byId('idea-explanation').value, limitations: byId('idea-limitations').value, kind: kind.value, experiment: Object.fromEntries(experimentFields.map(([key]) => [key, byId(`idea-experiment-${key}`).value])), referenceIds: [...references.querySelectorAll('input:checked')].map(checkbox => checkbox.value) });
       if (current !== epoch) return;
-      operation = preview.operation; byId('idea-destination').value = preview.destination; byId('idea-markdown').value = preview.text;
-      byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false;
+      showPreview(preview);
     } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
   };
   byId('idea-cancel').onclick = invalidate;
