@@ -1125,3 +1125,60 @@ for (const variant of ['matching updates', 'failed turn', 'unavailable']) {
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   });
 }
+
+test('prior conversation search is opt-in and selected excerpts are labelled historical dialogue in the exact new package', async () => {
+  test.setTimeout(90000);
+  const canary = 'HISTORICAL_DIALOGUE_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${canary}: revisit one chord after a delay; this is an unverified transfer.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(canary);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const originals = await fs.readdir(path.join(root, 'conversations'));
+  const originalFile = originals.find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const original = JSON.parse(await fs.readFile(path.join(root, 'conversations', originalFile), 'utf8'));
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`What did we previously discuss about ${canary}?`);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results')).not.toContainText('unverified transfer');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/What did we previously discuss/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/revisit one chord after a delay/);
+
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  const excerpt = page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: canary });
+  await expect(excerpt).toHaveCount(1);
+  await expect(excerpt).toContainText('Historical dialogue');
+  await expect(excerpt).toContainText('unverified transfer');
+  await excerpt.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/revisit one chord after a delay/);
+  const reviewed = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  expect(reviewed).toContain('Historical dialogue');
+  expect(reviewed).toContain(original.id);
+  expect(reviewed).toContain(original.requests[0].id);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic selected historical dialogue reply.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('selected historical dialogue reply.');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions).toHaveLength(2);
+  expect(submissions[1].text).toBe(reviewed);
+  expect(submissions[1].threadId).not.toBe(submissions[0].threadId);
+  const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => /^[a-f0-9-]{36}\.json$/.test(name)).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+  expect(records).toHaveLength(2);
+  const saved = records.find(record => record.id !== original.id).requests[0].package;
+  expect(saved.text).toBe(reviewed);
+  expect(saved.count).toBe([...reviewed].length);
+  expect(saved.historyRefs).toEqual([expect.objectContaining({ conversationId: original.id, requestId: original.requests[0].id })]);
+  for (const dependency of original.requests[0].package.dependencies) expect(saved.dependencies).toContainEqual(dependency);
+  expect(await fs.readdir(path.join(root, 'vault', 'Companion', 'Ideas'))).toEqual([]);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Use only current project context.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Use only current project context/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/HISTORICAL_DIALOGUE_12_CANARY|revisit one chord after a delay/);
+});
