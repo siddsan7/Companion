@@ -590,3 +590,98 @@ test('invalid archive inputs and a file changed after matched preview preserve c
   expect(await archiveSafetyState()).toEqual(missingBefore);
   await expect(restore.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
 });
+
+test('archive export preserves collisions and failed publication then rejects a replaced parent before an explicit retry', async () => {
+  test.setTimeout(150000);
+  const valid = await createSafetyArchive(), before = await archiveSafetyState();
+  const selectedParent = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-destination-'));
+  const heldParent = `${selectedParent}-held`, outside = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-outside-'));
+  let redirected = false, held = false;
+  try {
+    await fs.writeFile(path.join(outside, 'outside-writing.md'), 'OUTSIDE_WRITING_MUST_REMAIN_UNCHANGED\n', 'utf8');
+    const outsideBefore = await tree(outside);
+    const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+    const exportTo = async destination => {
+      await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination }), 'utf8');
+      await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+      await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+      await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+    };
+    const collision = path.join(selectedParent, 'keep-existing.json');
+    await fs.writeFile(collision, 'EXISTING_USER_FILE_MUST_NOT_BE_REPLACED\n', 'utf8');
+    await exportTo(collision);
+    await expect(region.locator('#archive-summary')).toContainText('already exists');
+    expect(await fs.readFile(collision, 'utf8')).toBe('EXISTING_USER_FILE_MUST_NOT_BE_REPLACED\n');
+    expect(await archiveSafetyState()).toEqual(before);
+    const failed = path.join(selectedParent, 'failed-history.json');
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'archive-before-publish', code: 'EACCES' }), 'utf8');
+    await exportTo(failed);
+    await expect(region.locator('#archive-summary')).toContainText('Controlled filesystem boundary failure');
+    expect(await fs.access(failed).then(() => true, () => false)).toBe(false);
+    expect(await archiveSafetyState()).toEqual(before);
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'archive-before-publish' }), 'utf8');
+    const redirectedDestination = path.join(selectedParent, 'redirected-history.json');
+    await exportTo(redirectedDestination);
+    await expect.poll(async () => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('archive-before-publish');
+    await fs.rename(selectedParent, heldParent); held = true;
+    await fs.symlink(outside, selectedParent, process.platform === 'win32' ? 'junction' : 'dir'); redirected = true;
+    await fs.writeFile(path.join(root, 'release.txt'), 'release', 'utf8');
+    await expect(region.locator('#archive-summary')).toContainText(/destination folder changed|alias/i);
+    expect(await tree(outside)).toEqual(outsideBefore);
+    const retainedStages = (await fs.readdir(heldParent)).filter(name => name.startsWith('.companion-archive-') && name.endsWith('.pending'));
+    expect(retainedStages).toHaveLength(1);
+    const retained = JSON.parse(await fs.readFile(path.join(heldParent, retainedStages[0]), 'utf8'));
+    expect(retained.payload.conversations).toEqual(valid.archive.payload.conversations);
+    expect(await archiveSafetyState()).toEqual(before);
+    await fs.unlink(selectedParent); redirected = false;
+    await fs.unlink(path.join(root, 'faults.json'));
+    const retry = path.join(root, 'retried-history.json');
+    await exportTo(retry);
+    await expect(region.locator('#archive-summary')).toContainText('Archive exported');
+    expect(JSON.parse(await fs.readFile(retry, 'utf8')).payload.conversations).toEqual(valid.archive.payload.conversations);
+    expect(await archiveSafetyState()).toEqual(before);
+    expect(await tree(outside)).toEqual(outsideBefore);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (redirected) await fs.unlink(selectedParent);
+    if (held) await fs.rm(heldParent, { recursive: true, force: true }); else await fs.rm(selectedParent, { recursive: true, force: true });
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
+test('archive settings stay bound to the canonical data root after its original launch alias is retargeted', async () => {
+  test.setTimeout(90000);
+  const valid = await createSafetyArchive(), before = await archiveSafetyState();
+  await app.close(); app = null;
+  const aliasParent = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-alias-'));
+  const alias = path.join(aliasParent, 'launch-root'), outside = path.join(aliasParent, 'outside');
+  await fs.mkdir(outside);
+  const destination = path.join(root, 'canonical-settings-history.json');
+  await fs.writeFile(path.join(outside, 'settings.json'), JSON.stringify({ vault: outside, parent: 'DO_NOT_EXPORT_OUTSIDE_SETTINGS_CANARY' }), 'utf8');
+  await fs.writeFile(path.join(outside, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
+  await fs.writeFile(path.join(outside, 'archive-dialog.json'), JSON.stringify({ save: destination }), 'utf8');
+  let linked = false;
+  try {
+    await fs.symlink(root, alias, process.platform === 'win32' ? 'junction' : 'dir'); linked = true;
+    app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: alias } }); page = await app.firstWindow();
+    await expect(page.locator('#conversation-history')).toContainText('ARCHIVE_SAFETY_HISTORY');
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await fs.unlink(alias); linked = false;
+    await fs.symlink(outside, alias, process.platform === 'win32' ? 'junction' : 'dir'); linked = true;
+    const outsideBefore = await tree(outside);
+    const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+    await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+    await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+    await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+    await expect(region.locator('#archive-summary')).toContainText('Archive exported');
+    const text = await fs.readFile(destination, 'utf8'), exported = JSON.parse(text);
+    expect(exported.payload.settings).toEqual(valid.archive.payload.settings);
+    expect(text).not.toContain('DO_NOT_EXPORT_OUTSIDE_SETTINGS_CANARY');
+    expect(await archiveSafetyState()).toEqual(before);
+    expect(await tree(outside)).toEqual(outsideBefore);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (linked) await fs.unlink(alias);
+    await fs.rm(aliasParent, { recursive: true, force: true });
+  }
+});
