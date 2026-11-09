@@ -377,6 +377,7 @@ class Archives {
     await guard(); const stage = path.join(parent, `.companion-archive-${randomUUID()}.pending`); let handle;
     try {
       handle = await fs.open(stage, 'wx'); await guard(); await handle.writeFile(text, 'utf8'); await handle.sync(); await handle.close(); handle = null;
+      await this.checkpoint('archive-before-publish');
       await guard();
       // Atomic exclusive publication: an existing destination is never replaced.
       await fs.link(stage, destination); await guard();
