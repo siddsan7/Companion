@@ -282,13 +282,20 @@ class Ideas {
       await this.checkpoint('idea-before-publication');
       const currentPreview = await this.preview(preview.input);
       if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
+      const freshLinks = local.lstatSync(stage).nlink;
+      if (![1, 2].includes(freshLinks)) throw Error('Saved idea stage has unknown linked copies. No destination was created.');
+      const freshStage = await this.readFile(vault, stage, parents, freshLinks);
+      if (!same(staged.stat, freshStage.stat) || freshStage.text !== preview.text) throw Error('Saved idea stage changed. The proposal and existing files were preserved.');
       this.guard(vault, parents);
-      try { await fs.link(stage, preview.destination); }
-      catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        const current = await this.readFile(vault, preview.destination, parents, 2);
-        if (!same(staged.stat, current.stat) || current.text !== preview.text) throw Error('Saved idea destination exists. Existing content was preserved.');
-      }
+      // Check exact peers after every asynchronous checkpoint, immediately before
+      // exclusive publication. Two links are valid only for our known destination.
+      const finalStage = local.lstatSync(stage, { bigint: true });
+      let finalDestination;
+      try { finalDestination = local.lstatSync(preview.destination, { bigint: true }); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (!finalStage.isFile() || finalStage.isSymbolicLink() || !same(freshStage.stat, finalStage)) throw Error('Saved idea stage identity changed. No destination was created.');
+      if (finalStage.nlink === 1n && !finalDestination) local.linkSync(stage, preview.destination);
+      else if (finalStage.nlink !== 2n || !finalDestination?.isFile() || finalDestination.isSymbolicLink() || finalDestination.nlink !== 2n || !same(finalStage, finalDestination)) throw Error('Saved idea stage has an unknown peer or the destination exists. Existing files were preserved; no destination peer was created.');
       this.guard(vault, parents);
       const published = await this.readFile(vault, preview.destination, parents, 2);
       if (!same(staged.stat, published.stat) || published.text !== preview.text) throw Error('Saved idea changed during publication. Preserve the proposal and inspect the note.');
