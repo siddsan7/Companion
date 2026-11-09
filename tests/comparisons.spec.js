@@ -60,3 +60,54 @@ test('authored comparison keeps three inspectable cases and six pending slots ac
   expect(await savedComparison()).toEqual(before);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
 });
+
+test('one reviewed comparison slot retains the authoritative final candidate and never replays on restart', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound, not live proof', harnessAndOutputEvidence: 'authored fixture harness and output allowance, not live proof' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({
+    model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default',
+    messages: [
+      { phase: 'commentary', text: 'Authored commentary is retained separately.' },
+      { phase: 'final_answer', text: 'Authored final candidate: no supported connection is established. See supplied source limitations and approved project constraints. A synthetic answer is not an executed experiment.' }
+    ]
+  }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  const reviewed = await page.getByLabel('Reviewed comparison package', { exact: true }).inputValue();
+  expect(reviewed).toContain('final answer up to 600 words');
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect(page.locator('#comparison-slots article').first()).toContainText('completed');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('Authored final candidate:');
+  const saved = await savedComparison();
+  const completed = saved.slots.filter(slot => slot.status === 'completed');
+  expect(completed).toHaveLength(1);
+  const slot = completed[0];
+  expect(slot.package.text).toBe(reviewed);
+  expect(slot.reply).toContain('Authored commentary is retained separately.');
+  expect(slot.messages.map(message => message.phase)).toEqual(['commentary', 'final_answer']);
+  expect(slot.candidate.text).toBe('Authored final candidate: no supported connection is established. See supplied source limitations and approved project constraints. A synthetic answer is not an executed experiment.');
+  expect(slot.candidate.warning).toBeNull();
+  expect(slot.requested).toEqual({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default' });
+  expect(slot.effective).toEqual(slot.requested);
+  expect(slot.evidence).toBe('controlled-fixture-not-live');
+  expect(slot.usage).toBeNull(); expect(slot.usageEvidence).toContain('unavailable');
+  expect(Number.isFinite(slot.elapsedMs) && slot.elapsedMs >= 0).toBe(true);
+  expect(slot.elapsedBoundary).toContain('preflight');
+  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(5);
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(calls.trim().split('\n').map(line => JSON.parse(line).text)).toEqual([reviewed]);
+  const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  const threadStart = requests.find(request => request.method === 'thread/start').params;
+  expect(threadStart.model).toBe('fixture'); expect(threadStart.modelProvider).toBe('fixture-provider');
+  expect(threadStart.serviceTier).toBe('default'); expect(threadStart.config.model_reasoning_effort).toBe('medium');
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('Authored final candidate:');
+  await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
