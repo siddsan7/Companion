@@ -153,7 +153,7 @@ class Conversations {
       const key = `${conversationId}:${requestId}`, record = await load(conversationId);
       const request = record.requests.find(item => item.id === requestId), scope = scopeOf(record);
       if (!request || record.requests.filter(item => item.id === requestId).length !== 1) throw Error('historical request is unavailable or ambiguous');
-      const digest = hash(JSON.stringify({ request, brief: record.brief, scope }));
+      const digest = hash(JSON.stringify({ request, brief: record.brief, scope, ...(record.generation ? { generation: record.generation } : {}) }));
       if (expectedDigest !== undefined && expectedDigest !== digest) throw Error('historical dialogue or its originating exclusions changed; search and select it again');
       if (resolved.has(key)) return resolved.get(key);
       if (visiting.has(key) || visiting.size >= 128 || resolved.size >= 512) throw Error('historical dependency ancestry is cyclic or exceeds the inspection bound');
@@ -292,14 +292,15 @@ class Conversations {
     const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}${foreignText ? `\n\nPrior-conversation historical dialogue (retained discussion, not independent evidence):\n${foreignText}` : ''}${authorityText ? `\n\nHistorical dependency authority (provenance only; unselected ancestor dialogue is omitted):\n${authorityText}` : ''}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
     const count = [...text].length;
     this.safeDirectory(false, directory);
-    return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, capacityBinding: preview.capacityBinding, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), historyRefs: [...foreign.values()].map(turn => turn.ref), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
+    return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, capacityBinding: preview.capacityBinding, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), historyRefs: [...foreign.values()].map(turn => turn.ref), conversationGeneration: prior?.generation || null, brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
   }
   async preview(input) {
     const snapshot = await this.build(input), packageId = randomUUID();
     if (input.conversationId) await this.lock(async () => {
       const record = await this.read(input.conversationId), baseline = scopeOf(record);
-      if (record.vault.root !== snapshot.vault.root || JSON.stringify(record.brief) !== JSON.stringify(snapshot.brief) || baseline.version !== snapshot.scope.version || hash(JSON.stringify(record.requests)) !== snapshot.historyDigest) throw Error('Conversation or reviewed scope changed in another window. Preview again.');
+      if (record.vault.root !== snapshot.vault.root || (record.generation || null) !== snapshot.conversationGeneration || JSON.stringify(record.brief) !== JSON.stringify(snapshot.brief) || baseline.version !== snapshot.scope.version || hash(JSON.stringify(record.requests)) !== snapshot.historyDigest) throw Error('Conversation or reviewed scope changed in another window. Preview again.');
       if (!record.scope || JSON.stringify(baseline) !== JSON.stringify(snapshot.scope)) {
+        await this.controls.approveScope(record, snapshot.scope);
         record.scope = { ...snapshot.scope, version: randomUUID() };
         await this.write(record); snapshot.scope = record.scope;
         for (const [token, approved] of this.tokens) if (approved.input.conversationId === input.conversationId) this.tokens.delete(token);

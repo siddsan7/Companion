@@ -39,7 +39,9 @@ class ConversationControls {
   }
   validate(value, id) {
     const fail = () => { throw Error('Conversation control is unknown or corrupt. Preserve all writing; ordinary history access is blocked.'); };
-    if (!fields(value, ['schema', 'id', 'generation', 'phase', 'scope', 'targets', 'publication']) || value.schema !== 1 || value.id !== id || !uuid(id) || !uuid(value.generation) || !uuid(value.publication) || !['deleting', 'deleted', 'restoring', 'active'].includes(value.phase)) fail();
+    if (!fields(value, ['schema', 'id', 'generation', 'phase', 'scope', 'targets', 'publication', 'restoration']) || value.schema !== 1 || value.id !== id || !uuid(id) || !uuid(value.generation) || !uuid(value.publication) || !['deleting', 'deleted', 'restoring', 'active'].includes(value.phase)) fail();
+    if (value.restoration !== undefined && (!fields(value.restoration, ['archiveId', 'recordDigest']) || !uuid(value.restoration.archiveId) || typeof value.restoration.recordDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.restoration.recordDigest))) fail();
+    if (value.phase === 'restoring' && !value.restoration) fail();
     if (!fields(value.scope, ['excludedSources', 'excludedHistory']) || !Array.isArray(value.scope.excludedSources) || value.scope.excludedSources.some(key => typeof key !== 'string') || !Array.isArray(value.scope.excludedHistory) || value.scope.excludedHistory.some(key => !uuid(key)) || !Array.isArray(value.targets)) fail();
     const names = new Set();
     for (const target of value.targets) {
@@ -89,6 +91,27 @@ class ConversationControls {
     if (marker.phase !== 'active' || record.generation !== marker.generation) throw Error('Conversation was deleted or its generation changed. Stale history cannot be saved or sent.');
     const scope = record.scope;
     if (!scope || marker.scope.excludedSources.some(key => !scope.excludedSources.includes(key)) || marker.scope.excludedHistory.some(id => !scope.excludedHistory.includes(id))) throw Error('Current conversation exclusions remain authoritative. Preview current scope again.');
+  }
+  async authority() {
+    const directory = this.guard(); if (!directory) return { markers: [], stages: [] };
+    const markers = [], stages = [];
+    for (const name of (await fs.readdir(directory.directory)).sort()) {
+      if (/^[a-f0-9-]{36}\.json$/.test(name)) markers.push(await this.state(name.slice(0, -5)));
+      else if (/^[a-f0-9-]{36}\.pending$/.test(name)) {
+        const stat = await fs.lstat(path.join(directory.directory, name));
+        if (![1, 2].includes(stat.nlink)) throw Error('Unknown control stage peers remain preserved.');
+        const file = await this.file(path.join(directory.directory, name), directory, null, stat.nlink, true), value = JSON.parse(file.text);
+        this.validate(value, value.id); if (name !== `${value.publication}.pending`) throw Error('Unknown control stage remains preserved.');
+        stages.push(file.owned);
+      } else throw Error('Unknown local conversation authority remains preserved. Archive review is blocked.');
+    }
+    return { markers, stages };
+  }
+  async approveScope(record, scope) {
+    const marker = await this.state(record.id); if (!marker) return;
+    await this.check(record);
+    await this.settlePublication(marker);
+    await this.put({ ...marker, scope: { excludedSources: [...scope.excludedSources], excludedHistory: [...scope.excludedHistory] } }, marker);
   }
   async put(marker, baseline) {
     const directory = this.guard(true), file = path.join(directory.directory, `${marker.id}.json`);
