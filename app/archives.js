@@ -316,7 +316,7 @@ class Archives {
   }
   async metadataPlan(archive, sourceRoot, targetRoot) {
     const candidates = [], additions = [], equal = [], conflicts = [], types = { cadence: 0, codexHints: 0, coverage: 0 };
-    for (const value of [...(archive.payload.settings?.inactiveScheduleIntents || []), ...(archive.payload.scheduleIntent ? [{ schema: 1, archiveId: archive.id, sourceRoot, targetRoot, intent: archive.payload.scheduleIntent }] : [])]) {
+    for (const value of this.matchedIntents(archive, sourceRoot, targetRoot)) {
       const record = inactiveIntent(value); candidates.push({ kind: 'cadence', name: `archive-intent-${record.archiveId}-${hash(record.sourceRoot + '\n' + record.targetRoot)}.json`, record });
     }
     for (const value of [...(archive.payload.settings?.inactiveArchiveCoverage || []), ...(archive.coverage ? [{ schema: 1, archiveId: archive.id, coverage: archive.coverage }] : [])]) {
@@ -400,8 +400,7 @@ class Archives {
   }
   async retainIntents(archive, sourceRoot, targetRoot) {
     let preserved = 0;
-    const inherited = archive.payload.settings?.inactiveScheduleIntents || [];
-    const records = [...inherited, ...(archive.payload.scheduleIntent ? [{ schema: 1, archiveId: archive.id, sourceRoot, targetRoot, intent: archive.payload.scheduleIntent }] : [])];
+    const records = this.matchedIntents(archive, sourceRoot, targetRoot);
     for (const original of records) {
       const record = inactiveIntent(original), destination = path.join(this.history.dataRoot, `archive-intent-${record.archiveId}-${hash(record.sourceRoot + '\n' + record.targetRoot)}.json`);
       const existing = await this.json(destination, undefined, true);
@@ -414,6 +413,15 @@ class Archives {
       } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
     }
     return preserved;
+  }
+  matchedIntents(archive, sourceRoot, targetRoot) {
+    const inherited = (archive.payload.settings?.inactiveScheduleIntents || []).map(original => {
+      const record = structuredClone(inactiveIntent(original));
+      // Only this explicitly matched former destination may become usable in the new installation.
+      if (record.targetRoot === sourceRoot) record.targetRoot = targetRoot;
+      return record;
+    });
+    return [...inherited, ...(archive.payload.scheduleIntent ? [{ schema: 1, archiveId: archive.id, sourceRoot, targetRoot, intent: archive.payload.scheduleIntent }] : [])];
   }
   async state() { return this.history.lock(async () => { this.directory = this.history.safeDirectory(); return { inactiveIntents: await this.inactiveIntents(), codexHints: await this.inactiveCodexHints() }; }); }
   async reconnectPreview(input) {
