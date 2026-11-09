@@ -902,3 +902,43 @@ test('active and unsaved history require local resave while reviewed pending omi
   expect(await fs.readFile(path.join(preservedDirectory, unknownName))).toEqual(unknownBytes);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
+
+test('archive export refuses a final serialized file above 128 MiB without truncating near-limit retained history', async () => {
+  test.setTimeout(180000);
+  const crypto = require('node:crypto'), local = require('node:fs');
+  const limit = 128 * 1024 * 1024, valid = await createSafetyArchive();
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await app.close(); app = null;
+  // Temporarily disconnected configuration keeps ordinary history polling from rendering a 64 MiB reply.
+  // Export still enumerates the actual retained history through its public desktop control.
+  await fs.rename(path.join(root, 'settings.json'), path.join(root, 'separately-preserved-settings.json'));
+  let record = structuredClone(valid.record);
+  expect(record.requests[0].messages).toHaveLength(1);
+  record.requests[0].reply = ''; record.requests[0].messages[0].text = '';
+  const binding = { ...valid.archive.payload.vaultBindings[0], vault: null, parent: null };
+  const compactBase = Buffer.byteLength(JSON.stringify({ ...valid.archive.payload, settings: null, vaultBindings: [binding], conversations: [record] }), 'utf8');
+  const prefix = 'NEAR_LIMIT_RETAINED_TEXT_START_', suffix = '_NEAR_LIMIT_RETAINED_TEXT_END';
+  const length = Math.floor((limit - 64 - compactBase) / 2);
+  let longText = prefix + 'x'.repeat(length - prefix.length - suffix.length) + suffix;
+  record.requests[0].reply = longText; record.requests[0].messages[0].text = longText;
+  const historyFile = path.join(root, 'conversations', `${record.id}.json`);
+  let serialized = JSON.stringify(record);
+  expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThan(limit);
+  await fs.writeFile(historyFile, serialized, 'utf8');
+  record = null; longText = null; serialized = null;
+  const digest = async file => { const hash = crypto.createHash('sha256'); for await (const bytes of local.createReadStream(file)) hash.update(bytes); return hash.digest('hex'); };
+  const before = { bytes: (await fs.stat(historyFile)).size, digest: await digest(historyFile) };
+  const destination = path.join(root, 'oversized-final-archive.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination }), 'utf8');
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled({ timeout: 60000 });
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(region.locator('#archive-summary')).toContainText('Final serialized archive exceeds 128 MiB', { timeout: 60000 });
+  expect(await fs.access(destination).then(() => true, () => false)).toBe(false);
+  expect({ bytes: (await fs.stat(historyFile)).size, digest: await digest(historyFile) }).toEqual(before);
+  expect((await fs.readdir(root)).filter(name => name.startsWith('.companion-archive-') && name.endsWith('.pending'))).toEqual([]);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
