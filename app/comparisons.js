@@ -6,6 +6,7 @@ const { performance } = require('node:perf_hooks');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
 const { fixtures, prompts } = require('./comparison-fixtures');
+const rubric = require('./comparison-rubric');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 function makePackage(brief, fixture, method) {
@@ -223,6 +224,37 @@ class Comparisons {
       return this.view(record);
     });
   }
+  scoreProjection(record) {
+    return { id: record.id, rubric, storageWarning: record.storageWarning || null,
+      notice: 'Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.',
+      outputs: record.displayOrder.map((id, index) => {
+        const slot = record.slots.find(item => item.id === id);
+        const candidateDigest = hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
+        return { displayIndex: index, displayId: `Output ${index + 1}`, status: slot.status, candidate: slot.candidate || null, candidateDigest, error: slot.error || null, rating: slot.rating || null };
+      }) };
+  }
+  async scoreView(input) {
+    const record = await this.read(input?.id);
+    if (record.vault.root !== this.getVault()?.root) throw Error('Comparison belongs to another vault.');
+    return this.scoreProjection(record);
+  }
+  async rate(input) {
+    const fields = rubric.dimensions.map(dimension => dimension.key), rating = input?.rating;
+    if (!rating || Object.keys(rating).sort().join(',') !== [...fields, 'reason', 'materialError'].sort().join(',') || fields.some(key => !Number.isSafeInteger(rating[key]) || rating[key] < 1 || rating[key] > 5) || typeof rating.reason !== 'string' || !rating.reason.trim() || rating.reason.length > 2000 || typeof rating.materialError !== 'boolean') throw Error('Enter four separate integer ratings from 1 to 5, a short reason and a material-error choice.');
+    return this.lock(async () => {
+      const record = await this.read(input.id);
+      if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output. Repair storage before saving feedback.');
+      const slotId = record.displayOrder[input.displayIndex], slot = record.slots.find(item => item.id === slotId);
+      if (!slot || !['completed', 'failed', 'interrupted'].includes(slot.status) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
+      const projection = this.scoreProjection(record).outputs[input.displayIndex];
+      if (projection.candidateDigest !== input.candidateDigest) throw Error('Retained output changed. Inspect it again before saving feedback.');
+      const values = { ...rating, reason: rating.reason.trim() };
+      if (slot.rating && fields.concat('reason', 'materialError').every(key => slot.rating[key] === values[key]) && slot.rating.candidateDigest === input.candidateDigest) return this.scoreProjection(record);
+      if ((slot.rating?.revision || null) !== input.expectedRevision) throw Error('Feedback changed in another view. Inspect the current feedback before confirming an update.');
+      slot.rating = { ...values, rubricVersion: rubric.version, candidateDigest: input.candidateDigest, revision: randomUUID(), savedAt: this.clock().now };
+      await this.write(record); return this.scoreProjection(record);
+    });
+  }
 }
 function installComparisons({ ipcMain, ...options }) {
   const store = new Comparisons(options);
@@ -230,6 +262,8 @@ function installComparisons({ ipcMain, ...options }) {
   ipcMain.handle('comparison-create', (_, input) => store.create(input));
   ipcMain.handle('comparison-preview', (_, input) => store.preview(input));
   ipcMain.handle('comparison-send', (_, input) => store.send(input));
+  ipcMain.handle('comparison-score-view', (_, input) => store.scoreView(input));
+  ipcMain.handle('comparison-rate', (_, input) => store.rate(input));
   return store;
 }
 module.exports = { installComparisons };

@@ -2,13 +2,29 @@
   const section = document.createElement('section'); section.id = 'comparison-section'; section.setAttribute('aria-label', 'Reasoning comparison');
   section.innerHTML = '<h2>Reasoning comparison</h2><p>Inspect three authored synthetic cases against one approved MyTune brief. Creating a comparison makes no model request.</p><label>Comparison brief version<input id="comparison-brief" type="number" min="1" value="1"></label><button id="comparison-create">Create comparison</button><label for="comparison-select">Retained comparison</label><select id="comparison-select"><option value="">Choose comparison</option></select><p id="comparison-error" role="alert"></p><p id="comparison-notice"></p><div id="comparison-cases"></div><label>Reviewed comparison package<textarea id="comparison-package" rows="12" readonly></textarea></label><p id="comparison-preview-summary"></p><button id="comparison-send" disabled>Send reviewed comparison slot</button><div id="comparison-slots"></div>';
   document.querySelector('main').append(section);
+  const scoring = document.createElement('div'); scoring.id = 'comparison-score-panel'; scoring.hidden = true;
+  scoring.innerHTML = '<h3>Blind scoring</h3><p id="comparison-score-notice"></p><div id="comparison-rubric"></div><div id="comparison-score"></div><button id="comparison-inspect">Inspect comparison</button>';
+  section.append(scoring);
+  const startScoring = document.createElement('button'); startScoring.id = 'comparison-score-start'; startScoring.textContent = 'Start blind scoring';
+  document.getElementById('comparison-notice').after(startScoring);
   const byId = id => document.getElementById(id);
   let current = null;
   let token = null, epoch = 0, sending = false;
   const records = new Map();
+  const drafts = new Map();
+  function scoreMode(enabled) {
+    for (const id of ['comparison-cases', 'comparison-package', 'comparison-preview-summary', 'comparison-send', 'comparison-slots']) {
+      byId(id).hidden = enabled;
+      if (id === 'comparison-package') byId(id).parentElement.hidden = enabled;
+    }
+    byId('comparison-notice').hidden = enabled; byId('comparison-score-panel').hidden = !enabled;
+    byId('comparison-score-start').hidden = enabled;
+    if (enabled) invalidate();
+  }
   function invalidate() { token = null; byId('comparison-send').disabled = true; byId('comparison-package').value = ''; byId('comparison-preview-summary').textContent = ''; }
   function show(record) {
     invalidate(); epoch++;
+    scoreMode(false);
     current = record.id; byId('comparison-select').value = current;
     byId('comparison-notice').textContent = `${record.notice} Approved brief version ${record.brief.version}; sha256 ${record.brief.digest}.${record.storageWarning ? ` ${record.storageWarning}` : ''}`;
     byId('comparison-cases').replaceChildren();
@@ -47,6 +63,61 @@
     try { await work(); byId('comparison-error').textContent = ''; }
     catch (error) { byId('comparison-error').textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   }
+  function renderScores(result) {
+    byId('comparison-score-notice').textContent = `${result.notice}${result.storageWarning ? ` ${result.storageWarning}` : ''}`;
+    byId('comparison-rubric').replaceChildren();
+    const note = document.createElement('p'); note.textContent = result.rubric.note; byId('comparison-rubric').append(note);
+    for (const dimension of result.rubric.dimensions) {
+      const paragraph = document.createElement('p'); paragraph.textContent = `${dimension.label}: 1 - ${dimension.anchors[0]}; 3 - ${dimension.anchors[1]}; 5 - ${dimension.anchors[2]}. ${dimension.example}`;
+      byId('comparison-rubric').append(paragraph);
+    }
+    byId('comparison-score').replaceChildren();
+    for (const output of result.outputs) {
+      const article = document.createElement('article'), heading = document.createElement('h4'), text = document.createElement('pre'), state = document.createElement('p'), feedback = document.createElement('p'), save = document.createElement('button');
+      heading.textContent = output.displayId; text.textContent = output.candidate?.text || '';
+      state.textContent = `${output.status}. ${output.candidate?.warning || ''} ${output.error || ''}${output.status === 'failed' || output.status === 'interrupted' ? ' Generation failure is not grounded abstention; explain that distinction in the rating reason.' : ''}`;
+      article.append(heading, state, text);
+      const key = `${result.id}:${output.displayIndex}`;
+      let draft = drafts.get(key);
+      if (!draft || draft.candidateDigest !== output.candidateDigest) { draft = { candidateDigest: output.candidateDigest, values: { ...output.rating } }; drafts.set(key, draft); }
+      const controls = {};
+      const addControl = (labelText, tag, type, field) => {
+        const label = document.createElement('label'), input = document.createElement(tag);
+        input.id = `comparison-rating-${output.displayIndex}-${field}`; label.htmlFor = input.id; label.textContent = `${output.displayId} ${labelText}`;
+        if (type) input.type = type;
+        input.disabled = !output.candidate || !['completed', 'failed', 'interrupted'].includes(output.status) || !!result.storageWarning;
+        if (type === 'number') { input.min = '1'; input.max = '5'; input.step = '1'; input.value = draft.values[field] ?? ''; }
+        else if (type === 'checkbox') input.checked = draft.values[field] === true;
+        else { input.value = draft.values[field] || ''; input.maxLength = 2000; }
+        input.oninput = () => { draft.values[field] = type === 'checkbox' ? input.checked : input.value; };
+        controls[field] = input; article.append(label, input);
+      };
+      for (const dimension of result.rubric.dimensions) addControl(dimension.label, 'input', 'number', dimension.key);
+      addControl('Rating reason', 'textarea', null, 'reason'); addControl('Material error', 'input', 'checkbox', 'materialError');
+      feedback.textContent = output.rating ? 'Feedback saved' : 'Not rated'; save.textContent = `Save feedback ${output.displayId}`;
+      save.disabled = controls.reason.disabled;
+      save.onclick = () => perform(async () => {
+        const observedEpoch = epoch, rating = {};
+        for (const dimension of result.rubric.dimensions) rating[dimension.key] = Number(controls[dimension.key].value);
+        rating.reason = controls.reason.value; rating.materialError = controls.materialError.checked;
+        save.disabled = true;
+        try {
+          const saved = await window.companion['comparison-rate']({ id: result.id, displayIndex: output.displayIndex, candidateDigest: output.candidateDigest, expectedRevision: output.rating?.revision || null, rating });
+          if (observedEpoch !== epoch) return;
+          output.rating = saved.outputs[output.displayIndex].rating; draft.values = { ...output.rating }; feedback.textContent = 'Feedback saved';
+        } finally { if (observedEpoch === epoch) save.disabled = false; }
+      });
+      article.append(save, feedback); byId('comparison-score').append(article);
+    }
+  }
+  byId('comparison-score-start').onclick = () => perform(async () => {
+    if (!current || sending) throw Error('Choose a retained comparison after generation has settled.');
+    const observedEpoch = ++epoch, id = current;
+    const result = await window.companion['comparison-score-view']({ id });
+    if (observedEpoch !== epoch || current !== id) return;
+    scoreMode(true); renderScores(result);
+  });
+  byId('comparison-inspect').onclick = () => { if (current && records.has(current)) show(records.get(current)); };
   byId('comparison-create').onclick = () => perform(async () => {
     byId('comparison-create').disabled = true;
     try { const record = await window.companion['comparison-create']({ briefVersion: Number(byId('comparison-brief').value) }); records.set(record.id, record); choices(); show(record); }
