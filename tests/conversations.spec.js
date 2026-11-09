@@ -612,6 +612,75 @@ for (const outcome of ['completed', 'failed', 'interrupted', 'late citation']) {
   });
 }
 
+test('explicit conversation selection preserves independent brief pins and resumes both conversations after restart', async () => {
+  // Existing setup/send/restart takes about18s; this journey adds refresh, another turn and switching.
+  test.setTimeout(90000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic CONVERSATION_A_V1_REPLY_CANARY.' }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const originalA = await onlyConversation();
+  expect(originalA.brief.version).toBe(1);
+  const originalContext = originalA.requests[0].package.text;
+  const callsA = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await fs.writeFile(path.join(root, 'README.md'), '# MyTune\n\nBRIEF_V2_SOURCE_CANARY: A rhythm practice tutor with a new metronome goal.\n');
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 2');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toHaveValue('1');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toBeDisabled();
+  await page.getByLabel('Context question', { exact: true }).fill('Continue conversation A using its original approved project context.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Approved brief version 1/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/BRIEF_V2_SOURCE_CANARY/);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(callsA);
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await expect(page.locator('#conversation-history article')).toHaveCount(0);
+  await expect(page.getByLabel('Context question', { exact: true })).toHaveValue('');
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+  await expect(page.getByLabel('Allow beyond-evidence speculation', { exact: true })).not.toBeChecked();
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toBeEnabled();
+  await page.getByLabel('Conversation brief version', { exact: true }).fill('2');
+  await page.getByLabel('Context question', { exact: true }).fill('CONVERSATION_B_QUESTION_CANARY: relate retrieval to the refreshed rhythm goal.');
+  await selectCapture();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Approved brief version 2/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/BRIEF_V2_SOURCE_CANARY/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/CONVERSATION_A_V1_REPLY_CANARY/);
+  const reviewedB = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic CONVERSATION_B_V2_REPLY_CANARY.' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('CONVERSATION_B_V2_REPLY_CANARY');
+  await expect(page.locator('#conversation-history')).not.toContainText('CONVERSATION_A_V1_REPLY_CANARY');
+  const records = await Promise.all((await fs.readdir(path.join(root, 'conversations'))).filter(name => name.endsWith('.json')).map(async name => JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'))));
+  expect(records).toHaveLength(2);
+  const a = records.find(record => record.id === originalA.id), b = records.find(record => record.id !== originalA.id);
+  expect(a.requests).toHaveLength(1); expect(a.brief).toEqual(originalA.brief); expect(a.requests[0].package.text).toBe(originalContext);
+  expect(b.brief.version).toBe(2); expect(b.requests).toHaveLength(1); expect(b.requests[0].package.text).toBe(reviewedB);
+  const choose = page.getByLabel('Retained conversation', { exact: true });
+  await choose.selectOption(a.id);
+  await expect(page.locator('#conversation-history')).toContainText('CONVERSATION_A_V1_REPLY_CANARY');
+  await expect(page.locator('#conversation-history')).not.toContainText('CONVERSATION_B_V2_REPLY_CANARY');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toHaveValue('1');
+  await expect(page.getByLabel('Saved approved context', { exact: true })).toHaveValue(originalContext);
+  await choose.selectOption(b.id);
+  await expect(page.locator('#conversation-history')).toContainText('CONVERSATION_B_V2_REPLY_CANARY');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toHaveValue('2');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(calls.trim().split('\n').map(JSON.parse).map(call => call.text)).toEqual([originalContext, reviewedB]);
+  await app.close(); app = null; await launch(false);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(a.id);
+  await expect(page.locator('#conversation-history')).toContainText('CONVERSATION_A_V1_REPLY_CANARY');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toHaveValue('1');
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(b.id);
+  await expect(page.locator('#conversation-history')).toContainText('CONVERSATION_B_V2_REPLY_CANARY');
+  await expect(page.getByLabel('Conversation brief version', { exact: true })).toHaveValue('2');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
 // Authored main-process capacity evidence is a controlled boundary, never live readiness.
 const capacityEvidence = () => ({
   capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'Authored synthetic capacity proof v1', harnessAndOutputEvidence: 'Authored synthetic harness and output proof v1' },
