@@ -48,8 +48,8 @@ async function observeConversation(watchFiles = true) {
     });
   }).on('error', error => diagnosticFiles.push({ watcherError: error.code || error.message }));
 }
-async function launch(configure = true) {
-  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+async function launch(configure = true, extraEnv = {}) {
+  app = await electron.launch({ args: ['.'], env: { ...process.env, ...extraEnv, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
   if (configure) {
     await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
     await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
@@ -93,8 +93,8 @@ test('explicit reviewed synthetic turn persists the exact package and resumes wi
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
 
-async function prepareConversation() {
-  await launch();
+async function prepareConversation(extraEnv = {}) {
+  await launch(true, extraEnv);
   await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
   await page.getByRole('button', { name: 'Save capture', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Capture saved.');
@@ -611,6 +611,141 @@ for (const outcome of ['completed', 'failed', 'interrupted', 'late citation']) {
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   });
 }
+
+// Authored main-process capacity evidence is a controlled boundary, never live readiness.
+const capacityEvidence = () => ({
+  capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'Authored synthetic capacity proof v1', harnessAndOutputEvidence: 'Authored synthetic harness and output proof v1' },
+  proofFingerprint: 'controlled-proof-1', settingsRevision: 'controlled-settings-1', dispatchEnabled: true,
+  privateProofMarker: 'PRIVATE_CAPACITY_PROOF_CANARY'
+});
+async function writeCapacity(evidence) { await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify(evidence)); }
+async function conversationRpc() {
+  return (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).trim().split('\n').filter(Boolean).map(JSON.parse);
+}
+async function noSubmission() { expect(await fs.stat(path.join(root, 'conversation-submissions.jsonl')).catch(error => error.code)).toBe('ENOENT'); }
+async function onlyConversation() {
+  const files = await fs.readdir(path.join(root, 'conversations'));
+  return JSON.parse(await fs.readFile(path.join(root, 'conversations', files.find(name => name.endsWith('.json'))), 'utf8'));
+}
+
+test('shared verified capacity bounds the complete Unicode package without trimming and keeps private proof local', async () => {
+  test.setTimeout(60000);
+  const evidence = capacityEvidence(); await writeCapacity(evidence);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic bounded reply.' }));
+  await prepareConversation();
+  const question = page.getByLabel('Context question', { exact: true }), reviewed = page.getByLabel('Reviewed conversation package', { exact: true });
+  const initial = await reviewed.inputValue(), originalQuestion = await question.inputValue();
+  // Dynamic vault provenance has a variable length. Pad only the question to the literal limit.
+  const padding = 32000 - [...initial].length;
+  await question.fill(originalQuestion + '🎸'.repeat(padding));
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-summary')).toContainText('32000 / 32000 Unicode code points');
+  expect([...(await reviewed.inputValue())]).toHaveLength(32000);
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  await question.fill(originalQuestion + '🎸'.repeat(padding + 1));
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-summary')).toContainText('32001 / 32000 Unicode code points');
+  expect([...(await reviewed.inputValue())]).toHaveLength(32001);
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+  evidence.capacity.maxCodePoints = 2000; await writeCapacity(evidence);
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-summary')).toContainText('32001 / 2000 Unicode code points');
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  await expect(page.locator('#context-summary')).toContainText('/ 2000 Unicode code points');
+  await expect(page.locator('#context-summary')).toContainText('Authored synthetic capacity proof v1');
+  await question.fill(originalQuestion);
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-summary')).toContainText('/ 2000 Unicode code points');
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  const exact = await reviewed.inputValue();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  const record = await onlyConversation();
+  expect(record.requests[0].package.limit).toBe(2000); expect(record.requests[0].package.text).toBe(exact);
+  expect(JSON.stringify(record)).not.toContain('PRIVATE_CAPACITY_PROOF_CANARY');
+  expect(JSON.stringify(record)).not.toContain('controlled-proof-1');
+  const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(submissions.map(value => value.text)).toEqual([exact]);
+  const report = JSON.parse(await fs.readFile(path.join(root, 'conversation-transport', 'readiness.json'), 'utf8'));
+  expect(report.ready).toBe(false); expect(report.evidence).toBe('controlled-fixture-not-live');
+});
+
+test('model proof settings and dispatch changes revoke a reviewed capacity snapshot before any provider request', async () => {
+  test.setTimeout(60000);
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic binding reply.' }));
+  await prepareConversation();
+  for (const change of [
+    evidence => { evidence.capacity.model = 'changed-model'; },
+    evidence => { evidence.capacity.harnessAndOutputEvidence = 'changed output proof'; },
+    evidence => { evidence.proofFingerprint = 'changed-private-proof'; },
+    evidence => { evidence.settingsRevision = 'changed-settings'; },
+    evidence => { evidence.dispatchEnabled = false; }
+  ]) {
+    const changed = capacityEvidence(); change(changed); await writeCapacity(changed);
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|unavailable|preview/i);
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+    await noSubmission(); expect(await conversationRpc()).toEqual([]);
+    await writeCapacity(capacityEvidence());
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  }
+  const exact = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  expect((await onlyConversation()).requests).toHaveLength(1);
+  expect(JSON.parse((await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim()).text).toBe(exact);
+});
+
+for (const checkpoint of ['conversation-before-dispatch', 'conversation-before-turn-start']) {
+  test(`capacity evidence changed at ${checkpoint} preserves intent and never starts a model turn`, async () => {
+    test.setTimeout(60000);
+    await writeCapacity(capacityEvidence());
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic forbidden stale-bound reply.' }));
+    await prepareConversation();
+    const exact = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: checkpoint }));
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(checkpoint);
+    const changed = capacityEvidence(); changed.proofFingerprint = 'changed-during-preflight'; await writeCapacity(changed);
+    await fs.writeFile(path.join(root, 'release.txt'), 'release controlled capacity preflight');
+    await expect(page.locator('#conversation-history')).toContainText('failed');
+    await expect(page.locator('#conversation-history')).toContainText(/changed|preview/i);
+    const record = await onlyConversation(); expect(record.requests).toHaveLength(1);
+    expect(record.requests[0].package.text).toBe(exact); expect(record.requests[0].reply).toBe('');
+    await noSubmission();
+    const rpc = await conversationRpc();
+    expect(rpc.filter(call => call.method === 'turn/start')).toEqual([]);
+    expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(checkpoint === 'conversation-before-turn-start' ? 1 : 0);
+  });
+}
+
+test('returned model must match the reviewed capacity model before turn start', async () => {
+  test.setTimeout(60000);
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'unexpected-fixture-model', reply: 'Authored synthetic forbidden model reply.' }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  await expect(page.locator('#conversation-history')).toContainText(/model changed|model.*preview/i);
+  await noSubmission();
+  const rpc = await conversationRpc(); expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(1);
+  expect(rpc.filter(call => call.method === 'turn/start')).toEqual([]);
+});
+
+test('production conversation without verified capacity and isolation proof stays closed while capture works', async () => {
+  test.setTimeout(60000);
+  await prepareConversation({ COMPANION_TEST_REAL_PROVIDER_GUARD: '1' });
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  await expect(page.locator('#conversation-history')).toContainText(/verified isolation.*capacity evidence/i);
+  expect(await conversationRpc()).toEqual([]); await noSubmission();
+  await page.getByLabel('Thought or link', { exact: true }).fill('Capture while production conversation evidence is unavailable.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  await expect(page.getByRole('heading', { name: 'Capture while production conversation evidence is unavailable.', exact: true })).toBeVisible();
+});
 
 for (const variant of ['matching updates', 'failed turn', 'unavailable']) {
   test(`observed turn usage stays scoped and truthful: ${variant}`, async () => {
