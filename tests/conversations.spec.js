@@ -2284,3 +2284,134 @@ test('archive generation restoration fences a stale other-instance unsaved overl
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   } finally { await otherApp.close(); }
 });
+
+async function deletedArchiveFixture(label) {
+  const fixture = await deletionFixture(label), archive = path.join(root, `reserved-${label}.json`);
+  await exportHistoryForGeneration(page, archive);
+  const archiveBytes = await fs.readFile(archive, 'utf8');
+  await deleteHistoryForGeneration(page);
+  return { ...fixture, archive, archiveBytes, controlFile: path.join(fixture.directory, '.control', `${fixture.record.id}.json`) };
+}
+async function reviewReservedArchive(targetPage, archive) {
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: archive }), 'utf8');
+  const region = targetPage.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(targetPage.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+  return region;
+}
+for (const boundary of ['archive-restore-after-reservation', 'archive-restore-after-link', 'archive-restore-before-active']) {
+  test(`restoration authority guards explicitly recover after actual main exit at ${boundary}`, async ({}, testInfo) => {
+    test.setTimeout(150000);
+    const fixture = await deletedArchiveFixture(`RESTORE_CRASH_${boundary}`), region = await reviewReservedArchive(page, fixture.archive);
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+    await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+    const markerBytes = await fs.readFile(fixture.controlFile, 'utf8'), marker = JSON.parse(markerBytes), stageTarget = marker.targets.find(target => target.name.endsWith('.pending'));
+    expect(marker.phase).toBe('restoring'); expect(marker.restoration.archiveId).toBe(JSON.parse(fixture.archiveBytes).id);
+    expect(marker.scope.excludedHistory).toEqual(fixture.record.scope.excludedHistory);
+    const stage = path.join(fixture.directory, stageTarget.name);
+    const stageExists = boundary !== 'archive-restore-before-active', destinationExists = boundary !== 'archive-restore-after-reservation';
+    expect(await fs.access(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(stageExists);
+    expect(await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(destinationExists);
+    const reservedBytes = await fs.readFile(stageExists ? stage : fixture.file, 'utf8'), reserved = JSON.parse(reservedBytes);
+    expect(reserved.generation).toBe(marker.generation); expect(reserved.requests).toEqual(fixture.record.requests);
+    expect(require('node:crypto').createHash('sha256').update(reservedBytes).digest('hex')).toBe(marker.restoration.recordDigest);
+    const expectedLinks = boundary === 'archive-restore-after-link' ? 2 : 1;
+    expect((await fs.stat(stageExists ? stage : fixture.file)).nlink).toBe(expectedLinks);
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    evidence.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await testInfo.attach('restoration-crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+    app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+    await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    const pending = page.getByRole('region', { name: 'Pending history restorations', exact: true });
+    await expect(pending).toContainText(fixture.record.id); await expect(pending).toContainText(marker.generation); await expect(pending).toContainText(marker.restoration.archiveId);
+    expect(await fs.readFile(fixture.controlFile, 'utf8')).toBe(markerBytes);
+    expect(await fs.access(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(stageExists);
+    expect(await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(destinationExists);
+    expect(await fs.readFile(stageExists ? stage : fixture.file, 'utf8')).toBe(reservedBytes);
+    await pending.getByRole('button', { name: 'Resume history restoration', exact: true }).click();
+    const review = page.getByRole('region', { name: 'History restoration recovery review', exact: true });
+    await expect(review).toBeVisible(); await expect(review).toContainText(marker.generation);
+    await review.getByRole('button', { name: 'Confirm history restoration recovery', exact: true }).click();
+    await expect(page.locator('#archive-restore-summary')).toContainText('Restoration recovered');
+    const completed = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+    expect(completed.phase).toBe('active'); expect(completed.generation).toBe(marker.generation); expect(completed.scope).toEqual(marker.scope); expect(completed.restoration).toEqual(marker.restoration);
+    expect(await fs.readFile(fixture.file, 'utf8')).toBe(reservedBytes); expect((await fs.stat(fixture.file)).nlink).toBe(1);
+    expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT');
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending history restorations', exact: true }).getByRole('button', { name: 'Resume history restoration', exact: true })).toHaveCount(0);
+    await expect(page.locator('#conversation-history')).toContainText(`DELETE_RECOVERY_RESTORE_CRASH_${boundary}`);
+    expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'))).toEqual(completed);
+    expect(await fs.readFile(fixture.file, 'utf8')).toBe(reservedBytes); expect(await fs.readFile(fixture.archive, 'utf8')).toBe(fixture.archiveBytes);
+    expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  });
+}
+
+test('restoration authority guards reject a stale other-instance approved send instead of appending to a new generation', async () => {
+  test.setTimeout(150000);
+  const fixture = await deletionFixture('STALE_APPROVED_SEND'), archive = path.join(root, 'stale-approved-send.json');
+  await exportHistoryForGeneration(page, archive);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow(); await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(other.locator('#conversation-history')).toContainText('DELETE_RECOVERY_STALE_APPROVED_SEND');
+    await other.getByLabel('Context question', { exact: true }).fill('Approved before deletion; never append this stale request after restoration.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await deleteHistoryForGeneration(page); await restoreHistoryForGeneration(page, archive);
+    const restoredBytes = await fs.readFile(fixture.file, 'utf8'), restored = JSON.parse(restoredBytes), controlFile = path.join(fixture.directory, '.control', `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8');
+    expect(restored.generation).toBe(JSON.parse(controlBytes).generation); expect(restored.scope.version).not.toBe(fixture.record.scope.version);
+    await other.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(other.locator('#conversation-error')).toContainText(/changed|generation|preview/i);
+    expect(await fs.readFile(fixture.file, 'utf8')).toBe(restoredBytes); expect(await fs.readFile(controlFile, 'utf8')).toBe(controlBytes);
+    expect(JSON.parse(await fs.readFile(fixture.file, 'utf8')).requests).toHaveLength(1);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+    await other.getByLabel('Context question', { exact: true }).fill('Fresh review may use current project context alone.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Fresh review may use current project/);
+    await expect(other.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  } finally { await otherApp.close(); }
+});
+
+test('restoration authority guards keep an active generation usable after a failed scope save without losing prior exclusions', async () => {
+  test.setTimeout(150000);
+  const fixture = await deletedArchiveFixture('FAILED_SCOPE_SAVE'); await restoreHistoryForGeneration(page, fixture.archive);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(fixture.record.id);
+  await expect(page.locator('#conversation-history')).toContainText('DELETE_RECOVERY_FAILED_SCOPE_SAVE');
+  const before = await fs.readFile(fixture.file, 'utf8'), active = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  expect(active.phase).toBe('active'); expect(active.scope.excludedHistory).toEqual(fixture.record.scope.excludedHistory);
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: exclude this source in a deliberately failed scope save.'); await selectCapture();
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'conversation-before-store', code: 'EACCES' }), 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-error')).toContainText('Controlled filesystem boundary failure');
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(before);
+  expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8')).scope.excludedHistory).toEqual(active.scope.excludedHistory);
+  await fs.unlink(path.join(root, 'faults.json'));
+  await page.reload(); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await expect(page.locator('#conversation-history')).toContainText('DELETE_RECOVERY_FAILED_SCOPE_SAVE');
+  await page.getByLabel('Context question', { exact: true }).fill('Continue respecting the previously retained history exclusion after local save failure.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/previously retained history exclusion/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/DELETE_RECOVERY_FAILED_SCOPE_SAVE/);
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: explicitly retry the current source exclusion.'); await selectCapture();
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/explicitly retry the current source exclusion/);
+  const saved = JSON.parse(await fs.readFile(fixture.file, 'utf8')), marker = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  const sourceKey = fixture.record.requests[0].package.dependencies.find(dep => dep.key.startsWith('capture:')).key;
+  expect(saved.generation).toBe(active.generation); expect(marker.generation).toBe(active.generation);
+  expect(saved.scope.excludedSources).toContain(sourceKey); expect(marker.scope.excludedSources).toContain(sourceKey);
+  expect(saved.scope.excludedHistory).toEqual(active.scope.excludedHistory); expect(marker.scope.excludedHistory).toEqual(active.scope.excludedHistory);
+  expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
