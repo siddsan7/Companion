@@ -6,6 +6,7 @@ const { readReview } = require('./intake-review');
 const { intakeLock } = require('./intake-lock');
 const { withTitle, captureHeading } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission } = require('./source-authority');
+const { IntakeLedger } = require('./intake-ledger');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
 const conflict = message => Object.assign(Error(message), { intakeConflict: true });
@@ -15,26 +16,20 @@ function noteText(capture, revision) {
   return `---\n${Object.entries(fields).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n')}\n---\n\n${captureHeading(capture.title, 'reel_import')}\n\n${revision.text}`;
 }
 class Intake {
-  constructor(vault) { this.vault = vault; this.dir = path.join(vault.root, '.intake'); }
+  constructor(vault) { this.vault = vault; this.dir = path.join(vault.root, '.intake'); this.storage = new IntakeLedger(vault); }
   async setup() {
     try { await this.vault.writable(); await fs.mkdir(this.dir, { recursive: true }); await this.vault.contained(this.dir); await this.vault.contained(path.join(this.vault.root, 'Revisions')); }
     catch (error) { throw Error('Vault access failure. Restore access to the configured vault and Companion folders, then Refresh. Existing notes and intake history were preserved; no missing-note removal was inferred.', { cause: error }); }
   }
   async load() {
-    // Check the ordinary parent before reading authority, including source purges
-    // whose manifests contain no .intake payload backup.
-    let directory;
-    try { directory = await fs.lstat(this.dir); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    if (directory && (!directory.isDirectory() || directory.isSymbolicLink())) throw Error('Intake authority requires an ordinary contained folder. Preserve it for repair.');
-    if (directory) await this.vault.contained(this.dir);
-    const text = await read(path.join(this.dir, 'ledger.json')); if (text === null) return empty();
+    const text = await this.storage.read(); if (text === null) return empty();
     let ledger; try { ledger = JSON.parse(text); } catch { throw Error('Intake ledger is unreadable. Preserve .intake and restore a vault backup before checking sources.'); }
     if (ledger.schema !== 1 || !Array.isArray(ledger.sources) || !ledger.captures || !ledger.attempts || !ledger.blocks || !ledger.pending || !ledger.outcomes || !Array.isArray(ledger.suppressed)) throw Error('Unsupported intake ledger. Preserve it for repair.');
     validateAuthority(ledger); return ledger;
   }
   async save(ledger) {
-    await this.vault.contained(this.dir);
-    const temp = path.join(this.dir, `ledger-${randomUUID()}.tmp`); await fs.writeFile(temp, JSON.stringify(ledger, null, 2), { flag: 'wx', flush: true }); await fs.rename(temp, path.join(this.dir, 'ledger.json'));
+    validateAuthority(ledger);
+    await this.storage.replace(JSON.stringify(ledger, null, 2));
   }
   async publishJournal(file, value) {
     await this.vault.contained(this.dir);
@@ -328,6 +323,7 @@ class Intake {
     await fs.unlink(intentFile);
   }
   async publicationAuthority(tx, ledger) {
+    await this.storage.guardParents();
     assertPublication(ledger, tx.capture.id, tx);
     if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
   }
@@ -337,6 +333,10 @@ class Intake {
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
     const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
+    // Keep exact existing peers before successful admission clears pending state.
+    const journalPeers = [];
+    if (tx.restoreOperation) journalPeers.push(path.join(this.dir, `restoration-${tx.restoreOperation}.json`));
+    for (const item of [ledger.pending[tx.sourceHash], ledger.blocks[tx.sourceHash]]) if (item?.journal && /^(?:pending|conflict)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.journal)) journalPeers.push(path.join(this.dir, item.journal));
     const immutable = async (file, content) => {
       try { await fs.writeFile(file, content, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(file) !== content) throw Error('Immutable import file conflicts. Preserve the vault for repair.'); }
     };
@@ -401,9 +401,22 @@ class Intake {
     delete ledger.pending[tx.sourceHash];
     await this.publicationAuthority(tx, ledger);
     await this.save(ledger); await this.vault.checkpoint('intake-ledger');
+    await this.publicationAuthority(tx, ledger);
     this.vault.expected.set(tx.capture.id, tx.capture.currentHash);
-    for (const file of [stage, snapshotStage]) await fs.unlink(file).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    await fs.unlink(path.join(this.dir, 'transaction.json'));
+    const transaction = path.join(this.dir, 'transaction.json');
+    const cleanup = [];
+    for (const [file, peers, expected] of [[stage, destination, tx.content], [snapshotStage, snapshot, snapshotBytes], [transaction, journalPeers, JSON.stringify(tx)]]) {
+      const info = await this.ownedFile(file, peers, 'Intake publication cleanup');
+      if (!info) continue;
+      if (await read(file) !== expected) throw Error('Intake publication cleanup changed. Independent files were preserved.');
+      cleanup.push({ file, peers, expected, dev: info.dev, ino: info.ino });
+    }
+    for (const item of cleanup) {
+      await this.publicationAuthority(tx, ledger);
+      const info = await this.ownedFile(item.file, item.peers, 'Intake publication cleanup');
+      if (!info || info.dev !== item.dev || info.ino !== item.ino || await read(item.file) !== item.expected) throw Error('Intake publication cleanup identity changed. Independent files were preserved.');
+      await fs.unlink(item.file);
+    }
   }
   async recover() {
     const controlled = await this.load();
