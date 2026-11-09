@@ -200,3 +200,47 @@ test('an explicitly selected imported evidence citation opens its original revis
   await expect(page.getByLabel('Cited revision snapshot', { exact: true })).not.toHaveValue(/Authored synthetic corrected review/);
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
 });
+
+test('citation inspection ignores damaged uncited revisions and reports a damaged cited revision without substitution', async () => {
+  test.setTimeout(120000);
+  await completedConversation({ imported: true });
+  const vault = path.join(root, 'vault', 'Companion'), revisions = path.join(vault, 'Revisions');
+  const originalName = (await fs.readdir(revisions)).find(name => name.endsWith('.json'));
+  const original = JSON.parse(await fs.readFile(path.join(revisions, originalName), 'utf8'));
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Keep independent interpretation when evidence is damaged');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('This interpretation stays available for review even if its cited source becomes unavailable.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic fixture; a reference is not independent verification.');
+  await page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/evidence_id: a1/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(root, 'producer', 'edit'), { recursive: true });
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }), 'utf8');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('Last check: 2026-11-09T12:00:01Z · manual · complete');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  const newerName = (await fs.readdir(revisions)).find(name => name.endsWith('.json') && name !== originalName);
+  expect(newerName).toBeTruthy();
+  await fs.appendFile(path.join(revisions, newerName), '\nDAMAGED_UNCITED_B\n', 'utf8');
+  const inspect = page.locator('#saved-ideas article').getByRole('button', { name: 'Inspect cited evidence', exact: true });
+  await inspect.click();
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(original.text.replace(/\r\n?/g, '\n'));
+  await expect(page.locator('#idea-evidence')).toContainText(original.id);
+  await expect(page.locator('#idea-evidence')).not.toContainText('DAMAGED_UNCITED_B');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+
+  await fs.appendFile(path.join(revisions, originalName), '\nDAMAGED_CITED_A\n', 'utf8');
+  await inspect.click();
+  await expect(page.locator('#idea-evidence')).toContainText('Cited evidence unavailable:');
+  await expect(page.locator('#idea-evidence')).toContainText('No newer revision was substituted.');
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveCount(0);
+  await expect(page.locator('#idea-evidence')).not.toContainText('Authored synthetic corrected review');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+});
