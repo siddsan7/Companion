@@ -285,3 +285,55 @@ test('reviewed source and history scope survives restart before send and after s
   expect(submissions[3].text).toMatch(/PERSIST_SOURCE_CANARY/);
   expect(submissions[3].text).toMatch(/PERSIST_DESCENDANT_CANARY/);
 });
+
+test('a completed restoration in a stale window cannot undo another windows later reviewed exclusion', async () => {
+  test.setTimeout(90000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic STALE_RESTORE_HISTORY_CANARY.' }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('STALE_RESTORE_HISTORY_CANARY');
+  await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('retrieval: exclude this evidence and its history');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/exclude this evidence/);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(other.locator('#conversation-history')).toContainText('STALE_RESTORE_HISTORY_CANARY');
+    // Complete an intentional restore in the first window. Its action must be consumed.
+    await selectCapture();
+    await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).check();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/STALE_RESTORE_HISTORY_CANARY/);
+    // A later independent window explicitly removes the same source and history.
+    await other.getByLabel('Context question', { exact: true }).fill('retrieval: later independent exclusion');
+    await other.getByRole('button', { name: 'Find context', exact: true }).click();
+    await other.locator('#context-results article').filter({ hasText: 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+    await other.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+    const otherHistory = other.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true });
+    await otherHistory.check(); await otherHistory.uncheck();
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/later independent exclusion/);
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/STALE_RESTORE_HISTORY_CANARY|Spaced retrieval/);
+    const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    // The earlier approved token is revoked by the newer main-owned scope revision.
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|preview/i);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+    await page.getByLabel('Context question', { exact: true }).fill('Continue without another Add or history recheck.');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Continue without another Add/);
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/STALE_RESTORE_HISTORY_CANARY|Spaced retrieval/);
+    // Fresh explicit actions can restore the material, followed by a new review.
+    await page.getByLabel('Context question', { exact: true }).fill('retrieval: intentionally restore after the independent exclusion');
+    await selectCapture();
+    const ownHistory = page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true });
+    await ownHistory.uncheck(); await ownHistory.check();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/STALE_RESTORE_HISTORY_CANARY/);
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Spaced retrieval/);
+  } finally { await otherApp.close(); }
+});
