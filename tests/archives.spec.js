@@ -967,7 +967,7 @@ test('archive preserves only inert Codex setup preferences and inherited hints w
     expect(await fs.readFile(setupFile, 'utf8')).toBe(setupBefore);
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
     await expect(page.getByLabel('Codex executable', { exact: true })).toHaveValue('');
-    await expect(page.getByLabel('Windows isolation', { exact: true })).toHaveValue('mxc');
+    await expect(page.getByRole('combobox', { name: /^Windows isolation/ })).toHaveValue('mxc');
     await app.close(); app = null;
     targetRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-inert-setup-')); root = targetRoot;
     await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
@@ -1002,7 +1002,7 @@ test('archive preserves only inert Codex setup preferences and inherited hints w
     await expect(restarted).toContainText(sourcePreferences.project);
     await expect(page.getByLabel('Codex executable', { exact: true })).toHaveValue('');
     await expect(page.getByLabel('Project folder to protect', { exact: true })).toHaveValue('');
-    await expect(page.getByLabel('Windows isolation', { exact: true })).toHaveValue('mxc');
+    await expect(page.getByRole('combobox', { name: /^Windows isolation/ })).toHaveValue('mxc');
     await expect(page.getByRole('button', { name: 'Verify isolation', exact: true })).toBeDisabled();
     await expect(page.getByRole('button', { name: 'Send synthetic turn', exact: true })).toBeDisabled();
     const reexport = path.join(root, 'inherited-inert-setup.json');
