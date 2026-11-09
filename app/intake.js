@@ -60,8 +60,9 @@ class Intake {
     };
     await visit(folder, 0); return found;
   }
-  async reconcile({ trigger = 'manual', now = new Date().toISOString() } = {}) {
+  async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit = async () => true } = {}) {
     return this.locked(async () => {
+      if (!await admit()) return { skipped: true };
       await this.retryPending();
       let ledger = await this.load(); const seen = new Map(), ready = [];
       ledger.lastCheck = { at: now, trigger, status: 'running' }; await this.save(ledger);
@@ -95,7 +96,9 @@ class Intake {
             await this.save(ledger);
           }
       }
-      ledger.lastCheck = { at: now, trigger, status: ledger.sources.some(x => x.error) ? 'error' : 'complete' }; await this.save(ledger); return ledger;
+      ledger.lastCheck = { at: now, trigger, status: ledger.sources.some(x => x.error) ? 'error' : Object.values(ledger.outcomes).some(x => x.status === 'held') ? 'held' : 'complete' };
+      if (ledger.lastCheck.status === 'complete') ledger.lastSuccess = { at: now, trigger };
+      await this.save(ledger); return ledger;
     });
   }
   async admit(ledger, draft, key, now) {

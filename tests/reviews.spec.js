@@ -22,11 +22,11 @@ async function setup() {
   await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Source connected');
 }
-async function check() {
+async function check(expectedStatus = 'complete') {
   const instant = new Date(Date.parse('2026-11-08T06:59:00Z') + ++checks * 1000).toISOString();
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
-  await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · complete`);
+  await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · ${expectedStatus}`);
 }
 async function snapshots() {
   const base = path.join(root, 'vault', 'Companion', 'Revisions');
@@ -184,7 +184,11 @@ test('invalid finalized bundles are held without source fragments while an indep
   const invalidUtf8 = path.join(root, 'producer', 'invalid-utf8'); await fs.cp(accepted, invalidUtf8, { recursive: true });
   const utf8Manifest = JSON.parse(await fs.readFile(path.join(invalidUtf8, 'manifest.json'), 'utf8')); utf8Manifest.finalization_id = 'e'.repeat(32);
   await fs.writeFile(path.join(invalidUtf8, 'manifest.json'), Buffer.concat([Buffer.from('{"utf8_probe":"'), Buffer.from([255]), Buffer.from('",' + JSON.stringify(utf8Manifest).slice(1))]));
-  await launch(); await setup(); await check();
+  await launch(); await setup(); await check('held');
+  const ledgerFile = path.join(root, 'vault', 'Companion', '.intake', 'ledger.json');
+  const initialLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(initialLedger.lastCheck.status).toBe('held');
+  expect(initialLedger.lastSuccess).toBeUndefined();
   const retained = await snapshots(); expect(retained).toHaveLength(1);
   expect(retained[0].humanReview).toBe('accept');
   await expect(page.locator('#captures article')).toHaveCount(1);
@@ -202,9 +206,11 @@ test('invalid finalized bundles are held without source fragments while an indep
   await expect(held).toContainText('Finalized evidence does not match the original attempt identity');
   await expect(held).toContainText('Unsafe integer in review semantics');
   await expect(held).toContainText('Missing or unsupported original attempt identity');
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch(); await check('held');
   expect(await snapshots()).toEqual(retained);
-  const ledger = JSON.parse(await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8'));
+  const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(ledger.lastCheck.status).toBe('held');
+  expect(ledger.lastSuccess).toBeUndefined();
   expect(Object.values(ledger.captures)[0].supportEligible).toBe(true);
   await expect(page.locator('#held-imports')).not.toContainText('TOPSECRET');
 });
