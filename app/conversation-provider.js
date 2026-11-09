@@ -8,10 +8,12 @@ const { samePath } = require('./codex-policy');
 // This adapter has no renderer entry point and never runs sign-in or isolation probes.
 // Production uses only evidence already established by the main-owned setup gate.
 class ConversationProvider {
-  constructor({ setup, testRoot, getVault, getVerifiedCapacity = () => null }) {
-    Object.assign(this, { setup, testRoot, getVault, getVerifiedCapacity });
+  constructor({ setup, testRoot, getVault, getEvidence }) {
+    Object.assign(this, { setup, testRoot, getVault, getEvidence });
   }
   async preflight() {
+    const evidence = await this.getEvidence();
+    if (!evidence.dispatchEnabled) throw Error('Codex chat is unavailable. Check setup and preview again. Local capture remains available.');
     if (this.testRoot) {
       await fs.access(path.join(this.testRoot, 'conversation-provider.json'));
       if (this.controlled?.rpc && !this.controlled.rpc.closed) return;
@@ -24,18 +26,24 @@ class ConversationProvider {
       await controlled.startServer();
       return;
     }
-    const state = this.setup.snapshot(), capacity = await this.getVerifiedCapacity();
+    const state = this.setup.snapshot(), capacity = evidence.capacity;
     if (!state.ready || !state.isolationPassed || !state.authenticated || !this.setup.certificate || Date.now() >= this.setup.certificate.expires || !capacity || !Number.isSafeInteger(capacity.maxCodePoints) || capacity.maxCodePoints < 1 || !capacity.model || !capacity.evidence || !capacity.harnessAndOutputEvidence) throw Error('Codex chat is unavailable: verified isolation, prompt/tool inventory, managed sign-in and input/harness/output capacity evidence are required. Local capture remains available.');
     if (!samePath(this.setup.vaultRoot, this.getVault()?.root)) throw Error('Codex protected vault changed. Verify isolation again.');
+    const certificate = this.setup.certificate;
     await this.setup.readAccount();
-    if (!this.setup.state.authenticated || await audit(this.setup) !== this.setup.certificate.fingerprint) throw Error('Codex account, inventory, configuration or protected roots changed. Verify isolation again.');
+    const fingerprint = await audit(this.setup);
+    if (!this.setup.state.authenticated || this.setup.certificate !== certificate || Date.now() >= certificate.expires || fingerprint !== certificate.fingerprint || (await this.getEvidence()).binding !== evidence.binding) throw Error('Codex account, inventory, configuration or protected roots changed. Verify isolation and preview again.');
   }
-  async turn(text, { beforeStart, onState }) {
+  async turn(text, { capacityBinding, beforeStart, onState }) {
     const setup = this.testRoot ? this.controlled : this.setup;
     const reply = await runTurn(setup, text, { onState: snapshot => onState({ ...snapshot, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration' }), beforeStart: async metadata => {
       await this.preflight();
-      if (!this.testRoot && metadata.model !== (await this.getVerifiedCapacity()).model) throw Error('Codex model changed. Verify input and output capacity, then preview again.');
       await beforeStart();
+      // Last asynchronous check before the shared transport sends the exact text.
+      const evidence = await this.getEvidence(), capacity = evidence.capacity;
+      if (!evidence.dispatchEnabled || evidence.binding !== capacityBinding) throw Error('Codex setup or capacity evidence changed. Check setup and preview again.');
+      if (capacity && metadata.model !== capacity.model) throw Error('Codex model changed. Verify input and output capacity, then preview again.');
+      if ([...text].length > Math.min(32000, capacity?.maxCodePoints || 32000)) throw Error('Package exceeds the context limit. Remove or explicitly shorten sources, then preview again.');
     } });
     const latest = setup.turnHistory.at(-1);
     return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: latest.usage ? structuredClone(latest.usage) : null, usageEvidence: latest.usageEvidence };

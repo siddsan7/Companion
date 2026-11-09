@@ -9,6 +9,7 @@ const { installBriefs } = require('./briefs-ipc');
 const { installContext } = require('./context');
 const { installConversations } = require('./conversations');
 const { ConversationProvider } = require('./conversation-provider');
+const { ConversationEvidence } = require('./conversation-evidence');
 let codex, conversationProvider;
 const testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
@@ -82,9 +83,11 @@ app.whenReady().then(async () => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri); else await shell.openExternal(uri);
   });
   installBriefs({ ipcMain, dialog, fs, path, testRoot, getVault: () => vault, clock });
-  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData') });
+  const evidence = new ConversationEvidence({ setup: codex, getVault: () => vault, settingsPath, testRoot });
+  const getEvidence = () => evidence.read();
+  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData'), getEvidence });
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
-  conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault });
+  conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
   installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));

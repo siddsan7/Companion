@@ -149,7 +149,7 @@ class Conversations {
     const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
     const count = [...text].length;
     const scope = { version: baseline.version, excludedSources: [...excluded].sort(), excludedHistory: [...excludedHistory].sort() };
-    return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
+    return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, capacityBinding: preview.capacityBinding, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], historyIds: history.map(item => item.id), brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
   }
   async preview(input) {
     const snapshot = await this.build(input), packageId = randomUUID();
@@ -190,7 +190,7 @@ class Conversations {
           if (JSON.stringify(await this.build(approved.input, request.id)) !== JSON.stringify(approved.snapshot)) throw Error('Context changed during preflight. Preview and approve a new package.');
         };
         await revalidate();
-        const result = await this.provider.turn(current.text, { beforeStart: async () => {
+        const result = await this.provider.turn(current.text, { capacityBinding: current.capacityBinding, beforeStart: async () => {
           await this.checkpoint('conversation-before-turn-start'); await revalidate();
         }, onState: async snapshot => { Object.assign(request, snapshot); await this.write(record); } });
         Object.assign(request, result, { status: 'completed', completedAt: this.clock().now });
