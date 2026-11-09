@@ -3,9 +3,9 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 let root, app, page;
-let diagnostic, diagnosticWatcher, diagnosticReads = Promise.resolve(), diagnosticFiles = [];
+let diagnostic, diagnosticWatcher, diagnosticReads = Promise.resolve(), diagnosticFiles = [], diagnosticPriorTimelines = [];
 test.beforeEach(async () => {
-  diagnostic = false; diagnosticWatcher = null; diagnosticReads = Promise.resolve(); diagnosticFiles = [];
+  diagnostic = false; diagnosticWatcher = null; diagnosticReads = Promise.resolve(); diagnosticFiles = []; diagnosticPriorTimelines = [];
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-conversation-'));
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T12:00:00Z', timezone: 'America/Phoenix' }));
 });
@@ -13,10 +13,10 @@ test.afterEach(async ({}, testInfo) => {
   diagnosticWatcher?.close(); await diagnosticReads;
   if (diagnostic) {
     const destination = testInfo.outputPath('conversation-state'); await fs.mkdir(destination, { recursive: true });
-    const manifest = { title: testInfo.title, status: testInfo.status, wrapperPid: app?.process().pid, mainPid: app ? await app.evaluate(() => process.pid).catch(() => null) : null, testRoot: root, files: diagnosticFiles };
+    const manifest = { title: testInfo.title, status: testInfo.status, wrapperPid: app?.process().pid, mainPid: app ? await app.evaluate(() => process.pid).catch(() => null) : null, testRoot: root, files: diagnosticFiles, priorVisibleTimelines: diagnosticPriorTimelines };
     manifest.visible = await page.evaluate(() => ({ timeline: window.__conversationDiagnostic || [], history: document.getElementById('conversation-history')?.textContent, error: document.getElementById('conversation-error')?.textContent, status: document.querySelector('[role="status"]')?.textContent })).catch(error => ({ unavailable: error.message }));
     const copy = async (name, target) => { try { await fs.copyFile(path.join(root, name), path.join(destination, target)); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
-    for (const name of ['conversation-provider.json', 'conversation-submissions.jsonl', 'codex-requests.jsonl', 'conversation-store-failures.jsonl', 'clock.json', 'faults.json', 'checkpoint.txt', 'release.txt']) await copy(name, name);
+    for (const name of ['conversation-provider.json', 'conversation-submissions.jsonl', 'conversation-release.json', 'codex-requests.jsonl', 'conversation-store-failures.jsonl', 'clock.json', 'faults.json', 'checkpoint.txt', 'release.txt']) await copy(name, name);
     await fs.mkdir(path.join(destination, 'conversations'));
     for (const name of await fs.readdir(path.join(root, 'conversations')).catch(() => [])) if (/^[a-f0-9-]{36}\.json$/.test(name)) await copy(path.join('conversations', name), path.join('conversations', name));
     await fs.writeFile(path.join(destination, 'observations.json'), JSON.stringify(manifest, null, 2));
@@ -24,7 +24,7 @@ test.afterEach(async ({}, testInfo) => {
   }
   if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true });
 });
-async function observeConversation() {
+async function observeConversation(watchFiles = true) {
   diagnostic = true;
   await page.evaluate(() => {
     const timeline = window.__conversationDiagnostic = []; let previous;
@@ -37,6 +37,7 @@ async function observeConversation() {
     observer.observe(document.getElementById('conversation-section'), { childList: true, subtree: true, characterData: true });
     observer.observe(document.querySelector('[role="status"]'), { childList: true, subtree: true, characterData: true }); record();
   });
+  if (!watchFiles) return;
   diagnosticWatcher = require('node:fs').watch(path.join(root, 'conversations'), (_, name) => {
     if (!/^[a-f0-9-]{36}\.json$/.test(String(name))) return;
     diagnosticReads = diagnosticReads.then(async () => {
@@ -505,4 +506,75 @@ test('a late memory citation removes the offending item from retained partial te
   await expect(page.locator('#conversation-history')).toContainText('SAFE_EARLIER_ITEM_CANARY');
   await expect(page.locator('#conversation-history')).not.toContainText('UNSELECTED_LATE_MEMORY_CANARY');
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+async function unavailableFinalHistory() {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ holdCompletion: true, messages: [
+    { delta: 'Authored synthetic DURABLE_PREFIX.', text: 'Authored synthetic LATEST_VISIBLE_REPLY_CANARY after the history failure.', phase: 'final_answer' }
+  ] }));
+  await prepareConversation(); await observeConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('DURABLE_PREFIX');
+  const files = await fs.readdir(path.join(root, 'conversations'));
+  const savedFile = path.join(root, 'conversations', files.find(name => name.endsWith('.json')));
+  await expect.poll(async () => JSON.parse(await fs.readFile(savedFile, 'utf8')).requests[0].reply).toContain('DURABLE_PREFIX');
+  // Existing filesystem checkpoint fails all later history writes; provider release is external.
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'conversation-before-store', code: 'EACCES' }));
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}');
+  await expect.poll(() => page.evaluate(() => window.__conversationDiagnostic.some(entry => entry.error?.includes('may not survive restart')))).toBe(true);
+  await page.getByLabel('Thought or link', { exact: true }).fill('Capture after unavailable history storage.');
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  await fs.unlink(path.join(root, 'faults.json'));
+  const mainPid = await app.evaluate(() => process.pid);
+  diagnosticPriorTimelines.push({ mainPid, timeline: await page.evaluate(() => window.__conversationDiagnostic) });
+  await page.reload(); await observeConversation(false);
+  expect(await app.evaluate(() => process.pid)).toBe(mainPid);
+  await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+  await expect(page.locator('#conversation-error')).toContainText('may not survive restart');
+  const durable = JSON.parse(await fs.readFile(savedFile, 'utf8'));
+  expect(durable.requests[0].reply).toContain('DURABLE_PREFIX');
+  expect(durable.requests[0].reply).not.toContain('LATEST_VISIBLE_REPLY_CANARY');
+  expect(durable.requests[0].status).not.toBe('completed');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(calls.trim().split('\n').filter(Boolean)).toHaveLength(1);
+  return { savedFile, calls };
+}
+
+test('persistent history storage failure retains latest text and warning until an explicit local resave', async () => {
+  test.setTimeout(60000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+  await expect(page.locator('#conversation-error')).not.toContainText('may not survive restart');
+  await expect.poll(async () => JSON.parse(await fs.readFile(savedFile, 'utf8')).requests[0].reply).toContain('LATEST_VISIBLE_REPLY_CANARY');
+  const saved = JSON.parse(await fs.readFile(savedFile, 'utf8'));
+  expect(saved.requests[0].status).toBe('interrupted');
+  expect(saved.storageWarning).toBeUndefined();
+  expect(saved.requests).toHaveLength(1);
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+  await expect(page.locator('#conversation-history')).toContainText('incomplete');
+  await expect(page.getByRole('heading', { name: 'Capture after unavailable history storage.', exact: true })).toBeVisible();
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('persistent history storage recovery preserves a conflicting update from another desktop instance', async () => {
+  test.setTimeout(90000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#conversation-history')).toContainText('DURABLE_PREFIX');
+    await expect(other.locator('#conversation-history')).toContainText('interrupted');
+    const changed = await fs.readFile(savedFile, 'utf8');
+    await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/changed|conflict/i);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    expect(await fs.readFile(savedFile, 'utf8')).toBe(changed);
+    await page.reload(); await observeConversation(false);
+    await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+    await expect(page.locator('#conversation-error')).toContainText(/unsaved|may not survive restart/i);
+    expect(await fs.readFile(savedFile, 'utf8')).toBe(changed);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  } finally { await otherApp.close(); }
 });
