@@ -79,6 +79,8 @@ test('one reviewed comparison slot retains the authoritative final candidate and
   await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
   await expect(page.locator('#comparison-slots article')).toHaveCount(6);
   await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  await expect(page.getByLabel('Reviewed comparison package', { exact: true })).toHaveValue(/final answer up to 600 words/);
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
   const reviewed = await page.getByLabel('Reviewed comparison package', { exact: true }).inputValue();
   expect(reviewed).toContain('final answer up to 600 words');
   await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
