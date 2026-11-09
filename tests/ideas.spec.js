@@ -24,8 +24,8 @@ async function launch(configure = true) {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation({ imported = false, twoCaptures = false } = {}) {
-  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
+async function completedConversation({ imported = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation' } = {}) {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario || { reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
   await launch();
   if (imported) {
     await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
@@ -63,8 +63,8 @@ async function completedConversation({ imported = false, twoCaptures = false } =
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(imported ? 'synthetic review support' : 'How could retrieval help MyTune\\?'));
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
-  await expect(page.locator('#conversation-history')).toContainText('completed');
-  await expect(page.locator('#conversation-history')).toContainText('Authored synthetic observation');
+  await expect(page.locator('#conversation-history')).toContainText(expectedStatus);
+  await expect(page.locator('#conversation-history')).toContainText(expectedReply);
 }
 async function markdownSnapshot(directory) {
   const result = {};
@@ -301,4 +301,51 @@ test('two captures can support multiple independent saved interpretations that r
   await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(/eligibilitysignal: the two captures suggest/);
   for (const [index, destination] of destinations.entries()) expect(await fs.readFile(destination, 'utf8')).toBe(saved[index]);
   expect(await fs.readFile(historyFile, 'utf8')).toBe(historyBytes);
+});
+
+test('an interrupted reply with late unselected memory can retain independent writing without entering supporting context', async () => {
+  test.setTimeout(120000);
+  await completedConversation({
+    scenario: { messages: [
+      { text: 'Authored synthetic SAFE_LOCAL_FRAGMENT for independent review.', phase: 'partial_answer' },
+      { text: 'UNSELECTED_IDEA_MEMORY_CANARY', phase: 'final_answer', citationAtCompletion: true, memoryCitation: { entries: [{ path: 'UNSELECTED_IDEA_MEMORY_PATH.md', lineStart: 1, lineEnd: 1, note: 'Authored unselected fixture memory' }], threadIds: ['unselected-idea-thread'] } }
+    ] },
+    expectedStatus: 'interrupted', expectedReply: 'SAFE_LOCAL_FRAGMENT'
+  });
+  await expect(page.locator('#conversation-history')).toContainText(/unselected memory/i);
+  await expect(page.locator('#conversation-history')).not.toContainText('UNSELECTED_IDEA_MEMORY_CANARY');
+  const vault = path.join(root, 'vault', 'Companion'), originals = await markdownSnapshot(path.join(vault, 'Captures'));
+  const historyName = (await fs.readdir(path.join(root, 'conversations'))).find(name => name.endsWith('.json'));
+  const historyFile = path.join(root, 'conversations', historyName), history = await fs.readFile(historyFile, 'utf8');
+  const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(await fs.readdir(path.join(vault, 'Ideas'))).toEqual([]);
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await expect(page.getByLabel('Idea explanation', { exact: true })).toHaveValue(/SAFE_LOCAL_FRAGMENT/);
+  await expect(page.locator('#idea-references input[type="checkbox"]')).toHaveCount(0);
+  const title = 'An independently retained incomplete interpretation';
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('incompletesignal: retain this independent question for review; the interrupted response establishes no supported conclusion.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Interrupted response after an unselected-memory boundary failure. Attribution is unavailable and this writing must not become supporting context.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Conversation output status: interrupted/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  const fields = YAML.parse(proposed.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect(fields.origin.status).toBe('interrupted'); expect(fields.support_attribution_unavailable).toBe(true);
+  expect(fields.citations).toEqual([]); expect(proposed).not.toContain('UNSELECTED_IDEA_MEMORY_CANARY');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#saved-ideas').getByRole('heading', { name: title, exact: true })).toBeVisible();
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(originals);
+  expect(await fs.readFile(historyFile, 'utf8')).toBe(history);
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#saved-ideas').getByRole('heading', { name: title, exact: true })).toBeVisible();
+  await page.getByLabel('Context question', { exact: true }).fill('incompletesignal');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results')).toContainText('No Relevant Context');
+  await expect(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Manual context source', { exact: true }).getByRole('option', { name: title, exact: true })).toHaveCount(0);
+  await expect(page.locator('#context-error')).toContainText('Saved idea unavailable');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
