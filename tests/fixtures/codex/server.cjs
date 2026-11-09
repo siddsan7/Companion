@@ -15,7 +15,8 @@ const send = message => {
 const notify = (method, params) => send({ method, params });
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const { id, method, params } = JSON.parse(line); if (id === undefined) return;
-  const scenario = JSON.parse(fs.readFileSync(path.join(root, 'codex-fixture.json'), 'utf8'));
+  const conversation = process.env.COMPANION_CONVERSATION_FIXTURE === '1';
+  const scenario = JSON.parse(fs.readFileSync(path.join(root, conversation ? 'conversation-provider.json' : 'codex-fixture.json'), 'utf8'));
   fs.appendFileSync(path.join(root, 'codex-requests.jsonl'), JSON.stringify({ method, params }) + '\n');
   let result = {};
   if (method === 'account/read') result = { account: signedIn ? { type: 'chatgpt', email: 'fixture@example.invalid', planType: 'plus' } : null, requiresOpenaiAuth: true };
@@ -31,15 +32,16 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     // Real unrestricted child-process reads emulate a broken sandbox. The production gate must detect it.
     result = scenario.isolation === 'denied' && !file.includes('positive-') ? { exitCode: 73, stdout: 'COMPANION_OS_DENIED', stderr: '' } : { exitCode: 0, stdout: fs.readFileSync(file, 'utf8'), stderr: '' };
   }
-  if (method === 'thread/start') result = { cwd: process.cwd(), runtimeWorkspaceRoots: [process.cwd()], approvalPolicy: 'never', activePermissionProfile: { id: 'companion-context' }, instructionSources: [], model: 'fixture', thread: { id: `fixture-thread-${++sequence}` } };
+  if (method === 'thread/start') result = { cwd: process.cwd(), runtimeWorkspaceRoots: [process.cwd()], approvalPolicy: 'never', activePermissionProfile: { id: 'companion-context' }, instructionSources: [], model: 'fixture', thread: { id: `fixture-thread-${process.pid}-${++sequence}` } };
   if (method === 'turn/start') {
+    if (conversation) fs.appendFileSync(path.join(root, 'conversation-submissions.jsonl'), JSON.stringify({ threadId: params.threadId, text: params.input[0].text }) + '\n');
     if (scenario.turn === 'exit-before-ack') { process.exit(23); return; }
     active = { threadId: params.threadId, turnId: `fixture-turn-${sequence}` }; result = { turn: { id: active.turnId, status: 'inProgress' } };
   }
   if (method === 'turn/interrupt') setTimeout(() => notify('turn/completed', { threadId: active.threadId, turn: { id: active.turnId, status: 'interrupted' } }), 30);
   send({ id, result });
   if (method === 'turn/start') setTimeout(() => {
-    notify('item/agentMessage/delta', { threadId: active.threadId, delta: scenario.turn === 'pending' ? 'Incomplete fixture reply 🎸' : 'Companion context received.' });
+    notify('item/agentMessage/delta', { threadId: active.threadId, delta: conversation ? scenario.reply || 'Authored synthetic response.' : scenario.turn === 'pending' ? 'Incomplete fixture reply 🎸' : 'Companion context received.' });
     if (scenario.turn === 'usage-limit') notify('error', { threadId: active.threadId, turnId: active.turnId, willRetry: false, error: { message: 'PRIVATE_PROVIDER_DETAIL', codexErrorInfo: 'usageLimitExceeded' } });
     if (scenario.turn !== 'pending') notify('turn/completed', { threadId: active.threadId, turn: { id: active.turnId, status: scenario.turn === 'usage-limit' ? 'failed' : scenario.turn || 'completed' } });
   }, 50);
