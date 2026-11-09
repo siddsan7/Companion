@@ -222,6 +222,59 @@ test('changed pinned brief input before comparison dispatch starts no provider t
   await expect(page.getByRole('status')).toContainText('Capture saved.');
 });
 
+for (const alias of ['directory junction', 'history hardlink']) test(`comparison ${alias} rejects outside history while capture remains usable`, async () => {
+  test.setTimeout(60000);
+  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-outside-comparison-'));
+  const directory = path.join(root, 'comparisons'), outsideDirectory = path.join(outside, 'records');
+  let linkedDirectory = false;
+  try {
+    await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+      dispatchEnabled: true,
+      capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+      comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+    }), 'utf8');
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', messages: [{ phase: 'final_answer', text: 'PRIVATE_OUTSIDE_COMPARISON_CANARY. Authored synthetic response.' }] }), 'utf8');
+    await launch(); await approveBrief();
+    await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+    await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+    await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+    await expect(page.locator('#comparison-slots article').first()).toContainText('completed');
+    const record = await savedComparison(), file = path.join(directory, `${record.id}.json`);
+    const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    await app.close(); app = null;
+    if (alias === 'directory junction') {
+      await fs.rename(directory, outsideDirectory);
+      await fs.symlink(outsideDirectory, directory, process.platform === 'win32' ? 'junction' : 'dir'); linkedDirectory = true;
+    } else {
+      await fs.mkdir(outsideDirectory);
+      const outsideFile = path.join(outsideDirectory, `${record.id}.json`);
+      await fs.rename(file, outsideFile); await fs.link(outsideFile, file);
+      expect((await fs.stat(file)).nlink).toBe(2);
+    }
+    const snapshot = async () => Object.fromEntries(await Promise.all((await fs.readdir(outsideDirectory)).sort().map(async name => [name, await fs.readFile(path.join(outsideDirectory, name), 'utf8')])));
+    const before = await snapshot();
+    await launch(false);
+    await expect(page.locator('#comparison-error')).toContainText(/ordinary|contained|history/i);
+    await expect(page.locator('#comparison-section')).not.toContainText('PRIVATE_OUTSIDE_COMPARISON_CANARY');
+    await expect(page.getByLabel('Retained comparison', { exact: true }).locator('option')).toHaveCount(1);
+    if (alias === 'directory junction') {
+      await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+      await expect(page.locator('#comparison-error')).toContainText(/ordinary|contained/i);
+    }
+    await page.getByLabel('Thought or link', { exact: true }).fill(`Capture works with rejected comparison ${alias}.`);
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture saved.');
+    expect(await snapshot()).toEqual(before);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (linkedDirectory) await fs.unlink(directory);
+    await fs.rm(outside, { recursive: true, force: true });
+  }
+});
+
 test('an active comparison poll cannot authorize overwriting an external history edit', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
