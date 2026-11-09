@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const { generations } = require('./source-generations');
 const local = require('node:fs');
 const path = require('node:path');
 const YAML = require('yaml');
@@ -68,7 +69,10 @@ class Transcripts {
     const scope = record.scope || { excludedSources: [], excludedHistory: [] };
     const resolve = this.conversations.historyResolver({ all, vault, active: record, excludedSources: new Set(scope.excludedSources), excludedHistory: new Set(scope.excludedHistory) });
     for (const request of record.requests) {
-      for (const dep of request.package?.dependencies || []) dependencies.push({ requestId: request.id, original: dep, currentDigest: all.find(source => source.key === dep.key)?.digest || null });
+      for (const dep of request.package?.dependencies || []) {
+        const current = all.find(source => source.key === dep.key);
+        dependencies.push({ requestId: request.id, original: dep, currentDigest: current?.digest || null, ...(current?.sourceGenerations === undefined ? {} : { currentSourceGenerations: generations(current.sourceGenerations) }) });
+      }
       for (const ref of request.package?.historyRefs || []) if (typeof ref.conversationId === 'string' && !origins.has(ref.conversationId)) {
         try { origins.set(ref.conversationId, hash((await this.conversations.readStored(ref.conversationId, true)).text)); }
         catch { origins.set(ref.conversationId, null); }
@@ -119,7 +123,10 @@ class Transcripts {
     if (!object(intent.vault, ['vault', 'root']) || intent.vault.vault !== vault.vault || intent.vault.root !== vault.root || typeof intent.destination !== 'string' || !path.isAbsolute(intent.destination) || path.resolve(intent.destination) !== intent.destination) reject();
     const state = intent.reviewState;
     if (!object(state, ['digest', 'warnings', 'dependencies', 'origins', 'contextError']) || state.digest !== intent.recordDigest || !Array.isArray(state.warnings) || state.warnings.some(warning => typeof warning !== 'string') || !Array.isArray(state.dependencies) || !Array.isArray(state.origins) || state.contextError !== null && typeof state.contextError !== 'string') reject();
-    for (const dep of state.dependencies) if (!object(dep, ['requestId', 'original', 'currentDigest']) || !uuid(dep.requestId) || dep.currentDigest !== null && !digest(dep.currentDigest) || !object(dep.original, ['key', 'digest', 'captureId', 'revisionId']) || typeof dep.original.key !== 'string' || !digest(dep.original.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep.original, key) && !uuid(dep.original[key]))) reject();
+    for (const dep of state.dependencies) {
+      if (!object(dep, ['requestId', 'original', 'currentDigest', 'currentSourceGenerations']) || !uuid(dep.requestId) || dep.currentDigest !== null && !digest(dep.currentDigest) || !object(dep.original, ['key', 'digest', 'captureId', 'revisionId', 'sourceGenerations']) || typeof dep.original.key !== 'string' || !digest(dep.original.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep.original, key) && !uuid(dep.original[key]))) reject();
+      try { generations(dep.original.sourceGenerations); generations(dep.currentSourceGenerations); } catch { reject(); }
+    }
     if (state.origins.some(item => !Array.isArray(item) || item.length !== 2 || !uuid(item[0]) || item[1] !== null && !digest(item[1])) || new Set(state.origins.map(item => item[0])).size !== state.origins.length) reject();
     const front = intent.text.match(/^---\n([\s\S]*?)\n---\n/), metadata = front && YAML.parse(front[1]);
     if (!metadata || metadata.artifact_type !== 'conversation_transcript' || metadata.schema_version !== 1 || metadata.companion_id !== intent.id || metadata.conversation_id !== intent.conversationId || metadata.conversation_sha256 !== intent.recordDigest || metadata.created_at !== intent.createdAt) reject();
