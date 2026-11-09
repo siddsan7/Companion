@@ -27,7 +27,7 @@ Complete valid pending-only authority can be explicitly reviewed, revalidated an
 
 ## Remaining checks and scope
 
-The observed checks do not complete ticket 13. Required follow-up verticals include stale export confirmations and acknowledgements, changed files, unknown aliases, and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
+The observed checks do not complete ticket 13. Required follow-up checks include changed files, unknown aliases and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
 
 ## Retained intent with missing output
 
@@ -50,4 +50,16 @@ Root session `85300` passed one parameterized behavior at three removal boundari
 
 Each case recorded the wrapper PID, main PID, wrapper exit result and observed main-process exit in its own `testInfo.outputPath` JSON before restarting. Root verified and copied all three distinct proof files (223, 222 and 226 bytes) to `Temp/companion-ticket13-transcript-crashes-green-20261109/`.
 
-All three cases verified no automatic mutation on restart or preview, no reconstructed output, an unchanged content-free permanent marker after completion, exact selected-file absence, and preserved originating conversation, source capture, other export, external backup and provider submissions. A second restart offered no duplicate recovery and kept the same persisted result. Stale normal-export confirmation coverage remains pending.
+All three cases verified no automatic mutation on restart or preview, no reconstructed output, an unchanged content-free permanent marker after completion, exact selected-file absence, and preserved originating conversation, source capture, other export, external backup and provider submissions. A second restart offered no duplicate recovery and kept the same persisted result.
+
+## Stale normal-export confirmation
+
+One finite behavior uses a controlled failure after the original publication receipt. That leaves the actual normal export confirmation token visible. The user then explicitly removes that export and presses its stale normal confirmation. The behavior covers both an intact removal marker and external removal of that previously observed marker while the `.transcripts` directory identity stays unchanged.
+
+Root session `45650` produced a real RED: one pass and one failure, exit 1 in 1.0 minute. The intact-marker case refused stale publication in 30.9 seconds. The external-marker-loss case failed in 28.8 seconds: the stale token recreated the old output (3,581 bytes), intent (5,089 bytes) and receipt (252 bytes). Tests saved actual status, export identities, unchanged parent identities and unexpected file hashes before refusal assertions. Root retained the distinct 607-byte and 1,354-byte diagnostics under `Temp/companion-ticket13-transcript-stale-red-20261109/` and committed the behavior as `aadab5b21658da77c8db1c69adadf9cd0a81eaec` before the fix.
+
+The minimum fix remembers refused transcript IDs in the existing store instance, keyed by vault and application-root paths. It remembers its own created removal control and observed fixed marker/stage presence, including listing before parsing. The remembered ID continues to refuse old publication and acknowledgement when its control later disappears, including after same-vault reconfiguration. This memory only refuses: it cannot authorize unlink, reconstruct controls or relax strict loaded-marker and per-attempt identity checks. Fresh explicit exports still receive new IDs.
+
+Root session `54007` passed the focused two-state rerun. Root verified durable `.last-run` state `passed` with no failed tests and inspected both actual diagnostics: directory identities stayed unchanged and `unexpectedReappearances` was empty. Fresh explicit export assertions also completed. No duration was recorded from this checkpoint. The behavior also checks exact preserved vault bytes after stale confirmation and unchanged originating conversation, source capture, other export, external backup and provider submissions.
+
+The cache lasts only for the process. External loss of every durable removal control across a process restart cannot be inferred from memory. This is an explicit limit; no cross-restart authority reconstruction is claimed.

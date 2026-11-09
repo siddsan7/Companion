@@ -13,7 +13,18 @@ const held = () => Error('Transcript removal scope or identity changed. Preserve
 
 // This store owns only explicitly selected transcript exports, never their origins.
 class TranscriptRemoval {
-  constructor(store) { this.store = store; this.previews = new Map(); }
+  constructor(store) { this.store = store; this.previews = new Map(); this.refused = new Map(); }
+  refusals(vault) {
+    const key = JSON.stringify([vault.vault, vault.root]);
+    if (!this.refused.has(key)) this.refused.set(key, new Set());
+    return this.refused.get(key);
+  }
+  rememberRefusal(vault, id) {
+    if (!uuid(id)) throw held();
+    // Refusal only: this memory never supplies removal authority or recreates controls.
+    // Across restart, external loss of all durable authority cannot be inferred from memory.
+    this.refusals(vault).add(id);
+  }
   location(vault, id) {
     if (!uuid(id)) throw held();
     const marker = path.join(vault.root, '.transcripts', `${id}.removed.json`);
@@ -21,7 +32,10 @@ class TranscriptRemoval {
   }
   async fence(intent, vault) {
     const { marker, stage } = this.location(vault, intent.id);
-    if (await exists(marker) || await exists(stage)) throw Error('This transcript identity has a removal record. Old export confirmations and recovery cannot recreate or acknowledge it.');
+    if (this.refusals(vault).has(intent.id) || await exists(marker) || await exists(stage)) {
+      this.rememberRefusal(vault, intent.id);
+      throw Error('This transcript identity has an observed removal record. Old export confirmations and recovery cannot recreate or acknowledge it, even if that control is later missing.');
+    }
   }
   relative(vault, file) {
     const relative = path.relative(vault.vault, file);
@@ -89,6 +103,7 @@ class TranscriptRemoval {
     try { this.store.guard(vault, this.placeholder(vault)); names = await fs.readdir(directory); }
     catch (error) { if (error.code !== 'ENOENT') issues.push(error.message); return { records, pending, issues }; }
     const removed = new Set(names.map(name => name.match(/^([a-f0-9-]{36})\.removed\.json(?:\.pending)?$/)?.[1]).filter(uuid));
+    for (const id of removed) this.rememberRefusal(vault, id);
     for (const id of removed) {
       try {
         const record = await this.load(vault, id);
@@ -145,6 +160,7 @@ class TranscriptRemoval {
     const { marker: file, stage } = this.location(vault, id), parents = this.store.guard(vault, this.placeholder(vault));
     const hasMarker = await exists(file), hasStage = await exists(stage), links = hasMarker && hasStage ? 2 : 1;
     if (!hasMarker && !hasStage) throw held();
+    this.rememberRefusal(vault, id);
     const raw = await this.store.read(vault, this.placeholder(vault), hasMarker ? file : stage, parents, links);
     const marker = this.validate(JSON.parse(raw.text), vault, id);
     if (!same(marker.control, raw.stat)) throw held();
@@ -202,6 +218,7 @@ class TranscriptRemoval {
           const marker = { schema: 1, kind: 'transcript-removal', ...scope, operation: randomUUID(), control: { dev: String(stat.dev), ino: String(stat.ino) } };
           const bytes = JSON.stringify(marker, null, 2);
           record = { vault, marker, bytes, hasMarker: false, hasStage: true };
+          this.rememberRefusal(vault, scope.id);
           await handle.writeFile(bytes); await handle.sync();
         } finally { await handle.close(); }
         await this.store.checkpoint('transcript-remove-after-stage');
