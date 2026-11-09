@@ -511,3 +511,75 @@ for (const [boundary, receiptExists] of [['idea-after-publication', false], ['id
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
   });
 }
+
+test('a source edit during pending confirmation blocks publication and retains the exact proposed writing', async () => {
+  test.setTimeout(120000);
+  await completedConversation();
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Recheck supporting context before publication');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('contextchangewriting: retain the interpretation while requiring review of changed supporting material.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Unverified interpretation based on the reviewed source bytes.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/contextchangewriting/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'idea-before-publication' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect.poll(async () => {
+    try { return await fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }).toBe('idea-before-publication');
+  const captureDirectory = path.join(root, 'vault', 'Companion', 'Captures');
+  const captureFile = path.join(captureDirectory, (await fs.readdir(captureDirectory)).find(name => name.endsWith('.md')));
+  await fs.appendFile(captureFile, '\nAn external editor changed the source after preview.\n', 'utf8');
+  const edited = await fs.readFile(captureFile, 'utf8');
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue', 'utf8');
+  await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+  await expect(page.locator('#idea-status')).toContainText(/context changed|source.*changed|support.*changed/i);
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
+  expect(await fs.lstat(destination).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  expect(await fs.readFile(captureFile, 'utf8')).toBe(edited);
+  const directory = path.join(root, 'vault', 'Companion', '.ideas');
+  const intentName = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
+  expect(JSON.parse(await fs.readFile(path.join(directory, intentName), 'utf8')).text).toBe(proposed);
+  expect((await fs.readdir(directory)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+});
+
+for (const area of ['Ideas', '.ideas']) {
+  test(`a replaced ${area} parent junction rejects outside idea storage while capture stays usable`, async () => {
+    test.setTimeout(120000);
+    await completedConversation();
+    await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+    await page.getByLabel('Idea title', { exact: true }).fill('Preserve this pending interpretation inside the vault');
+    await page.getByLabel('Idea explanation', { exact: true }).fill('aliaswriting: keep independent writing in its owned vault folder.');
+    await page.getByLabel('Idea limitations', { exact: true }).fill('No verified result. A changed storage parent must block idea storage.');
+    await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+    await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/aliaswriting/);
+    const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-before-publication' }), 'utf8');
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+    await app.close(); app = null;
+    const directory = path.join(root, 'vault', 'Companion', area), retained = path.join(root, `retained-${area}-folder`), outside = path.join(root, `outside-${area}-folder`);
+    await fs.rename(directory, retained); await fs.mkdir(outside);
+    const privateFile = path.join(outside, 'outside-private.md'), privateBytes = '# OUTSIDE_IDEA_PRIVATE_CANARY\n\nThis outside text must remain private and unchanged.\n';
+    await fs.writeFile(privateFile, privateBytes, 'utf8');
+    await fs.symlink(outside, directory, process.platform === 'win32' ? 'junction' : 'dir');
+    try {
+      await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch(false);
+      await expect(page.locator('#idea-status')).toContainText(/ordinary|contained|folder/i);
+      await expect(page.locator('#ideas-section')).not.toContainText('OUTSIDE_IDEA_PRIVATE_CANARY');
+      await page.getByLabel('Thought or link', { exact: true }).fill(`Capture works after ${area} parent alias refusal.`);
+      await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+      await expect(page.locator('#captures').getByRole('heading', { name: `Capture works after ${area} parent alias refusal.`, exact: true })).toBeVisible();
+      expect(await fs.readdir(outside)).toEqual(['outside-private.md']);
+      expect(await fs.readFile(privateFile, 'utf8')).toBe(privateBytes);
+      const journalDirectory = area === '.ideas' ? retained : path.join(root, 'vault', 'Companion', '.ideas');
+      const intentName = (await fs.readdir(journalDirectory)).find(name => name.endsWith('.intent.json'));
+      expect(JSON.parse(await fs.readFile(path.join(journalDirectory, intentName), 'utf8')).text).toBe(proposed);
+    } finally {
+      if (app) { await app.close(); app = null; }
+      await fs.unlink(directory);
+    }
+  });
+}
