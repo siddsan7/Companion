@@ -64,6 +64,11 @@
       article.dataset.requestId = request.id;
       state.textContent = `${request.status}${request.status === 'completed' ? '' : ' — incomplete'} · ${request.evidence || 'provider evidence unavailable'} · ${request.id}${request.error ? ` · ${request.error}` : ''}`;
       question.textContent = request.question; reply.textContent = request.reply; article.append(state, question, reply); byId('conversation-history').append(article);
+      if (request.reply) {
+        const draft = document.createElement('button'); draft.textContent = 'Draft saved idea';
+        draft.onclick = () => window.dispatchEvent(new CustomEvent('companion-idea-draft', { detail: { conversationId: record.id, requestId: request.id } }));
+        article.append(draft);
+      }
       const includeLabel = document.createElement('label'), include = document.createElement('input');
       include.type = 'checkbox'; include.checked = request.status === 'completed' && !excludedHistory.has(request.id); include.disabled = request.status !== 'completed';
       includeLabel.append(include, document.createTextNode('Include request in next context'));
