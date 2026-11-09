@@ -1,5 +1,11 @@
 # Ticket #5 verification
 
+Final integration: `473fbffa9b3c06008fa0e228ff92bfe744d7ff0d` is integrated on the spec branch with all ticket history preserved. Independent exact-tip review and merger checks approved it. The final 98-case Electron desktop/file gate passed **97 tests with one existing Windows file-symlink capability skip in 18.8 minutes**. This includes the guarded annotation/context coupling, canonical-loss controls, kept-current recovery and the three backup-detachment crash states.
+
+The first combined run had 94 passes, three restart-readiness failures and one capability skip. Test-only commit `4ec80ef` added public startup-ready waits to those three paths, retaining all byte, snapshot, revision and native-lock assertions. The focused rerun passed all three in 45.3 seconds; the complete gate then passed. Later synchronization changed publishing documentation only.
+
+Actual-producer smoke on the integrated build passed: one capture, one immutable revision, 33 evidence entries, restart idempotence and unchanged producer files. It remains labeled partial and unreviewed. Actual Obsidian opening is not established by URI fixtures. Live sign-in/inference remains user-deferred; hosted Actions is billing-blocked and user-waived. These limits do not become passed live gates or a release-readiness claim. Earlier pending statements below are the retained work record; this final status supersedes them.
+
 Goal: preserve independent annotations and repair external managed-note changes through the desktop workflow.
 
 Constraints: vault Markdown and .intake ledger remain authoritative; preserve source snapshots, conflict journals and unrelated files. No history restore may roll back .intake. Shared kernel lock covers repairs. Ordinary contained files and stage ownership checks remain required.
