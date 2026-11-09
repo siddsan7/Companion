@@ -482,7 +482,15 @@ for (const [boundary, receiptExists] of [['idea-after-publication', false], ['id
     evidence.wrapperExit = await exited; await abrupt;
     await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
     await testInfo.attach('crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
-    app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch(false);
+    app = null;
+    const expectedSources = { ...sources };
+    if (!receiptExists) {
+      // Acknowledge the already published note, without authorizing new source use.
+      const sourceFile = Object.keys(sources)[0];
+      await fs.appendFile(sourceFile, '\nEditor writing after publication and before acknowledgement.\n', 'utf8');
+      expectedSources[sourceFile] = await fs.readFile(sourceFile, 'utf8');
+    }
+    await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch(false);
     const pending = page.locator('#pending-ideas article').filter({ hasText: title });
     await expect(pending).toBeVisible();
     expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
@@ -497,8 +505,10 @@ for (const [boundary, receiptExists] of [['idea-after-publication', false], ['id
     expect((await fs.stat(destination)).nlink).toBe(1);
     expect(await fs.lstat(stage).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
     expect(JSON.parse(await fs.readFile(receipt, 'utf8')).id).toBe(intent.id);
+    expect((await fs.readdir(directory)).filter(name => name.endsWith('.published.json'))).toHaveLength(1);
+    await expect(page.locator('#saved-ideas article')).toHaveCount(1);
     expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
-    expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(sources);
+    expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(expectedSources);
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
     await app.close(); app = null;
     await fs.unlink(destination);
