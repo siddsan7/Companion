@@ -502,6 +502,78 @@ test('history archives roundtrip exact source generations without rolling back t
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
 
+test('same-byte restoration revokes a two-hop foreign history closure and its stale reviewed dispatch without changing retained dialogue', async () => {
+  test.setTimeout(180000);
+  const fixture = await manualConversationForRestoration(), generation = await restoreManualConversation(fixture);
+  const region = () => page.getByRole('region', { name: 'Prior conversation search', exact: true });
+  for (const [ancestor, reply] of [['FRESHIDEAGENERATION', 'FOREIGNGENERATION_B authored synthetic first derived turn.'], ['FOREIGNGENERATION_B', 'FOREIGNGENERATION_C authored synthetic second derived turn.']]) {
+    await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+    await page.getByLabel('Context question', { exact: true }).fill(ancestor);
+    await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+    const result = region().getByRole('article').filter({ hasText: ancestor });
+    await expect(result).toHaveCount(1);
+    await result.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply }), 'utf8');
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText(reply);
+    await expect(page.locator('#conversation-history')).toContainText('completed');
+  }
+  const historyDirectory = path.join(root, 'conversations'), originals = await files(historyDirectory);
+  const records = await Promise.all((await fs.readdir(historyDirectory)).filter(name => name.endsWith('.json')).map(async name => JSON.parse(await fs.readFile(path.join(historyDirectory, name), 'utf8'))));
+  expect(records).toHaveLength(3);
+  const derived = records.find(record => record.requests[0].reply.startsWith('FOREIGNGENERATION_C'));
+  expect(derived.requests[0].package.historyRefs).toHaveLength(2);
+  const dependency = derived.requests[0].package.dependencies.find(dep => dep.captureId === fixture.id);
+  expect(dependency.sourceGenerations).toEqual([{ captureId: fixture.id, generation }]);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('FOREIGNGENERATION_C');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  const selected = region().getByRole('article').filter({ hasText: 'FOREIGNGENERATION_C' });
+  await expect(selected).toHaveCount(1);
+  await selected.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/FOREIGNGENERATION_C authored/);
+  const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected manual capture file', { exact: true }).fill(fixture.backup);
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source restored');
+  const ledger = JSON.parse(await fs.readFile(path.join(fixture.base, '.intake', 'ledger.json'), 'utf8')), nextGeneration = ledger.sourceAuthority[fixture.id].generation;
+  expect(nextGeneration).not.toBe(generation);
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-error')).toContainText(/historical|changed|unavailable/i);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  expect(await files(historyDirectory)).toEqual(originals);
+  await app.close(); app = null; await launch();
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('FOREIGNGENERATION_C');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await expect(page.locator('#history-search-status')).toContainText('0 matching historical turns');
+  await expect(region()).not.toContainText('FOREIGNGENERATION_C authored');
+  await page.getByLabel('Context question', { exact: true }).fill('Use only the current manual source.');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.getByLabel('Manual context source', { exact: true }).selectOption('capture:' + fixture.id);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  const reviewed = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  expect(reviewed).toContain(nextGeneration); expect(reviewed).toContain('IDEAGENERATION spaced retrieval');
+  expect(reviewed).not.toContain('FOREIGNGENERATION_B'); expect(reviewed).not.toContain('FOREIGNGENERATION_C'); expect(reviewed).not.toContain('FRESHIDEAGENERATION');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'CURRENTFOREIGNGENERATION independent fresh reply.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('CURRENTFOREIGNGENERATION');
+  const calls = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(calls).toHaveLength(5); expect(calls.at(-1).text).toBe(reviewed);
+  for (const [name, bytes] of Object.entries(originals)) expect((await fs.readFile(path.join(historyDirectory, name))).toString('base64')).toBe(bytes);
+});
+
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
   test.setTimeout(90000);
   await artifact('first', '1'); await launch();
