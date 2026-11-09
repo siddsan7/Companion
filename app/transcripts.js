@@ -6,6 +6,8 @@ const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
+const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const literal = text => {
   let length = 3; for (const match of text.matchAll(/`+/g)) length = Math.max(length, match[0].length + 1);
   const fence = '`'.repeat(length); return `${fence}text\n${text}\n${fence}`;
@@ -110,6 +112,84 @@ class Transcripts {
     return { token, text, destination: file, warnings: snapshot.warnings };
   }
   cancel(token) { this.previews.delete(token); }
+  validateIntent(intent, operation, vault) {
+    const object = (value, fields) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
+    const reject = () => { throw Error('Transcript intent has unknown or damaged ownership. Preserve all retained writing for review.'); };
+    if (!object(intent, ['schema', 'operation', 'id', 'vault', 'conversationId', 'recordDigest', 'destination', 'text', 'digest', 'reviewState', 'createdAt']) || intent.schema !== 1 || !uuid(operation) || intent.operation !== operation || !uuid(intent.id) || !uuid(intent.conversationId) || !digest(intent.recordDigest) || !digest(intent.digest) || typeof intent.text !== 'string' || hash(intent.text) !== intent.digest || typeof intent.createdAt !== 'string' || !Number.isFinite(Date.parse(intent.createdAt))) reject();
+    if (!object(intent.vault, ['vault', 'root']) || intent.vault.vault !== vault.vault || intent.vault.root !== vault.root || typeof intent.destination !== 'string' || !path.isAbsolute(intent.destination) || path.resolve(intent.destination) !== intent.destination) reject();
+    const state = intent.reviewState;
+    if (!object(state, ['digest', 'warnings', 'dependencies', 'origins', 'contextError']) || state.digest !== intent.recordDigest || !Array.isArray(state.warnings) || state.warnings.some(warning => typeof warning !== 'string') || !Array.isArray(state.dependencies) || !Array.isArray(state.origins) || state.contextError !== null && typeof state.contextError !== 'string') reject();
+    for (const dep of state.dependencies) if (!object(dep, ['requestId', 'original', 'currentDigest']) || !uuid(dep.requestId) || dep.currentDigest !== null && !digest(dep.currentDigest) || !object(dep.original, ['key', 'digest', 'captureId', 'revisionId']) || typeof dep.original.key !== 'string' || !digest(dep.original.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep.original, key) && !uuid(dep.original[key]))) reject();
+    if (state.origins.some(item => !Array.isArray(item) || item.length !== 2 || !uuid(item[0]) || item[1] !== null && !digest(item[1])) || new Set(state.origins.map(item => item[0])).size !== state.origins.length) reject();
+    const front = intent.text.match(/^---\n([\s\S]*?)\n---\n/), metadata = front && YAML.parse(front[1]);
+    if (!metadata || metadata.artifact_type !== 'conversation_transcript' || metadata.schema_version !== 1 || metadata.companion_id !== intent.id || metadata.conversation_id !== intent.conversationId || metadata.conversation_sha256 !== intent.recordDigest || metadata.created_at !== intent.createdAt) reject();
+    return intent;
+  }
+  async retained(operation) {
+    const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
+    if (!uuid(operation)) throw Error('Transcript operation identity is invalid.');
+    const placeholder = path.join(vault.vault, 'Transcript inspection.md'), parents = this.guard(vault, placeholder);
+    const directory = path.join(vault.root, '.transcripts'), base = path.join(directory, operation);
+    const journal = await this.read(vault, placeholder, `${base}.intent.json`, parents);
+    const intent = this.validateIntent(JSON.parse(journal.text), operation, vault);
+    return { intent, vault, base };
+  }
+  async publicationState(intent, vault, base, parents) {
+    const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    const stage = `${base}.md.pending`, receipt = `${base}.published.json`;
+    const hasStage = await exists(stage), hasReceipt = await exists(receipt);
+    let saved;
+    if (hasReceipt) {
+      saved = JSON.parse((await this.read(vault, intent.destination, receipt, parents)).text);
+      if (!saved || Object.keys(saved).some(key => !['schema', 'operation', 'id', 'digest', 'dev', 'ino'].includes(key)) || saved.schema !== 1 || saved.operation !== intent.operation || saved.id !== intent.id || saved.digest !== intent.digest || typeof saved.dev !== 'string' || typeof saved.ino !== 'string') throw Error('Transcript publication receipt is damaged. Preserve the writing for review.');
+      if (!hasStage) return { completed: true, published: true };
+    }
+    if (!hasStage) throw Error('Transcript stage is unavailable. Preserve the retained intent writing; no publication was attempted.');
+    const hasDestination = await exists(intent.destination), links = hasDestination ? 2 : 1;
+    const stageFile = await this.read(vault, intent.destination, stage, parents, links);
+    if (stageFile.text !== intent.text) throw Error('Transcript stage was edited. Preserve the retained writing for review.');
+    if (hasDestination) {
+      const destination = await this.read(vault, intent.destination, intent.destination, parents, 2);
+      if (!same(stageFile.stat, destination.stat) || destination.text !== intent.text || saved && (saved.dev !== String(stageFile.stat.dev) || saved.ino !== String(stageFile.stat.ino))) throw Error('Transcript publication peers changed. Preserve both copies for review.');
+    } else if (hasReceipt) throw Error('Completed transcript destination is missing. Preserve the stage; it will not be recreated.');
+    return { completed: false, published: hasDestination };
+  }
+  async pending() {
+    const vault = this.getVault(); if (!vault) return { records: [], issues: [] };
+    const placeholder = path.join(vault.vault, 'Transcript inspection.md'), directory = path.join(vault.root, '.transcripts');
+    const records = [], issues = [];
+    let names;
+    try { this.guard(vault, placeholder); names = await fs.readdir(directory); }
+    catch (error) { if (error.code !== 'ENOENT') issues.push(error.message); return { records, issues }; }
+    const owned = new Set();
+    for (const name of names) {
+      const match = name.match(/^([a-f0-9-]{36})\.intent\.json$/); if (!match) continue;
+      owned.add(name);
+      let intent;
+      try {
+        const retained = await this.retained(match[1]); intent = retained.intent;
+        owned.add(`${intent.operation}.md.pending`); owned.add(`${intent.operation}.published.json`);
+        const parents = this.guard(vault, intent.destination), state = await this.publicationState(intent, vault, retained.base, parents);
+        if (!state.completed) records.push({ operation: intent.operation, destination: intent.destination, text: intent.text, canResume: true, warning: state.published ? 'Already-published copy awaits explicit acknowledgement. No fresh source eligibility is needed to acknowledge the exact pair.' : 'Unpublished retained writing. Resume and confirm explicitly; current origin and warnings will be rechecked.' });
+      } catch (error) {
+        records.push({ operation: match[1], destination: intent?.destination || 'Unavailable destination', text: intent?.text || '', canResume: false, warning: error.message });
+      }
+    }
+    for (const name of names) if (!owned.has(name)) issues.push(`Unrecognized transcript recovery file ${name} remains preserved. It cannot be promoted automatically.`);
+    return { records, issues };
+  }
+  async resume(operation) {
+    const { intent, vault, base } = await this.retained(operation), parents = this.guard(vault, intent.destination);
+    const state = await this.publicationState(intent, vault, base, parents);
+    if (state.completed) throw Error('This transcript export is already completed. Missing or edited destinations are never recreated.');
+    if (!state.published) {
+      const fresh = await this.snapshot(intent.conversationId);
+      if (JSON.stringify(fresh.state) !== JSON.stringify(intent.reviewState) || this.markdown(fresh, intent.id, intent.createdAt) !== intent.text) throw Error('The original conversation or support warnings changed. Retained writing remains inspectable; new publication requires a fresh preview.');
+    }
+    const token = randomUUID(); if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
+    this.previews.set(token, { intent, parents });
+    return { token, destination: intent.destination, text: intent.text };
+  }
   async confirm(token) {
     const preview = this.previews.get(token); if (!preview) throw Error('Preview the transcript again before exporting.');
     const { intent } = preview, vault = this.getVault();
@@ -174,6 +254,8 @@ function installTranscripts({ ipcMain, ...options }) {
   ipcMain.handle('transcript-preview', (_, input) => store.preview(input));
   ipcMain.handle('transcript-confirm', (_, input) => store.confirm(input?.token));
   ipcMain.handle('transcript-cancel', (_, input) => store.cancel(input?.token));
+  ipcMain.handle('transcript-pending', () => store.pending());
+  ipcMain.handle('transcript-resume', (_, input) => store.resume(input?.operation));
   return store;
 }
 module.exports = { Transcripts, installTranscripts };
