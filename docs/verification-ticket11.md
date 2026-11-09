@@ -2,7 +2,7 @@
 
 Goal: retain a chosen conversation interpretation as an independent vault Markdown note after reviewing its exact content and destination. The approved seam is the ordinary Electron UI plus resulting Markdown, conversation files and operation journals. Tests use the real external stdio fixture, portable authored producer review bundles, controlled time and the existing OS dispatch/filesystem checkpoint substitutes. They do not establish live model readiness or installed Obsidian behavior.
 
-Source checkpoint: `bc9a312`, followed by history-preserving upstream integration merge `73e5afd` from `52488c9`. The initial frozen tip `1dafd2d` passed the 62-case ideas/context/conversations gate. Independent Spec review then found a recovery blocker; regression `7d61dad` reproduced it, and source fix `5cfc77a` passed the focused check. Root owns actual tests, Git and integration. Production and tests are frozen. Sync with integration `6a7c7fb` (including approved #15), all ideas checks on that resolved union, and final-tip independent reapproval are **pending**. The earlier 62-case pass is not a passing rerun of the later fix or resolved union.
+Source checkpoint: `bc9a312`, followed by history-preserving upstream integration merge `73e5afd` from `52488c9`. The initial frozen tip `1dafd2d` passed the 62-case ideas/context/conversations gate. Independent Spec review then found a recovery blocker; regression `7d61dad` reproduced it, and source fix `5cfc77a` passed the focused check. Reviewed preserving sync `6460d3e` incorporates integration `6a7c7fb`, including approved #15. All 24 ideas/comparisons checks passed on that resolved union, and independent Standards and Spec approved its exact source tip. Root records final documentation-tip approval and preserving integration in issue #11. The earlier 62-case pass is not described as a rerun of the later fix or union.
 
 ## Acceptance coverage
 
@@ -19,7 +19,7 @@ Source checkpoint: `bc9a312`, followed by history-preserving upstream integratio
 
 ## Actual verification
 
-All elapsed times below are root-reported actual Electron runs. The pre-fix combined pass and subsequent focused check are separate evidence; final union checks and independent reapproval remain pending.
+All elapsed times below are root-reported actual Electron runs. The pre-fix combined pass, focused recovery check and final union gate are separate evidence.
 
 | Check | Actual result |
 | --- | --- |
@@ -39,13 +39,26 @@ All elapsed times below are root-reported actual Electron runs. The pre-fix comb
 | Initial frozen combined gate | At `1dafd2d`, `npm.cmd test -- tests/ideas.spec.js tests/context.spec.js tests/conversations.spec.js`: all 62 passed, no skips, exit 0, 26.9 minutes. This preceded the review regression and recovery fix. |
 | Initial independent review | Standards approved `1dafd2d`, with an optional suggestion to consolidate duplicated five-field labels. Spec found the P1 recovery issue described below and withheld approval. The optional label consolidation was not a blocker and introduced no unrelated runtime change. |
 | Review recovery RED/GREEN | Regression `7d61dad`: actual RED 57.1 seconds; after a source edit following link/before receipt, Resume left Confirm disabled although the exact published pair remained intact. Fix `5cfc77a`: focused GREEN 30.4 seconds, exit 0. |
-| Final union checks and independent review | Pending: history-preserving sync from integration `6a7c7fb`, all ideas checks on the resolved union, and independent final-tip Standards/Spec reapproval. No ticket-complete, final integration approval or release-ready claim. |
+| Final union gate | At reviewed preserving sync `6460d3e`, `npm.cmd test -- tests/ideas.spec.js tests/comparisons.spec.js`: all 24 passed, no skips, exit 0, 10.4 minutes. Covers the corrected recovery and every saved-idea/comparison case with both workflows retained. |
+| Independent source reapproval | Standards and Spec approved exact `6460d3e1e8d7690d0b042287c9fd39c8239e7235` with no blockers. Final documentation-tip approval and merger verification are recorded in issue #11 before closure. |
 
 The P1 review cited [D04-I05](local-second-brain-spec.md):
 
 > Write the note safely, avoid overwriting unrelated files, and make retries recoverable without duplicate successful saves. Preserve the proposed content after failure so the user can retry.
 
 The old recovery path treated acknowledgement of an already-published note as authorization for a new publication. Changed source support therefore stranded the exact known stage/destination pair. The fix gives explicit acknowledgement its own mode: under the mutation lock, main revalidates exact intent, text, destination, inode/device and known peers; it writes one receipt without a new link or model call, then rechecks ownership before removing only the known stage. The regression preserves the external source edit and original note/intent bytes, checks one receipt and visible idea, removes the stage to one remaining link, and verifies no new submission. Current support eligibility remains the Context authority. New unpublished proposals still require fresh support binding.
+
+## Standards
+
+Independent reviewer `review11_standards` approved exact synchronized source tip `6460d3e`. The recovery fix preserves independent-writing ownership and main-process filesystem authority. It validates an existing publication before acknowledging it, verifies journal/bytes/known peers under lock, records a receipt, and removes only the known stage. Main retains both ideas and comparisons without expanding renderer authority. No documented-standard blockers were found.
+
+One optional low heuristic remains: the five Experiment Proposal field names/labels are duplicated in main and view modules. Consolidation is not required for correctness. The reviewer used the complete smell baseline with repository overrides and performed no edits or tests.
+
+## Spec
+
+Independent reviewer `review11_spec` initially withheld approval for the P1 above, then approved exact `6460d3e` after reviewing its regression and fix. The exact already-published pair can now be acknowledged after support changes, without a new link, model request or source authorization. Completed receipts prevent resurrection; unpublished proposals retain current-support validation. The reviewer found no remaining blocker in confirmation, complete proposals, independent writing, conservative dependencies or exact historical evidence handling.
+
+Review totals at the synchronized source tip: Standards zero hard violations and one low heuristic; Spec one resolved P1 and zero remaining findings. These are ticket reviews, not final whole-PR or release approval. Final documentation-only changes preserve tested source and tests; root obtains exact-tip approval before integration.
 
 ## Reference and eligibility contract
 
