@@ -142,6 +142,68 @@ for (const boundary of ['transcript-remove-after-stage', 'transcript-remove-afte
     await expectProtocolIndependence(fixture);
   });
 }
+
+for (const authority of ['intact', 'externally removed after observation']) {
+  test(`stale normal transcript confirmation cannot recreate a removed identity when its marker is ${authority}`, async ({}, testInfo) => {
+    test.setTimeout(150000);
+    const fixture = await transcriptProtocolFixture('transcript-after-receipt');
+    const staleReview = page.getByLabel('Proposed transcript Markdown', { exact: true });
+    await expect(staleReview).toBeVisible(); await expect(staleReview).toHaveValue(fixture.selectedBytes);
+    await expect(page.getByRole('button', { name: 'Export reviewed transcript', exact: true })).toBeEnabled();
+    const review = await reviewProtocolRemoval(fixture);
+    await review.getByRole('button', { name: 'Confirm transcript removal', exact: true }).click();
+    await expect(page.locator('#transcript-remove-status')).toContainText('Transcript removed locally');
+    const markerFile = path.join(fixture.directory, `${fixture.intent.id}.removed.json`);
+    const markerBytes = await fs.readFile(markerFile, 'utf8');
+    for (const file of fixture.selectedCopies) expect(await fs.stat(file).catch(error => error.code)).toBe('ENOENT');
+    await expect(staleReview).toBeVisible(); await expect(staleReview).toHaveValue(fixture.selectedBytes);
+    const directoryBefore = await fs.stat(fixture.directory, { bigint: true });
+    if (authority === 'externally removed after observation') await fs.unlink(markerFile);
+    const beforeStale = await files(fixture.vault), priorStatus = await page.locator('#transcript-status').textContent();
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect.poll(() => page.locator('#transcript-status').textContent()).not.toBe(priorStatus);
+
+    // Save actual unexpected publication facts before any refusal or absence assertion.
+    const observed = [];
+    for (const file of fixture.selectedCopies) {
+      try {
+        const bytes = await fs.readFile(file);
+        observed.push({ file, bytes: bytes.length, sha256: require('node:crypto').createHash('sha256').update(bytes).digest('hex') });
+      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    const directoryAfter = await fs.stat(fixture.directory, { bigint: true });
+    const diagnostic = {
+      authority, id: fixture.intent.id, exportOperation: fixture.intent.operation,
+      directoryBefore: { dev: String(directoryBefore.dev), ino: String(directoryBefore.ino) },
+      directoryAfter: { dev: String(directoryAfter.dev), ino: String(directoryAfter.ino) },
+      status: await page.locator('#transcript-status').textContent(), unexpectedReappearances: observed
+    };
+    const evidence = testInfo.outputPath('transcript-stale-confirmation.json');
+    await fs.mkdir(path.dirname(evidence), { recursive: true }); await fs.writeFile(evidence, JSON.stringify(diagnostic, null, 2));
+    expect(diagnostic.directoryAfter).toEqual(diagnostic.directoryBefore);
+    expect(observed).toEqual([]);
+    await expect(page.locator('#transcript-status')).toContainText(/removed|removal/i);
+    expect(await files(fixture.vault)).toEqual(beforeStale);
+    if (authority === 'intact') expect(await fs.readFile(markerFile, 'utf8')).toBe(markerBytes);
+    else expect(await fs.stat(markerFile).catch(error => error.code)).toBe('ENOENT');
+    await expectProtocolIndependence(fixture);
+
+    const fresh = path.join(fixture.vault, 'Fresh explicit transcript.md');
+    await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: fresh }));
+    await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+    await expect(staleReview).toBeVisible();
+    const freshBytes = await staleReview.inputValue();
+    await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+    await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+    expect(await fs.readFile(fresh, 'utf8')).toBe(freshBytes);
+    const YAML = require('yaml'), metadata = YAML.parse(freshBytes.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+    expect(metadata.companion_id).not.toBe(fixture.intent.id);
+    for (const file of fixture.selectedCopies) expect(await fs.stat(file).catch(error => error.code)).toBe('ENOENT');
+    if (authority === 'intact') expect(await fs.readFile(markerFile, 'utf8')).toBe(markerBytes);
+    else expect(await fs.stat(markerFile).catch(error => error.code)).toBe('ENOENT');
+    await expectProtocolIndependence(fixture);
+  });
+}
 test.afterEach(async () => {
   if (app) await app.close(); app = null;
   await fs.rm(root, { recursive: true, force: true });
