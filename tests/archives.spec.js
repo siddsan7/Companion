@@ -994,6 +994,24 @@ test('archive preserves only inert Codex setup preferences and inherited hints w
     expect(await fs.readFile(targetSetup, 'utf8')).toBe(before.setup);
     const after = await archiveSafetyState();
     expect({ vault: after.vault, settings: after.settings, scopes: after.scopes, task: after.task, schedule: after.schedule, calls: after.calls }).toEqual({ vault: before.authority.vault, settings: before.authority.settings, scopes: before.authority.scopes, task: before.authority.task, schedule: before.authority.schedule, calls: before.authority.calls });
+    // The conversation is already equal. Re-importing one missing inert hint must stay independently reachable.
+    await fs.unlink(path.join(root, `archive-codex-hints-${exported.id}.json`));
+    await restore.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+    await expect(restore).toContainText('Integrity and version validated');
+    await restore.getByLabel('Archive vault to match', { exact: true }).selectOption(sourcePreferences.vault);
+    await restore.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+    await restore.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+    await expect(restore).toContainText('0 missing conversations');
+    await expect(restore).toContainText('1 equal');
+    await expect(restore).toContainText('1 inert settings records to preserve');
+    const preserveHint = restore.getByRole('button', { name: 'Restore reviewed additions', exact: true });
+    await expect(preserveHint).toBeEnabled();
+    expect(await archiveSafetyState()).toEqual(after);
+    await preserveHint.click();
+    await expect(restore).toContainText('Restored 0 conversations');
+    await expect(restore).toContainText('Preserved 1 inert settings records');
+    expect(await archiveSafetyState()).toEqual(after);
+    expect(await fs.readFile(targetSetup, 'utf8')).toBe(before.setup);
     await app.close(); app = null;
     app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
     await expect(page.locator('#timezone')).toContainText('America/Phoenix');
