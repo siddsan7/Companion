@@ -298,6 +298,8 @@ test('moved installation requires explicit validated vault matching and retains 
     await fs.cp(path.join(sourceRoot, 'vault'), path.join(root, 'vault'), { recursive: true });
     const before = { vault: await tree(path.join(root, 'vault')), settings: await fs.readFile(path.join(root, 'settings.json'), 'utf8') };
     app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await page.getByRole('button', { name: 'All captures', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Spaced retrieval revisits a learned chord.', exact: true })).toBeVisible();
     const matchedRegion = await inspectAndMatch();
     await expect(matchedRegion.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
