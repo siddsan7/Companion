@@ -10,6 +10,9 @@ The root agent ran the normal Electron UI with isolated persisted files and cont
 - The subsequent test tidy removed copied unused helpers, imports and optional setup branches. The scenario and acceptance assertions stayed the same.
 - GREEN: one case passed in 38.0 seconds (case: 37.6 seconds). It displayed the selected UUID and all three managed paths: note, intent and publication receipt. Raw preview and cancel preserved exact bytes. Confirmation removed those copies, preserved the other idea and source/history bytes, and restart did not recreate the removed note or pending proposal.
 - Worker syntax checks passed for `ideas-removal.js`, `ideas.js`, `ideas-view.js` and `preload.js`. The whitespace diff check passed.
+- Crash/Context RED: the next single case failed in 42.5 seconds after actual Electron `app.exit(77)` and restart. All selected copies remained behind the durable marker. The selected idea still appeared once in the manual Context options; zero was required. The other idea remained eligible. The root retained the actual 190-byte process/exit record under `companion-ticket13-idea-context-red-20261109`.
+- Crash/Context GREEN: the unchanged case passed in 39.7 seconds (case: 39.3 seconds). Before cleanup, the selected note still existed but was absent from manual Context options and discovery candidates; the other idea stayed eligible. Explicit recovery removed exactly the committed copies, retained a one-link permanent marker and preserved source/history and the other idea's bytes.
+- Syntax checks also passed for the focused `context.js` and `main.js` changes. Context uses the existing Ideas guard and removal fence through a production callback, including the shared store anchor. Direct Context callers have a raw marker check. Eligibility is checked again after asynchronous corpus reads, before returning eligible ideas.
 
 ## Approved authority protocol
 
@@ -23,7 +26,6 @@ Ideas guards retain each observed `.ideas` directory identity for the process li
 
 ## Remaining checks
 
-- Actual Electron exit after marker publication, then restart and explicit recovery of only the exact manifest.
-- Context discovery must exclude a committed removal while the note still exists before cleanup. Static review found that Context currently reads Ideas directly; a focused desktop RED and shared Ideas authority callback are still required.
 - Unknown orphan stages, changed scope, unknown hardlink peers and stale operation publication need focused regression evidence. Static review found that a selected-identity orphan stage without its own validated intent is not yet detected by the removal scope scan.
+- Pending-only proposals need their own explicit removal control and desktop evidence; the current visible removal action starts from saved-note rows.
 - Full ticket review, integration, release checks and live provider/isolation checks remain with the root agent. No live provider, authentication, merge or deployment was performed by this worker.
