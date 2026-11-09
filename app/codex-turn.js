@@ -71,7 +71,19 @@ async function runTurn(setup, text, { beforeStart = async () => {}, onState = as
       if (!['completed', 'interrupted', 'failed'].includes(params.turn.status)) { rejectContext('Codex did not report a terminal turn state. The reply is incomplete.'); return; }
       // Terminal snapshots can expose context even if its individual event was omitted.
       if (!Array.isArray(params.turn.items) || !['full', 'summary', 'notLoaded'].includes(params.turn.itemsView)) { rejectContext('Codex terminal items are unavailable. The reply is incomplete.'); return; }
-      for (const item of params.turn.items) if (!(params.turn.itemsView === 'full' ? acceptItem(item, true) : validateItem(item))) return;
+      if (params.turn.itemsView === 'full') {
+        const itemIds = new Set(), agentIds = [];
+        for (const item of params.turn.items) {
+          if (!validateItem(item)) return;
+          if (itemIds.has(item.id)) { rejectContext('Codex full terminal items repeat an identity. The reply is incomplete.'); return; }
+          itemIds.add(item.id); if (item.type === 'agentMessage') agentIds.push(item.id);
+        }
+        if ([...messages.keys()].some(id => !agentIds.includes(id))) { rejectContext('Codex turn interrupted: full terminal items omitted an observed assistant message. The retained text is incomplete.'); return; }
+        for (const item of params.turn.items) if (!acceptItem(item, true)) return;
+        const ordered = agentIds.map(id => messages.get(id));
+        messages.clear(); for (const message of ordered) messages.set(message.id, message);
+        preserveMessages();
+      } else for (const item of params.turn.items) if (!validateItem(item)) return;
       setup.settleTurn(params.turn.status);
     }
     if (method === 'error' && params.willRetry !== true) {
