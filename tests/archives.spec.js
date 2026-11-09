@@ -224,3 +224,100 @@ test('explicit keep current conflict resolution restores only missing history an
   expect({ vault: await tree(path.join(root, 'vault')), settings: await fs.readFile(path.join(root, 'settings.json'), 'utf8'), calls: await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8') }).toEqual(before);
   expect((await fs.readdir(historyDirectory)).filter(name => name.endsWith('.json')).sort()).toEqual([nameA, nameB].sort());
 });
+
+test('moved installation requires explicit validated vault matching and retains inactive cadence intent without startup catch-up', async () => {
+  test.setTimeout(150000);
+  const sourceRoot = root;
+  let targetRoot;
+  try {
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic MOVED_INSTALLATION_HISTORY 🎸.' }), 'utf8');
+    await launch();
+    await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture saved.');
+    const readme = path.join(root, 'README.md');
+    await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
+    await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]), 'utf8');
+    await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+    await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+    await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+    await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+    await page.getByLabel('Context question', { exact: true }).fill('How could retrieval help MyTune?');
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    await page.locator('#context-results article').filter({ hasText: 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('MOVED_INSTALLATION_HISTORY');
+    await expect(page.locator('#conversation-history article').last()).toContainText('completed');
+    await page.getByLabel('Include request in next context', { exact: true }).uncheck();
+    await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).first().click();
+    await page.getByLabel('Context question', { exact: true }).fill('What can MyTune support without the removed retrieval source?');
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.locator('#conversation-summary')).toContainText('Reviewed exclusion scope saved locally');
+    const [name] = (await fs.readdir(path.join(root, 'conversations'))).filter(name => name.endsWith('.json'));
+    const original = JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'));
+    expect(original.scope.excludedHistory).toContain(original.requests[0].id);
+    expect(original.scope.excludedSources).not.toEqual([]);
+    await page.getByLabel('Draft source folder', { exact: true }).fill(path.resolve('tests/fixtures/reel-draft'));
+    await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+    const destination = path.join(root, 'moved-installation-history.json');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination }), 'utf8');
+    await page.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Local history archive', exact: true })).toContainText('Archive exported');
+    const exported = JSON.parse(await fs.readFile(destination, 'utf8'));
+    expect(exported.payload.scheduleIntent).toMatchObject({ mode: 'enabled', reconnectRequired: true });
+    await app.close(); app = null;
+    targetRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-installation-')); root = targetRoot;
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-13T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: destination }), 'utf8');
+    await launch(); // An empty selected vault is deliberately the wrong destination.
+    const inspectAndMatch = async () => {
+      const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+      await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+      await expect(region).toContainText('Integrity and version validated');
+      await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+      await region.getByLabel('Archive vault to match', { exact: true }).selectOption(original.vault.root);
+      await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+      await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+      return region;
+    };
+    const wrongVault = await tree(path.join(root, 'vault'));
+    const wrongRegion = await inspectAndMatch();
+    await expect(wrongRegion).toContainText('Exact archived brief pin is unavailable in the selected vault');
+    await expect(wrongRegion.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+    expect(await tree(path.join(root, 'vault'))).toEqual(wrongVault);
+    expect((await fs.readdir(path.join(root, 'conversations'))).filter(name => name.endsWith('.json'))).toEqual([]);
+    await app.close(); app = null;
+    // A separately copied vault backup supplies notes and exact pins; the history archive supplies none of them.
+    await fs.cp(path.join(sourceRoot, 'vault'), path.join(root, 'vault'), { recursive: true });
+    const before = { vault: await tree(path.join(root, 'vault')), settings: await fs.readFile(path.join(root, 'settings.json'), 'utf8') };
+    app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+    await expect(page.getByRole('heading', { name: 'Spaced retrieval revisits a learned chord.', exact: true })).toBeVisible();
+    const matchedRegion = await inspectAndMatch();
+    await expect(matchedRegion.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
+    await matchedRegion.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+    await expect(matchedRegion).toContainText('Restored 1 conversation');
+    await expect(matchedRegion).toContainText('Imported daily intake intent is inactive');
+    const restored = JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'));
+    expect(restored.id).toBe(original.id); expect(restored.vault.root).toBe(path.join(root, 'vault', 'Companion'));
+    expect(restored.requests).toEqual(original.requests); expect(restored.brief).toEqual(original.brief); expect(restored.scope).toEqual(original.scope);
+    expect(restored.archiveBinding).toMatchObject({ archiveId: exported.id, originalManagedRoot: original.vault.root });
+    expect({ vault: await tree(path.join(root, 'vault')), settings: await fs.readFile(path.join(root, 'settings.json'), 'utf8') }).toEqual(before);
+    await app.close(); app = null;
+    app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+    await expect(page.locator('#conversation-history')).toContainText('MOVED_INSTALLATION_HISTORY');
+    await expect(page.getByRole('region', { name: 'Local history archive', exact: true })).toContainText('Imported daily intake intent is inactive');
+    expect({ vault: await tree(path.join(root, 'vault')), settings: await fs.readFile(path.join(root, 'settings.json'), 'utf8') }).toEqual(before);
+    for (const name of ['schedule.json', 'scheduler-task.json', 'conversation-submissions.jsonl']) expect(await fs.access(path.join(root, name)).then(() => true, () => false)).toBe(false);
+  } finally {
+    if (app) { await app.close(); app = null; }
+    if (targetRoot) await fs.rm(targetRoot, { recursive: true, force: true });
+    root = sourceRoot;
+  }
+});
