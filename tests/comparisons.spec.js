@@ -113,3 +113,43 @@ test('one reviewed comparison slot retains the authoritative final candidate and
   await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
+
+test('returned comparison settings mismatch consumes the failed slot before turn start without replay', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  // This external server control returns schema-valid observed metadata that
+  // disagrees with the reviewed settings. It is not a wire protocol extension.
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({
+    model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'low', serviceTier: 'default',
+    messages: [{ phase: 'final_answer', text: 'THIS_SYNTHETIC_REPLY_MUST_NEVER_BE_GENERATED' }]
+  }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  await expect(page.getByLabel('Reviewed comparison package', { exact: true })).toHaveValue(/final answer up to 600 words/);
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect(page.locator('#comparison-slots article').first()).toContainText('failed');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('settings changed or are unavailable');
+  await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
+  const saved = await savedComparison(), failed = saved.slots.filter(slot => slot.status === 'failed');
+  expect(failed).toHaveLength(1);
+  expect(failed[0].requested.reasoningEffort).toBe('medium');
+  expect(failed[0].effective.reasoningEffort).toBe('low');
+  expect(failed[0].reply).toBe('');
+  expect(failed[0].candidate.warning).toContain('unavailable or ambiguous');
+  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(5);
+  const requests = await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8');
+  expect(requests.trim().split('\n').map(line => JSON.parse(line)).filter(request => request.method === 'thread/start')).toHaveLength(1);
+  expect(requests.trim().split('\n').map(line => JSON.parse(line)).filter(request => request.method === 'turn/start')).toHaveLength(0);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('failed');
+  await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
+  expect(await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).toBe(requests);
+});
