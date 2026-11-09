@@ -1985,3 +1985,177 @@ test('explicit conversation deletion previews and cancels before removing only l
   for (const [file, text] of Object.entries(journals)) expect(await fs.readFile(path.join(vault, file), 'utf8')).toBe(text);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
+
+async function deletionFixture(label) {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `DELETE_RECOVERY_${label}: authored synthetic retained dialogue.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(`DELETE_RECOVERY_${label}`);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await page.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+  await page.getByLabel('Context question', { exact: true }).fill('Retain this explicit history exclusion through deletion recovery.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Retain this explicit history exclusion/);
+  const directory = path.join(root, 'conversations'), name = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name)), file = path.join(directory, name);
+  const text = await fs.readFile(file, 'utf8'), record = JSON.parse(text);
+  const captureDirectory = path.join(root, 'vault', 'Companion', 'Captures'), source = path.join(captureDirectory, (await fs.readdir(captureDirectory)).find(name => name.endsWith('.md')));
+  const independent = path.join(root, 'vault', 'Independent deletion writing.md');
+  await fs.writeFile(independent, '# Independent writing\n\nRetain these words after conversation removal.\n', 'utf8');
+  return { directory, name, file, text, record, source, sourceBytes: await fs.readFile(source, 'utf8'), independent, independentBytes: await fs.readFile(independent, 'utf8'), calls: await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8') };
+}
+
+for (const boundary of ['conversation-delete-after-tombstone', 'conversation-delete-after-unlink']) {
+  test(`conversation deletion guards recover explicitly after actual main exit at ${boundary}`, async ({}, testInfo) => {
+    test.setTimeout(120000);
+    const fixture = await deletionFixture(boundary);
+    await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+    await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(boundary);
+    const controlFile = path.join(fixture.directory, '.control', `${fixture.record.id}.json`), controlBytes = await fs.readFile(controlFile, 'utf8'), marker = JSON.parse(controlBytes);
+    expect(marker.phase).toBe('deleting');
+    expect(marker.scope.excludedHistory).toEqual(fixture.record.scope.excludedHistory);
+    expect(marker.targets).toEqual([expect.objectContaining({ name: fixture.name, sha256: require('node:crypto').createHash('sha256').update(fixture.text).digest('hex'), dev: expect.any(String), ino: expect.any(String) })]);
+    const child = app.process(), mainPid = await app.evaluate(() => process.pid), evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    evidence.wrapperExit = await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await testInfo.attach('deletion-crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+    app = null;
+    const existedBeforeRestart = await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    expect(existedBeforeRestart).toBe(boundary === 'conversation-delete-after-tombstone');
+    await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+    await launch(false); await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    const pending = page.getByRole('region', { name: 'Pending conversation deletions', exact: true });
+    await expect(pending).toContainText(fixture.record.id);
+    await expect(pending).toContainText(marker.generation);
+    expect(await fs.readFile(controlFile, 'utf8')).toBe(controlBytes);
+    expect(await fs.access(fixture.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(existedBeforeRestart);
+    if (existedBeforeRestart) expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+    expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+    expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+    await pending.getByRole('button', { name: 'Resume conversation deletion', exact: true }).click();
+    await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+    await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+    expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+    const completed = JSON.parse(await fs.readFile(controlFile, 'utf8'));
+    expect(completed.phase).toBe('deleted'); expect(completed.generation).toBe(marker.generation);
+    expect(completed.scope).toEqual(marker.scope); expect(completed.targets).toEqual(marker.targets);
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    await expect(page.getByRole('region', { name: 'Pending conversation deletions', exact: true }).getByRole('button', { name: 'Resume conversation deletion', exact: true })).toHaveCount(0);
+    expect(JSON.parse(await fs.readFile(controlFile, 'utf8'))).toEqual(completed);
+    expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes);
+    expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+  });
+}
+
+test('conversation deletion guards refuse an active request without removing its durable intent', async () => {
+  test.setTimeout(90000);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ holdCompletion: true, messages: [{ delta: 'ACTIVE_DELETE_GUARD_12', text: 'Completed authored synthetic reply after explicit release.', phase: 'final_answer' }] }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('ACTIVE_DELETE_GUARD_12');
+  const directory = path.join(root, 'conversations'), name = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const intent = await fs.readFile(path.join(directory, name), 'utf8'), calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText(/active|busy|finish/i);
+  expect(await fs.readFile(path.join(directory, name), 'utf8')).toBe(intent);
+  expect(await fs.stat(path.join(directory, '.control')).catch(error => error.code)).toBe('ENOENT');
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}', 'utf8');
+  await expect(page.locator('#conversation-history')).toContainText('Completed authored synthetic reply after explicit release.');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('conversation deletion guards retain the only unsaved overlay until it is explicitly preserved', async () => {
+  test.setTimeout(90000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  const before = await fs.readFile(savedFile, 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText(/unsaved|preserve/i);
+  await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+  await expect(page.locator('#conversation-error')).toContainText('may not survive restart');
+  expect(await fs.readFile(savedFile, 'utf8')).toBe(before);
+  expect(await fs.stat(path.join(root, 'conversations', '.control')).catch(error => error.code)).toBe('ENOENT');
+  await page.getByRole('button', { name: 'Save retained reply locally', exact: true }).click();
+  await expect(page.locator('#conversation-error')).not.toContainText('may not survive restart');
+  await expect.poll(async () => JSON.parse(await fs.readFile(savedFile, 'utf8')).requests[0].reply).toContain('LATEST_VISIBLE_REPLY_CANARY');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('conversation deletion guards inventory exact selected stages, preserve unknown writing and retain unrelated pending history', async () => {
+  test.setTimeout(120000);
+  const fixture = await deletionFixture('PENDING_INVENTORY');
+  const { randomUUID } = require('node:crypto');
+  const selectedStage = path.join(fixture.directory, `${randomUUID()}.pending`), selected = JSON.parse(fixture.text);
+  selected.requests[0].reply += '\nONLY_SELECTED_PENDING_VARIANT_12';
+  const selectedBytes = JSON.stringify(selected, null, 2); await fs.writeFile(selectedStage, selectedBytes, 'utf8');
+  const unknownStage = path.join(fixture.directory, `${randomUUID()}.pending`), damaged = JSON.parse(fixture.text);
+  damaged.requests[0].reply = 'UNKNOWN_PENDING_ONLY_COPY_12: preserve this damaged same-identity writing.';
+  damaged.requests[0].status = 'unknown-provider-authority'; damaged.requests[0].package.dependencies = null;
+  const unknownBytes = JSON.stringify(damaged, null, 2);
+  await fs.writeFile(unknownStage, unknownBytes, 'utf8');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText(/unknown pending|blocked|preserved/i);
+  expect(await fs.readFile(unknownStage, 'utf8')).toBe(unknownBytes); expect(await fs.readFile(selectedStage, 'utf8')).toBe(selectedBytes);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  expect(await fs.stat(path.join(fixture.directory, '.control')).catch(error => error.code)).toBe('ENOENT');
+  // The test owner separately removes its unknown fixture; the application must never infer permission.
+  await fs.unlink(unknownStage);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Independent unrelated conversation for pending ownership.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'UNRELATED_PENDING_HISTORY_12: authored synthetic separate writing.' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('UNRELATED_PENDING_HISTORY_12');
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const otherName = (await fs.readdir(fixture.directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name) && name !== fixture.name), otherFile = path.join(fixture.directory, otherName), otherBytes = await fs.readFile(otherFile, 'utf8');
+  const unrelatedStage = path.join(fixture.directory, `${randomUUID()}.pending`); await fs.writeFile(unrelatedStage, otherBytes, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(fixture.record.id);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  const review = page.getByRole('region', { name: 'Conversation deletion review', exact: true });
+  await expect(review).toBeVisible();
+  await expect(review).toContainText(path.basename(selectedStage));
+  await expect(review).not.toContainText(path.basename(unrelatedStage));
+  await expect(review.getByLabel(`Selected pending history ${path.basename(selectedStage)}`, { exact: true })).toHaveValue(selectedBytes);
+  await page.getByRole('button', { name: 'Cancel conversation deletion', exact: true }).click();
+  expect(await fs.readFile(selectedStage, 'utf8')).toBe(selectedBytes); expect(await fs.readFile(unrelatedStage, 'utf8')).toBe(otherBytes);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(fixture.text);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(review).toBeVisible();
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+  expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT'); expect(await fs.stat(selectedStage).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(unrelatedStage, 'utf8')).toBe(otherBytes); expect(await fs.readFile(otherFile, 'utf8')).toBe(otherBytes);
+  const marker = JSON.parse(await fs.readFile(path.join(fixture.directory, '.control', `${fixture.record.id}.json`), 'utf8'));
+  expect(marker.targets.map(target => target.name).sort()).toEqual([fixture.name, path.basename(selectedStage)].sort());
+  expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+});
+
+test('conversation deletion guards preserve an externally altered target after the durable tombstone', async () => {
+  test.setTimeout(90000);
+  const fixture = await deletionFixture('ALTERED_TARGET');
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-delete-after-tombstone' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('conversation-delete-after-tombstone');
+  const editorBytes = '# External independent editor writing\n\nCHANGED_DELETION_TARGET_12 must survive.\n';
+  await fs.writeFile(fixture.file, editorBytes, 'utf8');
+  await fs.writeFile(path.join(root, 'release.txt'), 'release changed target', 'utf8');
+  await expect(page.locator('#conversation-delete-status')).toContainText(/target changed|identity changed|preserve/i);
+  expect(await fs.readFile(fixture.file, 'utf8')).toBe(editorBytes);
+  const marker = JSON.parse(await fs.readFile(path.join(fixture.directory, '.control', `${fixture.record.id}.json`), 'utf8'));
+  expect(marker.phase).toBe('deleting');
+  expect(await fs.readFile(fixture.independent, 'utf8')).toBe(fixture.independentBytes); expect(await fs.readFile(fixture.source, 'utf8')).toBe(fixture.sourceBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
