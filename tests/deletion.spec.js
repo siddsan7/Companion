@@ -430,3 +430,69 @@ for (const boundary of ['capture-restoration-authorized', 'intake-ledger', 'capt
   expect(Object.keys(repeated.admissions)).toEqual([revision]);
   expect(repeated.attempts).toEqual(original.attempts);
 });
+
+async function importedCapture() {
+  await artifact('first', '1'); await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now' }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  return { base, ledgerFile, ledger, capture: ledger.captures['a'.repeat(64)] };
+}
+
+test('intake authority rejects an unknown hardlinked ledger before deletion preview', async () => {
+  const { ledgerFile } = await importedCapture();
+  const remove = page.getByRole('button', { name: 'Delete capture', exact: true }); await expect(remove).toBeVisible();
+  const before = await fs.readFile(ledgerFile), peer = path.join(root, 'external-ledger-peer.json');
+  await fs.link(ledgerFile, peer); expect((await fs.stat(ledgerFile)).nlink).toBe(2);
+  await remove.click();
+  await expect(page.getByRole('status')).toContainText('ordinary unlinked intake ledger');
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await fs.readFile(peer)).toEqual(before); expect(await fs.readFile(ledgerFile)).toEqual(before);
+});
+
+test('intake authority never overwrites an external ledger replacement after a confirmed unlink', async () => {
+  const { ledgerFile, capture } = await importedCapture();
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+  const confirm = page.getByRole('button', { name: 'Confirm capture deletion', exact: true, includeHidden: true }); await confirm.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('capture-deletion-unlinked');
+  await expect(confirm).toBeDisabled();
+  const prior = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), priorIdentity = await fs.stat(ledgerFile, { bigint: true });
+  expect(prior.sourceAuthority[capture.id].phase).toBe('deleting');
+  const foreign = { ...prior, suppressed: [...prior.suppressed, 'c'.repeat(64)] }, foreignBytes = JSON.stringify(foreign, null, 2), replacement = path.join(root, 'external-ledger-replacement.json');
+  await fs.writeFile(replacement, foreignBytes); await fs.rename(replacement, ledgerFile);
+  expect((await fs.stat(ledgerFile, { bigint: true })).ino).not.toBe(priorIdentity.ino);
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+  await expect(confirm).toBeEnabled();
+  expect(await fs.readFile(ledgerFile, 'utf8')).toBe(foreignBytes);
+  await expect(page.getByRole('status')).toContainText('ledger changed');
+  await fs.writeFile(path.join(root, 'faults.json'), '{}');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect.poll(async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8')).sourceAuthority[capture.id].phase).toBe('deleted');
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).suppressed).toContain('c'.repeat(64));
+});
+
+test('restoration cleanup preserves independent stage and journal names in a replaced intake parent', async () => {
+  test.setTimeout(90000);
+  const { base, ledgerFile, id } = await pauseSelectedRestoration('intake-ledger');
+  const committedBytes = await fs.readFile(ledgerFile, 'utf8'), committed = JSON.parse(committedBytes), revision = committed.sourceAuthority[id].restoration.revision;
+  const intake = path.join(base, '.intake'), original = intake + '.original';
+  await fs.rename(intake, original); await fs.mkdir(intake); await fs.writeFile(ledgerFile, committedBytes);
+  const names = [revision + '.stage', revision + '.snapshot.stage', 'transaction.json'];
+  for (const name of names) await fs.writeFile(path.join(intake, name), 'Independent replacement writing: ' + name);
+  await expect(page.getByRole('status')).toContainText('Restoring selected source');
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+  await expect(page.getByRole('status')).not.toContainText('Restoring selected source');
+  for (const name of names) {
+    expect(await fs.readFile(path.join(intake, name), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBe('Independent replacement writing: ' + name);
+    expect(await fs.access(path.join(original, name)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(true);
+  }
+  expect(await fs.readFile(ledgerFile, 'utf8')).toBe(committedBytes);
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).suppressed).toContain('a'.repeat(64));
+});
