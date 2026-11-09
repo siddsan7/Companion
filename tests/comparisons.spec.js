@@ -192,6 +192,54 @@ test('an active comparison poll cannot authorize overwriting an external history
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
 
+test('a missing comparison file keeps unsaved output visible until exact local storage recovery without generation', async () => {
+  test.setTimeout(60000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({
+    model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', holdCompletion: true,
+    messages: [{ phase: 'final_answer', text: 'MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT. Keep this full text without another turn.' }]
+  }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes('MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT'))).toBe(true);
+  const durable = await savedComparison(), file = path.join(root, 'comparisons', `${durable.id}.json`), retainedFile = path.join(root, 'last-durable-comparison.json');
+  await fs.rename(file, retainedFile);
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}', 'utf8');
+  await expect(page.locator('#comparison-notice')).toContainText('unsaved');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT');
+  const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  await page.reload();
+  await expect(page.locator('#comparison-notice')).toContainText('unsaved');
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT');
+  expect(await fs.access(file).then(() => 'exists', error => error.code)).toBe('ENOENT');
+  await page.getByRole('button', { name: 'Save retained comparison locally', exact: true }).click();
+  await expect(page.locator('#comparison-error')).toContainText(/changed|unavailable/);
+  expect(await fs.access(file).then(() => 'exists', error => error.code)).toBe('ENOENT');
+  // Restore the exact last durable file identity/content, then explicitly save
+  // the retained bytes. Neither repair step permits another model request.
+  await fs.rename(retainedFile, file);
+  await page.getByRole('button', { name: 'Save retained comparison locally', exact: true }).click();
+  await expect(page.locator('#comparison-notice')).not.toContainText('unsaved');
+  await expect(page.locator('#comparison-slots article').first()).toContainText('MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT');
+  const recovered = await savedComparison();
+  expect(recovered).not.toHaveProperty('storageWarning');
+  expect(recovered.slots.filter(slot => slot.status === 'interrupted')).toHaveLength(1);
+  expect(recovered.slots.filter(slot => slot.status === 'pending')).toHaveLength(5);
+  expect(recovered.slots.find(slot => slot.status === 'interrupted').reply).toContain('MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT');
+  await app.close(); app = null; await launch(false);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('MISSING_FILE_RETAINED_ACTUAL_SYNTHETIC_OUTPUT');
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+});
+
 test('independent blind aliases retain six validated ratings and reveal methods only after feedback', async () => {
   test.setTimeout(180000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
