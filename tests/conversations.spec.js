@@ -17,6 +17,7 @@ test.afterEach(async ({}, testInfo) => {
     manifest.visible = await page.evaluate(() => ({ timeline: window.__conversationDiagnostic || [], history: document.getElementById('conversation-history')?.textContent, error: document.getElementById('conversation-error')?.textContent, status: document.querySelector('[role="status"]')?.textContent })).catch(error => ({ unavailable: error.message }));
     const copy = async (name, target) => { try { await fs.copyFile(path.join(root, name), path.join(destination, target)); } catch (error) { if (error.code !== 'ENOENT') throw error; } };
     for (const name of ['conversation-provider.json', 'conversation-submissions.jsonl', 'conversation-release.json', 'codex-requests.jsonl', 'conversation-store-failures.jsonl', 'clock.json', 'faults.json', 'checkpoint.txt', 'release.txt']) await copy(name, name);
+    await copy(path.join('conversation-transport', 'readiness.json'), 'conversation-transport-readiness.json');
     await fs.mkdir(path.join(destination, 'conversations'));
     for (const name of await fs.readdir(path.join(root, 'conversations')).catch(() => [])) if (/^[a-f0-9-]{36}\.json$/.test(name)) await copy(path.join('conversations', name), path.join('conversations', name));
     await fs.writeFile(path.join(destination, 'observations.json'), JSON.stringify(manifest, null, 2));
@@ -578,3 +579,35 @@ test('persistent history storage recovery preserves a conflicting update from an
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   } finally { await otherApp.close(); }
 });
+
+for (const outcome of ['completed', 'failed', 'interrupted', 'late citation']) {
+  test(`conversation transport persists truthful terminal setup diagnostics: ${outcome}`, async () => {
+    test.setTimeout(60000);
+    const scenario = outcome === 'late citation' ? { messages: [
+      { text: 'Authored synthetic DIAGNOSTIC_SAFE_REPLY_CANARY.', phase: 'partial_answer' },
+      { text: 'DIAGNOSTIC_UNSELECTED_MEMORY_CANARY', phase: 'final_answer', citationAtCompletion: true, memoryCitation: { entries: [{ path: 'DIAGNOSTIC_UNSELECTED_PATH_CANARY.md', lineStart: 1, lineEnd: 1, note: 'Authored synthetic boundary finding' }], threadIds: ['diagnostic-unselected-thread'] } }
+    ] } : { reply: 'Authored synthetic DIAGNOSTIC_SAFE_REPLY_CANARY.', ...(outcome === 'failed' ? { turn: 'usage-limit' } : { turn: outcome }) };
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario));
+    await prepareConversation(); await observeConversation();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('DIAGNOSTIC_SAFE_REPLY_CANARY');
+    const files = await fs.readdir(path.join(root, 'conversations'));
+    const historyFile = path.join(root, 'conversations', files.find(name => name.endsWith('.json')));
+    const terminal = outcome === 'late citation' ? 'interrupted' : outcome;
+    await expect.poll(async () => JSON.parse(await fs.readFile(historyFile, 'utf8')).requests[0].status).toBe(terminal);
+    const reportFile = path.join(root, 'conversation-transport', 'readiness.json');
+    await expect.poll(async () => JSON.parse(await fs.readFile(reportFile, 'utf8')).status).toBe(terminal);
+    const reportText = await fs.readFile(reportFile, 'utf8'), report = JSON.parse(reportText);
+    expect(report.turns.at(-1).status).toBe(terminal);
+    expect(report.reply).toContain('DIAGNOSTIC_SAFE_REPLY_CANARY');
+    expect(reportText).not.toMatch(/DIAGNOSTIC_UNSELECTED_|userCode|fixture@example/);
+    expect(report.ready).toBe(false); expect(report.evidence).toBe('controlled-fixture-not-live');
+    const rpc = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    expect(rpc.filter(call => /account\/|command\/exec|config\/|skills\//.test(call.method))).toEqual([]);
+    const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    expect(calls.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#conversation-history')).toContainText('DIAGNOSTIC_SAFE_REPLY_CANARY');
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  });
+}

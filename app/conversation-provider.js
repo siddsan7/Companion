@@ -1,6 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { CodexRpc } = require('./codex-rpc');
+const { CodexSetup } = require('./codex');
 const { runTurn } = require('./codex-turn');
 const { audit } = require('./codex-isolation');
 const { samePath } = require('./codex-policy');
@@ -16,11 +16,12 @@ class ConversationProvider {
       await fs.access(path.join(this.testRoot, 'conversation-provider.json'));
       if (this.controlled?.rpc && !this.controlled.rpc.closed) return;
       const work = path.join(this.testRoot, 'conversation-empty-work'); await fs.mkdir(work, { recursive: true });
-      const rpc = new CodexRpc(process.execPath, [path.join(__dirname, '../tests/fixtures/codex/server.cjs'), this.testRoot], { cwd: work, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CODEX_HOME: work, COMPANION_CONVERSATION_FIXTURE: '1' } });
-      this.controlled = { rpc, work, state: {}, threads: new Set(), turnHistory: [], persist: async () => {} };
-      rpc.on('closed', () => this.controlled.settleTurn?.('interrupted'));
-      rpc.on('violation', reason => rpc.close(reason));
-      await rpc.request('initialize', { clientInfo: { name: 'companion-controlled-conversation', version: '0.1.0' } }); rpc.notify('initialized');
+      const controlled = new CodexSetup({ dataRoot: path.join(this.testRoot, 'conversation-transport'), testRoot: this.testRoot });
+      await controlled.loaded;
+      controlled.fixture = true; controlled.work = work; controlled.executable = process.execPath;
+      controlled.launch = { args: [path.join(__dirname, '../tests/fixtures/codex/server.cjs'), this.testRoot], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', CODEX_HOME: work, COMPANION_CONVERSATION_FIXTURE: '1' } };
+      this.controlled = controlled;
+      await controlled.startServer();
       return;
     }
     const state = this.setup.snapshot(), capacity = await this.getVerifiedCapacity();
@@ -39,6 +40,6 @@ class ConversationProvider {
     const latest = setup.turnHistory.at(-1);
     return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: null, usageEvidence: 'App Server did not provide usage through this supported transport.' };
   }
-  close() { this.controlled?.rpc.close(); }
+  close() { this.controlled?.close(); }
 }
 module.exports = { ConversationProvider };
