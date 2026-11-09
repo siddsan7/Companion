@@ -19,18 +19,19 @@
   recovery.after(restoreReview, restoration);
   restoreReview.onclick = () => action(async () => {
     const captures = await window.captureDeletion.suppressed(); restoration.replaceChildren(); restoration.hidden = false;
-    if (!captures.length) restoration.textContent = 'No deliberately deleted imported sources.';
+    if (!captures.length) restoration.textContent = 'No deliberately deleted sources.';
     for (const capture of captures) {
       const article = document.createElement('article'), title = document.createElement('h3'), label = document.createElement('label'), folder = document.createElement('input'), kindLabel = document.createElement('label'), kind = document.createElement('select'), preview = document.createElement('button'), details = document.createElement('div');
-      title.textContent = capture.title + ' · ' + capture.id; label.textContent = 'Selected producer artifact folder'; label.append(folder);
+      title.textContent = capture.title + ' · ' + capture.id; label.textContent = capture.manual ? 'Selected manual capture file' : 'Selected producer artifact folder'; label.append(folder);
       kindLabel.textContent = 'Selected producer artifact kind';
       for (const [value, text] of [['draft', 'Validated draft'], ['review', 'Finalized review']]) { const option = document.createElement('option'); option.value = value; option.textContent = text; kind.append(option); }
       kindLabel.append(kind); preview.textContent = 'Preview source restoration';
+      kindLabel.hidden = capture.manual;
       preview.onclick = () => action(async () => {
         details.replaceChildren();
-        const selected = await window.captureDeletion['restoration-preview']({ id: capture.id, folder: folder.value, kind: kind.value });
+        const selected = await window.captureDeletion['restoration-preview'](capture.manual ? { id: capture.id, file: folder.value } : { id: capture.id, folder: folder.value, kind: kind.value });
         const scope = document.createElement('p'), text = document.createElement('pre'), confirm = document.createElement('button');
-        scope.textContent = `Only this selected producer artifact will be restored as a fresh revision and source generation. Earlier unselected attempts remain deleted. Original producer acceptance stays unchanged. Independent writing keeps its original attribution. ${selected.identity} · ${selected.fingerprint} · ${selected.review}`;
+        scope.textContent = capture.manual ? 'Only this exact selected manual capture backup will be restored, with its original identity, capture instant and content checksum. A fresh source generation keeps earlier references unavailable.' : `Only this selected producer artifact will be restored as a fresh revision and source generation. Earlier unselected attempts remain deleted. Original producer acceptance stays unchanged. Independent writing keeps its original attribution. ${selected.identity} · ${selected.fingerprint} · ${selected.review}`;
         text.textContent = selected.text; confirm.textContent = 'Confirm source restoration';
         confirm.onclick = () => action(async () => { confirm.disabled = true; status('Restoring selected source...'); try { await window.captureDeletion['restoration-confirm']({ token: selected.token }); article.remove(); await refresh(); status('Source restored from the selected artifact. Earlier references remain unavailable.'); } finally { confirm.disabled = false; } });
         details.append(scope, text, confirm);

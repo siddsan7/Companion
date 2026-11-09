@@ -32,8 +32,10 @@ class CaptureDeletion {
     const intake = new Intake(vault), ledger = await intake.load(); validateAuthority(ledger);
     if (ledger.sourceAuthority?.[id] && ledger.sourceAuthority[id].phase !== 'active') throw Error('This capture already has a deletion operation.');
     const entry = Object.entries(ledger.captures).find(([, capture]) => capture.id === id);
-    if (!entry) throw Error('Choose an imported capture to delete.');
-    const [sourceHash, capture] = entry, notes = (await vault.scan()).filter(note => note.id === id);
+    const notes = (await vault.scan()).filter(note => note.id === id);
+    if (!entry && (notes.length !== 1 || !['thought', 'link'].includes(notes[0].type))) throw changed();
+    const manual = !entry ? { captureId: id, type: notes[0].type, capturedAt: notes[0].capturedAt, currentHash: hash(notes[0].content), file: path.basename(notes[0].file), relative: relative(vault, notes[0].file) } : undefined;
+    const [sourceHash, capture] = entry || [null, { id, title: notes[0].title, currentHash: manual.currentHash, revisions: [] }];
     if (notes.length !== 1 || hash(notes[0].content) !== capture.currentHash) throw changed();
     const targets = [await this.target(vault, notes[0].file, 'capture')], revisions = new Map();
     for (const revisionId of capture.revisions) {
@@ -50,7 +52,7 @@ class CaptureDeletion {
       const file = path.join(intake.dir, name), stat = await fs.lstat(file);
       if (!stat.isFile() || stat.isSymbolicLink()) throw changed();
       const text = await fs.readFile(file, 'utf8');
-      if (!text.includes(id) && !text.includes(sourceHash)) continue;
+      if (!text.includes(id) && !(sourceHash && text.includes(sourceHash))) continue;
       const note = parse(text);
       if (!note || note.id !== id || !new RegExp(`^${id}-[a-f0-9-]{36}\\.before(?:-[a-f0-9-]{36})?\\.md$`).test(name)) throw changed();
       const metadata = YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]), revision = revisions.get(metadata.source_revision);
@@ -68,7 +70,8 @@ class CaptureDeletion {
       }
     }
     const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
-    return { id, root: await fs.realpath(vault.vault), sourceHash, capture, targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations };
+    if (manual) await inspectManualPeers(vault, manual);
+    return { id, root: await fs.realpath(vault.vault), sourceHash, capture, ...(manual ? { manual } : {}), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations };
   }
   async preview(id) {
     const inventory = await this.inventory(id), token = randomUUID(); this.previews.set(token, inventory);
@@ -78,14 +81,20 @@ class CaptureDeletion {
   async suppressed() {
     const vault = this.getVault(); if (!vault) return [];
     const ledger = await new Intake(vault).load();
-    return Object.entries(ledger.sourceAuthority || {}).filter(([, authority]) => authority.phase === 'deleted').map(([id, authority]) => ({ id, title: ledger.captures[authority.sourceHash]?.title || id }));
+    return Object.entries(ledger.sourceAuthority || {}).filter(([, authority]) => authority.phase === 'deleted').map(([id, authority]) => ({ id, manual: !!authority.manual, title: ledger.captures[authority.sourceHash]?.title || id }));
   }
   async restorationInput(input) {
     const vault = this.getVault();
-    if (!vault || !uuid(input?.id) || typeof input.folder !== 'string' || !path.isAbsolute(input.folder) || !['draft', 'review'].includes(input.kind)) throw Error('Choose one complete producer artifact folder and its kind.');
+    if (!vault || !uuid(input?.id)) throw Error('Choose a deliberately deleted source.');
     const intake = new Intake(vault), ledger = await intake.load(), authority = ledger.sourceAuthority?.[input.id];
-    if (authority?.phase !== 'deleted' || !ledger.suppressed.includes(authority.sourceHash)) throw Error('Choose a deliberately deleted source.');
+    if (authority?.phase !== 'deleted' || !authority.manual && !ledger.suppressed.includes(authority.sourceHash)) throw Error('Choose a deliberately deleted source.');
     await guardRestorationParents(intake, authority);
+    if (authority.manual) {
+      const selected = await readManualSelection(input.file, authority.manual);
+      if ((await vault.scan()).some(note => note.id === input.id)) throw changed();
+      return { input: { id: input.id, file: input.file }, vault: vault.root, authority, selected, capture: { id: input.id, title: parse(selected.content).title }, draft: { text: selected.content, identity: input.id, fingerprint: selected.sha256, humanReview: 'user capture' } };
+    }
+    if (typeof input.folder !== 'string' || !path.isAbsolute(input.folder) || !['draft', 'review'].includes(input.kind)) throw Error('Choose one complete producer artifact folder and its kind.');
     const folder = await fs.lstat(input.folder, { bigint: true });
     if (!folder.isDirectory() || folder.isSymbolicLink()) throw Error('Choose an ordinary producer artifact folder.');
     const draft = await (input.kind === 'review' ? readReview(input.folder) : readDraft(input.folder));
@@ -106,6 +115,17 @@ class CaptureDeletion {
       const fresh = await this.restorationInput(selected.input);
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw Error('Selected restoration material changed. Preview it again.');
       const intake = new Intake(vault), ledger = await intake.load(), operationId = randomUUID(), generation = randomUUID(), revisionId = randomUUID(), now = this.clock().now;
+      if (selected.authority.manual) {
+        const journal = `restoration-${operationId}.json`, value = { schema: 1, id: selected.input.id, operationId, generation, content: selected.selected.content }, bytes = JSON.stringify(value);
+        await guardRestorationParents(intake, selected.authority);
+        await intake.publishJournal(path.join(intake.dir, journal), value);
+        await guardRestorationParents(intake, selected.authority);
+        const { history, ...prior } = selected.authority;
+        ledger.sourceAuthority[selected.input.id] = { ...selected.authority, phase: 'restoring', operationId, generation, history: [...(history || []), prior], restoration: { journal, revision: null, sha256: hash(bytes) } };
+        await intake.save(ledger); this.restorations.delete(token); this.clearApprovals();
+        await vault.checkpoint('capture-restoration-authorized');
+        await finishRestoration(intake, ledger, selected.input.id); return true;
+      }
       const revision = { schema: 1, id: revisionId, captureId: selected.input.id, importedAt: now, ...selected.draft };
       const capture = { id: selected.capture.id, file: selected.capture.file, ...(selected.capture.relative ? { relative: selected.capture.relative } : {}), capturedAt: selected.capture.capturedAt, title: selected.capture.title, currentRevision: revisionId, currentHash: '', reviewed: !!revision.review, rejected: revision.humanReview === 'reject', supportEligible: revision.supportEligible !== false, revisions: [revisionId], updatedAt: now };
       const content = noteText(capture, revision); capture.currentHash = hash(content);
@@ -153,9 +173,8 @@ class CaptureDeletion {
         if (JSON.stringify(await this.inventory(selected.id)) !== JSON.stringify(selected)) throw changed();
         const intake = new Intake(vault), ledger = await intake.load();
         ledger.sourceAuthority ||= {};
-        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId: randomUUID(), sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}) };
-        ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])];
-        ledger.captures[fresh.sourceHash].removed = true;
+        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId: randomUUID(), sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual } : {}), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}) };
+        if (!fresh.manual) { ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])]; ledger.captures[fresh.sourceHash].removed = true; }
         await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
         await vault.checkpoint('capture-deletion-authorized');
         await finishDeletion(intake, ledger, selected.id);
@@ -163,6 +182,44 @@ class CaptureDeletion {
       return true;
     }));
   }
+}
+async function inspectManualPeers(vault, manual) {
+  // Adjacent recovery records are deliberately held until their separate
+  // source/writing inventory is reviewed. They cannot hide behind completion.
+  const visit = async directory => {
+    await vault.contained(directory);
+    for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+      if (['.intake', '.git', '.obsidian', '.codex', 'managed-home'].includes(entry.name)) continue;
+      const file = path.join(directory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
+      else if (entry.isFile() && /(?:\.md\.pending|\.md\.title-transaction\.json|\.md\.before-title-[a-f0-9-]+\.bak)$/.test(entry.name)) {
+        const text = await fs.readFile(file, 'utf8');
+        if (text.includes(manual.captureId)) throw changed();
+      }
+    }
+  };
+  await visit(vault.vault);
+}
+async function readManualSelection(file, manual) {
+  if (typeof file !== 'string' || !path.isAbsolute(file) || !file.endsWith('.md') || file.split(/[\\/]/).some(part => ['.codex', 'managed-home'].includes(part.toLowerCase()))) throw Error('Choose an ordinary explicitly selected manual capture Markdown backup.');
+  const directories = [];
+  for (let directory = path.dirname(file);;) {
+    const stat = await fs.lstat(directory, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw changed();
+    directories.push({ file: directory, dev: String(stat.dev), ino: String(stat.ino) });
+    const parent = path.dirname(directory); if (parent === directory) break; directory = parent;
+  }
+  const before = await fs.lstat(file, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1n) throw changed();
+  const bytes = await fs.readFile(file), after = await fs.lstat(file, { bigint: true });
+  if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || after.nlink !== 1n || bytes.length !== Number(after.size)) throw changed();
+  for (const item of directories) {
+    const stat = await fs.lstat(item.file, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink() || String(stat.dev) !== item.dev || String(stat.ino) !== item.ino) throw changed();
+  }
+  const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes), note = parse(content);
+  if (!note || note.id !== manual.captureId || note.type !== manual.type || note.capturedAt !== manual.capturedAt || hash(bytes) !== manual.currentHash) throw Error('The selected backup does not match the deleted manual capture identity, instant and exact content.');
+  return { content, sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), directories };
 }
 async function inspectDeletion(intake, ledger, id) {
   validateAuthority(ledger);
@@ -181,7 +238,8 @@ async function inspectDeletion(intake, ledger, id) {
   if (new Set(authority.directories.map(item => item.file)).size !== authority.directories.length || authority.directories.length !== requiredDirectories.size || authority.directories.some(item => !requiredDirectories.has(item.file))) throw changed();
   for (const directory of authority.directories) if (JSON.stringify(await deletion.directory(vault, path.join(vault.vault, directory.file))) !== JSON.stringify(directory)) throw changed();
   const capture = ledger.captures[authority.sourceHash];
-  if (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash)) throw changed();
+  if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
+  if (authority.manual) await inspectManualPeers(vault, authority.manual);
   const knownPaths = new Set(authority.targets.map(target => target.file));
   for (const note of (await vault.scan()).filter(note => note.id === id)) if (!knownPaths.has(relative(vault, note.file))) throw changed();
   for (const folder of [intake.dir, path.join(vault.root, 'Revisions')]) for (const name of await fs.readdir(folder)) {
@@ -189,7 +247,7 @@ async function inspectDeletion(intake, ledger, id) {
     const file = path.join(folder, name), info = await fs.lstat(file);
     if (!info.isFile() || info.isSymbolicLink()) throw changed();
     const text = await fs.readFile(file, 'utf8');
-    if ((text.includes(id) || text.includes(authority.sourceHash)) && !knownPaths.has(relative(vault, file))) throw changed();
+    if ((text.includes(id) || authority.sourceHash && text.includes(authority.sourceHash)) && !knownPaths.has(relative(vault, file))) throw changed();
   }
   // Validate the entire remaining manifest before the first unlink, and each file again at unlink.
   const remaining = [];
@@ -198,7 +256,10 @@ async function inspectDeletion(intake, ledger, id) {
     try {
       if (JSON.stringify(await deletion.target(vault, file, target.kind)) !== JSON.stringify(target)) throw changed();
       const text = await fs.readFile(file, 'utf8');
-      if (target.kind === 'snapshot') {
+      if (authority.manual) {
+        const note = parse(text), manual = authority.manual;
+        if (target.kind !== 'capture' || target.file !== manual.relative || target.sha256 !== manual.currentHash || !note || note.id !== id || note.type !== manual.type || note.capturedAt !== manual.capturedAt) throw changed();
+      } else if (target.kind === 'snapshot') {
         const revision = JSON.parse(text), known = revisionAdmission(ledger, revision.id);
         if (!uuid(revision.id) || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || !capture.revisions.includes(revision.id) || !known || known.captureId !== id || known.sourceHash !== authority.sourceHash || known.snapshotHash !== target.sha256 || file !== path.join(vault.root, 'Revisions', revision.id + '.json')) throw changed();
       } else {
@@ -239,6 +300,7 @@ async function finishRestoration(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], vault = intake.vault;
   if (authority?.phase !== 'restoring') return;
   await guardRestorationParents(intake, authority);
+  if (authority.manual) return finishManualRestoration(intake, ledger, id);
   if (!ledger.suppressed.includes(authority.sourceHash)) throw Error('Restoration authority changed. Suppression remains.');
   const journal = path.join(intake.dir, authority.restoration.journal), transaction = path.join(intake.dir, 'transaction.json');
   if (!authority.restoration.published && ledger.admissions?.[authority.restoration.revision]) {
@@ -289,6 +351,45 @@ async function finishRestoration(intake, ledger, id) {
   authority.phase = 'active'; delete authority.restoration;
   ledger.suppressed = ledger.suppressed.filter(item => item !== authority.sourceHash);
   await intake.save(ledger);
+}
+async function finishManualRestoration(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id], vault = intake.vault, restoration = authority.restoration;
+  const journal = path.join(intake.dir, restoration.journal), stage = path.join(intake.dir, `manual-${authority.operationId}.stage`), destination = path.join(vault.vault, authority.manual.relative);
+  const verify = async (peers = []) => {
+    await guardRestorationParents(intake, authority);
+    const info = await intake.ownedFile(destination, peers, 'Manual restoration capture');
+    if (!info || hash(await fs.readFile(destination)) !== authority.manual.currentHash) throw Error('Manual restoration publication is missing or changed. Old source authority remains unavailable.');
+    if (restoration.publication && (String(info.dev) !== restoration.publication.dev || String(info.ino) !== restoration.publication.ino || String(info.size) !== restoration.publication.bytes)) throw changed();
+    return info;
+  };
+  if (!restoration.published) {
+    if (!await intake.ownedFile(journal, [], 'Selected manual restoration journal')) throw changed();
+    const bytes = await fs.readFile(journal, 'utf8'); if (hash(bytes) !== restoration.sha256) throw changed();
+    const value = JSON.parse(bytes), note = parse(value.content || '');
+    if (Object.keys(value).sort().join(',') !== 'content,generation,id,operationId,schema' || value.schema !== 1 || value.id !== id || value.operationId !== authority.operationId || value.generation !== authority.generation || !note || note.id !== id || note.type !== authority.manual.type || note.capturedAt !== authority.manual.capturedAt || hash(value.content) !== authority.manual.currentHash) throw changed();
+    const existingStage = await intake.ownedFile(stage, destination, 'Manual restoration stage');
+    if (existingStage && hash(await fs.readFile(stage)) !== authority.manual.currentHash) throw changed();
+    if (!existingStage) await fs.writeFile(stage, value.content, { flag: 'wx', flush: true });
+    await guardRestorationParents(intake, authority);
+    try { await fs.link(stage, destination); } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const output = await intake.ownedFile(destination, stage, 'Manual restoration existing output'), peer = await intake.ownedFile(stage, destination, 'Manual restoration existing stage');
+      if (!output || !peer || output.nlink !== 2n || output.dev !== peer.dev || output.ino !== peer.ino) throw Error('Another file occupies the manual restoration destination. It was preserved.');
+    }
+    const info = await verify([stage]);
+    // This durable receipt marks completed publication. Recovery afterwards
+    // verifies existing output and never recreates an externally removed file.
+    restoration.published = true; restoration.publication = { dev: String(info.dev), ino: String(info.ino), bytes: String(info.size) };
+    await intake.save(ledger); await vault.checkpoint('capture-restoration-admitted');
+  }
+  await verify([stage]);
+  for (const [file, peers, expected] of [[stage, [destination], authority.manual.currentHash], [journal, [], restoration.sha256]]) {
+    await guardRestorationParents(intake, authority);
+    const info = await intake.ownedFile(file, peers, 'Manual restoration cleanup');
+    if (info) { if (hash(await fs.readFile(file)) !== expected) throw changed(); await fs.unlink(file); }
+  }
+  await verify(); await vault.checkpoint('capture-restoration-published'); await verify();
+  authority.phase = 'active'; delete authority.restoration; await intake.save(ledger);
 }
 async function guardRestorationParents(intake, authority) {
   const vault = intake.vault, deletion = new CaptureDeletion({ getVault: () => vault });
