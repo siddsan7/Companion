@@ -130,12 +130,13 @@ class Archives {
     };
     const read = await this.json(file, guard, false, true), archive = archiveRecord(read.value);
     const current = await this.snapshot(), plan = this.restorePlan(archive, current), id = randomUUID();
-    this.restoreReview = { id, archive, inspection: current };
+    this.restoreReview = { id, archive, inspection: current, input: { file, guard, digest: read.digest } };
     return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null };
   }
   async match(input) {
     const reviewed = this.restoreReview;
     if (!reviewed || reviewed.id !== input?.id || input.matched !== true) throw Error('Inspect the archive and explicitly match its vault first.');
+    await this.revalidateInspectedFile(reviewed);
     const vault = this.history.getVault(), root = vault?.root;
     const sourceRoot = input.sourceRoot || root;
     if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === sourceRoot)) throw Error('Choose an archived vault and explicitly match the current vault; nothing was restored.');
@@ -156,6 +157,7 @@ class Archives {
     if (!reviewed?.matched || input?.token !== reviewed.matched.token) throw Error('Preview the matched restore again before confirming additions.');
     const matched = reviewed.matched;
     return this.history.lock(async () => {
+      await this.revalidateInspectedFile(reviewed);
       const current = await this.snapshot({ locked: true });
       if (this.history.getVault()?.root !== matched.root || canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
       await this.validatePins(reviewed.archive, matched.sourceRoot, this.history.getVault());
@@ -177,6 +179,15 @@ class Archives {
       } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing conversations were preserved. ${noteFiles.length ? 'Reviewed note settings may have been published; inspect the current inclusions before retrying. ' : ''}Inspect again to review remaining additions; no automatic retry occurs.`); }
       return { restored, restoredNotes, equal: plan.equal.length, inactiveIntents: (await this.inactiveIntents()).length };
     });
+  }
+  async revalidateInspectedFile(reviewed) {
+    try {
+      const current = await this.json(reviewed.input.file, reviewed.input.guard, false, true);
+      if (current.digest !== reviewed.input.digest) throw Error('Changed archive bytes.');
+    } catch {
+      this.restoreReview = null;
+      throw Error('Archive file changed since inspection or is no longer an ordinary available file. Inspect the current file again; nothing was restored.');
+    }
   }
   async noteSnapshot(file, vault) {
     const base = path.resolve(vault.vault), relative = path.relative(base, file);
