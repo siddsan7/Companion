@@ -381,6 +381,8 @@ function installConversations({ ipcMain, ...options }) {
   ipcMain.handle('conversation-delete-preview', (_, input) => store.controls.preview(input?.id));
   ipcMain.handle('conversation-delete-cancel', (_, input) => store.controls.cancel(input?.token));
   ipcMain.handle('conversation-delete-confirm', (_, input) => store.controls.confirm(input?.token));
+  ipcMain.handle('conversation-delete-pending', () => store.controls.pending());
+  ipcMain.handle('conversation-delete-resume', (_, input) => store.controls.resume(input?.id));
   return store;
 }
 module.exports = { Conversations, installConversations };

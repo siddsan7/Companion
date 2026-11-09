@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
+const { conversation } = require('./archive-format');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -117,7 +118,8 @@ class ConversationControls {
       if (!/^[a-f0-9-]{36}\.pending$/.test(name) || !uuid(name.slice(0, -8))) throw Error('Unknown pending history requires separate inspection before deletion.');
       const staged = await this.file(path.join(this.store.directory, name), parent);
       let candidate; try { candidate = JSON.parse(staged.text); } catch { throw Error('Unknown pending history remains preserved; deletion is blocked.'); }
-      if (candidate.schema !== 1 || !uuid(candidate.id) || !Array.isArray(candidate.requests) || typeof candidate.vault?.root !== 'string') throw Error('Unknown pending history remains preserved; deletion is blocked.');
+      try { conversation(candidate); }
+      catch { throw Error('Unknown or damaged pending history remains preserved; deletion is blocked.'); }
       if (candidate.id === id) {
         if (candidate.vault.root !== record.vault.root) throw Error('Pending history ownership is ambiguous. Preserve it before deletion.');
         targets.push(staged.owned); pending.push({ name, text: staged.text });
@@ -134,24 +136,102 @@ class ConversationControls {
     });
   }
   cancel(token) { this.previews.delete(token); }
+  async recoverySnapshot(id) {
+    const marker = await this.state(id);
+    if (!marker || marker.phase !== 'deleting') throw Error('There is no interrupted deletion to resume for this identity.');
+    if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve unsaved writing or finish the active request before deletion recovery.');
+    const parent = this.store.safeDirectory(), remaining = [];
+    for (const target of marker.targets) {
+      try { await this.file(path.join(this.store.directory, target.name), parent, target); remaining.push(target.name); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    // Newly arrived or damaged stages were never covered by the retained deletion consent.
+    for (const name of await fs.readdir(this.store.directory)) if (name.endsWith('.pending')) {
+      if (!/^[a-f0-9-]{36}\.pending$/.test(name) || !uuid(name.slice(0, -8))) throw Error('Unknown pending history remains preserved; deletion recovery is blocked.');
+      const staged = await this.file(path.join(this.store.directory, name), parent);
+      let candidate;
+      try { candidate = conversation(JSON.parse(staged.text)); }
+      catch { throw Error('Unknown or damaged pending history remains preserved; deletion recovery is blocked.'); }
+      if (candidate.id === id && (!marker.targets.some(target => target.name === name) || candidate.vault.root !== this.store.getVault()?.root)) throw Error('New or ambiguous pending history remains preserved. It was not part of the confirmed deletion manifest.');
+    }
+    return { recovery: true, id, marker, remaining };
+  }
+  async pending() {
+    const records = [], issues = []; let directory;
+    try { directory = this.guard(); if (!directory) return { records, issues }; }
+    catch (error) { return { records, issues: [error.message] }; }
+    for (const name of await fs.readdir(directory.directory)) {
+      if (!/^[a-f0-9-]{36}\.json$/.test(name)) {
+        if (!/^[a-f0-9-]{36}\.pending$/.test(name)) issues.push(`Unknown conversation control ${name} remains preserved; recovery requires review.`);
+        else try {
+          const stat = await fs.lstat(path.join(directory.directory, name));
+          if (![1, 2].includes(stat.nlink)) throw Error('Unknown control stage peers remain preserved.');
+          const staged = await this.file(path.join(directory.directory, name), directory, null, stat.nlink, true), value = JSON.parse(staged.text);
+          this.validate(value, value.id);
+          if (name !== `${value.publication}.pending`) throw Error('Unknown control stage identity remains preserved.');
+          const published = await this.state(value.id);
+          if (!published || published.publication !== value.publication) issues.push(`Uncommitted control stage ${name} remains preserved for explicit control repair. It is not deletion or restoration consent.`);
+        } catch (error) { issues.push(`${name}: ${error.message}`); }
+        continue;
+      }
+      const id = name.slice(0, -5); let marker;
+      try {
+        marker = await this.state(id);
+        if (marker.phase === 'deleting') {
+          const snapshot = await this.recoverySnapshot(id);
+          records.push({ id, generation: marker.generation, targets: marker.targets.map(target => target.name), remaining: snapshot.remaining, canResume: true, warning: 'Previously confirmed deletion is incomplete. Inspect the exact retained manifest and resume explicitly. Nothing is removed during inspection.' });
+        } else if (marker.phase === 'restoring') records.push({ id, generation: marker.generation, targets: [], canResume: false, warning: 'Explicit archive restoration is incomplete. Its own reviewed recovery is required; deletion recovery cannot promote it.' });
+      } catch (error) { records.push({ id, generation: marker?.generation || 'unavailable', targets: marker?.targets?.map(target => target.name) || [], canResume: false, warning: error.message }); }
+    }
+    return { records, issues };
+  }
+  async resume(id) {
+    return this.store.lock(async () => {
+      const snapshot = await this.recoverySnapshot(id), token = randomUUID();
+      if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
+      this.previews.set(token, snapshot);
+      return { token, id, generation: snapshot.marker.generation, requestCount: null, targets: snapshot.marker.targets.map(target => target.name), pending: [], recovery: true };
+    });
+  }
+  async settlePublication(marker) {
+    const directory = this.guard(), file = path.join(directory.directory, `${marker.id}.json`), stat = await fs.lstat(file);
+    if (stat.nlink === 1) return;
+    if (stat.nlink !== 2) throw Error('Conversation control has unknown linked peers. Preserve them before recovery.');
+    const stage = path.join(directory.directory, `${marker.publication}.pending`);
+    const a = await this.file(file, directory, null, 2, true), b = await this.file(stage, directory, null, 2, true);
+    if (!same(a.stat, b.stat) || a.text !== b.text || JSON.stringify(JSON.parse(a.text)) !== JSON.stringify(marker)) throw Error('Conversation control publication changed. Unknown peers remain preserved.');
+    this.guard(false, directory.stat); await fs.unlink(stage);
+  }
+  async finish(marker) {
+    await this.settlePublication(marker);
+    this.store.tokens.clear(); this.store.durable.delete(marker.id);
+    await this.store.checkpoint('conversation-delete-after-tombstone');
+    const current = await this.recoverySnapshot(marker.id), parent = this.store.safeDirectory();
+    if (JSON.stringify(current.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion authority changed. Preserve remaining writing.');
+    for (const target of marker.targets) if (current.remaining.includes(target.name)) {
+      const file = path.join(this.store.directory, target.name);
+      await this.file(file, parent, target); this.store.safeDirectory(false, parent); await fs.unlink(file);
+      await this.store.checkpoint('conversation-delete-after-unlink');
+    }
+    // Verify no unknown or changed target appeared while completing the exact manifest.
+    const after = await this.recoverySnapshot(marker.id);
+    if (after.remaining.length || JSON.stringify(after.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion targets or authority changed. Recovery remains blocked.');
+    const completed = await this.put({ ...marker, phase: 'deleted' }, marker);
+    this.store.unsaved.delete(marker.id); return { id: marker.id, generation: completed.generation };
+  }
   async confirm(token) {
     const reviewed = this.previews.get(token); if (!reviewed) throw Error('Preview the selected conversation deletion again.');
     return this.store.lock(async () => {
+      if (reviewed.recovery) {
+        const current = await this.recoverySnapshot(reviewed.id);
+        if (JSON.stringify(current) !== JSON.stringify(reviewed)) throw Error('Deletion recovery manifest changed. Inspect it again; remaining writing was preserved.');
+        const result = await this.finish(current.marker); this.previews.delete(token); return result;
+      }
       const current = await this.inventory(reviewed.id);
       if (JSON.stringify(current) !== JSON.stringify(reviewed)) throw Error('Conversation or pending ownership changed. Preview deletion again; writing was preserved.');
       const scope = current.record.scope || { excludedSources: [], excludedHistory: current.record.requests.at(-1)?.package?.excludedHistory || [] };
-      let marker = await this.put({ schema: 1, id: current.id, generation: randomUUID(), phase: 'deleting', scope: { excludedSources: [...scope.excludedSources], excludedHistory: [...scope.excludedHistory] }, targets: current.targets }, current.marker);
-      this.store.tokens.clear(); this.store.durable.delete(current.id);
-      await this.store.checkpoint('conversation-delete-after-tombstone');
-      const parent = this.store.safeDirectory();
-      for (const target of marker.targets) {
-        const file = path.join(this.store.directory, target.name);
-        await this.file(file, parent, target); this.store.safeDirectory(false, parent); await fs.unlink(file);
-        await this.store.checkpoint('conversation-delete-after-unlink');
-      }
-      marker = await this.put({ ...marker, phase: 'deleted' }, marker);
-      this.store.unsaved.delete(current.id); this.previews.delete(token);
-      return { id: current.id, generation: marker.generation };
+      const marker = await this.put({ schema: 1, id: current.id, generation: randomUUID(), phase: 'deleting', scope: { excludedSources: [...scope.excludedSources], excludedHistory: [...scope.excludedHistory] }, targets: current.targets }, current.marker);
+      const result = await this.finish(marker); this.previews.delete(token); return result;
     });
   }
 }
