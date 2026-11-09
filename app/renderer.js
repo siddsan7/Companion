@@ -36,7 +36,7 @@ for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'pa
   finally { try { await refresh(); } finally { scheduleControls.forEach(control => { control.disabled = false; }); } }
 });
 $('choose').onclick = () => action(async () => { selectedVault = await window.companion['choose-vault'](); $('vault').textContent = selectedVault || 'Selection cancelled.'; });
-$('configure').onclick = () => action(async () => { await window.companion.configure({ vault: selectedVault, parent: $('parent').value }); await refresh(); status('Vault ready.'); });
+$('configure').onclick = () => action(async () => { try { await window.companion.configure({ vault: selectedVault, parent: $('parent').value }); await refresh(); status('Vault ready.'); } finally { window.dispatchEvent(new Event('companion-vault-configured')); } });
 $('add-excerpt').onclick = () => { $('excerpt-label').hidden = false; $('excerpt').focus(); };
 $('save').onclick = () => action(async () => { await window.companion.capture({ text: $('text').value, excerpt: $('excerpt').value }); $('text').value = ''; $('excerpt').value = ''; await refresh(); status('Capture saved.'); });
 $('today').onclick = () => action(async () => { view = 'today'; await refresh(); });
