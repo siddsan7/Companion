@@ -434,3 +434,37 @@ test('full terminal item order includes an earlier assistant item whose individu
   await expect(page.locator('#conversation-history')).toContainText('STREAMED_LATER_CANARY');
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
 });
+
+for (const boundary of ['memory citation', 'terminal-only command', 'unconfirmed assistant completion']) {
+  test(`protocol boundary preserves safe incomplete text without replay: ${boundary}`, async () => {
+    test.setTimeout(60000);
+    const scenario = { messages: [{ text: 'Authored synthetic SAFE_BOUNDARY_PARTIAL_CANARY.', phase: 'partial_answer' }] };
+    if (boundary === 'memory citation') scenario.messages.push({ text: 'UNSELECTED_MEMORY_CONTENT_CANARY', phase: 'final_answer', memoryCitation: { entries: [{ path: 'UNSELECTED_MEMORY_PATH_CANARY.md', lineStart: 1, lineEnd: 1, note: 'UNSELECTED_MEMORY_METADATA_CANARY' }], threadIds: ['UNSELECTED_HIDDEN_THREAD_CANARY'] } });
+    if (boundary === 'terminal-only command') scenario.terminalCommand = true;
+    if (boundary === 'unconfirmed assistant completion') { scenario.messages[0].omitCompletedEvent = true; scenario.terminalView = 'notLoaded'; }
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario));
+    await prepareConversation(); await observeConversation();
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-history')).toContainText('SAFE_BOUNDARY_PARTIAL_CANARY');
+    const files = await fs.readdir(path.join(root, 'conversations'));
+    const savedFile = path.join(root, 'conversations', files.find(name => name.endsWith('.json')));
+    await expect.poll(async () => JSON.parse(await fs.readFile(savedFile, 'utf8')).requests[0].status).toMatch(/^(completed|failed|interrupted)$/);
+    const savedText = await fs.readFile(savedFile, 'utf8'), saved = JSON.parse(savedText);
+    expect(['failed', 'interrupted']).toContain(saved.requests[0].status);
+    await expect(page.locator('#conversation-history')).toContainText('incomplete');
+    if (boundary !== 'unconfirmed assistant completion') await expect(page.locator('#conversation-history')).toContainText(/unselected memory|unselected tool/i);
+    expect(savedText).not.toMatch(/UNSELECTED_MEMORY_|UNSELECTED_HIDDEN_THREAD_|UNSELECTED_COMMAND_CONTENT_CANARY/);
+    expect(saved.requests[0].reply).toContain('SAFE_BOUNDARY_PARTIAL_CANARY');
+    const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    expect(calls.trim().split('\n').filter(Boolean)).toHaveLength(1);
+    const rpc = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    expect(rpc.filter(call => /command\/exec|login/.test(call.method))).toEqual([]);
+    await page.getByLabel('Thought or link', { exact: true }).fill('Capture remains available after a protocol boundary failure.');
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture saved.');
+    await app.close(); app = null; await launch(false);
+    await expect(page.locator('#conversation-history')).toContainText('SAFE_BOUNDARY_PARTIAL_CANARY');
+    await expect(page.locator('#conversation-history')).toContainText('incomplete');
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  });
+}

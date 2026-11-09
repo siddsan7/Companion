@@ -18,8 +18,8 @@ const send = message => {
   }).catch(() => process.exit(24));
 };
 const notify = (method, params) => send({ method, params });
-const agentItem = (id, text, phase) => ({ type: 'agentMessage', id, text, phase, memoryCitation: null, delivery: null, questions: null });
-const turn = (status, items = []) => ({ id: active.turnId, rootTurnId: null, items, itemsView: 'full', status, error: null, startedAt: 1794139200, completedAt: status === 'inProgress' ? null : 1794139200, durationMs: status === 'inProgress' ? null : 0 });
+const agentItem = (id, text, phase, memoryCitation = null) => ({ type: 'agentMessage', id, text, phase, memoryCitation, delivery: null, questions: null });
+const turn = (status, items = [], itemsView = 'full') => ({ id: active.turnId, rootTurnId: null, items, itemsView, status, error: null, startedAt: 1794139200, completedAt: status === 'inProgress' ? null : 1794139200, durationMs: status === 'inProgress' ? null : 0 });
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const { id, method, params } = JSON.parse(line); if (id === undefined) return;
   const conversation = process.env.COMPANION_CONVERSATION_FIXTURE === '1';
@@ -54,18 +54,19 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     messages.forEach((message, index) => {
       const itemId = `fixture-message-${process.pid}-${sequence}-${index}`;
       const identity = { threadId: active.threadId, turnId: active.turnId };
-      const item = agentItem(itemId, message.text, message.phase);
+      const item = agentItem(itemId, message.text, message.phase, message.memoryCitation);
       if (!message.omitIndividualEvents) {
-        notify('item/started', { ...identity, item: agentItem(itemId, '', message.phase), startedAtMs: 1794139200000 + index });
+        notify('item/started', { ...identity, item: agentItem(itemId, '', message.phase, message.memoryCitation), startedAtMs: 1794139200000 + index });
         notify('item/agentMessage/delta', { ...identity, itemId, delta: message.delta === undefined ? message.text : message.delta });
-        if (scenario.turn !== 'pending') notify('item/completed', { ...identity, item, completedAtMs: 1794139200000 + index });
+        if (scenario.turn !== 'pending' && !message.omitCompletedEvent) notify('item/completed', { ...identity, item, completedAtMs: 1794139200000 + index });
       }
       if (scenario.turn !== 'pending') {
         completedItems.push(item);
       }
     });
+    if (scenario.terminalCommand) completedItems.push({ type: 'commandExecution', id: `fixture-unselected-command-${sequence}`, pluginId: null, scriptPath: null, command: 'SYNTHETIC_NOT_EXECUTED', cwd: process.cwd(), processId: null, source: 'agent', status: 'completed', commandActions: [], aggregatedOutput: 'UNSELECTED_COMMAND_CONTENT_CANARY', exitCode: 0, durationMs: 0 });
     if (scenario.turn === 'usage-limit') notify('error', { threadId: active.threadId, turnId: active.turnId, willRetry: false, error: { message: 'PRIVATE_PROVIDER_DETAIL', codexErrorInfo: 'usageLimitExceeded' } });
-    if (scenario.turn !== 'pending') notify('turn/completed', { threadId: active.threadId, turn: turn(scenario.turn === 'usage-limit' ? 'failed' : scenario.turn || 'completed', completedItems) });
+    if (scenario.turn !== 'pending') notify('turn/completed', { threadId: active.threadId, turn: turn(scenario.turn === 'usage-limit' ? 'failed' : scenario.turn || 'completed', scenario.terminalView === 'notLoaded' ? [] : completedItems, scenario.terminalView || 'full') });
   }, 50);
   if (method === 'account/login/start' && scenario.login === 'complete') setTimeout(() => { signedIn = true; notify('account/login/completed', { loginId, success: true }); }, 40);
   if (method === 'account/login/start' && scenario.login === 'expired') setTimeout(() => notify('account/login/completed', { loginId, success: false, error: 'authorization expired' }), 40);
