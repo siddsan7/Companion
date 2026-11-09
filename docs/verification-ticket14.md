@@ -2,7 +2,7 @@
 
 Goal: export and restore application history through the Electron desktop without copying credential stores or rolling back vault authority. The accepted boundary is the desktop workflow plus resulting files and history. OS dialogs, time, filesystem faults and the external synthetic provider/task boundaries are controlled in acceptance tests. Root ran all tests; the implementer ran syntax checks only.
 
-Current ticket implementation: `d882125`, after reviewed metadata-only fix `2b1d6ab`, equal-history follow-up `ee75296`, final-size fix `f8ec153` and inert-preference implementation `99aa73f`. Final preserving synchronization remains root-owned; the reported integration tip is `677e143`, including completed #11 and #15 and the committed #12 plan. The early 54-case archives/schedule/conversations gate was intentionally stopped after 3 passes (exit 1), with no owned Electron/Node process left. It is not a passing combined gate. Both requested size-bound and inert-provider-preference follow-ups now have focused passing results below. The final 58-case archives/schedule/conversations gate, source synchronization and exact-tip reapproval are **pending**. This document does not claim a passing combined gate, completed ticket, native reconnect verification or release readiness.
+Reviewed synchronized source: `2077f0a`, after metadata-only fix `2b1d6ab`, equal-history follow-up `ee75296`, inherited-cadence fix `d882125`, final-size fix `f8ec153` and inert-preference implementation `99aa73f`. The preserving sync includes approved #11 and #15 wiring. Both independent Standards and Spec reviewers approved the exact `2077f0a` source with both P2 findings resolved. Root's synchronized archives/schedule/conversations gate passed all 58 cases, no skips, exit 0, in 25.9 minutes. The earlier 54-case gate remains an intentionally interrupted run after 3 passes, exit 1, with no owned Electron/Node process left; it was not a passing gate. Both small idea/comparison wiring checks passed, exit 0, in 46.4 seconds. Root records final documentation-tip approval and merger verification in issue #14 before closure. No native reconnect, live-model or release-ready claim is made.
 
 ## Actual verification
 
@@ -28,10 +28,12 @@ The following are root-reported observed results, not inferred from code. Focuse
 | Initial independent Spec review: metadata-only restore | P2 blocker: zero missing conversations and zero selected notes disabled confirmation despite new inert metadata. RED 19.6s; GREEN 28.2s after explicit per-type metadata planning/consent. | Regression `8db1411`; fix `2b1d6ab` |
 | Equal-existing history with one missing imported hint | Passed 48.0s: deleted only the imported hint sidecar, reinspected equal chat plus one new hint, preserved the hint with exact conversation/current setup/authority bytes unchanged. Existing runtime unchanged. | Test-only `ee75296` |
 | Second independent Spec finding: inherited cadence on a third move | P2 blocker: explicit B→C matching retained an inherited former target B, leaving reconnect unusable. RED 41.0s; GREEN 35.9s after shared matched-intent mapping. Unrelated roots stay inert and original A task/B intent bytes stay unchanged. | Regression `2963cc1`; fix `d882125` |
-| Final 58-case archives/schedule/conversations gate | Pending after the two reviewed P2 fixes | No passing combined result claimed |
-| Final exact-tip independent reapproval and merger review | Pending after preserving source sync | Earlier Standards approval is not approval of the changed final tip |
+| Final synchronized archives/schedule/conversations gate | All 58 passed, no skips, exit 0, 25.9 minutes | Exact reviewed source `2077f0a` |
+| Independent Standards and Spec source reapproval | Both approved exact synchronized source; both P2 findings resolved. Optional duplicated inert-publication helper consolidation remains a nonblocking suggestion. | `2077f0a` |
+| Small saved-idea/comparison wiring checks, 2 cases | Both passed, exit 0, 46.4 seconds | Same frozen source after the 58-case gate |
+| Documentation-tip reapproval and final merger review | Pending until remaining root evidence is recorded | No merger approval or ticket completion claimed |
 
-Focused checks use `npm.cmd test -- tests/archives.spec.js --grep "<test title fragment>"`. The file now has 15 archive cases; the final combined archives/schedule/conversations gate has 58 cases. The interrupted 54-case gate preceded the final size/preferences and two reviewed Spec-fix cases. The requested combined command is `npm.cmd test -- tests/archives.spec.js tests/schedule.spec.js tests/conversations.spec.js`; root owns its actual execution and result.
+Focused checks use `npm.cmd test -- tests/archives.spec.js --grep "<test title fragment>"`. The file has 15 archive cases; the synchronized archives/schedule/conversations gate passed all 58 cases. The interrupted 54-case gate preceded the final size/preferences and two reviewed Spec-fix cases. The requested combined command is `npm.cmd test -- tests/archives.spec.js tests/schedule.spec.js tests/conversations.spec.js`; root owns its actual execution and result.
 
 ## Behavior and acceptance boundary
 
@@ -109,6 +111,20 @@ Vault `.intake` ledger, suppression/annotations, approved brief files, capture/r
 
 ## Remaining gates and limits
 
-The size/preferences follow-ups and both Spec P2 fixes have the focused passing results recorded above. Standards approved the earlier `277bfb1` source with an optional refactor suggestion; that approval does not substitute for reapproval of the changed final tip. The preserving integration sync, full 58-case local gate, final exact-tip independent reapproval and merger review remain pending. Root must update this record with the actual result, required fixes/rechecks and reviewer findings before completion. #16 still owns complete-PR release and cross-feature suppression/task checks.
+## Standards
+
+Independent reviewer `review14_standards` approved exact synchronized source `2077f0ab5656eedbd057fb13494b3dcaa45cebb2`. No documented-standard blockers were found. Metadata-only restore explicitly previews new inert records, preserves equal content, blocks conflicting identities and revalidates the plan under lock. Preview and publication share the same explicit inherited-intent mapping. The integration retains one conversation store and the complete archive/idea/comparison bridge.
+
+One P3 heuristic remains: the three inert-metadata publishers repeat guarded staging, synchronization, exclusive publication and cleanup. A narrow helper is optional; this is not a documented breach. The reviewer used the complete smell baseline with repository overrides and made no changes or test runs.
+
+## Spec
+
+Independent reviewer `review14_spec` initially blocked metadata-only restoration, then confirmed the repeated-move cadence blocker. Both regressions and fixes are recorded above. The reviewer approved exact `2077f0a` after verifying explicit zero-chat/equal-chat metadata consent, conflict/no-op handling, and mapping only an inherited intent whose former target equals the selected archived binding. Original identity/anchor/mode and unrelated roots remain unchanged; task reconnection is separate.
+
+No remaining concrete Spec blocker was found in strict format/integrity validation, guarded input/publication, preserved conflicts, exact moved-vault pins, reviewed note inclusion, pending-only-copy preservation, credential exclusion or inert preferences. Review totals: Standards zero hard violations and one nonblocking heuristic; Spec two resolved P2s and zero remaining findings. These are ticket reviews, not whole-PR, release or live/native verification.
+
+## Release limits
+
+The size/preferences follow-ups and both Spec P2 fixes have the focused passing results recorded above. Both independent axes approved exact preserving-sync source `2077f0a`; root then passed all 58 synchronized archive/schedule/conversation cases with no skips in 25.9 minutes. Consolidating duplicated inert-metadata publication code remains an optional nonblocking suggestion. Both saved-idea/comparison wiring checks then passed in 46.4 seconds with unchanged source/tests. Root obtains final documentation-tip approval and records merger verification in issue #14 before completion. #16 still owns complete-PR release and cross-feature suppression/task checks.
 
 Native reconnect after import, natural missed-run timing across sleep/sign-out, installed Obsidian and live Codex sign-in/inference/inventory/capacity are unobserved for this slice or explicitly deferred. No auth file was inspected or copied and no live model/probe was run by this worker. Controlled stdio and scheduler fixtures cannot establish a passed native/live gate. Prior #6/#8/#10 evidence remains separately scoped. Hosted CI billing remains user-waived, not passed. No deployment, merge authorization or release-ready claim follows from these focused results.
