@@ -2,6 +2,7 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const YAML = require('yaml');
 
 let root, app, page;
@@ -175,6 +176,35 @@ test('a confirmed removal survives actual exit and excludes its still-present sa
   expect(await fs.lstat(`${marker}.pending`).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
   expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
   expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+  expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+});
+
+test('an unowned selected-idea stage added after removal preview holds before any marker or unlink', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  await completedConversation();
+  const title = 'Selected idea with an unknown pending copy';
+  const selected = await saveIdea(title), retained = await saveIdea('Other idea survives unknown copy hold');
+  const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+  const selectedBytes = await fs.readFile(selected, 'utf8'), retainedBytes = await fs.readFile(retained, 'utf8');
+  const id = YAML.parse(selectedBytes.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+  const history = await bytesIn(path.join(root, 'conversations'));
+  await page.locator('#saved-ideas article').filter({ hasText: title }).getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+  await expect(page.getByLabel('Saved idea removal preview', { exact: true })).toContainText(id);
+  const orphan = path.join(directory, `${randomUUID()}.md.pending`);
+  await fs.writeFile(orphan, selectedBytes, { flag: 'wx', encoding: 'utf8' });
+  const before = await bytesIn(vault);
+  await page.getByRole('button', { name: 'Confirm saved idea removal', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText(/Saved idea removal (held|complete)/);
+  const marker = path.join(directory, `${id}.removed.json`);
+  const exists = async file => !!await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const evidence = testInfo.outputPath('idea-removal-orphan-scope.json');
+  await fs.writeFile(evidence, JSON.stringify({ markerExists: await exists(marker), selectedExists: await exists(selected), orphanExists: await exists(orphan), status: await page.locator('#idea-status').innerText() }, null, 2), 'utf8');
+  expect(await exists(marker)).toBe(false);
+  expect(await exists(`${marker}.pending`)).toBe(false);
+  await expect(page.locator('#idea-status')).toContainText('Saved idea removal held.');
+  expect(await bytesIn(vault)).toEqual(before);
+  expect(await fs.readFile(orphan, 'utf8')).toBe(selectedBytes);
+  expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
   expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
 });
 
