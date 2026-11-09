@@ -156,11 +156,17 @@ class CaptureDeletion {
       else if (authority.phase === 'deleting') { try { await inspectDeletion(intake, ledger, id); } catch (error) { reason = error.message; } }
       else if (authority.manual) {
         try {
+          await verifyRetiredSlots(intake, ledger, id);
+          if (authority.restoration.retirement) await inspectManualRetirement(intake, ledger, id);
           if (authority.restoration.published) await verifyManualPublication(intake, ledger, id, [manualFiles(intake, authority).stage]);
           await scanManualRecovery(intake, ledger, id); reason = 'Only this exact authorized manual restoration can be resumed.';
         } catch (error) { if (!isManualHold(error, id, authority)) throw error; reason = error.message; }
       } else reason = 'Only this exact selected producer restoration can be resumed.';
       const targets = authority.phase === 'restoring' && authority.manual ? Object.values(manualFiles(intake, authority)).map(file => relative(vault, file)) : authority.targets.map(target => target.file);
+      if (authority.restoration?.retirement) targets.push(...authority.restoration.retirement.slots.map(slot => slot.file));
+      for (const receipt of authority.phase === 'restoring' ? authority.retiredRestorations || [] : []) for (const name of retirementFiles(intake, receipt)) {
+        if (await fs.lstat(path.join(vault.vault, name)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) targets.push(name);
+      }
       result.push({ id, operationId: authority.operationId, phase: authority.phase, manual: !!authority.manual, targets, reason, needsScopeReview: missing.has(id), blockedByScope: missing.size > 0 });
     }
     return result;
@@ -484,24 +490,29 @@ async function verifyRetiredSlots(intake, ledger, id) {
   }
   await scanManualRecovery(intake, ledger, id);
 }
-async function retireManualOperation(intake, ledger, id) {
-  const authority = ledger.sourceAuthority[id], receipt = authority.restoration.retirement, access = manualAccess(intake, ledger, id), inspector = new CaptureDeletion({ getVault: () => intake.vault });
+async function inspectRetirementSlot(intake, ledger, id, slot) {
+  const access = manualAccess(intake, ledger, id), inspector = new CaptureDeletion({ getVault: () => intake.vault }), file = path.join(intake.vault.vault, slot.file);
+  const exists = await fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+  if (!exists) return null;
+  if (!slot.expected) throw access.fail(`A file appeared in a previously absent restoration slot: ${slot.file}. It was preserved.`);
+  const actual = await access.run(file, () => inspector.target(intake.vault, file, 'source-backup'));
+  if (['sha256', 'dev', 'ino', 'bytes'].some(key => actual[key] !== slot.expected[key])) throw access.fail(`A reviewed retirement file changed: ${slot.file}. It was preserved.`);
+  return file;
+}
+async function inspectManualRetirement(intake, ledger, id) {
+  const receipt = ledger.sourceAuthority[id].restoration.retirement, remaining = [];
   retirementFiles(intake, receipt); await pendingParents(intake, ledger); await scanManualRecovery(intake, ledger, id);
-  const inspect = async slot => {
-    const file = path.join(intake.vault.vault, slot.file);
-    const exists = await fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-    if (!exists) return null;
-    if (!slot.expected) throw access.fail('A file appeared in a previously absent restoration slot. It was preserved.');
-    const actual = await access.run(file, () => inspector.target(intake.vault, file, 'source-backup'));
-    if (['sha256', 'dev', 'ino', 'bytes'].some(key => actual[key] !== slot.expected[key])) throw access.fail('A reviewed retirement file changed. It was preserved.');
-    return file;
-  };
-  for (const slot of receipt.slots) await inspect(slot);
+  for (const slot of receipt.slots) { const file = await inspectRetirementSlot(intake, ledger, id, slot); if (file) remaining.push(file); }
+  return remaining;
+}
+async function retireManualOperation(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id], receipt = authority.restoration.retirement, access = manualAccess(intake, ledger, id);
+  await inspectManualRetirement(intake, ledger, id);
   for (const slot of receipt.slots) {
-    await pendingParents(intake, ledger); const file = await inspect(slot);
+    await pendingParents(intake, ledger); const file = await inspectRetirementSlot(intake, ledger, id, slot);
     if (file) { await access.run(file, () => fs.unlink(file)); await intake.vault.checkpoint('capture-restoration-retirement-unlinked'); }
   }
-  for (const slot of receipt.slots) if (await inspect(slot)) throw access.fail('Restoration retirement is incomplete.');
+  if ((await inspectManualRetirement(intake, ledger, id)).length) throw access.fail('Restoration retirement is incomplete.');
   authority.retiredRestorations = [...(authority.retiredRestorations || []), receipt]; delete authority.restoration.retirement;
   await intake.save(ledger); await intake.vault.checkpoint('capture-restoration-retired');
 }
