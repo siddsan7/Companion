@@ -305,3 +305,59 @@ test('unknown independent text in a selected idea intent or receipt holds remova
   }
 });
 
+test('unknown writing nested in selected idea envelopes holds removal while a known legacy support state remains unchanged', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  await completedConversation();
+  const title = 'Selected idea with unknown nested writing';
+  const selected = await saveIdea(title), retained = await saveIdea('Other idea retained beside nested writing');
+  const selectedBytes = await fs.readFile(selected, 'utf8'), retainedBytes = await fs.readFile(retained, 'utf8');
+  const id = YAML.parse(selectedBytes.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+  const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+  let intentFile, intentBytes;
+  for (const name of await fs.readdir(directory)) {
+    if (!name.endsWith('.intent.json')) continue;
+    const file = path.join(directory, name), bytes = await fs.readFile(file, 'utf8');
+    if (JSON.parse(bytes).id === id) { intentFile = file; intentBytes = bytes; }
+  }
+  expect(intentFile).toBeTruthy();
+  const sources = await bytesIn(path.join(vault, 'Captures')), history = await bytesIn(path.join(root, 'conversations'));
+  const marker = path.join(directory, `${id}.removed.json`);
+  const exists = async file => !!await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  for (const envelope of ['input', 'authority']) {
+    const value = JSON.parse(intentBytes), writing = `NESTED_${envelope.toUpperCase()}_WRITING_13: retain this independent unreviewed text.`;
+    if (envelope === 'input') value.input.unreviewed_writing = writing;
+    else {
+      const state = value.supportState.find(item => item.key.startsWith('capture:'));
+      expect(state).toBeTruthy(); state.authority.unreviewed_writing = writing;
+    }
+    await fs.writeFile(intentFile, JSON.stringify(value), 'utf8'); await page.reload();
+    const article = page.locator('#saved-ideas article').filter({ hasText: title }); await expect(article).toBeVisible();
+    const before = await bytesIn(vault);
+    await article.getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+    const preview = page.getByLabel('Saved idea removal preview', { exact: true });
+    await expect.poll(async () => await preview.isVisible() || /removal.*held/i.test(await page.locator('#idea-status').innerText())).toBe(true);
+    await fs.writeFile(testInfo.outputPath(`idea-removal-nested-${envelope}.json`), JSON.stringify({ envelope, previewOffered: await preview.isVisible(), markerExists: await exists(marker), status: await page.locator('#idea-status').innerText() }, null, 2), 'utf8');
+    await expect(preview).toBeHidden(); await expect(page.locator('#idea-status')).toContainText(/removal.*held/i);
+    expect(await exists(marker)).toBe(false); expect(await exists(`${marker}.pending`)).toBe(false);
+    expect(await bytesIn(vault)).toEqual(before);
+    expect(await fs.readFile(intentFile, 'utf8')).toContain(writing);
+    expect(await fs.readFile(selected, 'utf8')).toBe(selectedBytes); expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+    expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+    expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+    await fs.writeFile(intentFile, intentBytes, 'utf8');
+  }
+  const legacy = JSON.parse(intentBytes);
+  for (const state of legacy.supportState) { delete state.originalSourceGenerations; delete state.currentSourceGenerations; }
+  await fs.writeFile(intentFile, JSON.stringify(legacy), 'utf8'); await page.reload();
+  const article = page.locator('#saved-ideas article').filter({ hasText: title }); await expect(article).toBeVisible();
+  const before = await bytesIn(vault);
+  await article.getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+  await expect(page.getByLabel('Saved idea removal preview', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Cancel saved idea removal', exact: true }).click();
+  expect(await bytesIn(vault)).toEqual(before);
+  expect(JSON.parse(await fs.readFile(intentFile, 'utf8')).supportState.every(state => !Object.hasOwn(state, 'originalSourceGenerations') && !Object.hasOwn(state, 'currentSourceGenerations'))).toBe(true);
+  expect(await exists(marker)).toBe(false); expect(await exists(`${marker}.pending`)).toBe(false);
+  expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+  await fs.writeFile(intentFile, intentBytes, 'utf8');
+});
+
