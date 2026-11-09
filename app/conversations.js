@@ -177,7 +177,7 @@ class Conversations {
       if (current.blocked) throw Error('Package exceeds the context limit. Remove or explicitly shorten sources, then preview again.');
       const record = approved.input.conversationId ? await this.read(approved.input.conversationId) : { schema: 1, id: randomUUID(), vault: current.vault, brief: current.brief, createdAt: this.clock().now, requests: [] };
       if (!record.scope) record.scope = { ...current.scope, version: randomUUID() };
-      const request = { id: randomUUID(), question: current.question, speculation: current.speculation, package: current, status: 'inProgress', reply: '', startedAt: this.clock().now, completedAt: null };
+      const request = { id: randomUUID(), question: current.question, speculation: current.speculation, package: current, status: 'inProgress', reply: '', startedAt: this.clock().now, completedAt: null, usage: null, usageEvidence: 'Usage unavailable: no valid matching provider counters were retained for this request.' };
       record.requests.push(request);
       this.running.add(record.id);
       try {

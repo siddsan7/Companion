@@ -38,7 +38,7 @@ class ConversationProvider {
       await beforeStart();
     } });
     const latest = setup.turnHistory.at(-1);
-    return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: null, usageEvidence: 'App Server did not provide usage through this supported transport.' };
+    return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: latest.usage ? structuredClone(latest.usage) : null, usageEvidence: latest.usageEvidence };
   }
   close() { this.controlled?.close(); }
 }

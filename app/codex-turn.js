@@ -1,4 +1,13 @@
 const { PROFILE, INSTRUCTIONS, samePath } = require('./codex-policy');
+const USAGE_UNAVAILABLE = 'Usage unavailable: no valid matching provider update was observed while this turn listener was active.';
+const USAGE_OBSERVED = 'Observed provider token counters while this turn listener was active. Updates may be incomplete; not complete billing, account usage, or capacity evidence.';
+function parseUsage(value) {
+  const fields = ['totalTokens', 'inputTokens', 'cachedInputTokens', 'cacheWriteInputTokens', 'outputTokens', 'reasoningOutputTokens'];
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.modelContextWindow !== null && (!Number.isSafeInteger(value.modelContextWindow) || value.modelContextWindow < 0)) return null;
+  const read = part => part && typeof part === 'object' && !Array.isArray(part) && fields.every(key => Number.isSafeInteger(part[key]) && part[key] >= 0) ? Object.fromEntries(fields.map(key => [key, part[key]])) : null;
+  const total = read(value.total), last = read(value.last);
+  return total && last ? { total, last, modelContextWindow: value.modelContextWindow } : null;
+}
 function failureMessage(info) {
   if (['usageLimitExceeded', 'sessionBudgetExceeded', 'rateLimitExceeded'].includes(info)) return 'Codex usage limit reached. Check your account limits, then retry explicitly.';
   if (info === 'unauthorized') return 'Codex sign-in expired or was rejected. Sign in again, verify isolation, then retry explicitly.';
@@ -41,13 +50,13 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
   if (typeof threadId !== 'string' || !threadId.trim() || setup.threads.has(threadId)) throw Error('Codex did not create a fresh thread.');
   setup.threads.add(threadId);
   setup.state.reply = ''; setup.state.turnActive = true; setup.state.status = 'running';
-  const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null };
+  const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null, usage: null, usageEvidence: USAGE_UNAVAILABLE };
   setup.turnHistory.push(record);
   let turnId, terminal, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
   const messages = new Map();
   let sinkTail = Promise.resolve(), sinkFailure;
   const preserve = () => {
-    const snapshot = { threadId, turnId: turnId || null, model: started.model, reply: setup.state.reply, messages: [...messages.values()].map(message => ({ ...message })) };
+    const snapshot = { threadId, turnId: turnId || null, model: started.model, reply: setup.state.reply, messages: [...messages.values()].map(message => ({ ...message })), usage: record.usage === null ? null : structuredClone(record.usage), usageEvidence: record.usageEvidence };
     sinkTail = sinkTail.then(() => onState(snapshot)).catch(error => {
       sinkFailure = error;
       rpc.close('Cannot preserve the incomplete conversation reply.'); setup.settleTurn?.('interrupted');
@@ -83,6 +92,12 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
   };
   const handler = (method, params) => {
     if (unexpected || rpc.closed) return;
+    if (method === 'thread/tokenUsage/updated') {
+      if (!startAttempted || !validId(turnId) || params?.threadId !== threadId || params?.turnId !== turnId) return;
+      const usage = parseUsage(params.tokenUsage);
+      if (usage) { record.usage = usage; record.usageEvidence = USAGE_OBSERVED; preserve(); }
+      return;
+    }
     if (!['turn/started', 'item/agentMessage/delta', 'item/started', 'item/completed', 'turn/completed', 'error'].includes(method)) return;
     if (!validId(params?.threadId)) { rejectContext('Codex returned a malformed thread identity. The reply is incomplete.'); return; }
     if (params?.threadId !== threadId) return;
