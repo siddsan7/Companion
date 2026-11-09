@@ -1,4 +1,5 @@
 const { createHash } = require('node:crypto');
+const path = require('node:path');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const fail = () => { throw Error('History contains unsupported data. Preserve local files for repair; archive export was blocked.'); };
@@ -74,6 +75,15 @@ function inactiveCoverage(value) {
   object(value, ['schema', 'archiveId', 'coverage']);
   if (value.schema !== 1 || !uuid(value.archiveId)) fail(); coverage(value.coverage); return value;
 }
+function codexHints(value) {
+  object(value, ['executable', 'project', 'vault', 'sandbox', 'reapprovalRequired']);
+  if (['executable', 'project', 'vault'].some(key => typeof value[key] !== 'string' || !path.isAbsolute(value[key]) || /[\x00-\x1f]/.test(value[key])) || !['mxc', 'elevated'].includes(value.sandbox) || value.reapprovalRequired !== true) fail();
+  return value;
+}
+function inactiveCodexHints(value) {
+  object(value, ['schema', 'archiveId', 'preferences']);
+  if (value.schema !== 1 || !uuid(value.archiveId)) fail(); codexHints(value.preferences); return value;
+}
 // v1 canonical JSON: sorted UTF-16 object keys, array order preserved, JSON primitive spelling.
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -121,7 +131,7 @@ function archiveRecord(value) {
   if (value.coverage !== undefined) coverage(value.coverage);
   if (value.integrity.algorithm !== 'sha256' || value.integrity.digest !== hash(canonical(value.coverage ? { payload: value.payload, coverage: value.coverage } : value.payload))) throw Error('History archive integrity check failed. Preserve the original file; nothing was restored.');
   const payload = object(value.payload, ['settings', 'contextScopes', 'scheduleIntent', 'vaultBindings', 'conversations']);
-  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent', 'inactiveScheduleIntents', 'inactiveArchiveCoverage']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); if (payload.settings.inactiveScheduleIntents !== undefined) { if (!Array.isArray(payload.settings.inactiveScheduleIntents)) fail(); payload.settings.inactiveScheduleIntents.forEach(inactiveIntent); } if (payload.settings.inactiveArchiveCoverage !== undefined) { if (!Array.isArray(payload.settings.inactiveArchiveCoverage)) fail(); payload.settings.inactiveArchiveCoverage.forEach(inactiveCoverage); } }
+  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent', 'inactiveScheduleIntents', 'inactiveArchiveCoverage', 'codexReconnectHints', 'inactiveCodexReconnectHints']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); if (payload.settings.inactiveScheduleIntents !== undefined) { if (!Array.isArray(payload.settings.inactiveScheduleIntents)) fail(); payload.settings.inactiveScheduleIntents.forEach(inactiveIntent); } if (payload.settings.inactiveArchiveCoverage !== undefined) { if (!Array.isArray(payload.settings.inactiveArchiveCoverage)) fail(); payload.settings.inactiveArchiveCoverage.forEach(inactiveCoverage); } if (payload.settings.codexReconnectHints !== undefined) codexHints(payload.settings.codexReconnectHints); if (payload.settings.inactiveCodexReconnectHints !== undefined) { if (!Array.isArray(payload.settings.inactiveCodexReconnectHints)) fail(); payload.settings.inactiveCodexReconnectHints.forEach(inactiveCodexHints); } }
   if (!Array.isArray(payload.contextScopes) || !Array.isArray(payload.vaultBindings) || !Array.isArray(payload.conversations)) fail();
   const scopes = new Set(), roots = new Set(), ids = new Set();
   for (const item of payload.contextScopes) { object(item, ['binding', 'schema', 'files']); if (!/^[a-f0-9]{64}$/.test(item.binding) || scopes.has(item.binding) || item.schema !== 1) fail(); strings(item.files); scopes.add(item.binding); }
@@ -140,3 +150,5 @@ module.exports.parseArchive = parseArchive;
 module.exports.archiveRecord = archiveRecord;
 module.exports.inactiveIntent = inactiveIntent;
 module.exports.inactiveCoverage = inactiveCoverage;
+module.exports.codexHints = codexHints;
+module.exports.inactiveCodexHints = inactiveCodexHints;

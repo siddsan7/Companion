@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent, inactiveCoverage } = require('./archive-format');
+const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent, inactiveCoverage, codexHints, inactiveCodexHints } = require('./archive-format');
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { withBriefMutation } = require('./briefs-lock');
@@ -67,6 +67,10 @@ class Archives {
       const priorCoverage = await this.inactiveCoverages(fingerprints);
       if (priorCoverage.length && !settings) throw Error('Select the current vault configuration before exporting retained archive omission metadata.');
       if (settings && priorCoverage.length) settings.inactiveArchiveCoverage = priorCoverage;
+      const localCodexHints = await this.ownCodexHints(fingerprints), priorCodexHints = await this.inactiveCodexHints(fingerprints);
+      if (!settings && (localCodexHints || priorCodexHints.length)) throw Error('Select the current vault configuration before exporting retained Codex reconnection preferences.');
+      if (settings && localCodexHints) settings.codexReconnectHints = localCodexHints;
+      if (settings && priorCodexHints.length) settings.inactiveCodexReconnectHints = priorCodexHints;
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
@@ -145,7 +149,7 @@ class Archives {
     const read = await this.json(file, guard, false, true), archive = archiveRecord(read.value);
     const current = await this.snapshot(), plan = this.restorePlan(archive, current), id = randomUUID();
     this.restoreReview = { id, archive, inspection: current, input: { file, guard, digest: read.digest } };
-    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null, omitted: archive.coverage?.omitted.length || 0 };
+    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null, omitted: archive.coverage?.omitted.length || 0, codexHints: this.archiveCodexHints(archive) };
   }
   async match(input) {
     const reviewed = this.restoreReview;
@@ -185,6 +189,7 @@ class Archives {
       try {
         await this.retainIntents(reviewed.archive, matched.sourceRoot, matched.root);
         await this.retainCoverage(reviewed.archive);
+        await this.retainCodexHints(reviewed.archive);
         for (const original of plan.additions) {
           const record = structuredClone(original);
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
@@ -304,6 +309,41 @@ class Archives {
     }
     return records;
   }
+  async ownCodexHints(fingerprints) {
+    const directory = path.join(this.history.dataRoot, 'codex'); this.guard();
+    let guard;
+    try { guard = this.directoryGuard(directory); } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    const file = path.join(directory, 'setup.json'), read = await this.json(file, guard, true);
+    if (!read) return null;
+    // Only this Companion-owned preference file is read. Never traverse managed-home or other Codex data.
+    const preferences = codexHints({ executable: read.value.executable, project: read.value.project, vault: read.value.vault, sandbox: read.value.sandbox, reapprovalRequired: true });
+    if (fingerprints) fingerprints[file] = read.digest;
+    return preferences;
+  }
+  archiveCodexHints(archive) {
+    return [...(archive.payload.settings?.inactiveCodexReconnectHints || []), ...(archive.payload.settings?.codexReconnectHints ? [{ schema: 1, archiveId: archive.id, preferences: archive.payload.settings.codexReconnectHints }] : [])];
+  }
+  async inactiveCodexHints(fingerprints) {
+    const records = [], names = await fs.readdir(this.history.dataRoot); this.guard();
+    for (const name of names.sort().filter(name => /^archive-codex-hints-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.json$/.test(name))) {
+      const file = path.join(this.history.dataRoot, name), read = await this.json(file), record = inactiveCodexHints(read.value);
+      if (name !== `archive-codex-hints-${record.archiveId}.json`) throw Error('Retained Codex hint identity needs repair.');
+      records.push(record); if (fingerprints) fingerprints[file] = read.digest;
+    }
+    return records;
+  }
+  async retainCodexHints(archive) {
+    for (const original of this.archiveCodexHints(archive)) {
+      const record = inactiveCodexHints(original), destination = path.join(this.history.dataRoot, `archive-codex-hints-${record.archiveId}.json`), existing = await this.json(destination, undefined, true);
+      if (existing) { if (canonical(existing.value) !== canonical(record)) throw Error('Retained Codex hints differ. Existing hints were preserved.'); continue; }
+      const directory = this.history.safeDirectory(), stage = path.join(this.history.dataRoot, `.archive-codex-hints-${randomUUID()}.pending`); let handle;
+      try {
+        this.history.safeDirectory(false, directory); handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
+        await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
+        this.history.safeDirectory(false, directory); await fs.link(stage, destination); this.history.safeDirectory(false, directory);
+      } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+    }
+  }
   async retainCoverage(archive) {
     const records = [...(archive.payload.settings?.inactiveArchiveCoverage || []), ...(archive.coverage ? [{ schema: 1, archiveId: archive.id, coverage: archive.coverage }] : [])];
     for (const original of records) {
@@ -342,7 +382,7 @@ class Archives {
       } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
     }
   }
-  async state() { return this.history.lock(async () => { this.directory = this.history.safeDirectory(); return { inactiveIntents: await this.inactiveIntents() }; }); }
+  async state() { return this.history.lock(async () => { this.directory = this.history.safeDirectory(); return { inactiveIntents: await this.inactiveIntents(), codexHints: await this.inactiveCodexHints() }; }); }
   async reconnectPreview(input) {
     this.reconnectReview = null;
     return this.history.lock(async () => {

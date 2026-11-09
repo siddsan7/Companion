@@ -10,7 +10,7 @@ archivePreview.onclick = async () => {
   archiveReview = null; archiveExport.disabled = true; archivePreview.disabled = true;
   try {
     const review = await window.companion['archive-preview']({ savedOnly: archiveSavedOnly.checked, recoveryId: archiveRecoveryReview }); archiveReview = review.id;
-    archiveSummary.textContent = `Application data: ${review.location}. ${review.count} conversation${review.count === 1 ? '' : 's'}; ${review.vaults} vault binding${review.vaults === 1 ? '' : 's'}. Includes complete saved history, defined settings and vault matching hints. Excludes credentials, provider setup and vault contents. Schedule intent requires explicit reconnection. This file contains private conversation text. Review before saving.`;
+    archiveSummary.textContent = `Application data: ${review.location}. ${review.count} conversation${review.count === 1 ? '' : 's'}; ${review.vaults} vault binding${review.vaults === 1 ? '' : 's'}. Includes complete saved history, defined settings and vault matching hints. Codex path and sandbox preferences are inert reconnect hints only. Excludes credentials, provider permissions and vault contents. Schedule intent requires explicit reconnection. This file contains private conversation text. Review before saving.`;
     if (review.omitted) archiveSummary.textContent += ` Incomplete archive: ${review.omitted} unresolved files omitted. Their only copies may remain in the local history folder shown below. Preserve those files separately; this export is not a complete history backup.`;
     archiveExport.disabled = false;
   } catch (error) { archiveSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
@@ -47,6 +47,7 @@ const archiveSource = document.getElementById('archive-source');
 const archiveSettings = document.getElementById('archive-settings');
 const archiveNotes = document.getElementById('archive-notes');
 const archiveIntentSummary = document.getElementById('archive-intents');
+const archiveCodexHintSummary = document.getElementById('archive-codex-hints');
 const archiveCadence = document.getElementById('archive-cadence');
 const archiveReconnectPreview = document.getElementById('archive-reconnect-preview');
 const archiveReconnectConfirm = document.getElementById('archive-reconnect');
@@ -71,6 +72,7 @@ archiveInspect.onclick = async () => {
     archiveSource.value = result.roots.includes(result.currentVault) ? result.currentVault : '';
     archiveRestoreSummary.textContent = `Integrity and version validated. ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Archive vault hints: ${result.roots.join('; ') || 'None'}. Current vault: ${result.currentVault || 'None selected'}. Paths and matching content do not prove vault identity. Current settings and source exclusions remain authoritative. Restore adds only reviewed missing conversations; it does not restore vault files, replace settings or connect a scheduled task. Explicit vault matching is required.`;
     if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Omission metadata is inert and cannot restore their missing content.`;
+    showCodexHints(result.codexHints);
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archiveInspect.disabled = false; }
 };
@@ -123,7 +125,11 @@ async function showArchiveIntents() {
     const previous = archiveCadence.value; archiveCadence.replaceChildren();
     for (const record of [null, ...result.inactiveIntents]) { const option = document.createElement('option'); option.value = record?.archiveId || ''; option.textContent = record ? `${record.archiveId}: ${record.intent.mode}; ${record.intent.anchor}; ${record.targetRoot}` : 'Choose an imported cadence'; archiveCadence.append(option); }
     if ([...archiveCadence.options].some(option => option.value === previous)) archiveCadence.value = previous;
+    showCodexHints(result.codexHints);
   } catch (error) { archiveIntentSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+}
+function showCodexHints(records) {
+  archiveCodexHintSummary.textContent = records.length ? `Archived Codex preferences are inert reconnection hints. ${records.map(record => `Archive ${record.archiveId}: executable ${record.preferences.executable}; project ${record.preferences.project}; former vault ${record.preferences.vault}; requested sandbox ${record.preferences.sandbox}.`).join(' ')} Reapproval is required in the existing Check Codex setup workflow. No imported path, sandbox permission, authentication, readiness or connection is applied.` : 'No archived Codex reconnection hints.';
 }
 archiveCadence.onchange = () => { archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectSummary.textContent = 'Preview the selected imported cadence before connecting it.'; };
 archiveReconnectPreview.onclick = async () => {
