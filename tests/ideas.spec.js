@@ -408,3 +408,41 @@ test('a failed publication retains the exact proposal across restart and explici
   expect(await fs.readdir(ideas)).toHaveLength(2);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
+
+test('an unknown outside hardlink to a staged proposal blocks publication before any destination peer is created', async () => {
+  test.setTimeout(120000);
+  await completedConversation();
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Keep a staged interpretation contained');
+  const explanation = 'hardlinkwriting: retain this proposed interpretation without publishing through an unknown linked copy.';
+  await page.getByLabel('Idea explanation', { exact: true }).fill(explanation);
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Unverified independent writing; publication needs exclusive ownership.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/hardlinkwriting/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'idea-before-publication' }), 'utf8');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect.poll(async () => {
+    try { return await fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8'); }
+    catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  }).toBe('idea-before-publication');
+  const directory = path.join(root, 'vault', 'Companion', '.ideas');
+  const stageName = (await fs.readdir(directory)).find(name => name.endsWith('.md.pending'));
+  expect(stageName).toBeTruthy();
+  const stage = path.join(directory, stageName), outside = path.join(root, 'outside-stage-peer.md');
+  await fs.link(stage, outside);
+  expect((await fs.stat(stage)).nlink).toBe(2);
+  expect(await fs.readFile(outside, 'utf8')).toBe(proposed);
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue', 'utf8');
+  await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+  const published = await fs.lstat(destination).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  expect.soft(published).toBeNull();
+  expect.soft((await fs.stat(stage)).nlink).toBe(2);
+  expect.soft((await fs.stat(outside)).nlink).toBe(2);
+  expect.soft((await fs.readdir(directory)).filter(name => name.endsWith('.published.json'))).toEqual([]);
+  expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
+  expect(await fs.readFile(outside, 'utf8')).toBe(proposed);
+  await expect(page.getByLabel('Idea explanation', { exact: true })).toHaveValue(explanation);
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
+});
