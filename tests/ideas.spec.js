@@ -2,6 +2,8 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
+const YAML = require('yaml');
 
 let root, app, page;
 test.beforeEach(async () => {
@@ -22,12 +24,21 @@ async function launch(configure = true) {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation() {
+async function completedConversation({ imported = false } = {}) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
   await launch();
-  await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
-  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  if (imported) {
+    await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
+    await page.getByLabel('Finalized review folder', { exact: true }).fill(path.join(root, 'producer'));
+    await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.locator('#captures article')).toContainText('Authored synthetic review');
+  } else {
+    await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture saved.');
+  }
   const readme = path.join(root, 'README.md');
   await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
   await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]), 'utf8');
@@ -35,12 +46,13 @@ async function completedConversation() {
   await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
   await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
-  await page.getByLabel('Context question', { exact: true }).fill('How could retrieval help MyTune?');
+  const question = imported ? 'What does the synthetic review support for MyTune?' : 'How could retrieval help MyTune?';
+  await page.getByLabel('Context question', { exact: true }).fill(question);
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
-  await page.locator('#context-results article').filter({ hasText: 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: imported ? 'Authored synthetic review' : 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
   await page.getByLabel('Conversation brief version', { exact: true }).fill('1');
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
-  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/How could retrieval help MyTune\?/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(imported ? 'synthetic review support' : 'How could retrieval help MyTune\\?'));
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
   await expect(page.locator('#conversation-history')).toContainText('completed');
   await expect(page.locator('#conversation-history')).toContainText('Authored synthetic observation');
@@ -140,4 +152,51 @@ test('an Experiment Proposal requires all five fields before preview and explici
   await expect(page.locator('#idea-status')).toContainText('Saved idea');
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
   expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
+});
+
+test('an explicitly selected imported evidence citation opens its original revision after a reviewed update', async () => {
+  test.setTimeout(120000);
+  await completedConversation({ imported: true });
+  const vault = path.join(root, 'vault', 'Companion');
+  const revisionNames = (await fs.readdir(path.join(vault, 'Revisions'))).filter(name => name.endsWith('.json'));
+  expect(revisionNames).toHaveLength(1);
+  const revisionBytes = await fs.readFile(path.join(vault, 'Revisions', revisionNames[0]));
+  const original = JSON.parse(revisionBytes.toString('utf8'));
+  const historyName = (await fs.readdir(path.join(root, 'conversations'))).find(name => name.endsWith('.json'));
+  const history = JSON.parse(await fs.readFile(path.join(root, 'conversations', historyName), 'utf8'));
+  const capturesBefore = await markdownSnapshot(path.join(vault, 'Captures'));
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Inspect the original authored evidence');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('The authored fixture is useful for inspecting provenance, not proof of a learning outcome.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic fixture; acceptance does not verify every claim. OCR and vision unavailable.');
+  await page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/evidence_id: a1/);
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  const fields = YAML.parse(proposed.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect(fields.project_brief).toEqual(history.brief);
+  expect(fields.citations).toHaveLength(1);
+  expect(fields.citations[0]).toMatchObject({ kind: 'imported_evidence', capture_id: original.captureId, revision_id: original.id, snapshot_sha256: createHash('sha256').update(revisionBytes).digest('hex'), evidence_id: 'a1', excerpt: 'Authored synthetic review fixture only.' });
+  expect(proposed).toContain('not independently verified');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+  expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(capturesBefore);
+
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(root, 'producer', 'edit'), { recursive: true });
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }), 'utf8');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('Last check: 2026-11-09T12:00:01Z · manual · complete');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  await expect(page.locator('#captures article')).toContainText('Authored synthetic corrected review');
+  await page.locator('#saved-ideas article').getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  await expect(page.locator('#idea-evidence')).toContainText(original.id);
+  await expect(page.locator('#idea-evidence')).toContainText('Authored synthetic review fixture only.');
+  // Native textarea values normalize CRLF; the saved anchor binds the raw snapshot hash.
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(original.text.replace(/\r\n?/g, '\n'));
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).not.toHaveValue(/Authored synthetic corrected review/);
+  expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
 });
