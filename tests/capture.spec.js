@@ -80,7 +80,7 @@ test('a damaged capture reports its file without hiding valid captures', async (
   await fs.writeFile(path.join(dir, file), note.replace('artifact_type: "capture"', 'artifact_type: capture').replace('title: "Still available"', "title: 'Still available'"));
   await fs.writeFile(path.join(dir, 'damaged.md'), note.replace(/^companion_id: .*$/m, 'companion_id: "different-id"').replace(/^captured_at: .*$/m, 'captured_at: 123'));
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-  await expect(page.getByRole('alert')).toContainText('damaged.md');
+  await expect(page.locator('#warnings')).toContainText('damaged.md');
   await expect(page.getByRole('heading', { name: 'Still available', exact: true })).toBeVisible();
 });
 test('a junction cannot redirect capture writes outside the selected vault', async () => {
@@ -209,7 +209,7 @@ test('recovery never restores an unrelated backup from an invalid title transact
   await fs.rename(path.join(dir, file), path.join(root, 'user-moved-original.md'));
   await fs.writeFile(path.join(dir, journal.backup), 'Unrelated personal writing.');
   await fs.unlink(path.join(root, 'faults.json')); await launch();
-  await expect(page.getByRole('alert')).toContainText(/conflict|Invalid/i);
+  await expect(page.locator('#warnings')).toContainText(/conflict|Invalid/i);
   expect(await fs.readFile(path.join(dir, file), 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
   expect(await fs.readFile(path.join(dir, journal.backup), 'utf8')).toBe('Unrelated personal writing.');
   expect(await fs.readFile(path.join(dir, `${file}.pending`), 'utf8')).toContain('Proposed title');
