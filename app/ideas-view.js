@@ -95,7 +95,12 @@
         article.append(title, resume); pendingView.append(article);
       }
       supportStatus.textContent = 'Current support inspected. Warnings do not change note ownership or independently verify claims.';
-    } catch (error) { if (current()) supportStatus.textContent = `Support inspection unavailable: ${error.message}`; }
+    } catch (error) {
+      if (current()) {
+        supportStatus.textContent = `Support inspection unavailable: ${error.message}`;
+        byId('idea-status').textContent = error.message;
+      }
+    }
   }
   window.addEventListener('companion-idea-draft', async event => {
     invalidate(); const current = epoch; origin = event.detail; byId('idea-status').textContent = '';
