@@ -263,3 +263,45 @@ test('a pending-only proposed idea can be explicitly previewed, cancelled and re
   expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
 });
 
+test('unknown independent text in a selected idea intent or receipt holds removal without erasing writing', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  await completedConversation();
+  const title = 'Selected idea with unknown journal writing';
+  const selected = await saveIdea(title), retained = await saveIdea('Other idea retained during journal shape hold');
+  const selectedBytes = await fs.readFile(selected, 'utf8'), retainedBytes = await fs.readFile(retained, 'utf8');
+  const id = YAML.parse(selectedBytes.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+  const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+  const journals = [];
+  for (const name of await fs.readdir(directory)) {
+    if (!name.endsWith('.intent.json') && !name.endsWith('.published.json')) continue;
+    const file = path.join(directory, name), bytes = await fs.readFile(file, 'utf8'), value = JSON.parse(bytes);
+    if (value.id === id) journals.push({ file, bytes, value, kind: name.endsWith('.intent.json') ? 'intent' : 'receipt' });
+  }
+  expect(journals).toHaveLength(2);
+  const sources = await bytesIn(path.join(vault, 'Captures')), history = await bytesIn(path.join(root, 'conversations'));
+  for (const journal of journals) {
+    const writing = `UNREVIEWED_${journal.kind.toUpperCase()}_WRITING_13: preserve this independent text outside the known schema.`;
+    await fs.writeFile(journal.file, JSON.stringify({ ...journal.value, unreviewed_writing: writing }), 'utf8');
+    await page.reload();
+    const article = page.locator('#saved-ideas article').filter({ hasText: title });
+    await expect(article).toBeVisible();
+    const before = await bytesIn(vault);
+    await article.getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+    const preview = page.getByLabel('Saved idea removal preview', { exact: true });
+    await expect.poll(async () => await preview.isVisible() || /removal.*held/i.test(await page.locator('#idea-status').innerText())).toBe(true);
+    const marker = path.join(directory, `${id}.removed.json`);
+    const exists = async file => !!await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    await fs.writeFile(testInfo.outputPath(`idea-removal-unknown-${journal.kind}.json`), JSON.stringify({ kind: journal.kind, previewOffered: await preview.isVisible(), markerExists: await exists(marker), status: await page.locator('#idea-status').innerText() }, null, 2), 'utf8');
+    await expect(preview).toBeHidden();
+    await expect(page.locator('#idea-status')).toContainText(/removal.*held/i);
+    expect(await exists(marker)).toBe(false); expect(await exists(`${marker}.pending`)).toBe(false);
+    expect(await bytesIn(vault)).toEqual(before);
+    expect(JSON.parse(await fs.readFile(journal.file, 'utf8')).unreviewed_writing).toBe(writing);
+    expect(await fs.readFile(selected, 'utf8')).toBe(selectedBytes);
+    expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+    expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+    expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+    await fs.writeFile(journal.file, journal.bytes, 'utf8');
+  }
+});
+
