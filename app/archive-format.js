@@ -19,13 +19,23 @@ function usage(value) {
   if (value.modelContextWindow !== null && (!Number.isSafeInteger(value.modelContextWindow) || value.modelContextWindow < 0)) fail();
 }
 function packageRecord(value) {
-  object(value, ['schema', 'text', 'digest', 'count', 'limit', 'blocked', 'capacityBinding', 'boundEvidence', 'warnings', 'historyExclusions', 'scope', 'excludedHistory', 'dependencies', 'historyIds', 'brief', 'vault', 'question', 'speculation', 'historyDigest']);
+  object(value, ['schema', 'text', 'digest', 'count', 'limit', 'blocked', 'capacityBinding', 'boundEvidence', 'warnings', 'historyExclusions', 'scope', 'excludedHistory', 'dependencies', 'historyIds', 'historyRefs', 'brief', 'vault', 'question', 'speculation', 'historyDigest']);
   if (value.schema !== 1 || typeof value.text !== 'string' || hash(value.text) !== value.digest || [...value.text].length !== value.count || !Number.isSafeInteger(value.limit) || typeof value.blocked !== 'boolean' || typeof value.question !== 'string' || typeof value.speculation !== 'boolean') fail();
   for (const key of ['capacityBinding', 'boundEvidence', 'historyDigest']) if (value[key] !== null && typeof value[key] !== 'string') fail();
   strings(value.warnings); strings(value.historyIds); strings(value.excludedHistory); scope(value.scope); pin(value.brief); root(value.vault);
   if (!Array.isArray(value.dependencies) || !Array.isArray(value.historyExclusions)) fail();
   for (const dep of value.dependencies) { object(dep, ['key', 'digest', 'captureId', 'revisionId']); if (typeof dep.key !== 'string' || !/^[a-f0-9]{64}$/.test(dep.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep, key) && !uuid(dep[key]))) fail(); }
   for (const item of value.historyExclusions) { object(item, ['id', 'reason']); if (!uuid(item.id) || typeof item.reason !== 'string') fail(); }
+  if (value.historyRefs !== undefined) {
+    if (!Array.isArray(value.historyRefs)) fail();
+    const qualified = new Set();
+    for (const ref of value.historyRefs) {
+      object(ref, ['conversationId', 'requestId', 'digest']);
+      if (!uuid(ref.conversationId) || !uuid(ref.requestId) || typeof ref.digest !== 'string' || !/^[a-f0-9]{64}$/.test(ref.digest)) fail();
+      const key = `${ref.conversationId}:${ref.requestId}`;
+      if (qualified.has(key)) fail(); qualified.add(key);
+    }
+  }
 }
 function conversation(value) {
   object(value, ['schema', 'id', 'vault', 'brief', 'createdAt', 'scope', 'requests', 'archiveBinding']);
