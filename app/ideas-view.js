@@ -22,8 +22,20 @@
   byId('idea-preview-button').before(references);
   const evidenceView = document.createElement('div'); evidenceView.id = 'idea-evidence'; section.append(evidenceView);
   const pendingView = document.createElement('div'); pendingView.id = 'pending-ideas'; section.append(pendingView);
+  const editorControls = document.createElement('fieldset');
+  Object.assign(editorControls.style, { border: '0', padding: '0', margin: '0', minWidth: '0' });
+  editorControls.append(...byId('idea-editor').childNodes); byId('idea-editor').append(editorControls);
   let origin = null, operation = null, epoch = 0, listEpoch = 0, vaultEpoch = 0, initialSupportPending = true;
+  let editorLoad = null;
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
+  function beginEditorLoad() {
+    invalidate(); editorLoad = { epoch, vaultEpoch }; editorControls.disabled = true; editorControls.setAttribute('aria-busy', 'true'); return editorLoad;
+  }
+  const ownsEditorLoad = owner => editorLoad === owner && owner.epoch === epoch && owner.vaultEpoch === vaultEpoch;
+  function finishEditorLoad(owner) {
+    if (editorLoad !== owner) return;
+    editorLoad = null; editorControls.disabled = false; editorControls.removeAttribute('aria-busy');
+  }
   for (const field of ['title', 'explanation', 'limitations']) byId(`idea-${field}`).oninput = invalidate;
   for (const [key] of experimentFields) byId(`idea-experiment-${key}`).oninput = invalidate;
   kind.onchange = () => { invalidate(); experiments.hidden = kind.value !== 'experiment_proposal'; };
@@ -84,13 +96,14 @@
         if (proposal.cleanup) { const state = document.createElement('p'); state.textContent = 'The note is already published. Resume to review and explicitly finish local staging cleanup.'; article.append(state); }
         else if (proposal.hasPublication) { const state = document.createElement('p'); state.textContent = 'The note is already published. Resume to acknowledge it and finish local staging cleanup.'; article.append(state); }
         resume.onclick = async () => {
-          invalidate(); const current = epoch;
+          const owner = beginEditorLoad(); byId('idea-status').textContent = 'Loading retained proposal…';
           try {
-            const retained = await window.companion['idea-resume']({ operation: proposal.operation }); if (current !== epoch) return;
+            const retained = await window.companion['idea-resume']({ operation: proposal.operation }); if (!ownsEditorLoad(owner)) return;
             origin = { conversationId: retained.input.conversationId, requestId: retained.input.requestId };
             fillEditor(retained.input, retained.references, retained.input.referenceIds); showPreview(retained);
             byId('idea-status').textContent = retained.blocked ? 'Proposed content retained. Context changed; review a new preview before confirmation.' : retained.acknowledgement ? 'Saved note already published. Confirm explicitly to acknowledge it and finish local staging cleanup. Supporting-context eligibility remains separate.' : retained.cleanup ? 'Saved note already published. Confirm explicitly to finish local staging cleanup.' : 'Proposed content restored. Confirm explicitly to retry the save.';
-          } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
+          } catch (error) { if (ownsEditorLoad(owner)) byId('idea-status').textContent = error.message; }
+          finally { finishEditorLoad(owner); }
         };
         article.append(title, resume); pendingView.append(article);
       }
@@ -103,13 +116,15 @@
     }
   }
   window.addEventListener('companion-idea-draft', async event => {
-    invalidate(); const current = epoch; origin = event.detail; byId('idea-status').textContent = '';
+    const selectedOrigin = { ...event.detail }, owner = beginEditorLoad(); byId('idea-status').textContent = 'Loading selected reply…';
     try {
-      const draft = await window.companion['idea-draft'](origin); if (current !== epoch) return;
+      const draft = await window.companion['idea-draft'](selectedOrigin); if (!ownsEditorLoad(owner)) return;
+      origin = selectedOrigin;
       fillEditor(draft, draft.references);
       const warning = document.createElement('p'); warning.textContent = (draft.warnings || []).join('\n'); references.append(warning);
-      byId('idea-title').focus();
-    } catch (error) { if (current === epoch) byId('idea-status').textContent = error.message; }
+      byId('idea-status').textContent = ''; finishEditorLoad(owner); byId('idea-title').focus();
+    } catch (error) { if (ownsEditorLoad(owner)) byId('idea-status').textContent = error.message; }
+    finally { finishEditorLoad(owner); }
   });
   byId('idea-preview-button').onclick = async () => {
     invalidate(); const current = epoch; byId('idea-status').textContent = '';
@@ -131,7 +146,7 @@
     finally { byId('idea-confirm').disabled = false; }
   };
   refreshSupport.onclick = () => list();
-  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
+  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; invalidate(); editorLoad = null; editorControls.disabled = false; editorControls.removeAttribute('aria-busy'); initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
   function inspectInitialSupport(event) {
     if (configurationBusy || event?.detail && event.detail.configurationEpoch !== configurationEpoch) return;
     refreshSupport.disabled = false;
