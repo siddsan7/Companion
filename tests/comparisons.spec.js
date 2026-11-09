@@ -153,3 +153,78 @@ test('returned comparison settings mismatch consumes the failed slot before turn
   await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
   expect(await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).toBe(requests);
 });
+
+test('six explicit paired attempts retain all outcomes and one independent blind feedback across restart', async () => {
+  test.setTimeout(180000);
+  await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
+    dispatchEnabled: true,
+    capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
+    comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
+  }), 'utf8');
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+  const initial = await savedComparison();
+  const counters = { totalTokens: 37, inputTokens: 20, cachedInputTokens: 2, cacheWriteInputTokens: 0, outputTokens: 17, reasoningOutputTokens: 4 };
+  for (let index = 1; index <= 6; index++) {
+    const text = index === 2 ? 'Authored synthetic long answer. ' + 'retained '.repeat(610) : `Authored synthetic candidate ${index}. The supplied passage and approved brief do not establish a learning benefit; limitations apply. This is a controlled output, not an executed experiment.`;
+    await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({
+      model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default',
+      turn: index === 6 ? 'usage-limit' : 'completed',
+      messages: [{ phase: index === 3 ? null : 'final_answer', text }],
+      ...(index === 1 ? { usageUpdates: [{ tokenUsage: { total: counters, last: counters, modelContextWindow: null } }] } : {})
+    }), 'utf8');
+    await page.getByRole('button', { name: `Preview Output ${index}`, exact: true }).click();
+    await expect(page.getByLabel('Reviewed comparison package', { exact: true })).toHaveValue(/final answer up to 600 words/);
+    await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+    await expect(page.locator('#comparison-slots article').nth(index - 1)).toContainText(index === 6 ? 'failed' : 'completed');
+  }
+  const generated = await savedComparison();
+  expect(generated.slots).toHaveLength(6);
+  expect(generated.slots.filter(slot => slot.status === 'completed')).toHaveLength(5);
+  expect(generated.slots.filter(slot => slot.status === 'failed')).toHaveLength(1);
+  expect(generated.displayOrder).toEqual(initial.displayOrder);
+  for (const fixture of generated.fixtures) {
+    const pair = generated.slots.filter(slot => slot.fixtureId === fixture.id);
+    expect(pair).toHaveLength(2);
+    expect(pair[0].package.sharedInputDigest).toBe(pair[1].package.sharedInputDigest);
+    expect(pair[0].requested).toEqual(pair[1].requested);
+    const direct = pair.find(slot => slot.method === 'direct'), analogy = pair.find(slot => slot.method === 'analogy');
+    expect(direct.package.text).not.toContain('Explicitly map');
+    expect(analogy.package.text).toContain('Explicitly map the source mechanism');
+    expect(direct.prompt.version).toBe(1); expect(analogy.prompt.version).toBe(1);
+  }
+  const byDisplay = generated.displayOrder.map(id => generated.slots.find(slot => slot.id === id));
+  expect(byDisplay[0].usage.last).toEqual(counters);
+  expect(byDisplay[1].candidate.overRequestedLimit).toBe(true);
+  expect(byDisplay[1].candidate.text).toContain('retained '.repeat(610));
+  expect(byDisplay[2].candidate.warning).toContain('unavailable or ambiguous');
+  expect(byDisplay[5].error).toContain('usage limit');
+  const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(submissions.trim().split('\n')).toHaveLength(6);
+  await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
+  await expect(page.locator('#comparison-score article')).toHaveCount(6);
+  await expect(page.locator('#comparison-score')).not.toContainText('analogy');
+  await expect(page.locator('#comparison-score')).not.toContainText('sharedInputDigest');
+  await expect(page.locator('#comparison-rubric')).toContainText('No concrete project decision is helped');
+  await expect(page.locator('#comparison-rubric')).toContainText('Claims and transfer follow');
+  await page.getByLabel('Output 1 Usefulness', { exact: true }).fill('3');
+  await page.getByLabel('Output 1 Surprise', { exact: true }).fill('5');
+  await page.getByLabel('Output 1 Grounding', { exact: true }).fill('1');
+  await page.getByLabel('Output 1 Ease of testing', { exact: true }).fill('2');
+  await page.getByLabel('Output 1 Rating reason', { exact: true }).fill('High surprise does not excuse an unsupported claim. This authored score is a UI fixture.');
+  await page.getByLabel('Output 1 Material error', { exact: true }).check();
+  await page.getByRole('button', { name: 'Save feedback Output 1', exact: true }).click();
+  await expect(page.locator('#comparison-score article').first()).toContainText('Feedback saved');
+  const scored = await savedComparison();
+  expect(scored.slots.find(slot => slot.id === scored.displayOrder[0]).rating).toMatchObject({ usefulness: 3, surprise: 5, grounding: 1, easeOfTesting: 2, reason: 'High surprise does not excuse an unsupported claim. This authored score is a UI fixture.', materialError: true });
+  expect(scored.slots.filter(slot => slot.rating)).toHaveLength(1);
+  expect(scored.displayOrder).toEqual(initial.displayOrder);
+  await app.close(); app = null; await launch(false);
+  await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
+  await expect(page.locator('#comparison-score article')).toHaveCount(6);
+  await expect(page.getByLabel('Output 1 Surprise', { exact: true })).toHaveValue('5');
+  await expect(page.getByLabel('Output 1 Material error', { exact: true })).toBeChecked();
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+});
