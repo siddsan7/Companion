@@ -11,7 +11,7 @@ test.beforeEach(async () => {
 });
 test.afterEach(async ({}, testInfo) => {
   diagnosticWatcher?.close(); await diagnosticReads;
-  if (diagnostic && testInfo.status !== testInfo.expectedStatus) {
+  if (diagnostic) {
     const destination = testInfo.outputPath('conversation-state'); await fs.mkdir(destination, { recursive: true });
     const manifest = { title: testInfo.title, status: testInfo.status, wrapperPid: app?.process().pid, mainPid: app ? await app.evaluate(() => process.pid).catch(() => null) : null, testRoot: root, files: diagnosticFiles };
     manifest.visible = await page.evaluate(() => ({ timeline: window.__conversationDiagnostic || [], history: document.getElementById('conversation-history')?.textContent, error: document.getElementById('conversation-error')?.textContent, status: document.querySelector('[role="status"]')?.textContent })).catch(error => ({ unavailable: error.message }));
@@ -20,7 +20,7 @@ test.afterEach(async ({}, testInfo) => {
     await fs.mkdir(path.join(destination, 'conversations'));
     for (const name of await fs.readdir(path.join(root, 'conversations')).catch(() => [])) if (/^[a-f0-9-]{36}\.json$/.test(name)) await copy(path.join('conversations', name), path.join('conversations', name));
     await fs.writeFile(path.join(destination, 'observations.json'), JSON.stringify(manifest, null, 2));
-    console.log(`Saved whitelisted conversation failure evidence: ${destination}`);
+    console.log(`Saved whitelisted conversation evidence: ${destination}`);
   }
   if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true });
 });
@@ -402,6 +402,7 @@ test('ordered assistant items retain every full completed message and phase acro
   ]);
   expect(new Set(saved.requests[0].messages.map(message => message.id)).size).toBe(3);
   const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+  expect(calls.trim().split('\n').filter(Boolean)).toHaveLength(1);
   await app.close(); app = null; await launch(false);
   await expect(page.locator('#conversation-history')).toContainText('COMMENTARY_COMPLETE_CANARY');
   await expect(page.locator('#conversation-history')).toContainText('FINAL_COMPLETE_CANARY');

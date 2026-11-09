@@ -84,7 +84,7 @@ app.whenReady().then(async () => {
   installBriefs({ ipcMain, dialog, fs, path, testRoot, getVault: () => vault, clock });
   const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData') });
   conversationProvider = new ConversationProvider({ setup: codex, testRoot, getVault: () => vault });
-  installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider });
+  installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));

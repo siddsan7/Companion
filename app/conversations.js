@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -13,8 +14,8 @@ function scopeOf(record) {
 }
 
 class Conversations {
-  constructor({ dataRoot, getContext, getVault, clock, provider, checkpoint }) {
-    Object.assign(this, { directory: path.join(dataRoot, 'conversations'), getContext, getVault, clock, provider, checkpoint });
+  constructor({ dataRoot, getContext, getVault, clock, provider, checkpoint, testRoot }) {
+    Object.assign(this, { directory: path.join(dataRoot, 'conversations'), getContext, getVault, clock, provider, checkpoint, testRoot });
     this.tokens = new Map(); this.running = new Set();
   }
   async lock(work) {
@@ -33,11 +34,37 @@ class Conversations {
   async write(record) {
     await this.checkpoint('conversation-before-store');
     const stage = path.join(this.directory, `${randomUUID()}.pending`);
-    let handle;
+    let handle, phase = 'open';
     try {
-      handle = await fs.open(stage, 'wx'); await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
-      await fs.rename(stage, path.join(this.directory, `${record.id}.json`));
-    } finally { await handle?.close(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+      handle = await fs.open(stage, 'wx');
+      phase = 'write'; await handle.writeFile(JSON.stringify(record, null, 2), 'utf8');
+      phase = 'sync'; await handle.sync();
+      phase = 'cleanup'; await handle.close(); handle = null;
+      phase = 'rename';
+      await this.publishStage(stage, path.join(this.directory, `${record.id}.json`));
+    } catch (error) { await this.storeFailure(phase, error); throw error; }
+    finally {
+      try { await handle?.close(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+      catch (error) { await this.storeFailure('cleanup', error); throw error; }
+    }
+  }
+  async publishStage(stage, destination) {
+    const deadline = performance.now() + 1000; let delay = 15;
+    while (true) {
+      try { await fs.rename(stage, destination); return; }
+      catch (error) {
+        const remaining = deadline - performance.now();
+        if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
+        await this.storeFailure('rename', error);
+        await new Promise(resolve => setTimeout(resolve, Math.min(delay, remaining)));
+        delay = Math.min(delay * 2, 100);
+      }
+    }
+  }
+  async storeFailure(phase, error) {
+    if (!this.testRoot) return;
+    const safe = { at: Date.now(), pid: process.pid, phase, code: typeof error.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : null, syscall: typeof error.syscall === 'string' && /^[a-zA-Z0-9_]{1,40}$/.test(error.syscall) ? error.syscall : null };
+    await fs.appendFile(path.join(this.testRoot, 'conversation-store-failures.jsonl'), JSON.stringify(safe) + '\n').catch(() => {});
   }
   async list() {
     const vault = this.getVault(); if (!vault) return { conversations: [], location: this.directory };
