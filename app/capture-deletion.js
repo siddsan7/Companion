@@ -237,6 +237,31 @@ async function finishRestoration(intake, ledger, id) {
   if (authority?.phase !== 'restoring') return;
   if (await fs.realpath(vault.vault) !== authority.root || !ledger.suppressed.includes(authority.sourceHash)) throw Error('Restoration authority changed. Suppression remains.');
   const journal = path.join(intake.dir, authority.restoration.journal), transaction = path.join(intake.dir, 'transaction.json');
+  if (!authority.restoration.published && ledger.admissions?.[authority.restoration.revision]) {
+    // A durable admission proves this exact publication already happened. Only
+    // verify and acknowledge it; replay must never recreate its missing output.
+    const admission = revisionAdmission(ledger, authority.restoration.revision), capture = ledger.captures[authority.sourceHash];
+    const snapshot = path.join(vault.root, 'Revisions', authority.restoration.revision + '.json'), destination = intake.destination(capture);
+    const stage = path.join(intake.dir, authority.restoration.revision + '.stage'), snapshotStage = path.join(intake.dir, authority.restoration.revision + '.snapshot.stage');
+    if (!admission || admission.captureId !== id || admission.sourceHash !== authority.sourceHash || admission.sourceGeneration !== authority.generation || capture.currentRevision !== authority.restoration.revision) throw Error('Restoration admission changed. Suppression remains.');
+    const current = await intake.ownedFile(destination, stage, 'Restoration capture'), retained = await intake.ownedFile(snapshot, snapshotStage, 'Restoration snapshot');
+    if (!current || !retained) throw Error('Restoration publication is missing. Its durable admission cannot recreate it; suppression remains.');
+    const snapshotBytes = await fs.readFile(snapshot, 'utf8'), revision = JSON.parse(snapshotBytes), content = await fs.readFile(destination, 'utf8');
+    if (hash(snapshotBytes) !== admission.snapshotHash || revision.id !== capture.currentRevision || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || hash(content) !== capture.currentHash || content !== noteText(capture, revision)) throw Error('Restoration publication changed. Its durable admission cannot replace it; suppression remains.');
+    const cleanup = [];
+    for (const [file, peer, expected] of [[stage, destination, hash(content)], [snapshotStage, snapshot, admission.snapshotHash], [transaction, journal, authority.restoration.sha256]]) {
+      const info = await intake.ownedFile(file, peer, 'Restoration publication acknowledgement');
+      if (!info) continue;
+      if (hash(await fs.readFile(file)) !== expected) throw Error('Restoration acknowledgement bytes changed. All files remain.');
+      cleanup.push({ file, peer, expected, dev: info.dev, ino: info.ino });
+    }
+    for (const item of cleanup) {
+      const info = await intake.ownedFile(item.file, item.peer, 'Restoration publication acknowledgement');
+      if (!info || info.dev !== item.dev || info.ino !== item.ino || hash(await fs.readFile(item.file)) !== item.expected) throw Error('Restoration acknowledgement identity changed.');
+      await fs.unlink(item.file);
+    }
+    authority.restoration.published = true; await intake.save(ledger);
+  }
   if (!authority.restoration.published) {
     await intake.ownedFile(journal, transaction, 'Selected restoration journal');
     const bytes = await fs.readFile(journal, 'utf8'); if (hash(bytes) !== authority.restoration.sha256) throw Error('Selected restoration journal changed. Suppression remains.');
