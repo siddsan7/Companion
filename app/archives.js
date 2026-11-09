@@ -576,5 +576,8 @@ function installArchives({ ipcMain, ...options }) {
   ipcMain.handle('archive-reconnect-preview', (_, input) => archives.reconnectPreview(input));
   ipcMain.handle('archive-reconnect', (_, input) => archives.reconnect(input));
   ipcMain.handle('archive-review-pending', () => archives.reviewPending());
+  ipcMain.handle('archive-recovery-pending', () => archives.history.controls.pendingRestorations());
+  ipcMain.handle('archive-recovery-resume', (_, input) => archives.history.controls.resumeRestoration(input?.id));
+  ipcMain.handle('archive-recovery-confirm', (_, input) => archives.history.controls.confirm(input?.token, 'restoration'));
 }
 module.exports = { installArchives };

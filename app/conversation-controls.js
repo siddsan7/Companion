@@ -50,6 +50,10 @@ class ConversationControls {
       if (target.name.endsWith('.json') && target.name !== `${id}.json`) fail();
     }
     if (['deleting', 'deleted'].includes(value.phase) && !names.has(`${id}.json`)) fail();
+    if (value.phase === 'restoring') {
+      const stage = value.targets.find(target => target.name.endsWith('.pending')), destination = value.targets.find(target => target.name === `${id}.json`);
+      if (value.targets.length !== 2 || !stage || !destination || stage.sha256 !== value.restoration.recordDigest || ['sha256', 'dev', 'ino', 'bytes'].some(key => stage[key] !== destination[key])) fail();
+    }
     return value;
   }
   async state(id) {
@@ -110,8 +114,19 @@ class ConversationControls {
   async approveScope(record, scope) {
     const marker = await this.state(record.id); if (!marker) return;
     await this.check(record);
+    // Lower only the explicitly restored floor before writing. Newly added exclusions
+    // already live in the durable record after write; publish their full floor afterwards.
+    const floor = { excludedSources: marker.scope.excludedSources.filter(key => scope.excludedSources.includes(key)), excludedHistory: marker.scope.excludedHistory.filter(id => scope.excludedHistory.includes(id)) };
+    if (JSON.stringify(floor) === JSON.stringify(marker.scope)) return;
     await this.settlePublication(marker);
-    await this.put({ ...marker, scope: { excludedSources: [...scope.excludedSources], excludedHistory: [...scope.excludedHistory] } }, marker);
+    await this.put({ ...marker, scope: floor }, marker);
+  }
+  async commitScope(record) {
+    const marker = await this.state(record.id); if (!marker) return;
+    await this.check(record);
+    const scope = { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] };
+    if (JSON.stringify(scope) === JSON.stringify(marker.scope)) return;
+    await this.settlePublication(marker); await this.put({ ...marker, scope }, marker);
   }
   async put(marker, baseline) {
     const directory = this.guard(true), file = path.join(directory.directory, `${marker.id}.json`);
@@ -203,7 +218,7 @@ class ConversationControls {
         if (marker.phase === 'deleting') {
           const snapshot = await this.recoverySnapshot(id);
           records.push({ id, generation: marker.generation, targets: marker.targets.map(target => target.name), remaining: snapshot.remaining, canResume: true, warning: 'Previously confirmed deletion is incomplete. Inspect the exact retained manifest and resume explicitly. Nothing is removed during inspection.' });
-        } else if (marker.phase === 'restoring') records.push({ id, generation: marker.generation, targets: [], canResume: false, warning: 'Explicit archive restoration is incomplete. Its own reviewed recovery is required; deletion recovery cannot promote it.' });
+        }
       } catch (error) { records.push({ id, generation: marker?.generation || 'unavailable', targets: marker?.targets?.map(target => target.name) || [], canResume: false, warning: error.message }); }
     }
     return { records, issues };
@@ -225,6 +240,63 @@ class ConversationControls {
     if (!same(a.stat, b.stat) || a.text !== b.text || JSON.stringify(JSON.parse(a.text)) !== JSON.stringify(marker)) throw Error('Conversation control publication changed. Unknown peers remain preserved.');
     this.guard(false, directory.stat); await fs.unlink(stage);
   }
+  async restorationSnapshot(id) {
+    const marker = await this.state(id);
+    if (!marker || marker.phase !== 'restoring') throw Error('There is no interrupted history restoration for this identity.');
+    if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve unsaved writing or finish the active request before restoration recovery.');
+    const parent = this.store.safeDirectory(), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), destinationTarget = marker.targets.find(target => target.name.endsWith('.json'));
+    const stage = path.join(this.store.directory, stageTarget.name), destination = path.join(this.store.directory, destinationTarget.name);
+    const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    const stageExists = await exists(stage), destinationExists = await exists(destination);
+    if (!stageExists && !destinationExists) throw Error('Restoration payload is unavailable. No history will be reconstructed from metadata.');
+    const links = stageExists && destinationExists ? 2 : 1;
+    const staged = stageExists ? await this.file(stage, parent, stageTarget, links) : null;
+    const published = destinationExists ? await this.file(destination, parent, destinationTarget, links) : null;
+    if (staged && published && (!same(staged.stat, published.stat) || staged.text !== published.text)) throw Error('Restoration has unknown or edited publication peers. Preserve both copies.');
+    const text = (staged || published).text, record = conversation(JSON.parse(text));
+    if (hash(text) !== marker.restoration.recordDigest || record.id !== id || record.generation !== marker.generation || record.vault.root !== this.store.getVault()?.root || JSON.stringify({ excludedSources: record.scope?.excludedSources, excludedHistory: record.scope?.excludedHistory }) !== JSON.stringify(marker.scope)) throw Error('Restoration ownership or retained exclusion authority changed. Preserve the payload for review.');
+    return { restoration: true, id, marker, stageExists, destinationExists, text };
+  }
+  async pendingRestorations() {
+    const records = [], issues = []; let directory;
+    try { directory = this.guard(); if (!directory) return { records, issues }; }
+    catch (error) { return { records, issues: [error.message] }; }
+    for (const name of await fs.readdir(directory.directory)) if (/^[a-f0-9-]{36}\.json$/.test(name)) {
+      const id = name.slice(0, -5); let marker;
+      try {
+        marker = await this.state(id); if (marker.phase !== 'restoring') continue;
+        const snapshot = await this.restorationSnapshot(id);
+        records.push({ id, generation: marker.generation, archiveId: marker.restoration.archiveId, targets: marker.targets.map(target => target.name), text: snapshot.text, canResume: true });
+      } catch (error) { if (marker?.phase === 'restoring') records.push({ id, generation: marker.generation, archiveId: marker.restoration.archiveId, targets: marker.targets.map(target => target.name), text: '', canResume: false, warning: error.message }); else issues.push(error.message); }
+    }
+    return { records, issues };
+  }
+  async resumeRestoration(id) {
+    return this.store.lock(async () => {
+      const snapshot = await this.restorationSnapshot(id), token = randomUUID();
+      if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
+      this.previews.set(token, snapshot);
+      return { token, id, generation: snapshot.marker.generation, archiveId: snapshot.marker.restoration.archiveId, targets: snapshot.marker.targets.map(target => target.name), text: snapshot.text };
+    });
+  }
+  async finishRestoration(snapshot) {
+    const { marker } = snapshot; await this.settlePublication(marker);
+    const parent = this.store.safeDirectory(), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), target = marker.targets.find(target => target.name.endsWith('.json'));
+    const stage = path.join(this.store.directory, stageTarget.name), destination = path.join(this.store.directory, target.name);
+    if (!snapshot.destinationExists) {
+      await this.file(stage, parent, stageTarget); this.store.safeDirectory(false, parent);
+      await fs.link(stage, destination); this.store.safeDirectory(false, parent);
+      await this.store.checkpoint('archive-restore-after-link');
+    }
+    const current = await this.restorationSnapshot(marker.id);
+    if (JSON.stringify(current.marker) !== JSON.stringify(marker) || current.text !== snapshot.text) throw Error('Restoration authority changed. Preserve the exact payload for review.');
+    if (current.stageExists) { this.store.safeDirectory(false, parent); await fs.unlink(stage); }
+    await this.store.checkpoint('archive-restore-before-active');
+    await this.file(destination, parent, target);
+    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker);
+    this.store.tokens.clear(); this.store.durable.set(marker.id, marker.restoration.recordDigest);
+    return { id: marker.id, generation: active.generation };
+  }
   async finish(marker) {
     await this.settlePublication(marker);
     this.store.tokens.clear(); this.store.durable.delete(marker.id);
@@ -242,9 +314,15 @@ class ConversationControls {
     const completed = await this.put({ ...marker, phase: 'deleted' }, marker);
     this.store.unsaved.delete(marker.id); return { id: marker.id, generation: completed.generation };
   }
-  async confirm(token) {
-    const reviewed = this.previews.get(token); if (!reviewed) throw Error('Preview the selected conversation deletion again.');
+  async confirm(token, kind = 'deletion') {
+    const reviewed = this.previews.get(token); if (!reviewed) throw Error('Review the intended local history action again.');
+    if (Boolean(reviewed.restoration) !== (kind === 'restoration')) throw Error('The reviewed action belongs to another history workflow. Review the intended action again.');
     return this.store.lock(async () => {
+      if (reviewed.restoration) {
+        const current = await this.restorationSnapshot(reviewed.id);
+        if (JSON.stringify(current) !== JSON.stringify(reviewed)) throw Error('Restoration publication state changed. Inspect its remaining owned payload again.');
+        const result = await this.finishRestoration(current); this.previews.delete(token); return result;
+      }
       if (reviewed.recovery) {
         const current = await this.recoverySnapshot(reviewed.id);
         if (JSON.stringify(current) !== JSON.stringify(reviewed)) throw Error('Deletion recovery manifest changed. Inspect it again; remaining writing was preserved.');

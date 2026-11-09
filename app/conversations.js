@@ -302,7 +302,7 @@ class Conversations {
       if (!record.scope || JSON.stringify(baseline) !== JSON.stringify(snapshot.scope)) {
         await this.controls.approveScope(record, snapshot.scope);
         record.scope = { ...snapshot.scope, version: randomUUID() };
-        await this.write(record); snapshot.scope = record.scope;
+        await this.write(record); await this.controls.commitScope(record); snapshot.scope = record.scope;
         for (const [token, approved] of this.tokens) if (approved.input.conversationId === input.conversationId) this.tokens.delete(token);
       }
     });
