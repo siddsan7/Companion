@@ -59,6 +59,21 @@ function inactiveIntent(value) {
   if (value.schema !== 1 || !uuid(value.archiveId) || typeof value.sourceRoot !== 'string' || typeof value.targetRoot !== 'string') fail();
   scheduleIntent(value.intent); return value;
 }
+function coverage(value) {
+  object(value, ['mode', 'omitted']);
+  if (value.mode !== 'saved-history-only' || !Array.isArray(value.omitted) || value.omitted.length === 0) fail();
+  const names = new Set();
+  for (const item of value.omitted) {
+    object(item, ['name', 'sha256', 'bytes', 'kind']);
+    if (typeof item.name !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,140}\.pending$/.test(item.name) || names.has(item.name) || !/^[a-f0-9]{64}$/.test(item.sha256) || !Number.isSafeInteger(item.bytes) || item.bytes < 0 || item.bytes > 128 * 1024 * 1024 || !['validated-conversation', 'unknown-data'].includes(item.kind)) fail();
+    names.add(item.name);
+  }
+  return value;
+}
+function inactiveCoverage(value) {
+  object(value, ['schema', 'archiveId', 'coverage']);
+  if (value.schema !== 1 || !uuid(value.archiveId)) fail(); coverage(value.coverage); return value;
+}
 // v1 canonical JSON: sorted UTF-16 object keys, array order preserved, JSON primitive spelling.
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -99,13 +114,14 @@ function parseArchive(text) {
   catch (error) { if (error instanceof SyntaxError) throw Error('Invalid archive JSON.'); throw error; }
 }
 function archiveRecord(value) {
-  object(value, ['format', 'version', 'id', 'createdAt', 'appVersion', 'payload', 'integrity']);
+  object(value, ['format', 'version', 'id', 'createdAt', 'appVersion', 'payload', 'integrity', 'coverage']);
   if (value.format !== 'companion-local-history' || value.version !== 1) throw Error('Unsupported history archive format or version.');
   if (!uuid(value.id) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.appVersion !== 'string') fail();
   object(value.integrity, ['algorithm', 'digest']);
-  if (value.integrity.algorithm !== 'sha256' || value.integrity.digest !== hash(canonical(value.payload))) throw Error('History archive integrity check failed. Preserve the original file; nothing was restored.');
+  if (value.coverage !== undefined) coverage(value.coverage);
+  if (value.integrity.algorithm !== 'sha256' || value.integrity.digest !== hash(canonical(value.coverage ? { payload: value.payload, coverage: value.coverage } : value.payload))) throw Error('History archive integrity check failed. Preserve the original file; nothing was restored.');
   const payload = object(value.payload, ['settings', 'contextScopes', 'scheduleIntent', 'vaultBindings', 'conversations']);
-  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent', 'inactiveScheduleIntents']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); if (payload.settings.inactiveScheduleIntents !== undefined) { if (!Array.isArray(payload.settings.inactiveScheduleIntents)) fail(); payload.settings.inactiveScheduleIntents.forEach(inactiveIntent); } }
+  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent', 'inactiveScheduleIntents', 'inactiveArchiveCoverage']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); if (payload.settings.inactiveScheduleIntents !== undefined) { if (!Array.isArray(payload.settings.inactiveScheduleIntents)) fail(); payload.settings.inactiveScheduleIntents.forEach(inactiveIntent); } if (payload.settings.inactiveArchiveCoverage !== undefined) { if (!Array.isArray(payload.settings.inactiveArchiveCoverage)) fail(); payload.settings.inactiveArchiveCoverage.forEach(inactiveCoverage); } }
   if (!Array.isArray(payload.contextScopes) || !Array.isArray(payload.vaultBindings) || !Array.isArray(payload.conversations)) fail();
   const scopes = new Set(), roots = new Set(), ids = new Set();
   for (const item of payload.contextScopes) { object(item, ['binding', 'schema', 'files']); if (!/^[a-f0-9]{64}$/.test(item.binding) || scopes.has(item.binding) || item.schema !== 1) fail(); strings(item.files); scopes.add(item.binding); }
@@ -123,3 +139,4 @@ function archiveRecord(value) {
 module.exports.parseArchive = parseArchive;
 module.exports.archiveRecord = archiveRecord;
 module.exports.inactiveIntent = inactiveIntent;
+module.exports.inactiveCoverage = inactiveCoverage;

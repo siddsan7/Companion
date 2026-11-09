@@ -1,19 +1,39 @@
 const archivePreview = document.getElementById('archive-preview');
 const archiveExport = document.getElementById('archive-export');
 const archiveSummary = document.getElementById('archive-summary');
+const archiveSavedOnly = document.getElementById('archive-saved-only');
+const archivePendingReview = document.getElementById('archive-pending-review');
+const archivePendingDetails = document.getElementById('archive-pending-details');
+let archiveRecoveryReview;
 let archiveReview;
 archivePreview.onclick = async () => {
   archiveReview = null; archiveExport.disabled = true; archivePreview.disabled = true;
   try {
-    const review = await window.companion['archive-preview'](); archiveReview = review.id;
+    const review = await window.companion['archive-preview']({ savedOnly: archiveSavedOnly.checked, recoveryId: archiveRecoveryReview }); archiveReview = review.id;
     archiveSummary.textContent = `Application data: ${review.location}. ${review.count} conversation${review.count === 1 ? '' : 's'}; ${review.vaults} vault binding${review.vaults === 1 ? '' : 's'}. Includes complete saved history, defined settings and vault matching hints. Excludes credentials, provider setup and vault contents. Schedule intent requires explicit reconnection. This file contains private conversation text. Review before saving.`;
+    if (review.omitted) archiveSummary.textContent += ` Incomplete archive: ${review.omitted} unresolved files omitted. Their only copies may remain in the local history folder shown below. Preserve those files separately; this export is not a complete history backup.`;
     archiveExport.disabled = false;
   } catch (error) { archiveSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archivePreview.disabled = false; }
 };
+archiveSavedOnly.onchange = () => { archiveReview = null; archiveExport.disabled = true; archiveSummary.textContent = 'Export scope changed. Preview the archive again.'; };
+archivePendingReview.onclick = async () => {
+  archiveRecoveryReview = null; archiveSavedOnly.checked = false; archiveSavedOnly.disabled = true; archiveReview = null; archiveExport.disabled = true; archivePendingDetails.replaceChildren(); archivePendingReview.disabled = true;
+  try {
+    const result = await window.companion['archive-review-pending'](); archiveRecoveryReview = result.id;
+    const warning = document.createElement('p'); warning.textContent = `${result.records.length} unresolved files remain preserved at ${result.location}. Copy these preserved files separately before closing or moving this installation. Some may contain the only copy of a reply. Complete export stays blocked; the optional saved-history-only archive omits these bytes and records only inert names, lengths and digests. Nothing is promoted or deleted.`; archivePendingDetails.append(warning);
+    for (const record of result.records) {
+      const row = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = `${record.kind === 'validated-conversation' ? 'Validated pending conversation' : 'Unknown recovery data'}: ${record.name}; ${record.bytes} bytes; SHA256 ${record.sha256}`; row.append(summary);
+      if (record.text !== undefined) { const text = document.createElement('pre'); text.textContent = record.text; row.append(text); }
+      archivePendingDetails.append(row);
+    }
+    archiveSavedOnly.disabled = result.records.length === 0;
+  } catch (error) { archivePendingDetails.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+  finally { archivePendingReview.disabled = false; }
+};
 archiveExport.onclick = async () => {
   const id = archiveReview; archiveReview = null; archiveExport.disabled = true; archivePreview.disabled = true;
-  try { const result = await window.companion['archive-export']({ id }); archiveSummary.textContent = result.cancelled ? 'Export cancelled. Preview again to export.' : `Archive exported: ${result.location}. Keep a separate vault backup. Imported history never proves current Codex readiness.`; }
+  try { const result = await window.companion['archive-export']({ id }); archiveSummary.textContent = result.cancelled ? 'Export cancelled. Preview again to export.' : `Archive exported: ${result.location}. ${result.omitted ? `Incomplete archive: ${result.omitted} unresolved files omitted; preserve those only copies separately. ` : ''}Keep a separate vault backup. Imported history never proves current Codex readiness.`; }
   catch (error) { archiveSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archivePreview.disabled = false; }
 };
@@ -50,6 +70,7 @@ archiveInspect.onclick = async () => {
     for (const root of ['', ...result.roots]) { const option = document.createElement('option'); option.value = root; option.textContent = root || 'Choose an archived vault'; archiveSource.append(option); }
     archiveSource.value = result.roots.includes(result.currentVault) ? result.currentVault : '';
     archiveRestoreSummary.textContent = `Integrity and version validated. ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Archive vault hints: ${result.roots.join('; ') || 'None'}. Current vault: ${result.currentVault || 'None selected'}. Paths and matching content do not prove vault identity. Current settings and source exclusions remain authoritative. Restore adds only reviewed missing conversations; it does not restore vault files, replace settings or connect a scheduled task. Explicit vault matching is required.`;
+    if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Omission metadata is inert and cannot restore their missing content.`;
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archiveInspect.disabled = false; }
 };
@@ -60,6 +81,7 @@ archiveMatchPreview.onclick = async () => {
     archiveRestoreToken = result.token; archiveMissing = result.missing;
     archiveRestoreSummary.textContent = `Matched restore preview: ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Missing history may have been deleted intentionally. Confirm only if you want to add these archived conversations. Current settings and source exclusions remain authoritative. Existing history and vault files stay unchanged. Exact retained brief pins match; original external documents may be unavailable or outdated. Historical restore does not refresh them. Schedule intent remains inactive; task reconnection is separate. Historic packages, capacity bindings and provider IDs do not prove current eligibility or readiness.`;
     archiveRestoreSummary.textContent += ` Current vault configuration is kept: ${result.currentVault.vault}; managed folder ${result.currentVault.managedRoot}. Archived hints: ${result.archivedVault.vault || 'unavailable'}; managed folder ${result.archivedVault.managedRoot}. Use Choose vault to change configuration. Note inclusions change only for individually checked current text below; conversation exclusions remain authoritative.`;
+    if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Their recovery content cannot be restored from this archive.`;
     for (const conflict of result.conflictRecords) {
       const row = document.createElement('div'), details = document.createElement('p'), label = document.createElement('label'), select = document.createElement('select');
       details.textContent = `Conversation ${conflict.id}: current ${conflict.currentRequests} requests and ${conflict.currentExclusions} omitted requests; archive ${conflict.archivedRequests} requests and ${conflict.archivedExclusions} omitted requests. Keep current preserves all current text and source scope. This restore adds missing history and keeps existing conflicts; it does not overwrite or merge them.`;

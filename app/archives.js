@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent } = require('./archive-format');
+const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent, inactiveCoverage } = require('./archive-format');
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { withBriefMutation } = require('./briefs-lock');
@@ -11,7 +11,7 @@ const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
   constructor(options) { Object.assign(this, options); this.review = null; }
   guard() { this.history.safeDirectory(false, this.directory); }
-  async json(file, guard = () => this.guard(), optional = false, strict = false) {
+  async json(file, guard = () => this.guard(), optional = false, strict = false, raw = false) {
     guard(); let handle;
     try {
       const before = await fs.lstat(file, { bigint: true }); guard();
@@ -22,6 +22,7 @@ class Archives {
       const bytes = await handle.readFile(); guard();
       const after = await handle.stat({ bigint: true }), leaf = await fs.lstat(file, { bigint: true }); guard();
       if (!same(opened, leaf) || leaf.isSymbolicLink() || leaf.nlink !== 1n || opened.size !== after.size || opened.mtimeNs !== after.mtimeNs || bytes.length > LIMIT) throw Error('Archive input changed. Preview again.');
+      if (raw) return { value: bytes, digest: hash(bytes) };
       const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       return { value: strict ? parseArchive(text) : JSON.parse(text), digest: hash(bytes) };
     } catch (error) { if (optional && error.code === 'ENOENT') return null; throw error; }
@@ -35,14 +36,21 @@ class Archives {
     };
     guard(); return guard;
   }
-  async snapshot({ locked = false } = {}) {
+  async snapshot({ locked = false, savedOnly = false, recoveryId } = {}) {
     // The store lock fences sends/scope writes/resave and keeps unsaved text out of a false complete backup.
     if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
     const collect = async () => {
       this.directory = this.history.safeDirectory();
       if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
       const names = (await fs.readdir(this.history.directory)).sort(); this.guard();
-      if (names.some(name => name.endsWith('.pending'))) throw Error('Unresolved local history pending files need preservation and review before a complete archive can be exported.');
+      const pending = names.filter(name => name.endsWith('.pending')); let coverage;
+      if (pending.length) {
+        if (!savedOnly) throw Error('Unresolved local history pending files need preservation and review before a complete archive can be exported.');
+        if (!this.recoveryReview || recoveryId !== this.recoveryReview.id) throw Error('Review unresolved history files before choosing a saved-history-only archive.');
+        const inventory = await this.pendingInventory(pending), omitted = inventory.map(({ text, ...item }) => item);
+        if (canonical(omitted) !== canonical(this.recoveryReview.omitted)) throw Error('Unresolved history files changed. Review their preservation and omission again.');
+        coverage = { mode: 'saved-history-only', omitted };
+      } else if (savedOnly) throw Error('Unresolved file inventory changed. Choose a complete export or review the current files again.');
       const fingerprints = {}, conversations = [];
       for (const name of names.filter(name => name.endsWith('.json'))) {
         if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.json$/.test(name)) throw Error('Unrecognized history file. Preserve it for repair.');
@@ -56,6 +64,9 @@ class Archives {
       if (settingsRead) fingerprints[path.join(this.history.dataRoot, 'settings.json')] = settingsRead.digest;
       const inactive = await this.inactiveIntents(fingerprints);
       if (settings && inactive.length) settings.inactiveScheduleIntents = inactive;
+      const priorCoverage = await this.inactiveCoverages(fingerprints);
+      if (priorCoverage.length && !settings) throw Error('Select the current vault configuration before exporting retained archive omission metadata.');
+      if (settings && priorCoverage.length) settings.inactiveArchiveCoverage = priorCoverage;
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
@@ -76,15 +87,15 @@ class Archives {
       const payload = { settings, contextScopes, scheduleIntent, vaultBindings, conversations };
       this.guard();
       if (Buffer.byteLength(canonical(payload)) > LIMIT) throw Error('History archive exceeds the 128 MiB limit.');
-      return { payload, fingerprints };
+      return { payload, fingerprints, ...(coverage ? { coverage } : {}) };
     };
     return locked ? collect() : this.history.lock(collect);
   }
-  async preview() {
+  async preview(input) {
     this.review = null;
-    const snapshot = await this.snapshot(), id = randomUUID();
-    this.review = { id, snapshot };
-    return { id, location: this.history.dataRoot, count: snapshot.payload.conversations.length, vaults: snapshot.payload.vaultBindings.length };
+    const options = { savedOnly: input?.savedOnly === true, recoveryId: input?.recoveryId }, snapshot = await this.snapshot(options), id = randomUUID();
+    this.review = { id, snapshot, options };
+    return { id, location: this.history.dataRoot, count: snapshot.payload.conversations.length, vaults: snapshot.payload.vaultBindings.length, omitted: snapshot.coverage?.omitted.length || 0 };
   }
   async export(input) {
     const review = this.review; this.review = null;
@@ -93,11 +104,12 @@ class Archives {
     if (this.testRoot) destination = JSON.parse(await fs.readFile(path.join(this.testRoot, 'archive-dialog.json'), 'utf8')).save;
     else { const selected = await this.dialog.showSaveDialog({ title: 'Export reviewed local history archive', defaultPath: 'companion-history.json', filters: [{ name: 'Local history archive', extensions: ['json'] }] }); if (!selected.canceled) destination = selected.filePath; }
     if (!destination) return { cancelled: true };
-    const current = await this.snapshot();
+    const current = await this.snapshot(review.options);
     if (canonical(current) !== canonical(review.snapshot)) throw Error('Local history or settings changed. Preview the archive again.');
     const archive = { format: 'companion-local-history', version: 1, id: randomUUID(), createdAt: this.clock().now, appVersion: this.appVersion, payload: current.payload, integrity: { algorithm: 'sha256', digest: hash(canonical(current.payload)) } };
+    if (current.coverage) { archive.coverage = current.coverage; archive.integrity.digest = hash(canonical({ payload: current.payload, coverage: current.coverage })); }
     await this.publish(destination, JSON.stringify(archive, null, 2) + '\n');
-    return { location: destination };
+    return { location: destination, omitted: current.coverage?.omitted.length || 0 };
   }
   restorePlan(archive, current, sourceRoot, targetRoot = sourceRoot) {
     const additions = [], equal = [], conflicts = [];
@@ -131,7 +143,7 @@ class Archives {
     const read = await this.json(file, guard, false, true), archive = archiveRecord(read.value);
     const current = await this.snapshot(), plan = this.restorePlan(archive, current), id = randomUUID();
     this.restoreReview = { id, archive, inspection: current, input: { file, guard, digest: read.digest } };
-    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null };
+    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null, omitted: archive.coverage?.omitted.length || 0 };
   }
   async match(input) {
     const reviewed = this.restoreReview;
@@ -147,7 +159,7 @@ class Archives {
     const noteCandidates = settingsMode === 'review-note-inclusions' ? await this.noteCandidates(reviewed.archive, sourceRoot, vault) : [];
     const token = randomUUID();
     reviewed.matched = { token, root, sourceRoot, snapshot: current, plan, settingsMode, noteCandidates };
-    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
+    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, omitted: reviewed.archive.coverage?.omitted.length || 0, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
       const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
       return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
     }) };
@@ -170,6 +182,7 @@ class Archives {
       let restored = 0, restoredNotes = 0;
       try {
         await this.retainIntents(reviewed.archive, matched.sourceRoot, matched.root);
+        await this.retainCoverage(reviewed.archive);
         for (const original of plan.additions) {
           const record = structuredClone(original);
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
@@ -255,6 +268,52 @@ class Archives {
         if (!pins.some(pin => pin.id === record.brief.id && pin.version === record.brief.version && pin.digest === record.brief.digest)) throw Error('Pin mismatch.');
       }
     } catch { throw Error('Exact archived brief pin is unavailable in the selected vault. Select its separate vault backup; nothing was restored.'); }
+  }
+  async pendingInventory(names) {
+    const records = []; let total = 0;
+    for (const name of [...names].sort()) {
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,140}\.pending$/.test(name)) throw Error('Unrecognized pending filename. Preserve it and inspect the local history folder separately; export stays blocked.');
+      const read = await this.json(path.join(this.history.directory, name), undefined, false, false, true);
+      total += read.value.length; if (total > LIMIT) throw Error('Pending recovery files exceed 128 MiB. Preserve and review them separately; export stays blocked.');
+      let kind = 'unknown-data', text;
+      try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(read.value); conversation(parseArchive(text)); kind = 'validated-conversation'; } catch { text = undefined; }
+      records.push({ name, sha256: read.digest, bytes: read.value.length, kind, ...(text === undefined ? {} : { text }) });
+    }
+    return records;
+  }
+  async reviewPending() {
+    this.recoveryReview = null;
+    if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before reviewing recovery files.');
+    return this.history.lock(async () => {
+      this.directory = this.history.safeDirectory();
+      if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before reviewing recovery files.');
+      const names = (await fs.readdir(this.history.directory)).filter(name => name.endsWith('.pending')); this.guard();
+      const records = await this.pendingInventory(names), id = randomUUID();
+      this.recoveryReview = { id, omitted: records.map(({ text, ...item }) => item) };
+      return { id, location: this.history.directory, records };
+    });
+  }
+  async inactiveCoverages(fingerprints) {
+    const records = [], names = await fs.readdir(this.history.dataRoot); this.guard();
+    for (const name of names.sort().filter(name => /^archive-coverage-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.json$/.test(name))) {
+      const file = path.join(this.history.dataRoot, name), read = await this.json(file), record = inactiveCoverage(read.value);
+      if (name !== `archive-coverage-${record.archiveId}.json`) throw Error('Retained archive coverage identity needs repair.');
+      records.push(record); if (fingerprints) fingerprints[file] = read.digest;
+    }
+    return records;
+  }
+  async retainCoverage(archive) {
+    const records = [...(archive.payload.settings?.inactiveArchiveCoverage || []), ...(archive.coverage ? [{ schema: 1, archiveId: archive.id, coverage: archive.coverage }] : [])];
+    for (const original of records) {
+      const record = inactiveCoverage(original), destination = path.join(this.history.dataRoot, `archive-coverage-${record.archiveId}.json`), existing = await this.json(destination, undefined, true);
+      if (existing) { if (canonical(existing.value) !== canonical(record)) throw Error('Retained omission metadata differs. Existing metadata was preserved.'); continue; }
+      const directory = this.history.safeDirectory(), stage = path.join(this.history.dataRoot, `.archive-coverage-${randomUUID()}.pending`); let handle;
+      try {
+        this.history.safeDirectory(false, directory); handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
+        await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
+        this.history.safeDirectory(false, directory); await fs.link(stage, destination); this.history.safeDirectory(false, directory);
+      } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+    }
   }
   async inactiveIntents(fingerprints) {
     const records = [], names = await fs.readdir(this.history.dataRoot); this.guard();
@@ -387,7 +446,7 @@ class Archives {
 }
 function installArchives({ ipcMain, ...options }) {
   const archives = new Archives(options);
-  ipcMain.handle('archive-preview', () => archives.preview());
+  ipcMain.handle('archive-preview', (_, input) => archives.preview(input));
   ipcMain.handle('archive-export', (_, input) => archives.export(input));
   ipcMain.handle('archive-inspect', () => archives.inspect());
   ipcMain.handle('archive-match', (_, input) => archives.match(input));
@@ -395,5 +454,6 @@ function installArchives({ ipcMain, ...options }) {
   ipcMain.handle('archive-state', () => archives.state());
   ipcMain.handle('archive-reconnect-preview', (_, input) => archives.reconnectPreview(input));
   ipcMain.handle('archive-reconnect', (_, input) => archives.reconnect(input));
+  ipcMain.handle('archive-review-pending', () => archives.reviewPending());
 }
 module.exports = { installArchives };
