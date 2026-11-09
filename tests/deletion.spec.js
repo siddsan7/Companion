@@ -390,3 +390,43 @@ for (const parent of ['Captures', 'Revisions']) test(`restoration rejects a repl
   expect(await fs.access(path.join(base, 'Captures', capture.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   await expect(page.locator('#captures article')).toHaveCount(0);
 });
+
+for (const boundary of ['capture-restoration-authorized', 'intake-ledger', 'capture-restoration-published']) test(`unchanged restoration recovers exactly once after process exit at ${boundary}`, async ({}, testInfo) => {
+  test.setTimeout(90000);
+  const { base, ledgerFile, original, id, capture } = await pauseSelectedRestoration(boundary);
+  const reserved = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), authority = reserved.sourceAuthority[id], revision = authority.restoration.revision;
+  expect(authority.phase).toBe('restoring'); expect(reserved.suppressed).toContain('a'.repeat(64));
+  if (boundary === 'capture-restoration-authorized') expect(reserved.admissions).toBeUndefined();
+  if (boundary === 'intake-ledger') {
+    expect(reserved.admissions[revision].sourceGeneration).toBe(authority.generation);
+    expect(authority.restoration.published).toBeUndefined();
+    expect((await fs.stat(path.join(base, 'Captures', capture.file))).nlink).toBe(2);
+    expect((await fs.stat(path.join(base, 'Revisions', revision + '.json'))).nlink).toBe(2);
+  }
+  if (boundary === 'capture-restoration-published') {
+    expect(authority.restoration.published).toBe(true);
+    expect(await fs.access(path.join(base, '.intake', authority.restoration.journal)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  }
+  await exitMain(boundary, testInfo);
+  await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const restored = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(restored.sourceAuthority[id].phase).toBe('active');
+  expect(restored.sourceAuthority[id].generation).toBe(authority.generation);
+  expect(restored.sourceAuthority[id].operationId).toBe(authority.operationId);
+  expect(restored.captures['a'.repeat(64)].currentRevision).toBe(revision);
+  expect(restored.captures['a'.repeat(64)].revisions).toEqual([revision]);
+  expect(restored.attempts).toEqual(original.attempts);
+  expect(Object.keys(restored.admissions)).toEqual([revision]);
+  expect(restored.suppressed).not.toContain('a'.repeat(64));
+  expect((await fs.stat(path.join(base, 'Captures', capture.file))).nlink).toBe(1);
+  expect((await fs.stat(path.join(base, 'Revisions', revision + '.json'))).nlink).toBe(1);
+  expect((await fs.readdir(path.join(base, '.intake'))).filter(name => name.endsWith('.stage') || name.startsWith('restoration-') || name === 'transaction.json')).toEqual([]);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  const repeated = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(repeated.captures['a'.repeat(64)].revisions).toEqual([revision]);
+  expect(Object.keys(repeated.admissions)).toEqual([revision]);
+  expect(repeated.attempts).toEqual(original.attempts);
+});
