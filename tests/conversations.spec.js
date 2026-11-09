@@ -1234,3 +1234,115 @@ test('omitting prior dialogue retains dependency authority without resending uns
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/RAW_ANCESTOR_ONLY_12_CANARY|a private prior-dialogue detail/);
   expect((await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue())).toContain(first.id);
 });
+
+test('foreign history revocation invalidates stale reviewed selections and asynchronous dispatch while retaining independent writing', async () => {
+  test.setTimeout(180000);
+  const ancestor = 'REVOCATION_ANCESTOR_12_CANARY', derived = 'REVOCATION_DERIVED_12_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${ancestor}: a retained historical mechanism.` }), 'utf8');
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(ancestor);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const firstName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const original = JSON.parse(await fs.readFile(path.join(root, 'conversations', firstName), 'utf8'));
+  const captures = path.join(root, 'vault', 'Companion', 'Captures');
+  const capture = path.join(captures, (await fs.readdir(captures)).find(name => name.endsWith('.md')));
+  const sourceBytes = await fs.readFile(capture, 'utf8');
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(ancestor);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: ancestor }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Use the selected discussion to propose a cautious application.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: `Authored synthetic ${derived}: an unverified application with a small test.` }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(derived);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const secondName = (await fs.readdir(path.join(root, 'conversations'))).find(name => /^[a-f0-9-]{36}\.json$/.test(name) && name !== firstName);
+  const second = JSON.parse(await fs.readFile(path.join(root, 'conversations', secondName), 'utf8'));
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Independent writing survives history revocation');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('The user retains this interpretation independently of conversation history.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('The transfer is unverified and no outcome was measured.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Independent writing survives/);
+  const ideaFile = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  const ideaBytes = await fs.readFile(ideaFile, 'utf8');
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(derived);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: derived }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Inspect the selected application and its limitations.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_DERIVED_12_CANARY/);
+  const otherApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const other = await otherApp.firstWindow();
+    await expect(other.locator('#timezone')).toContainText('America/Phoenix');
+    await other.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+    await expect(other.locator('#conversation-history')).toContainText(ancestor);
+    await other.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).uncheck();
+    await other.getByLabel('Context question', { exact: true }).fill('Exclude the original historical turn from future context.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Exclude the original historical turn/);
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/historical|changed|preview/i);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.locator('#conversation-error')).toContainText(/historical|changed|unavailable/i);
+    await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Inspect the selected application/);
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
+
+    await other.getByLabel('Retained conversation', { exact: true }).selectOption(second.id);
+    await expect(other.locator('#conversation-history')).toContainText(derived);
+    await other.getByLabel('Context question', { exact: true }).fill('Continue using only currently eligible project context.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/currently eligible project context/);
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
+    await expect(other.locator('#conversation-history .history-exclusion')).toContainText(/Excluded from next request/);
+    await expect(other.locator('#conversation-history')).toContainText(derived);
+    expect(await fs.readFile(capture, 'utf8')).toBe(sourceBytes);
+    expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+
+    // Restore A through its explicit UI, then make a fresh direct selection for the async boundary.
+    await other.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+    await other.locator('#conversation-history article').first().getByRole('checkbox', { name: 'Include request in next context', exact: true }).check();
+    await other.getByLabel('Context question', { exact: true }).fill('Explicitly restore the original historical turn.');
+    await other.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(other.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+  } finally { await otherApp.close(); }
+
+  await page.getByLabel('Context question', { exact: true }).fill(ancestor);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: ancestor }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Review the freshly selected original discussion.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/REVOCATION_ANCESTOR_12_CANARY/);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-before-turn-start' }), 'utf8');
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('conversation-before-turn-start');
+  const editedSource = `${sourceBytes}\nEXPLICIT_SOURCE_EDIT_DURING_FOREIGN_PREFLIGHT\n`;
+  await fs.writeFile(capture, editedSource, 'utf8');
+  await fs.writeFile(path.join(root, 'release.txt'), 'release controlled historical preflight', 'utf8');
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  await expect(page.locator('#conversation-history')).toContainText(/changed|unavailable/i);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  const rpc = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  expect(rpc.filter(call => call.method === 'turn/start')).toHaveLength(2);
+  expect(await fs.readFile(capture, 'utf8')).toBe(editedSource);
+  expect(await fs.readFile(ideaFile, 'utf8')).toBe(ideaBytes);
+  await page.getByRole('button', { name: 'Remove historical dialogue', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill('Continue after source change using project context alone.');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/project context alone/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/REVOCATION_ANCESTOR_12_CANARY|REVOCATION_DERIVED_12_CANARY/);
+});
