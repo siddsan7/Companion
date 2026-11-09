@@ -2,13 +2,13 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { conversation, canonical, hash } = require('./archive-format');
+const { conversation, canonical, hash, parseArchive, archiveRecord } = require('./archive-format');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
   constructor(options) { Object.assign(this, options); this.review = null; }
   guard() { this.history.safeDirectory(false, this.directory); }
-  async json(file, guard = () => this.guard(), optional = false) {
+  async json(file, guard = () => this.guard(), optional = false, strict = false) {
     guard(); let handle;
     try {
       const before = await fs.lstat(file, { bigint: true }); guard();
@@ -20,7 +20,7 @@ class Archives {
       const after = await handle.stat({ bigint: true }), leaf = await fs.lstat(file, { bigint: true }); guard();
       if (!same(opened, leaf) || leaf.isSymbolicLink() || leaf.nlink !== 1n || opened.size !== after.size || opened.mtimeNs !== after.mtimeNs || bytes.length > LIMIT) throw Error('Archive input changed. Preview again.');
       const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-      return { value: JSON.parse(text), digest: hash(bytes) };
+      return { value: strict ? parseArchive(text) : JSON.parse(text), digest: hash(bytes) };
     } catch (error) { if (optional && error.code === 'ENOENT') return null; throw error; }
     finally { await handle?.close(); }
   }
@@ -32,10 +32,10 @@ class Archives {
     };
     guard(); return guard;
   }
-  async snapshot() {
+  async snapshot({ locked = false } = {}) {
     // The store lock fences sends/scope writes/resave and keeps unsaved text out of a false complete backup.
     if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
-    return this.history.lock(async () => {
+    const collect = async () => {
       this.directory = this.history.safeDirectory();
       if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
       const names = (await fs.readdir(this.history.directory)).sort(); this.guard();
@@ -48,9 +48,9 @@ class Archives {
         if (record.requests.some(request => request.status === 'inProgress')) throw Error('Interrupted request needs inspection before exporting history.');
         fingerprints[file] = read.digest; conversations.push(record);
       }
-      const settingsRead = await this.json(this.settingsPath, undefined, true), settings = settingsRead ? { vault: settingsRead.value.vault, parent: settingsRead.value.parent } : null;
+      const settingsRead = await this.json(path.join(this.history.dataRoot, 'settings.json'), undefined, true), settings = settingsRead ? { vault: settingsRead.value.vault, parent: settingsRead.value.parent } : null;
       if (settings && (typeof settings.vault !== 'string' || !path.isAbsolute(settings.vault) || typeof settings.parent !== 'string' || path.isAbsolute(settings.parent) || path.relative(settings.vault, path.resolve(settings.vault, settings.parent)).startsWith('..'))) throw Error('Vault settings need repair before archive export.');
-      if (settingsRead) fingerprints[this.settingsPath] = settingsRead.digest;
+      if (settingsRead) fingerprints[path.join(this.history.dataRoot, 'settings.json')] = settingsRead.digest;
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
@@ -72,7 +72,8 @@ class Archives {
       this.guard();
       if (Buffer.byteLength(canonical(payload)) > LIMIT) throw Error('History archive exceeds the 128 MiB limit.');
       return { payload, fingerprints };
-    });
+    };
+    return locked ? collect() : this.history.lock(collect);
   }
   async preview() {
     this.review = null;
@@ -92,6 +93,82 @@ class Archives {
     const archive = { format: 'companion-local-history', version: 1, id: randomUUID(), createdAt: this.clock().now, appVersion: this.appVersion, payload: current.payload, integrity: { algorithm: 'sha256', digest: hash(canonical(current.payload)) } };
     await this.publish(destination, JSON.stringify(archive, null, 2) + '\n');
     return { location: destination };
+  }
+  restorePlan(archive, current, matchedRoot) {
+    const additions = [], equal = [], conflicts = [];
+    for (const record of archive.payload.conversations) {
+      if (matchedRoot && record.vault.root !== matchedRoot) continue;
+      const existing = current.payload.conversations.find(item => item.id === record.id);
+      if (!existing) additions.push(record);
+      else if (canonical(existing) === canonical(record)) equal.push(record.id);
+      else conflicts.push(record.id);
+    }
+    return { additions, equal, conflicts };
+  }
+  async inspect() {
+    this.restoreReview = null;
+    let file;
+    if (this.testRoot) file = JSON.parse(await fs.readFile(path.join(this.testRoot, 'archive-dialog.json'), 'utf8')).open;
+    else file = (await this.dialog.showOpenDialog({ title: 'Inspect local history archive', properties: ['openFile'], filters: [{ name: 'Local history archive', extensions: ['json'] }] })).filePaths[0];
+    if (!file) return { cancelled: true };
+    if (!path.isAbsolute(file)) throw Error('Choose an absolute archive file.');
+    file = path.resolve(file);
+    const parent = path.dirname(file), identity = await fs.lstat(parent, { bigint: true });
+    const guard = () => {
+      const current = local.lstatSync(parent, { bigint: true });
+      if (!identity.isDirectory() || identity.isSymbolicLink() || current.isSymbolicLink() || !same(identity, current) || local.realpathSync(parent) !== parent) throw Error('Archive folder changed or is an alias. Choose an ordinary folder.');
+    };
+    const read = await this.json(file, guard, false, true), archive = archiveRecord(read.value);
+    const current = await this.snapshot(), plan = this.restorePlan(archive, current), id = randomUUID();
+    this.restoreReview = { id, archive, inspection: current };
+    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null };
+  }
+  async match(input) {
+    const reviewed = this.restoreReview;
+    if (!reviewed || reviewed.id !== input?.id || input.matched !== true) throw Error('Inspect the archive and explicitly match its vault first.');
+    const vault = this.history.getVault(), root = vault?.root;
+    if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === root)) throw Error('Archive vault differs from the current vault. Explicit moved-vault matching is required; nothing was restored.');
+    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, root);
+    const token = randomUUID();
+    reviewed.matched = { token, root, snapshot: current, plan };
+    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length };
+  }
+  async restore(input) {
+    const reviewed = this.restoreReview; this.restoreReview = null;
+    if (!reviewed?.matched || input?.token !== reviewed.matched.token) throw Error('Preview the matched restore again before confirming additions.');
+    const matched = reviewed.matched;
+    return this.history.lock(async () => {
+      const current = await this.snapshot({ locked: true });
+      if (this.history.getVault()?.root !== matched.root || canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
+      const plan = this.restorePlan(reviewed.archive, current, matched.root);
+      if (plan.conflicts.length) throw Error('Conversation conflicts require explicit resolution. Existing history was preserved.');
+      let restored = 0;
+      try {
+        for (const original of plan.additions) {
+          const record = structuredClone(original);
+          for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
+          await this.publishAddition(record); restored++;
+        }
+      } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing content was preserved. Inspect again to review remaining additions; no automatic retry occurs.`); }
+      return { restored, equal: plan.equal.length };
+    });
+  }
+  async publishAddition(record) {
+    const directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
+    const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`); let handle;
+    try {
+      this.history.safeDirectory(false, directory);
+      handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
+      await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
+      this.history.safeDirectory(false, directory);
+      await fs.link(stage, destination); this.history.safeDirectory(false, directory);
+      // Imported capacity bindings and provider IDs are historical bytes, never dispatch approval.
+      for (const [token, approval] of this.history.tokens) if (approval.input.conversationId === record.id) this.history.tokens.delete(token);
+    } catch (error) { if (error.code === 'EEXIST') throw Error('A conversation appeared during restore. It was not replaced.'); throw error; }
+    finally {
+      await handle?.close(); this.history.safeDirectory(false, directory);
+      await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    }
   }
   async publish(destination, text) {
     if (!path.isAbsolute(destination)) throw Error('Choose an absolute archive destination.');
@@ -115,5 +192,8 @@ function installArchives({ ipcMain, ...options }) {
   const archives = new Archives(options);
   ipcMain.handle('archive-preview', () => archives.preview());
   ipcMain.handle('archive-export', (_, input) => archives.export(input));
+  ipcMain.handle('archive-inspect', () => archives.inspect());
+  ipcMain.handle('archive-match', (_, input) => archives.match(input));
+  ipcMain.handle('archive-restore', (_, input) => archives.restore(input));
 }
 module.exports = { installArchives };

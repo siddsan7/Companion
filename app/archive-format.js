@@ -50,3 +50,60 @@ function canonical(value) {
   return JSON.stringify(value);
 }
 module.exports = { conversation, canonical, hash };
+
+// Parse selected archive JSON with duplicate-member and nesting checks before trusting a manifest.
+function parseArchive(text) {
+  let offset = 0;
+  const whitespace = () => { while (/[ \t\r\n]/.test(text[offset] || '') && offset < text.length) offset++; };
+  const string = () => {
+    const start = offset++;
+    while (offset < text.length) { const character = text[offset++]; if (character === '\\') offset++; else if (character === '"') return JSON.parse(text.slice(start, offset)); }
+    throw Error('Incomplete archive JSON.');
+  };
+  const value = depth => {
+    if (depth > 48) throw Error('Archive nesting exceeds 48 levels.');
+    whitespace(); const character = text[offset];
+    if (character === '"') return string();
+    if (character === '{' || character === '[') {
+      const array = character === '[', result = array ? [] : Object.create(null), keys = new Set(); offset++; whitespace();
+      if (text[offset] === (array ? ']' : '}')) { offset++; return result; }
+      while (offset < text.length) {
+        whitespace(); let key;
+        if (!array) { if (text[offset] !== '"') throw Error('Invalid archive member.'); key = string(); if (keys.has(key)) throw Error('Duplicate archive JSON member.'); keys.add(key); whitespace(); if (text[offset++] !== ':') throw Error('Invalid archive member.'); }
+        const item = value(depth + 1); if (array) result.push(item); else result[key] = item;
+        whitespace(); const end = text[offset++]; if (end === (array ? ']' : '}')) return result; if (end !== ',') throw Error('Invalid archive JSON.');
+      }
+      throw Error('Incomplete archive JSON.');
+    }
+    const match = text.slice(offset).match(/^(?:null|true|false|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/);
+    if (!match) throw Error('Invalid archive JSON value.'); offset += match[0].length;
+    const result = JSON.parse(match[0]); if (typeof result === 'number' && !Number.isFinite(result)) throw Error('Invalid archive number.'); return result;
+  };
+  try { const archive = value(0); whitespace(); if (offset !== text.length) throw Error('Trailing archive data.'); return archive; }
+  catch (error) { if (error instanceof SyntaxError) throw Error('Invalid archive JSON.'); throw error; }
+}
+function archiveRecord(value) {
+  object(value, ['format', 'version', 'id', 'createdAt', 'appVersion', 'payload', 'integrity']);
+  if (value.format !== 'companion-local-history' || value.version !== 1) throw Error('Unsupported history archive format or version.');
+  if (!uuid(value.id) || typeof value.createdAt !== 'string' || !Number.isFinite(Date.parse(value.createdAt)) || typeof value.appVersion !== 'string') fail();
+  object(value.integrity, ['algorithm', 'digest']);
+  if (value.integrity.algorithm !== 'sha256' || value.integrity.digest !== hash(canonical(value.payload))) throw Error('History archive integrity check failed. Preserve the original file; nothing was restored.');
+  const payload = object(value.payload, ['settings', 'contextScopes', 'scheduleIntent', 'vaultBindings', 'conversations']);
+  if (payload.settings !== null) { object(payload.settings, ['vault', 'parent']); if (typeof payload.settings.vault !== 'string' || typeof payload.settings.parent !== 'string') fail(); }
+  if (!Array.isArray(payload.contextScopes) || !Array.isArray(payload.vaultBindings) || !Array.isArray(payload.conversations)) fail();
+  const scopes = new Set(), roots = new Set(), ids = new Set();
+  for (const item of payload.contextScopes) { object(item, ['binding', 'schema', 'files']); if (!/^[a-f0-9]{64}$/.test(item.binding) || scopes.has(item.binding) || item.schema !== 1) fail(); strings(item.files); scopes.add(item.binding); }
+  for (const binding of payload.vaultBindings) {
+    object(binding, ['managedRoot', 'vault', 'parent', 'matchingRequired', 'pins']);
+    if (typeof binding.managedRoot !== 'string' || roots.has(binding.managedRoot) || binding.matchingRequired !== true || !Array.isArray(binding.pins) || ['vault', 'parent'].some(key => binding[key] !== null && typeof binding[key] !== 'string')) fail();
+    binding.pins.forEach(pin); roots.add(binding.managedRoot);
+  }
+  if (payload.scheduleIntent !== null) {
+    const intent = object(payload.scheduleIntent, ['schema', 'id', 'anchor', 'vault', 'parent', 'mode', 'reconnectRequired']);
+    if (intent.schema !== 1 || !uuid(intent.id) || !Number.isFinite(Date.parse(intent.anchor)) || typeof intent.vault !== 'string' || typeof intent.parent !== 'string' || !['enabled', 'paused', 'disabled'].includes(intent.mode) || intent.reconnectRequired !== true) fail();
+  }
+  for (const record of payload.conversations) { conversation(record); if (ids.has(record.id) || !roots.has(record.vault.root)) fail(); ids.add(record.id); }
+  return structuredClone(value);
+}
+module.exports.parseArchive = parseArchive;
+module.exports.archiveRecord = archiveRecord;
