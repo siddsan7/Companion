@@ -82,11 +82,39 @@ class Ideas {
         const file = path.join(vault.root, 'Ideas', name); if (held.has(file)) continue;
         const { text } = await this.readFile(vault, file, parents);
         const data = metadata(text);
-        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0 });
+        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0, supportMetadata: data });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
-    return notes.map(note => ({ ...note, unavailable: counts.get(note.id) !== 1 }));
+    let corpus, supportError;
+    if (notes.length) try {
+      // Context reads saved metadata directly; it never calls Ideas.list. One
+      // corpus provides the same current eligibility used for outgoing context.
+      const context = await this.conversations.getContext();
+      if (context.vault.root !== vault.root) throw Error('Selected vault changed during support inspection.');
+      corpus = await context.corpus();
+    } catch (error) { supportError = error.message; }
+    this.guard(vault, parents);
+    if (this.getVault()?.root !== vault.root) throw Error('Selected vault changed. Inspect saved ideas again.');
+    return notes.map(({ supportMetadata: data, ...note }) => {
+      const warnings = [], dependencies = data.source_dependencies, ids = new Set();
+      if (data.support_attribution_unavailable !== false) warnings.push('Source attribution is unknown or unavailable; retained writing is not verified support.');
+      if (!Array.isArray(dependencies)) warnings.push('Recorded source dependency attribution is unavailable.');
+      else for (const dep of dependencies) {
+        if (!dep || typeof dep !== 'object' || Array.isArray(dep) || Object.keys(dep).some(key => !['capture_id', 'revision_id', 'content_sha256'].includes(key)) || !uuid(dep.capture_id) || ids.has(dep.capture_id) || (dep.revision_id !== undefined) === (dep.content_sha256 !== undefined) || dep.revision_id !== undefined && !uuid(dep.revision_id) || dep.content_sha256 !== undefined && (typeof dep.content_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(dep.content_sha256))) {
+          warnings.push('Recorded source dependency identity is unknown, ambiguous or damaged.'); continue;
+        }
+        ids.add(dep.capture_id);
+        if (!corpus?.all.some(source => source.key === `capture:${dep.capture_id}`)) warnings.push(`Capture ${dep.capture_id}${dep.revision_id ? `; exact revision ${dep.revision_id}` : ''}: current supporting source is unavailable, removed, rejected or otherwise ineligible.`);
+      }
+      if (!data.project_brief || !uuid(data.project_brief.id) || !Number.isSafeInteger(data.project_brief.version) || data.project_brief.version < 1 || data.project_brief.version !== data.project_brief_version || typeof data.project_brief.digest !== 'string' || !/^[a-f0-9]{64}$/.test(data.project_brief.digest)) warnings.push('Exact project brief attribution is unknown or unavailable.');
+      if (supportError) warnings.push(`Current support inspection unavailable: ${supportError}`);
+      else if (!corpus?.all.some(source => source.key === `idea:${note.id}`)) {
+        warnings.push(...(corpus?.issues || []).filter(issue => issue.startsWith(`Saved idea unavailable: ${path.basename(note.file)};`)));
+        warnings.push('Recorded dependency or brief support is currently unavailable. Retained writing remains independent and was not rewritten.');
+      }
+      return { ...note, unavailable: counts.get(note.id) !== 1, reviewSupport: warnings.length > 0, supportWarnings: [...new Set(warnings)] };
+    });
   }
   async origin(input) {
     const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
