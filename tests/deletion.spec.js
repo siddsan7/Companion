@@ -4,6 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
+const { randomUUID } = require('node:crypto');
 let root, app, page;
 
 test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-deletion-')); });
@@ -901,6 +902,44 @@ test('a file arriving in an absent old slot after retirement authorization stays
   recovery = page.getByLabel('Capture deletion recovery', { exact: true });
   await expect(recovery).toContainText(path.basename(selected.stage));
   await expect(recovery).toContainText('previously absent');
+});
+
+test('an orphan manual journal for the same capture under another operation prevents retirement and source activation', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const selected = await pauseManualRestoration('capture-restoration-admitted');
+  await exitMain('capture-restoration-admitted', testInfo);
+  await fs.unlink(selected.file); await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
+  let recovery = page.getByLabel('Capture deletion recovery', { exact: true });
+  await expect(recovery).toContainText(selected.id);
+  await recovery.getByLabel('Selected recovery backup file', { exact: true }).fill(selected.backup);
+  await recovery.getByRole('button', { name: 'Preview a new source restoration', exact: true }).click();
+  const confirm = recovery.getByLabel('New source restoration preview', { exact: true }).getByRole('button', { name: 'Confirm new source restoration', exact: true });
+  await expect(confirm).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-restoration-retirement-authorized' }), 'utf8');
+  await confirm.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('capture-restoration-retirement-authorized');
+  await expect(page.getByRole('status')).toContainText('Restoring newly reviewed source');
+  const ledgerBytes = await fs.readFile(selected.ledgerFile, 'utf8'), authority = JSON.parse(ledgerBytes).sourceAuthority[selected.id];
+  const oldJournal = path.join(selected.base, '.intake', selected.authority.restoration.journal), oldBytes = await fs.readFile(oldJournal);
+  const newJournal = path.join(selected.base, '.intake', authority.restoration.journal), newBytes = await fs.readFile(newJournal), profile = JSON.parse(newBytes.toString('utf8'));
+  const otherOperation = randomUUID(), orphan = path.join(selected.base, '.intake', `restoration-${otherOperation}.json`);
+  expect(otherOperation).not.toBe(authority.operationId); expect(otherOperation).not.toBe(selected.authority.operationId);
+  const orphanBytes = Buffer.from(JSON.stringify({ ...profile, operationId: otherOperation, generation: randomUUID() }), 'utf8');
+  await fs.writeFile(orphan, orphanBytes, { flag: 'wx', flush: true });
+  const identity = await fs.stat(orphan, { bigint: true });
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue', 'utf8');
+  await expect(page.getByRole('status')).toContainText('additional selected-source restoration journal');
+  expect(await fs.readFile(selected.ledgerFile, 'utf8')).toBe(ledgerBytes);
+  expect(await fs.readFile(orphan)).toEqual(orphanBytes); expect((await fs.stat(orphan, { bigint: true })).ino).toBe(identity.ino);
+  expect(await fs.readFile(selected.stage)).toEqual(selected.sourceBytes); expect(await fs.readFile(oldJournal)).toEqual(oldBytes); expect(await fs.readFile(newJournal)).toEqual(newBytes);
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  await app.close(); app = null; await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8'); await launch();
+  expect(JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.id]).toEqual(authority);
+  expect(await fs.readFile(orphan)).toEqual(orphanBytes);
+  await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
+  recovery = page.getByLabel('Capture deletion recovery', { exact: true });
+  await expect(recovery).toContainText(selected.id); await expect(recovery).toContainText('additional selected-source restoration journal');
 });
 
 for (const removed of ['capture', 'snapshot']) test(`durable restoration admission never reconstructs an externally removed ${removed} after process exit`, async ({}, testInfo) => {
