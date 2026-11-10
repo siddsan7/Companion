@@ -153,6 +153,54 @@ test('source deletion names actual retained writing and requests, cancels byte-e
 });
 
 
+test('source deletion preview preserves actual writing with damaged artifact types as unknown without changing files', async () => {
+  test.setTimeout(150000);
+  const fixture = await importedConversationForPreview();
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation', { exact: true }).fill('UNKNOWN_ANNOTATION independent writing survives external metadata damage.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved.');
+  await expect(page.getByLabel('New annotation', { exact: true })).toHaveValue('');
+  const annotationFile = path.join(fixture.base, 'Annotations', (await fs.readdir(path.join(fixture.base, 'Annotations'))).find(name => name.endsWith('.md')));
+  const annotationText = await fs.readFile(annotationFile, 'utf8');
+  const annotationId = YAML.parse(annotationText.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id;
+  const idea = await draftIdea('UNKNOWN_SAVED_IDEA independent conclusion');
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  await expect(page.locator('#saved-ideas')).toContainText('UNKNOWN_SAVED_IDEA');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  const ideaText = await fs.readFile(idea.file, 'utf8');
+  const ideaId = YAML.parse(ideaText.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id;
+  // Model an external editor damaging only artifact_type after actual writers complete.
+  const damagedAnnotation = annotationText.replace(/^artifact_type:.*\r?\n/m, '');
+  const damagedIdea = ideaText.replace(/^artifact_type:.*$/m, 'artifact_type: externally_damaged');
+  expect(damagedAnnotation).not.toBe(annotationText);
+  expect(damagedIdea).not.toBe(ideaText);
+  expect(YAML.parse(damagedAnnotation.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id).toBe(annotationId);
+  expect(YAML.parse(damagedIdea.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id).toBe(ideaId);
+  await fs.writeFile(annotationFile, damagedAnnotation);
+  await fs.writeFile(idea.file, damagedIdea);
+  const before = await files(root);
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'));
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const preview = page.getByLabel('Capture deletion preview');
+  await expect(preview).toBeVisible();
+  for (const [file, id, writing] of [[annotationFile, annotationId, 'UNKNOWN_ANNOTATION'], [idea.file, ideaId, 'UNKNOWN_SAVED_IDEA']]) {
+    const relative = path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+    const row = preview.getByRole('article').filter({ hasText: relative });
+    await expect(row).toHaveCount(1);
+    await expect(row).toContainText(id);
+    await expect(row).toContainText(writing);
+    await expect(row).toContainText('Dependency attribution is unknown.');
+    await expect(row).toContainText('Preserve and inspect this writing; no removal is authorized.');
+  }
+  expect(await files(root)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden();
+  expect(await files(root)).toEqual(before);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'))).toEqual(calls);
+});
+
 // Exercise the existing provider/save-failure boundary, without fabricating history.
 test('source deletion preview preserves foreign historical dialogue and the only unsaved derived reply without replay', async () => {
   test.setTimeout(150000);
