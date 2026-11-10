@@ -72,3 +72,23 @@ npx playwright test tests/detached-editor-deletion.spec.js --grep "outside alias
 The old-format malformed-titleProofs blocker remains a separate test-first fix and merge requirement. Primary synchronization, coupled old/new gates, and fresh Standards/Spec review remain outstanding.
 
 Root actual outside-alias guard passed in 16,186 ms, exit 0, one test and no skips, at staged tree 97bcba2d038c39ae0d27372b2ccb09e0295381f9. Evidence: Temp/companion-ticket13-detached-editor-outside-alias-20261110/exit.json and run.stdout.log. No product change followed the passing first journey. Independent review also found a restored-admission overconstraint in the new classifier; that separate case must be reproduced and fixed before final approval.
+
+## Restored-A admission regression: test only, awaiting actual RED
+
+Independent source audit found that readDetachedEditor compares the immutable original attempt's revision and snapshotHash with restored A's fresh admission. ADR0006 requires the original attempt to stay unchanged while restoration allocates a fresh revision and generation. Root authorized one real-writer reproduction before any source correction. Source remains frozen at the previously passing candidate.
+
+New test: `restored draft A retains detached editor writing with fresh admission and immutable original acceptance`. It first imports draft A, publicly deletes it, then publicly restores the same original producer folder as a draft. Evidence pins both snapshot buffers, the original immutable acceptance, the fresh revision/admission/G, exact current admission snapshot hash, and the intentionally different original revision/snapshot hash. The actual restored revision remains the existing plain draft envelope; no restoration fields are injected or normalized-draft rules changed.
+
+It then repeats the actual B ownership-failure/restored-pair/external-editor/hold path and normal restart. It records all nine origin buffers, identities, B pair, literal H/intent/evidence, original immutable attempts and fresh A admission before the first feature assertion. Expected RED is the complete deletion preview being unavailable because the current classifier requires old attempt/current admission equality. A setup failure does not establish this RED.
+
+The positive continuation preserves whole E in one visible output, proves exact Cancel and publication before the first source unlink, binds the preserved annotation and originGenerations to the restored G, requires a separate deletion generation, purges every origin, preserves original acceptance/current admission/producer facts, and checks suppression and restart. Check now must update the two actual producer-locator outcomes with truthful held status/current time; the prior public restoration's separate historical outcome must remain unchanged. No outcome is omitted from the key-set check.
+
+Both prior measured test journeys remain byte-exact as the existing file prefix. This change adds only the new regression and these notes. No source, Git, network or desktop runtime action was performed. Syntax passed. Root's exact one-case command is:
+
+```powershell
+npx playwright test tests/detached-editor-deletion.spec.js --grep "^restored draft A retains detached editor writing" --workers=1 --reporter=list
+```
+
+Expected selection: one new test, from three top-level tests in the file. Root must measure and preserve actual RED before approving the minimal source change; no new RED/GREEN or final merge approval is claimed here.
+
+Root first restored-A command selected zero tests because the anchored regex preceded Playwright's filename-prefixed title. No desktop run or feature RED occurred; that discovery failure remains in Temp/companion-ticket13-detached-editor-restored-a-red-20261110. Removing only the regex anchor selected one unchanged test. Actual restored-A feature RED: 26,319 ms, exit 1, staged tree 4237f2a792c36305310cfb56d24c223e4ea62906. All public seed deletion/restoration, immutable original acceptance versus fresh admission, real B writer pair/editor hold and nine-origin facts passed before hidden preview assertion621. Saved first-feature-preview.json reports Source recovery inventory contains changed or unsupported writing; no publication/purge continuation was reached. Evidence: Temp/companion-ticket13-detached-editor-restored-a-red-v2-20261110. Independent P2 therefore reproduced. Root authorizes only removal of original-attempt revision/snapshot equality from private readDetachedEditor; current admission continues to bind fresh revision/snapshot/G, and original acceptance retains identity/fingerprint/source/capture/status and acceptance digest. No normalized-draft/schema relaxation or acceptance rewrite.
