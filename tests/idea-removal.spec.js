@@ -361,3 +361,66 @@ test('unknown writing nested in selected idea envelopes holds removal while a kn
   await fs.writeFile(intentFile, intentBytes, 'utf8');
 });
 
+for (const control of ['intact', 'externally missing']) {
+  test(`stale normal idea confirmation cannot publish an identity whose observed removal marker is ${control}`, async ({}, testInfo) => {
+    test.setTimeout(120000);
+    await completedConversation();
+    const retained = await saveIdea('Retained idea beside stale proposal'), retainedBytes = await fs.readFile(retained, 'utf8');
+    const title = 'Do not revive this removed pending idea';
+    await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+    await page.getByLabel('Idea title', { exact: true }).fill(title);
+    await page.getByLabel('Idea explanation', { exact: true }).fill('STALE_PENDING_IDEA_13: old consent to save cannot supersede later removal.');
+    await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic writing; no verified outcome.');
+    await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+    const staleReview = page.getByLabel('Proposed idea Markdown', { exact: true });
+    await expect(staleReview).toHaveValue(/STALE_PENDING_IDEA_13/);
+    const writing = await staleReview.inputValue(), destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+    const id = YAML.parse(writing.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-before-publication' }));
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+    await fs.writeFile(path.join(root, 'faults.json'), '{}');
+    const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+    const exists = async file => !!await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    expect(await exists(destination)).toBe(false);
+    const history = await bytesIn(path.join(root, 'conversations')), sources = await bytesIn(path.join(vault, 'Captures'));
+    const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+    const pending = page.locator('#pending-ideas article').filter({ hasText: title }); await expect(pending).toBeVisible();
+    await pending.getByRole('button', { name: 'Preview proposed idea removal', exact: true }).click();
+    await expect(page.getByLabel('Saved idea removal preview', { exact: true })).toContainText(id);
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-removal-after-marker' }));
+    await page.getByRole('button', { name: 'Confirm saved idea removal', exact: true }).click();
+    await expect(page.locator('#idea-status')).toContainText('Saved idea removal held.');
+    const marker = path.join(directory, `${id}.removed.json`), stage = `${marker}.pending`;
+    expect(await exists(marker)).toBe(true); expect(await exists(stage)).toBe(true);
+    expect(await exists(destination)).toBe(false);
+    await expect(staleReview).toBeVisible(); await expect(staleReview).toHaveValue(writing);
+    const parentBefore = await fs.stat(directory, { bigint: true });
+    if (control === 'externally missing') { await fs.unlink(stage); await fs.unlink(marker); }
+    const before = await bytesIn(vault), parentAfter = await fs.stat(directory, { bigint: true });
+    expect([parentAfter.dev, parentAfter.ino]).toEqual([parentBefore.dev, parentBefore.ino]);
+    await fs.writeFile(path.join(root, 'faults.json'), '{}');
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect.poll(async () => /^(Save failed\.|Saved idea\.)/.test(await page.locator('#idea-status').innerText())).toBe(true);
+    const after = await bytesIn(vault);
+    await fs.writeFile(testInfo.outputPath('idea-stale-confirmation.json'), JSON.stringify({
+      control, id, status: await page.locator('#idea-status').innerText(), destinationExists: await exists(destination),
+      parentBefore: { dev: String(parentBefore.dev), ino: String(parentBefore.ino) }, parentAfter: { dev: String(parentAfter.dev), ino: String(parentAfter.ino) },
+      changedFiles: [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(file => before[file] !== after[file])
+    }, null, 2), 'utf8');
+    await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+    expect(await exists(destination)).toBe(false); expect(after).toEqual(before);
+    expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+    expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+    expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+    const fresh = await saveIdea('Fresh explicit idea after observed removal');
+    const freshId = YAML.parse((await fs.readFile(fresh, 'utf8')).match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+    expect(freshId).not.toBe(id); expect(await exists(destination)).toBe(false);
+    expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+    expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  });
+}
+
