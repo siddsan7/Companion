@@ -166,7 +166,16 @@ test('deleting a held kept-current repair retains distinct annotation and whole 
   expect(deleted.blocks[sourceHash]).toBeUndefined(); expect(deleted.pending[sourceHash]).toBeUndefined();
   expect(Object.keys(await observe(base)).filter(file => /^(Captures|Revisions)\//.test(file) || /^\.intake\/(?:repair-|conflict-|deletion-writing-)/.test(file))).toEqual([]);
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
-  await check(); await app.close(); app = null; await launch();
+  await check('held');
+  const checked = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), checkedAt = JSON.parse(await fs.readFile(path.join(root, 'clock.json'), 'utf8')).now;
+  const outcomes = Object.values(checked.outcomes);
+  expect(outcomes).toHaveLength(2);
+  expect(outcomes.map(value => value.locator).sort()).toEqual(Object.values(originalLedger.outcomes).map(value => value.locator).sort());
+  for (const outcome of outcomes) {
+    expect(outcome.status).toBe('held'); expect(outcome.checkedAt).toBe(checkedAt); expect(outcome.sourceHash).toBe(sourceHash);
+    expect(outcome.reason).toBe('Automatic re-import is suppressed. Restore this source explicitly before intake.');
+  }
+  await app.close(); app = null; await launch();
   await expect(page.locator('#captures article')).toHaveCount(0);
   for (const file of origins) expect(await exists(file)).toBe(false);
   expect(await Promise.all(outputFiles.map(file => fs.readFile(file)))).toEqual(outputBefore);
