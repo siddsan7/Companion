@@ -218,6 +218,73 @@ for (const outcome of ['success', 'error']) {
   });
 }
 
+test('a failed Check refresh cannot replace a newer saved capture status when its error reports later', async () => {
+  await reviewBundle('accept'); await launch();
+  await page.getByLabel('Finalized review folder').fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  const settings = path.join(root, 'schedule.json');
+  const previous = await fs.readFile(settings).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const restoreSettings = () => previous === null ? fs.rm(settings, { force: true }) : fs.writeFile(settings, previous);
+  await app.evaluate(({ ipcMain, app: mainApp }) => {
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const io = load('node:fs/promises'), paths = load('node:path');
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Check error control requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('check-intake');
+    const control = globalThis.__checkReporting = { original, calls: 0 };
+    ipcMain._invokeHandlers.set('check-intake', async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      if (++control.calls === 1) await io.writeFile(paths.join(process.env.COMPANION_TEST_ROOT, 'schedule.json'), '{');
+      return result;
+    });
+  });
+  await page.evaluate(() => {
+    const control = window.__checkReporting = { originalAction: window.action, originalCheck: document.getElementById('check-intake').onclick, inCheck: false, claimed: false, held: false };
+    control.wait = new Promise(resolve => { control.release = resolve; });
+    window.action = function (work, ...args) {
+      if (!control.inCheck || control.claimed) return Reflect.apply(control.originalAction, this, [work, ...args]);
+      control.claimed = true;
+      // Hold the genuine work rejection before the unchanged outer action reports it.
+      return Reflect.apply(control.originalAction, this, [async () => {
+        try { return await work(); }
+        catch (error) { control.error = error.message; control.held = true; await control.wait; throw error; }
+      }, ...args]);
+    };
+    document.getElementById('check-intake').onclick = function (...args) {
+      control.inCheck = true;
+      try { const returned = Reflect.apply(control.originalCheck, this, args); control.first = returned; return returned; }
+      finally { control.inCheck = false; }
+    };
+  });
+  try {
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => window.__checkReporting.held)).toBe(true);
+    expect(await page.evaluate(() => window.__checkReporting.error)).toContain('Daily intake settings are unreadable');
+    await restoreSettings();
+    await page.evaluate(() => { window.action = window.__checkReporting.originalAction; });
+    await capture('CHECKREPORT newer saved capture.');
+    await expect(page.locator('#captures')).toContainText('CHECKREPORT newer saved capture.');
+    const folder = path.join(root, 'vault', 'Companion', 'Captures');
+    const names = (await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort();
+    const bytes = await Promise.all(names.map(name => fs.readFile(path.join(folder, name))));
+    await page.evaluate(() => window.__checkReporting.release());
+    await page.evaluate(() => window.__checkReporting.first);
+    await expect(page.getByRole('status')).toHaveText('Capture saved.');
+    await expect(page.locator('#captures')).toContainText('CHECKREPORT newer saved capture.');
+    expect(await app.evaluate(() => globalThis.__checkReporting.calls)).toBe(1);
+    expect((await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort()).toEqual(names);
+    expect(await Promise.all(names.map(name => fs.readFile(path.join(folder, name))))).toEqual(bytes);
+  } finally {
+    await restoreSettings();
+    await app.evaluate(({ ipcMain }) => { ipcMain._invokeHandlers.set('check-intake', globalThis.__checkReporting.original); delete globalThis.__checkReporting; });
+    await page.evaluate(async () => {
+      const control = window.__checkReporting; control.release();
+      try { await control.first; }
+      finally { window.action = control.originalAction; document.getElementById('check-intake').onclick = control.originalCheck; delete window.__checkReporting; }
+    });
+  }
+});
+
 test('local exact matches show reasons and manual selection previews the literal question and source provenance', async () => {
   await launch(); await capture('Spaced retrieval can revisit a learned chord.');
   await search('How can retrieval help MyTune?');
