@@ -49,6 +49,7 @@ class IntakeLedger {
   async guardParents() { if (!this.expected || JSON.stringify(await this.parents()) !== JSON.stringify(this.expected.parents)) throw changed(); }
   async replace(text) {
     if (!this.matches(await this.view()) || this.expected.parents.missing) throw changed();
+    if (hash(Buffer.from(text, 'utf8')) === this.expected.identity?.digest) return;
     const stage = path.join(this.directory, `ledger-${randomUUID()}.tmp`), bytes = Buffer.from(text, 'utf8');
     let own;
     try {
