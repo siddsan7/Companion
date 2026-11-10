@@ -33,6 +33,96 @@ async function connect(scan = false) {
   await expect(page.getByRole('status')).toContainText(scan ? 'Intake check complete' : 'Source connected');
 }
 
+test('Check now stays unavailable until its own repair refresh completes', async () => {
+  const producer = await artifact();
+  const producerNames = (await fs.readdir(producer)).sort();
+  const producerBytes = await Promise.all(producerNames.map(name => fs.readFile(path.join(producer, name))));
+  await launch(); await setup(); await connect(false);
+  await app.evaluate(({ app: mainApp, ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Held intake refresh requires the disposable fixture.');
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Intake } = load('./intake');
+    const originalRepairs = Intake.prototype.repairs, originalCheck = ipcMain._invokeHandlers.get('check-intake');
+    const gate = globalThis.__checkNowRepairOwner = { held: false, claimed: false, checkCompleted: false, checkCalls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    gate.finished = new Promise(resolve => { gate.finish = resolve; });
+    ipcMain._invokeHandlers.set('check-intake', async function (...args) {
+      gate.checkCalls++;
+      const result = await Reflect.apply(originalCheck, this, args);
+      gate.checkCompleted = true;
+      return result;
+    });
+    Intake.prototype.repairs = async function (...args) {
+      if (!gate.checkCompleted || gate.claimed) return Reflect.apply(originalRepairs, this, args);
+      gate.claimed = true;
+      const ownLocked = Object.getOwnPropertyDescriptor(this, 'locked'), nativeLocked = this.locked;
+      this.locked = function (work, ...lockedArgs) {
+        return Reflect.apply(nativeLocked, this, [async function (...workArgs) {
+          // The original locked method has already acquired its real owner and recovered.
+          gate.held = true;
+          await delivery;
+          return Reflect.apply(work, this, workArgs);
+        }, ...lockedArgs]);
+      };
+      try { return await Reflect.apply(originalRepairs, this, args); }
+      finally {
+        if (ownLocked) Object.defineProperty(this, 'locked', ownLocked); else delete this.locked;
+        gate.finish();
+      }
+    };
+    gate.restore = () => {
+      Intake.prototype.repairs = originalRepairs;
+      ipcMain._invokeHandlers.set('check-intake', originalCheck);
+    };
+  });
+  await page.evaluate(() => {
+    const button = document.getElementById('check-intake'), original = button.onclick;
+    const observation = window.__checkNowSettlement = { settled: 0, original };
+    button.onclick = async function (...args) {
+      try { return await Reflect.apply(original, this, args); }
+      finally { observation.settled++; }
+    };
+  });
+  try {
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__checkNowRepairOwner.held)).toBe(true);
+    await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeDisabled();
+    expect(await app.evaluate(() => globalThis.__checkNowRepairOwner.checkCalls)).toBe(1);
+    expect(await page.evaluate(() => window.__checkNowSettlement.settled)).toBe(0);
+    await app.evaluate(() => globalThis.__checkNowRepairOwner.release());
+    await expect.poll(() => page.evaluate(() => window.__checkNowSettlement.settled)).toBe(1);
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeEnabled();
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => window.__checkNowSettlement.settled)).toBe(2);
+    expect(await app.evaluate(() => globalThis.__checkNowRepairOwner.checkCalls)).toBe(2);
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeEnabled();
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    const base = path.join(root, 'vault', 'Companion');
+    expect((await fs.readdir(path.join(base, 'Captures'))).filter(name => name.endsWith('.md'))).toHaveLength(1);
+    expect((await fs.readdir(path.join(base, 'Revisions'))).filter(name => name.endsWith('.json'))).toHaveLength(1);
+    const ledger = JSON.parse(await fs.readFile(path.join(base, '.intake', 'ledger.json'), 'utf8'));
+    expect(ledger.lastCheck).toMatchObject({ trigger: 'manual', status: 'complete' });
+    expect(Object.values(ledger.captures)).toHaveLength(1);
+    expect(Object.values(ledger.captures)[0].revisions).toHaveLength(1);
+    expect((await fs.readdir(producer)).sort()).toEqual(producerNames);
+    for (const [index, name] of producerNames.entries()) expect(await fs.readFile(path.join(producer, name))).toEqual(producerBytes[index]);
+  } finally {
+    await app.evaluate(async () => {
+      const gate = globalThis.__checkNowRepairOwner;
+      gate.release();
+      try { if (gate.claimed) await gate.finished; }
+      finally { gate.restore(); delete globalThis.__checkNowRepairOwner; }
+    });
+    await page.evaluate(() => {
+      document.getElementById('check-intake').onclick = window.__checkNowSettlement.original;
+      delete window.__checkNowSettlement;
+    });
+  }
+});
+
 for (const channel of ['state', 'vault-repairs']) test(`repair choices wait for current ${channel} inspection before accepting a changed-copy selection`, async () => {
   await artifact(); await launch(); await setup(); await connect(true);
   const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
