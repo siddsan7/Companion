@@ -27,7 +27,7 @@ async function leaf(vault, file) {
     const after = await handle.stat({ bigint: true }), final = await fs.lstat(file, { bigint: true });
     if ([after, final].some(stat => stat.dev !== before.dev || stat.ino !== before.ino || stat.nlink !== before.nlink || stat.size !== before.size || stat.mtimeNs !== before.mtimeNs) || BigInt(bytes.length) !== before.size) throw changed();
   } finally { await handle.close(); }
-  return { file: rel(vault, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), links: Number(before.nlink), text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
+  return { file: rel(vault, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), links: Number(before.nlink), raw: bytes, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
 }
 async function raw(vault) {
   const notes = [], directories = [];
@@ -64,6 +64,7 @@ async function inventory(vault, intake, id, captureId) {
     if (/^repair(?:-intent|-[a-f0-9-]{36})\.json$/.test(name)) throw Error('This annotation remains in mixed source repair data. Preserve and split that repair before selecting annotation removal.');
     if (name === 'annotation-intent.json') {
       if (!strict(object, ['schema', 'id', 'captureId', 'annotation']) || object.schema !== 1 || object.id !== id || typeof object.annotation !== 'string') throw changed();
+      if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
       const note = parseAnnotation(object.annotation); if (!note || note.captureId !== object.captureId) throw changed(); bind(note);
       candidates.push({ ...value, kind: 'annotation-intent' }); continue;
     }
@@ -72,6 +73,7 @@ async function inventory(vault, intake, id, captureId) {
     }
     if (name === 'link-intent.json' || /^link-[a-f0-9-]{36}\.json$/.test(name)) {
       if (!strict(object, ['schema', 'id', 'file', 'before', 'content', 'relative']) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
       // Journals retain their native serialized path. Only manifest paths use
       // canonical separators; the normal destination boundary validates both.
       const destination = intake.destination({ relative: object.file });
@@ -120,6 +122,7 @@ class AnnotationRemoval {
     if (pending) {
       const intent = JSON.parse(pending.text);
       if (!strict(intent, ['schema', 'id', 'captureId', 'annotation']) || intent.schema !== 1 || !uuid(intent.id) || !uuid(intent.captureId) || typeof intent.annotation !== 'string') throw changed();
+      if (!pending.raw.equals(Buffer.from(JSON.stringify(intent), 'utf8'))) throw changed();
       const annotation = parseAnnotation(intent.annotation);
       if (!annotation || annotation.id !== intent.id || annotation.captureId !== intent.captureId) throw changed();
       if (!ledger.annotationRemovals?.[intent.id]) {
