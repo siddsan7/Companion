@@ -8,14 +8,7 @@ const { randomUUID, createHash } = require('node:crypto');
 let root, app, page;
 
 test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-deletion-')); });
-test.afterEach(async ({}, testInfo) => {
-  if (app) await app.close(); app = null;
-  if (process.env.COMPANION_KEEP_FAILED_FIXTURE === '1' && testInfo.status !== testInfo.expectedStatus) {
-    await fs.writeFile(testInfo.outputPath('preserved-fixture.json'), JSON.stringify({ root }, null, 2));
-    return;
-  }
-  await fs.rm(root, { recursive: true, force: true });
-});
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function artifact(name, attempt) {
   const folder = path.join(root, 'producer', name); await fs.mkdir(folder, { recursive: true });
   await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify({ job_id: 'b'.repeat(64), attempt_id: attempt.repeat(32), started_utc: '2026-11-01T10:00:00Z', input_sha256: 'a'.repeat(64), input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed' }));
@@ -37,114 +30,6 @@ async function files(folder, prefix = '') {
     else result[relative] = (await fs.readFile(file)).toString('base64');
   }
   return result;
-}
-
-// Temporary [DEBUG-citation13] observer for the two recorded gate failures.
-async function installCitation13Probe(application) {
-  await application.evaluate(({ app: mainApp }) => {
-    const mainRequire = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
-    const { CaptureDeletion } = mainRequire('./capture-deletion');
-    const { IntakeLedger } = mainRequire('./intake-ledger');
-    const { Intake } = mainRequire('./intake');
-    const syncFs = mainRequire('node:fs');
-    const { createHash } = mainRequire('node:crypto');
-    const state = globalThis.__citation13Probe = { events: [], sequence: 0, operation: 0 };
-    const copy = value => value === undefined ? null : JSON.parse(JSON.stringify(value));
-    const add = (kind, detail = {}) => {
-      state.events.push({ seq: ++state.sequence, ns: process.hrtime.bigint().toString(), kind, ...detail });
-    };
-    const errorData = error => ({ message: error?.message, code: error?.code, stack: error?.stack });
-    const firstDiff = (left, right, at = '$') => {
-      if (Object.is(left, right)) return null;
-      if (left === null || right === null || typeof left !== 'object' || typeof right !== 'object') return { path: at, selected: left, fresh: right };
-      for (const key of [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()) {
-        if (!Object.hasOwn(left, key) || !Object.hasOwn(right, key)) return { path: at + '.' + key, selectedPresent: Object.hasOwn(left, key), freshPresent: Object.hasOwn(right, key), selected: left[key], fresh: right[key] };
-        const difference = firstDiff(left[key], right[key], at + '.' + key);
-        if (difference) return difference;
-      }
-      return null;
-    };
-    const phases = text => {
-      if (text === null) return null;
-      try {
-        const ledger = JSON.parse(text);
-        return Object.fromEntries(Object.entries(ledger.sourceAuthority || {}).map(([id, authority]) => [id, {
-          phase: authority.phase, generation: authority.generation, operationId: authority.operationId,
-          sourceHash: authority.sourceHash, restoration: authority.restoration,
-          currentRevision: ledger.captures?.[authority.sourceHash]?.currentRevision
-        }]));
-      } catch (error) { return { parseError: String(error) }; }
-    };
-
-    if (process.env.COMPANION_CITATION_LIGHT_PROBE !== '1') {
-      const nativeView = IntakeLedger.prototype.view;
-      IntakeLedger.prototype.view = async function (...args) {
-        const call = ++state.operation;
-        add('ledger.view.start', { call, file: args[0] || this.file });
-        try {
-          const value = await nativeView.apply(this, args);
-          // Observe precisely what the real read returned. Do not reread the file.
-          add('ledger.view.return', { call, file: args[0] || this.file, identity: copy(value.identity), phases: phases(value.text) });
-          return value;
-        } catch (error) { add('ledger.view.error', { call, error: errorData(error) }); throw error; }
-      };
-
-      const nativeReplace = IntakeLedger.prototype.replace;
-      IntakeLedger.prototype.replace = async function (...args) {
-        const call = ++state.operation;
-        add('ledger.replace.start', { call, file: this.file, expectedIdentity: copy(this.expected?.identity), proposedDigest: createHash('sha256').update(args[0]).digest('hex'), caller: new Error('ledger replace caller').stack });
-        try {
-          const value = await nativeReplace.apply(this, args);
-          add('ledger.replace.return', { call, identity: copy(this.expected?.identity) });
-          return value;
-        } catch (error) { add('ledger.replace.error', { call, error: errorData(error) }); throw error; }
-      };
-
-      const nativeInfo = Intake.prototype.info;
-      Intake.prototype.info = async function (...args) {
-        const call = ++state.operation;
-        add('intake.info.start', { call, caller: new Error('info caller').stack });
-        try {
-          const value = await nativeInfo.apply(this, args);
-          add('intake.info.return', { call }); return value;
-        } catch (error) { add('intake.info.error', { call, error: errorData(error) }); throw error; }
-      };
-    }
-
-    const nativeInventory = CaptureDeletion.prototype.inventory;
-    CaptureDeletion.prototype.inventory = async function (...args) {
-      const call = ++state.operation, selected = args[1];
-      add('deletion.inventory.start', { call, captureId: args[0], confirmationInventory: !!selected });
-      try {
-        const value = await nativeInventory.apply(this, args);
-        add('deletion.inventory.return', { call, inventory: copy(value), selectedFreshDiff: selected ? firstDiff(selected, value) : null, selectedFreshJsonEqual: selected ? JSON.stringify(selected) === JSON.stringify(value) : null });
-        return value;
-      } catch (error) { add('deletion.inventory.error', { call, error: errorData(error) }); throw error; }
-    };
-
-    const nativeConfirm = CaptureDeletion.prototype.confirm;
-    CaptureDeletion.prototype.confirm = async function (...args) {
-      const call = ++state.operation, selected = this.previews.get(args[0]);
-      add('deletion.confirm.start', { call, selected: copy(selected) });
-      try {
-        const value = await nativeConfirm.apply(this, args);
-        add('deletion.confirm.return', { call }); return value;
-      } catch (error) {
-        // Snapshot only AFTER the real failure. It does not fabricate a ledger
-        // observation at an earlier boundary or alter the failing guard.
-        let failureLedger;
-        try {
-          const storage = new IntakeLedger(this.getVault());
-          const stat = syncFs.lstatSync(storage.file, { bigint: true });
-          const bytes = syncFs.readFileSync(storage.file);
-          failureLedger = { file: storage.file, identity: { dev: String(stat.dev), ino: String(stat.ino), digest: createHash('sha256').update(bytes).digest('hex') }, bytes: String(bytes.length), phases: phases(bytes.toString('utf8')) };
-        } catch (snapshotError) { failureLedger = { snapshotError: String(snapshotError) }; }
-        add('deletion.confirm.error', { call, error: errorData(error), failureLedger });
-        throw error;
-      }
-    };
-    add('probe.installed');
-  });
 }
 
 test('source-only deletion inventories an unadmitted incoming conflict and its exact snapshot peers without manufacturing acceptance', async ({}, testInfo) => {
@@ -1944,12 +1829,10 @@ test('same-byte restoration revokes a two-hop foreign history closure and its st
 });
 
 test('restored imported citations bind the fresh admitted revision and preserve unavailable earlier citations without substitution', async ({}, testInfo) => {
-  try {
   test.setTimeout(180000);
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'OLDCITATIONGENERATION authored synthetic interpretation.' }), 'utf8');
   await launch();
-  await installCitation13Probe(app);
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
   await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Vault ready.');
@@ -2030,10 +1913,6 @@ test('restored imported citations bind the fresh admitted revision and preserve 
     await expect(page.locator('#idea-evidence')).toContainText(capture.currentRevision);
     await expect(page.locator('#idea-evidence')).toContainText('No newer revision was substituted');
     expect(await fs.readFile(old.file, 'utf8')).toBe(old.text);
-  }
-  } finally {
-    const captured = app ? await app.evaluate(() => globalThis.__citation13Probe?.events || []).catch(error => [{ probeCollectionError: String(error) }]) : [];
-    await fs.writeFile(testInfo.outputPath('citation13-diagnostic.json'), JSON.stringify({ fixtureRoot: root, events: captured }, null, 2));
   }
 });
 
@@ -2706,13 +2585,8 @@ test('intake authority rejects an unknown hardlinked ledger before deletion prev
   expect(await fs.readFile(peer)).toEqual(before); expect(await fs.readFile(ledgerFile)).toEqual(before);
 });
 
-test('intake authority never overwrites an external ledger replacement after a confirmed unlink', async ({}, testInfo) => {
-  let diagnosticExpectedForeignBytes;
-  let diagnosticLedgerFile;
-  try {
+test('intake authority never overwrites an external ledger replacement after a confirmed unlink', async () => {
   const { ledgerFile, capture } = await importedCapture();
-  diagnosticLedgerFile = ledgerFile;
-  await installCitation13Probe(app);
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-deletion-unlinked' }));
   const confirm = page.getByRole('button', { name: 'Confirm capture deletion', exact: true, includeHidden: true }); await confirm.click();
@@ -2721,7 +2595,6 @@ test('intake authority never overwrites an external ledger replacement after a c
   const prior = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), priorIdentity = await fs.stat(ledgerFile, { bigint: true });
   expect(prior.sourceAuthority[capture.id].phase).toBe('deleting');
   const foreign = { ...prior, suppressed: [...prior.suppressed, 'c'.repeat(64)] }, foreignBytes = JSON.stringify(foreign, null, 2), replacement = path.join(root, 'external-ledger-replacement.json');
-  diagnosticExpectedForeignBytes = foreignBytes;
   await fs.writeFile(replacement, foreignBytes); await fs.rename(replacement, ledgerFile);
   expect((await fs.stat(ledgerFile, { bigint: true })).ino).not.toBe(priorIdentity.ino);
   await fs.writeFile(path.join(root, 'release.txt'), 'continue');
@@ -2732,23 +2605,6 @@ test('intake authority never overwrites an external ledger replacement after a c
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await expect.poll(async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8')).sourceAuthority[capture.id].phase).toBe('deleted');
   expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).suppressed).toContain('c'.repeat(64));
-  } finally {
-    const captured = app ? await app.evaluate(() => globalThis.__citation13Probe?.events || []).catch(error => [{ probeCollectionError: String(error) }]) : [];
-    const byteEvidence = {};
-    if (diagnosticExpectedForeignBytes !== undefined) {
-      await fs.writeFile(testInfo.outputPath('ledger13-expected-foreign.json'), diagnosticExpectedForeignBytes, 'utf8');
-      byteEvidence.expectedArtifact = 'ledger13-expected-foreign.json';
-    }
-    if (diagnosticLedgerFile) {
-      try {
-        const observedBytes = await fs.readFile(diagnosticLedgerFile);
-        await fs.writeFile(testInfo.outputPath('ledger13-observed-after-test.json'), observedBytes);
-        byteEvidence.observedArtifact = 'ledger13-observed-after-test.json';
-        if (diagnosticExpectedForeignBytes !== undefined) byteEvidence.equalsExpectedForeignBytes = observedBytes.equals(Buffer.from(diagnosticExpectedForeignBytes, 'utf8'));
-      } catch (error) { byteEvidence.collectionError = String(error); }
-    }
-    await fs.writeFile(testInfo.outputPath('ledger13-diagnostic.json'), JSON.stringify({ fixtureRoot: root, events: captured, byteEvidence }, null, 2));
-  }
 });
 
 test('restoration cleanup preserves independent stage and journal names in a replaced intake parent', async () => {
