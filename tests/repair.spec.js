@@ -2,11 +2,22 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-let root, app, page;
+const { createDiagnostics } = require('./helpers/ui-phase-diagnostics');
+let root, app, page, diagnostics;
 const fixture = require('./fixtures/reel-draft/example.json');
 const sha = 'a'.repeat(64);
-test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-intake-')); });
-test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.beforeEach(async () => { diagnostics = null; root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-intake-')); });
+test.afterEach(async ({}, testInfo) => {
+  try {
+    if (diagnostics) {
+      if (testInfo.status === 'timedOut' && app) await diagnostics.tail(app, page, 'original overall timeout');
+      await diagnostics.save(app, page, root);
+    }
+  } finally {
+    if (app) await app.close(); app = null;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 async function artifact(name = 'first', attempt = '1'.repeat(32)) {
   const dir = path.join(root, 'producer', name); await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(path.join(dir, 'run.json'), JSON.stringify({ job_id: 'b'.repeat(64), attempt_id: attempt, started_utc: '2026-11-01T10:00:00Z', input_sha256: sha, input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed' }));
@@ -20,6 +31,7 @@ async function launch() {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   page = await app.firstWindow();
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  if (diagnostics) await diagnostics.install(app, page);
 }
 async function setup() {
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
@@ -33,33 +45,101 @@ async function connect(scan = false) {
   await expect(page.getByRole('status')).toContainText(scan ? 'Intake check complete' : 'Source connected');
 }
 
-test('external writing survives restart and transfers to an annotation before incoming source applies', async () => {
-  await artifact(); await launch(); await setup(); await connect(true);
+test('external writing survives restart and transfers to an annotation before incoming source applies', async ({}, testInfo) => {
+  diagnostics = createDiagnostics(testInfo, 'repair');
+  diagnostics?.mark("action 1: before await artifact()");
+  await artifact();
+  diagnostics?.mark('action 1: returned');
+  diagnostics?.mark("action 2: before await launch()");
+  await launch();
+  diagnostics?.mark('action 2: returned');
+  diagnostics?.mark("action 3: before await setup()");
+  await setup();
+  diagnostics?.mark('action 3: returned');
+  diagnostics?.mark("action 4: before await connect(true);");
+  await connect(true);
+  diagnostics?.mark('action 4: returned');
   const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
+  diagnostics?.mark("action 5: before const file = path.join(captures, (await fs.readdir(captures)).find(x => x.endsWith('.md')));");
   const file = path.join(captures, (await fs.readdir(captures)).find(x => x.endsWith('.md')));
+  diagnostics?.mark('action 5: returned');
+  diagnostics?.mark("action 6: before await fs.appendFile(file, '\\nMy external observation.\\n');");
   await fs.appendFile(file, '\nMy external observation.\n');
+  diagnostics?.mark('action 6: returned');
+  diagnostics?.mark("action 7: before await artifact('next', '2'.repeat(32));");
   await artifact('next', '2'.repeat(32));
+  diagnostics?.mark('action 7: returned');
+  diagnostics?.mark("action 8: before const independent = await artifact('independent', '3'.repeat(32));");
   const independent = await artifact('independent', '3'.repeat(32));
+  diagnostics?.mark('action 8: returned');
+  diagnostics?.mark("action 9: before const run = JSON.parse(await fs.readFile(path.join(independent, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);");
   const run = JSON.parse(await fs.readFile(path.join(independent, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
+  diagnostics?.mark('action 9: returned');
+  diagnostics?.mark("action 10: before await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify(run));");
   await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify(run));
+  diagnostics?.mark('action 10: returned');
+  diagnostics?.mark("action 11: before await page.getByRole('button', { name: 'Check now', exact: true }).click();");
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  diagnostics?.mark('action 11: returned');
+  diagnostics?.mark("action 12: before await expect(page.getByRole('status')).toContainText('Intake check complete');");
   await expect(page.getByRole('status')).toContainText('Intake check complete');
+  diagnostics?.mark('action 12: returned');
+  diagnostics?.mark("action 13: before await expect(page.getByLabel('Vault repairs')).toContainText('My external observation.');");
   await expect(page.getByLabel('Vault repairs')).toContainText('My external observation.');
+  diagnostics?.mark('action 13: returned');
+  diagnostics?.mark("action 14: before await expect(page.locator('#captures article')).toHaveCount(2);");
   await expect(page.locator('#captures article')).toHaveCount(2);
-  await app.close(); app = null; await launch();
+  diagnostics?.mark('action 14: returned');
+  diagnostics?.mark("action 15: before await app.close(); app = null");
+  if (diagnostics) await diagnostics.capture(app, page, 'before actual restart');
+  await app.close(); app = null;
+  diagnostics?.mark('action 15: returned');
+  diagnostics?.mark("action 16: before await launch();");
+  await launch();
+  diagnostics?.mark('action 16: returned');
+  diagnostics?.mark("action 17: before await expect(page.getByLabel('Vault repairs')).toContainText('Incoming revision');");
   await expect(page.getByLabel('Vault repairs')).toContainText('Incoming revision');
+  diagnostics?.mark('action 17: returned');
+  diagnostics?.mark("action 18: before expect(await fs.readFile(file, 'utf8')).toContain('My external observation.');");
   expect(await fs.readFile(file, 'utf8')).toContain('My external observation.');
+  diagnostics?.mark('action 18: returned');
+  diagnostics?.mark("action 19: before await page.getByLabel('Transfer local writing').fill('My external observation.');");
   await page.getByLabel('Transfer local writing').fill('My external observation.');
+  diagnostics?.mark('action 19: returned');
+  diagnostics?.mark("action 20: before await page.getByRole('button', { name: 'Save annotation and apply incoming', exact: true }).click();");
+  if (diagnostics) await diagnostics.actionState(page, 'before original Apply click');
+  diagnostics?.mark('original Apply click: immediate before');
   await page.getByRole('button', { name: 'Save annotation and apply incoming', exact: true }).click();
+  diagnostics?.mark('action 20: returned');
+  diagnostics?.mark("action 21: before await expect(page.getByRole('status')).toContainText('Conflict resolved');");
   await expect(page.getByRole('status')).toContainText('Conflict resolved');
+  diagnostics?.mark('action 21: returned');
+  diagnostics?.mark("action 22: before expect(await fs.readFile(file, 'utf8')).not.toContain('My external observation.');");
   expect(await fs.readFile(file, 'utf8')).not.toContain('My external observation.');
+  diagnostics?.mark('action 22: returned');
+  diagnostics?.mark("action 23: before const annotations = (await fs.readdir(path.join(base, 'Annotations'))).filter(x => x.endsWith('.md'));");
   const annotations = (await fs.readdir(path.join(base, 'Annotations'))).filter(x => x.endsWith('.md'));
+  diagnostics?.mark('action 23: returned');
   expect(annotations).toHaveLength(1);
+  diagnostics?.mark("action 24: before expect(await fs.readFile(path.join(base, 'Annotations', annotations[0]), 'utf8')).toContain('My external observation.');");
   expect(await fs.readFile(path.join(base, 'Annotations', annotations[0]), 'utf8')).toContain('My external observation.');
-  await app.close(); app = null; await launch();
+  diagnostics?.mark('action 24: returned');
+  diagnostics?.mark("action 25: before await app.close(); app = null");
+  if (diagnostics) await diagnostics.capture(app, page, 'before actual restart');
+  await app.close(); app = null;
+  diagnostics?.mark('action 25: returned');
+  diagnostics?.mark("action 26: before await launch();");
+  await launch();
+  diagnostics?.mark('action 26: returned');
+  diagnostics?.mark("action 27: before await page.getByRole('button', { name: 'Check now', exact: true }).click();");
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  diagnostics?.mark('action 27: returned');
+  diagnostics?.mark("action 28: before await expect(page.getByRole('status')).toContainText('Intake check complete');");
   await expect(page.getByRole('status')).toContainText('Intake check complete');
+  diagnostics?.mark('action 28: returned');
+  diagnostics?.mark("action 29: before expect((await fs.readdir(path.join(base, 'Annotations'))).filter(x => x.endsWith('.md'))).toHaveLength(1);");
   expect((await fs.readdir(path.join(base, 'Annotations'))).filter(x => x.endsWith('.md'))).toHaveLength(1);
+  diagnostics?.mark('action 29: returned');
 });
 
 test('independent annotations stay linked and unchanged after a source revision', async () => {
