@@ -251,3 +251,204 @@ test('deleting persistent detached editor writing retains one whole local annota
   await app.close(); app = null; await launch();
   await expect(page.locator('#timezone')).toContainText('America/Phoenix'); await verifyDeleted('suppressed-restart');
 });
+
+// Guard setup copies the proven real-writer journey; the first passing test stays unchanged.
+async function heldDetachedEditorForAlias(testInfo) {
+  await artifact('first', '1'); await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now' }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures[sourceHash];
+  const current = path.join(base, 'Captures', capture.file), currentBytes = await fs.readFile(current);
+  const writing = Object.fromEntries(Object.entries(await files(base)).filter(([name]) => name.startsWith('Annotations/')));
+  expect(Object.keys(writing)).toHaveLength(0);
+  await artifact('second', '2');
+  const producers = await files(path.join(root, 'producer'));
+
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-capture-staged' }));
+  // The public intake bridge avoids renderer refresh automatically detaching the
+  // just-restored pair before it can be observed. Deletion below uses rendered UI.
+  const checking = page.evaluate(() => window.companion['check-intake']());
+  await checkpoint('intake-capture-staged');
+  const tx = JSON.parse(await fs.readFile(path.join(intake, 'transaction.json'), 'utf8'));
+  const incoming = path.join(intake, tx.revision.id + '.stage'), outside = path.join(root, 'outside-incoming');
+  const backup = path.join(intake, tx.backup), intentFile = backup + '.detach.json';
+  const snapshotA = path.join(base, 'Revisions', capture.currentRevision + '.json');
+  const snapshotABytes = await fs.readFile(snapshotA);
+  const snapshotB = path.join(base, 'Revisions', tx.revision.id + '.json'), snapshotStage = path.join(intake, tx.revision.id + '.snapshot.stage');
+  await observe(testInfo, 'incoming-staged', base, { tx });
+  expect(tx.sourceHash).toBe(sourceHash); expect(tx.capture.id).toBe(capture.id);
+  expect(tx.revision.id).not.toBe(capture.currentRevision);
+  expect(await exists(current)).toBe(false);
+  await fs.copyFile(incoming, outside); await fs.unlink(incoming); await fs.link(outside, incoming);
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue'); const bridgeResult = await checking;
+
+  const conflicted = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), archive = path.join(intake, conflicted.blocks[sourceHash].journal);
+  const restored = await observe(testInfo, 'writer-restored-pair', base, { bridgeResult, ledger: conflicted });
+  const relative = file => path.relative(base, file).split(path.sep).join('/');
+  const pair = [restored[relative(current)], restored[relative(backup)]];
+  expect(pair.map(item => item.nlink)).toEqual(['2', '2']);
+  expect([pair[0].dev, pair[0].ino]).toEqual([pair[1].dev, pair[1].ino]);
+  expect(await fs.readFile(current)).toEqual(currentBytes); expect(await fs.readFile(backup)).toEqual(currentBytes);
+  expect(JSON.parse(await fs.readFile(archive, 'utf8'))).toEqual(tx);
+  expect(conflicted.attempts).toEqual(original.attempts); expect(conflicted.admissions).toEqual(original.admissions);
+  expect(conflicted.attempts[tx.revision.identity]).toBeUndefined();
+  expect(conflicted.captures[sourceHash].revisions).toEqual(capture.revisions);
+  await app.close(); app = null;
+  // Remove only the controlled outside alias. The actual writer pair stays intact.
+  await fs.unlink(outside); expect((await fs.stat(incoming)).nlink).toBe(1);
+  await fs.unlink(path.join(root, 'release.txt'));
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-restored-backup-publish' }));
+  await launch(); await checkpoint('intake-restored-backup-publish');
+  const intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
+  const retained = backup + '.detached-' + intent.id, independent = backup + '.independent';
+  const holdArchive = intentFile + '.held-' + intent.id;
+  await observe(testInfo, 'detach-publish-before-editor', base, { intentBytes, intent, ledger: JSON.parse(await fs.readFile(ledgerFile, 'utf8')) });
+  expect(await fs.readFile(independent)).toEqual(currentBytes);
+  const publishing = await files(base);
+  expect(publishing[relative(current)].nlink).toBe('2');
+  expect(publishing[relative(backup)].ino).toBe(publishing[relative(current)].ino);
+  // Model an external editor's atomic replacement; the real writer performs the later rename.
+  const wholeE = Buffer.concat([currentBytes, Buffer.from('\nWHOLEDETACHEDE: Preserve this entire local version. Source quotation: "Authored synthetic source material."\nLiteral fence stress: ````````\nUnicode: café — local observation.\n', 'utf8')]);
+  await fs.unlink(backup); await fs.writeFile(backup, wholeE, { flag: 'wx', flush: true });
+  const edited = await observe(testInfo, 'external-editor-replaced-backup', base, { wholeE: wholeE.toString('base64'), action: 'unlink P; exclusive write complete E at P' });
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+  await expect.poll(async () => await exists(holdArchive) && !await exists(intentFile)).toBe(true);
+  await observe(testInfo, 'actual-writer-detach-hold', base, { ledger: JSON.parse(await fs.readFile(ledgerFile, 'utf8')) });
+  await app.close(); app = null;
+  await fs.unlink(path.join(root, 'release.txt'));
+  await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
+  await expect(page.getByRole('button', { name: 'Delete capture', exact: true })).toBeVisible();
+  const targets = [current, snapshotA, snapshotB, snapshotStage, incoming, archive, independent, retained, holdArchive];
+  const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  const recovered = await observe(testInfo, 'persistent-family-before-count', base, {
+    root, targets: targets.map(relative), held, original, conflicted, tx, intentBytes, intent,
+    producers, wholeE: wholeE.toString('base64'), ui: await page.locator('body').innerText()
+  });
+  const sourceLeaves = tree => Object.keys(tree).filter(name => /^(Captures\/|Revisions\/)/.test(name) || name.startsWith('.intake/') && name !== '.intake/ledger.json').sort();
+  expect(sourceLeaves(recovered)).toEqual(targets.map(relative).sort());
+  expect(sourceLeaves(recovered)).toHaveLength(9);
+  expect(await exists(backup)).toBe(false); expect(await exists(intentFile)).toBe(false);
+  for (const file of [current, independent]) expect(await fs.readFile(file)).toEqual(currentBytes);
+  expect(await fs.readFile(retained)).toEqual(wholeE);
+  expect(recovered[relative(retained)]).toEqual(edited[relative(backup)]);
+  expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  expect(await fs.readFile(snapshotB)).toEqual(await fs.readFile(snapshotStage));
+  expect(intent.sourceHash).toBe(sourceHash); expect(intent.captureId).toBe(capture.id);
+  expect(intent.backup).toBe(tx.backup); expect(intent.journal).toBe(path.basename(archive));
+  expect(await fs.readFile(incoming, 'utf8')).toBe(tx.content);
+  expect(await fs.readFile(archive, 'utf8')).toBe(JSON.stringify(tx));
+  const holdBytes = await fs.readFile(holdArchive, 'utf8'), hold = JSON.parse(holdBytes);
+  expect(holdBytes).toBe(JSON.stringify(hold)); expect(hold.intentBytes).toBe(intentBytes);
+  expect(hold.evidence).toEqual([
+    { role: 'independent-editor-writing', file: path.basename(retained), hash: createHash('sha256').update(wholeE).digest('hex') },
+    { role: 'original-source-copy', file: path.basename(independent), hash: tx.previousHash }
+  ]);
+  expect(held.blocks[sourceHash].detachHold).toEqual({ journal: path.basename(holdArchive), reason: held.blocks[sourceHash].reason, evidence: hold.evidence });
+  expect(held.captures[sourceHash].conflict).toBe(held.blocks[sourceHash].reason);
+  expect(held.outcomes[tx.key].reason).toBe(held.blocks[sourceHash].reason);
+  expect(held.attempts).toEqual(original.attempts); expect(held.admissions).toEqual(original.admissions);
+  expect(held.attempts[tx.revision.identity]).toBeUndefined(); expect(held.admissions?.[tx.revision.id]).toBeUndefined();
+  expect(held.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect(held.captures[sourceHash].revisions).toEqual(capture.revisions);
+  const pairB = [snapshotB, snapshotStage].map(file => recovered[relative(file)]);
+  expect(pairB.map(item => item.nlink)).toEqual(['2', '2']); expect(pairB[0].ino).toBe(pairB[1].ino); expect(pairB[0].dev).toBe(pairB[1].dev);
+  for (const file of targets.filter(file => ![snapshotB, snapshotStage].includes(file))) expect(recovered[relative(file)].nlink).toBe('1');
+  expect(new Set(targets.map(file => recovered[relative(file)].dev + ':' + recovered[relative(file)].ino)).size).toBe(8);
+  expect(await files(path.join(root, 'producer'))).toEqual(producers);
+  expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
+  for (const file of targets) expect(recovered[relative(file)].ordinary).toBe(true);
+  return { base, intake, ledgerFile, current, retained, targets, original, capture, tx, recovered, held, producers, wholeE, relative, sourceLeaves };
+}
+
+test('outside alias of retained detached editor writing holds confirmed deletion before publication and after restart', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const f = await heldDetachedEditorForAlias(testInfo);
+  const { base, ledgerFile, current, retained, targets, original, capture, tx, recovered, producers, wholeE, relative, sourceLeaves } = f;
+  const vaultRelative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+  const beforeConsent = await files(base);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const preview = page.getByLabel('Capture deletion preview'); await expect(preview).toBeVisible();
+  const reviewed = await preview.innerText();
+  const reviewedPaths = (await preview.locator('p').allTextContents()).filter(line => line.startsWith('Remove: ')).map(line => line.slice(8)).sort();
+  expect(reviewedPaths).toEqual(targets.map(vaultRelative).sort()); expect(reviewed).toContain(wholeE.toString('utf8'));
+  expect(reviewed).toContain('Retained whole local version'); expect(reviewed).toMatch(/retain[\s\S]*source quotations/i);
+  const outputPaths = [...new Set(reviewed.match(/Companion\/Annotations\/[a-f0-9-]{36}\.md/g) || [])];
+  expect(outputPaths).toHaveLength(1); expect(await files(base)).toEqual(beforeConsent);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-deletion-authorized' }));
+  const confirm = preview.getByRole('button', { name: 'Confirm capture deletion', exact: true });
+  await confirm.click(); await checkpoint('capture-deletion-authorized');
+  const authorizedFiles = await files(base), committedBytes = await fs.readFile(ledgerFile);
+  const committed = JSON.parse(committedBytes), authority = committed.sourceAuthority[capture.id];
+  const mainPid = await app.evaluate(() => process.pid), ownedLock = current + '.lock', ownedLockRelative = relative(ownedLock);
+  const lockAtAuthorization = authorizedFiles[ownedLockRelative];
+  expect(lockAtAuthorization).toBeDefined(); expect(lockAtAuthorization.ordinary).toBe(true); expect(lockAtAuthorization.nlink).toBe('1');
+  expect(JSON.parse(Buffer.from(lockAtAuthorization.bytes, 'base64').toString('utf8'))).toEqual({ pid: mainPid });
+  expect(authority.phase).toBe('deleting'); expect(authority.mixedRecovery.format).toBe('restored-backup-editor-hold-v1');
+  expect(authority.targets.map(target => target.file).sort()).toEqual(targets.map(vaultRelative).sort());
+  expect(authority.preservedWriting).toHaveLength(1); expect(authority.preservedWriting[0].file).toBe(outputPaths[0]);
+  expect(authority.preservedWriting[0].publication).toBeUndefined(); expect(authority.preservedWriting[0].stageIdentity).toBeUndefined();
+  expect(committed.suppressed).toContain(sourceHash); expect(committed.attempts).toEqual(original.attempts); expect(committed.admissions).toEqual(original.admissions);
+  expect(committed.attempts[tx.revision.identity]).toBeUndefined(); expect(committed.admissions?.[tx.revision.id]).toBeUndefined();
+  for (const file of targets) expect(authorizedFiles[relative(file)]).toEqual(recovered[relative(file)]);
+  // The sole post-consent mutation is a controlled hardlink outside the vault to real R.
+  const outsideDirectory = path.join(root, 'outside-editor'); await fs.mkdir(outsideDirectory);
+  const outside = path.join(outsideDirectory, 'retained-editor.md'); await fs.link(retained, outside);
+  const arrivedFiles = await files(base), outsideAtArrival = await files(outsideDirectory);
+  const retainedAtArrival = arrivedFiles[relative(retained)], alias = outsideAtArrival['retained-editor.md'];
+  const expectedAfterRelease = { ...arrivedFiles }; delete expectedAfterRelease[ownedLockRelative];
+  await fs.writeFile(testInfo.outputPath('detached-editor-alias-authorized-arrival.json'), JSON.stringify({
+    boundary: 'capture-deletion-authorized', mainPid, targets: targets.map(relative), reviewed, outputPaths,
+    authorizedFiles, committed, arrivedFiles, outside: { path: outside, observed: outsideAtArrival },
+    ownedLock: { file: ownedLockRelative, observed: lockAtAuthorization }, expectedAfterRelease,
+    producer: await files(path.join(root, 'producer'))
+  }, null, 2));
+  expect(retainedAtArrival.nlink).toBe('2'); expect(alias.nlink).toBe('2'); expect(alias.ordinary).toBe(true);
+  expect(alias.dev).toBe(retainedAtArrival.dev); expect(alias.ino).toBe(retainedAtArrival.ino);
+  expect(alias).toEqual(retainedAtArrival); expect(alias.bytes).toBe(wholeE.toString('base64'));
+  for (const file of targets) expect(arrivedFiles[relative(file)]).toEqual({ ...recovered[relative(file)], ...(file === retained ? { nlink: '2' } : {}) });
+  expect(sourceLeaves(expectedAfterRelease)).toEqual(targets.map(relative).sort());
+  expect(Object.keys(arrivedFiles).filter(name => name.startsWith('.intake/deletion-writing-'))).toEqual([]);
+  expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
+  expect(await fs.readFile(ledgerFile)).toEqual(committedBytes); expect(await files(path.join(root, 'producer'))).toEqual(producers);
+  await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+  await expect(confirm).toBeEnabled();
+  const firstStatus = await page.getByRole('status').innerText();
+  await observe(testInfo, 'detached-editor-alias-after-release', base, { status: firstStatus, outside: await files(outsideDirectory), committed });
+  const heldReason = 'Source recovery inventory contains changed or unsupported writing. Preserve it for explicit review.';
+  await expect(page.getByRole('status')).toHaveText(heldReason);
+  async function assertHeld(name) {
+    const ledgerBytes = await fs.readFile(ledgerFile), ledger = JSON.parse(ledgerBytes);
+    const observed = await observe(testInfo, name, base, { ledger, status: await page.getByRole('status').innerText(), outside: await files(outsideDirectory), ui: await page.locator('body').innerText() });
+    expect(observed).toEqual(expectedAfterRelease); expect(ledgerBytes).toEqual(committedBytes);
+    expect(ledger.sourceAuthority[capture.id]).toEqual(authority);
+    expect(ledger.sourceAuthority[capture.id].operationId).toBe(authority.operationId);
+    expect(ledger.sourceAuthority[capture.id].preservedWriting).toEqual(authority.preservedWriting);
+    expect(sourceLeaves(observed)).toEqual(targets.map(relative).sort());
+    expect(await exists(ownedLock)).toBe(false);
+    expect(await files(outsideDirectory)).toEqual(outsideAtArrival);
+    expect(await files(path.join(root, 'producer'))).toEqual(producers);
+    expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
+    for (const plan of authority.preservedWriting) for (const file of [plan.file, plan.stage]) expect(await exists(path.join(root, 'vault', file))).toBe(false);
+  }
+  await assertHeld('detached-editor-alias-first-hold');
+  await fs.writeFile(path.join(root, 'faults.json'), '{}'); await fs.unlink(path.join(root, 'release.txt'));
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await expect(page.getByRole('status')).toHaveText(heldReason);
+  await assertHeld('detached-editor-alias-normal-restart');
+  await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
+  const recovery = page.getByLabel('Capture deletion recovery');
+  await expect(recovery).toContainText(capture.id); await expect(recovery).toContainText(heldReason);
+  for (const file of targets) await expect(recovery).toContainText(vaultRelative(file));
+  const resume = recovery.getByRole('button', { name: 'Resume confirmed capture deletion', exact: true });
+  await expect(resume).toBeEnabled(); await resume.click(); await expect(resume).toBeEnabled();
+  await expect(page.getByRole('status')).toHaveText(heldReason);
+  await assertHeld('detached-editor-alias-public-resume-hold');
+});

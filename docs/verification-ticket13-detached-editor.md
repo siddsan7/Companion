@@ -54,3 +54,21 @@ Root observer-correctedcandidate failed18524ms/exit1 at post-Checknow filesnapsh
 
 
 Root completefirsteditorjourney GREEN19211ms, exit0/no skips, on immutable stagedtreef703d300f10016b2fd31da290aca06127adbd2af. Product2filesUNCHANGEDfromfirstcandidateb6d2ebca; rootfixedonlyobservermoduleaccess(a84), distinctcycleassertion(d7), andactualfinalrepair/supportreadiness(b9), allfailedrunsretained andmisdiagnoses corrected above. Complete9origin/ONEvisiblewholeEpreview, byte-exactCancel, nativeBEFOREfirstsourceunlinkALL9intact+ONEdurablereceipt+exactannotation/fence, all9purge/metadata-onlyscope, immutableA/B/producers/Bpurgeobservation, exactsuppressionoutcomes/Checknow/restart passed. Evidence Temp/companion-ticket13-detached-editor-completion-20261110. Knownold5formatoptional-titleProofs schemafinding remainsseparateblocker underrootregression; new9format explicitlyrejectsproof-fields. RequiredoutsideRaliasguard, sharedold/newpublication/lifecycle/schema andprimarycomposition/coupled/independentfinalreview remain; no whole13/PR/liveapproval.
+
+## Outside-R hardlink guard: test only
+
+Root reported the complete first editor journey GREEN in 19,211 ms, exit0/no skips, with the same two product modules as the first candidate. It passed the actual nine-origin family, ONE whole-E preview/Cancel, actual native boundary before any source unlink with all nine origins and one publication receipt, exact fence/output, complete purge, immutable A/producer facts, suppression and restart. Root recorded two observer corrections before that pass: use process.getBuiltinModule in the evaluated main context, and wait for the final intake action/repair completion before filesystem snapshots. Evidence: C:/Users/sidds/AppData/Local/Temp/companion-ticket13-detached-editor-completion-20261110. The earlier fixture failures and corrected diagnosis remain in root's records; they were not product failures or product fixes.
+
+The next single test is `outside alias of retained detached editor writing holds confirmed deletion before publication and after restart`. Its helper copies the real-writer setup; the first passing journey is not refactored. Through rendered preview/confirm it pauses at the existing capture-deletion-authorized checkpoint after the actual authority/suppression commit, before publication. The sole post-consent external mutation adds a hardlink outside the vault to actual R. Evidence records R/outside exact bytes/SHA/dev/ino/size/nlink2, all nine real origins and B's original pair, producer files, committed authority/operation/plans and actual owned current.lock with the main PID.
+
+The guard releases the real operation and requires a truthful source-inventory HOLD before any output, stage or source removal. It then starts normally and exercises public recovery/resume with the alias still present. Across all three observations it requires the complete vault and raw ledger byte/identity exact, the same operation/plans with no receipts or alias adoption, all nine origins present, unchanged outside alias and producers, no annotation or publication stage. The only excluded transition is removal of the exact previously observed owned current.lock during confirm's finally block; no payload, arbitrary lock, temporary file or sidecar is filtered.
+
+No source changes or runtime claim accompany this guard. Syntax passed. Root owns the first actual case run with:
+
+```powershell
+npx playwright test tests/detached-editor-deletion.spec.js --grep "outside alias" --workers=1 --reporter=list
+```
+
+The old-format malformed-titleProofs blocker remains a separate test-first fix and merge requirement. Primary synchronization, coupled old/new gates, and fresh Standards/Spec review remain outstanding.
+
+Root actual outside-alias guard passed in 16,186 ms, exit 0, one test and no skips, at staged tree 97bcba2d038c39ae0d27372b2ccb09e0295381f9. Evidence: Temp/companion-ticket13-detached-editor-outside-alias-20261110/exit.json and run.stdout.log. No product change followed the passing first journey. Independent review also found a restored-admission overconstraint in the new classifier; that separate case must be reproduced and fixed before final approval.
