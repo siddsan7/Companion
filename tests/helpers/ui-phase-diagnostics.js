@@ -13,7 +13,8 @@ const bounded = async work => {
 };
 function createDiagnostics(testInfo, kind) {
   if (!enabled) return null;
-  const renderControl = process.env.COMPANION_UI_RENDER_CONTROL === 'unthrottled' ? 'unthrottled' : 'baseline';
+  const requestedRenderControl = process.env.COMPANION_UI_RENDER_CONTROL;
+  const renderControl = ['unthrottled', 'visible-unthrottled'].includes(requestedRenderControl) ? requestedRenderControl : 'baseline';
   const started = performance.now(), timeline = [], sessions = [];
   const clockStart = { at: Date.now(), monotonicMs: started, boundary: kind === 'repair' ? 'test body begins; excludes beforeEach' : 'after restoration preview; excludes all prior setup', frameworkDeadlineKnown: false };
   const mark = label => append(timeline, { label, at: Date.now(), elapsedSinceObserverMs: performance.now() - started, estimatedRemainingFromObserverMs: testInfo.timeout - (performance.now() - started) });
@@ -34,9 +35,12 @@ function createDiagnostics(testInfo, kind) {
         if (windows.length !== 1) throw Error('Expected one owned diagnostic fixture window');
         const ownedWindow = windows[0], contents = ownedWindow.webContents;
         const backgroundThrottlingBefore = contents.getBackgroundThrottling();
-        // Explicit condition B only. Baseline leaves the actual native policy untouched.
-        if (renderControl === 'unthrottled') contents.setBackgroundThrottling(false);
+        const visibleBefore = ownedWindow.isVisible(), focusedBefore = ownedWindow.isFocused();
+        // B and C share this policy; only C changes native visibility without focus.
+        if (renderControl === 'unthrottled' || renderControl === 'visible-unthrottled') contents.setBackgroundThrottling(false);
+        if (renderControl === 'visible-unthrottled') ownedWindow.showInactive();
         emit('native-window', { renderControl, windowId: ownedWindow.id, webContentsId: contents.id,
+          visibleBefore, focusedBefore,
           visible: ownedWindow.isVisible(), focused: ownedWindow.isFocused(),
           backgroundThrottlingBefore, backgroundThrottling: contents.getBackgroundThrottling() });
         let sequence = 0;

@@ -31,7 +31,21 @@ Both actual-form pairs passed at the same tree `001a0d7`: baseline A in 42,819ms
 
 Installed Electron 45 types declare the native visibility/focus and background-throttling methods used here. The official [BrowserWindow documentation](https://www.electronjs.org/docs/latest/api/browser-window) describes window visibility, and the official [webContents documentation](https://www.electronjs.org/docs/latest/api/web-contents) describes `getBackgroundThrottling` and `setBackgroundThrottling`. These describe APIs and policy; they do not prove the cadence measured in a particular fixture. The passive frame timestamps are the cadence evidence.
 
-A separately reviewed native-visibility condition C is planned but not implemented or executed in this report update. No final harness strategy is selected. Both original full-gate failures remain unresolved.
+Native-visibility condition C uses `COMPANION_UI_PHASE_DIAGNOSTICS=1` and `COMPANION_UI_RENDER_CONTROL=visible-unthrottled`. It uses the same owned-window background-throttling policy as B, then calls that window's `showInactive()`. This may briefly display the disposable fixture window without requesting focus. Installation records visibility and focus before and after, alongside the existing native identities and policy. Baseline and B behavior remain unchanged. No focus call, timer change, source change or original test action/assertion/budget change accompanies C; window visibility is the explicit controlled difference from B.
+
+C passed both cases, exit 0 in 20,432ms, at tree `101bcdd4e98d3256681f194651f152b5cff2c2d2` (`Temp/companion-ticket13-ui-control-c-two-20261110`). Independent analysis in `Temp/companion-ui-phase13-frame-ab-analysis-20261110.md` compares the actual samples:
+
+| Control | Native visible / focused / background throttling | Critical frame intervals: restoration / repair | Confirm / Apply request to trusted dispatch | Runner wall time |
+| --- | --- | --- | --- | --- |
+| A baseline | false / false / true | about 1,000ms / 1,016ms | 1,977ms / 2,022ms | 42,819ms; both passed |
+| B setter only | false / false / false | about 1,000ms / 1,016ms | 1,984ms / 2,002ms | 43,301ms; both passed |
+| C B policy plus `showInactive()` | true / false / false | 14.8–18.4ms / 16.1–16.8ms | 71ms / 41ms | 20,432ms; both passed |
+
+Playwright API logs place about two seconds in the combined visible/enabled/stable check for A/B and 27ms for C, with no logged critical retry or obstruction. Local Playwright implementation checks stable bounding rectangles through animation frames. Together these observations demonstrate hidden-fixture actionability overhead in these samples. They do not establish the original post-click Source restored 5s failure: the measured pre-dispatch delay precedes that assertion. C also retains B's false policy, so visible-with-default-policy behavior was not tested. These sequential samples are controlled observations, not statistical benchmarks.
+
+Repair samples retained a connected/enabled button with matching center hit and unchanged sampled bounds. Restoration A/B center hits were offscreen before successful scrolling; C's passive restoration button sample was empty, so no equivalent hit comparison is available. No sampled hit flag proves the failed historical run's state. Original repair timing was not captured; cumulative actionability overhead is a plausible contributor to its overall 30s timeout, not a proven historical cause.
+
+The verified A/B diagnostic source and report were committed at `fb2dd047205d6adb71df5bff8c27ea42c6e41a51` before adding C. Only the shared helper and this report changed for C; both test specs remain byte-identical. Installed Electron 45 types declare `showInactive`; the official BrowserWindow documentation describes the API, not its measured effect in this experiment. No final harness strategy or production correction is selected. Both original full-gate failures remain unresolved.
 
 The pending-title assertion catch retains and rethrows the same original error after an evidence-only tail. Repair's overall timeout is retained, with its tail in `afterEach` before close under the unchanged teardown budget. A tail waits six seconds and reserves four seconds for two individually bounded buffer reads; it never retries an assertion or cancelled click. Later observations are labeled separately.
 
