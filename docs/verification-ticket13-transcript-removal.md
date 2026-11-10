@@ -29,6 +29,14 @@ Complete valid pending-only authority can be explicitly reviewed, revalidated an
 
 The observed checks do not complete ticket 13. The finite coupled gate and independent review remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
 
+## Original coupled gate and review blocker
+
+Root session `33780` passed all 21 coupled cases on unchanged `7989a203bf8a633600cc39ff41fec140c2f19dd6` in 10.3 minutes, with no skips. Root retained the last-run result and stale-confirmation diagnostics under `Temp/companion-ticket13-transcript-coupled-green-20261109/`.
+
+Independent Standards review approved that bounded tip. Independent Spec review remains blocked by P2: hardlink peer construction uses default string ordering, while strict marker validation requires locale ordering. A legal lowercase destination such as `a/Transcript.md` and its app-created `Companion/.transcripts` stage can produce removal authority that rejects its own peer order. The passing original gate does not cover that destination and is not final-tip approval.
+
+The focused regressions now use that lowercase destination for normal removal confirmation and for actual main-process exit after removal staging followed by explicit recovery. Both retain a real app-created output/stage hardlink pair from the controlled post-receipt export interruption. Production is unchanged pending root-observed RED and its test-only commit.
+
 ## Retained intent with missing output
 
 Root ran a second desktop/file vertical after the first implementation milestone. The normal UI published an export. A controlled external file removal then removed its output, leaving the app-owned intent as the only retained export writing and keeping the original publication receipt as historical metadata.

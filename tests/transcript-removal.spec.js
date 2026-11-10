@@ -9,7 +9,7 @@ test.beforeEach(async () => {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T12:00:00Z', timezone: 'America/Phoenix' }));
 });
 
-async function transcriptProtocolFixture(selectedFailure) {
+async function transcriptProtocolFixture(selectedFailure, selectedRelative = 'Selected protocol transcript.md') {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'TRANSCRIPT_PROTOCOL_13: authored historical writing stays in its origin conversation.' }));
   await launch();
   await page.getByLabel('Thought or link', { exact: true }).fill('Transcript protocol recovery preserves this independent source capture.');
@@ -28,7 +28,8 @@ async function transcriptProtocolFixture(selectedFailure) {
   await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_PROTOCOL_13');
   await expect(page.locator('#conversation-history')).toContainText('completed');
   const vault = path.join(root, 'vault'), directory = path.join(vault, 'Companion', '.transcripts');
-  const selected = path.join(vault, 'Selected protocol transcript.md'), other = path.join(vault, 'Other protocol transcript.md');
+  const selected = path.join(vault, selectedRelative), other = path.join(vault, 'Other protocol transcript.md');
+  await fs.mkdir(path.dirname(selected), { recursive: true });
   let selectedBytes;
   for (const file of [other, selected]) {
     await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: file }));
@@ -51,6 +52,11 @@ async function transcriptProtocolFixture(selectedFailure) {
   expect(intent).toBeDefined();
   const selectedCopies = [selected, path.join(directory, `${intent.operation}.intent.json`), path.join(directory, `${intent.operation}.published.json`)];
   if (selectedFailure) selectedCopies.push(path.join(directory, `${intent.operation}.md.pending`));
+  if (selectedFailure) {
+    const outputStat = await fs.stat(selected), stageStat = await fs.stat(path.join(directory, `${intent.operation}.md.pending`));
+    expect(outputStat.nlink).toBe(2);
+    expect(stageStat.dev).toBe(outputStat.dev); expect(stageStat.ino).toBe(outputStat.ino);
+  }
   const backup = path.join(root, 'protocol-external-backup.md'); await fs.copyFile(selected, backup);
   return {
     vault, directory, selected, other, selectedBytes, selectedCopies, backup, intent,
@@ -77,7 +83,9 @@ async function expectProtocolIndependence(fixture) {
 for (const boundary of ['transcript-remove-after-stage', 'transcript-remove-after-tombstone', 'transcript-remove-after-unlink']) {
   test(`actual main exit at ${boundary} keeps exact transcript removal recoverable only after explicit review`, async ({}, testInfo) => {
     test.setTimeout(150000);
-    const fixture = await transcriptProtocolFixture();
+    const fixture = boundary === 'transcript-remove-after-stage'
+      ? await transcriptProtocolFixture('transcript-after-receipt', path.join('a', 'Transcript.md'))
+      : await transcriptProtocolFixture();
     const review = await reviewProtocolRemoval(fixture);
     await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }));
     await review.getByRole('button', { name: 'Confirm transcript removal', exact: true }).click();
@@ -303,7 +311,8 @@ test('separately selected transcript removal previews every managed copy, cancel
   await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_REMOVE_13');
   await expect(page.locator('#conversation-history')).toContainText('completed');
   const vault = path.join(root, 'vault'), managed = path.join(vault, 'Companion'), directory = path.join(managed, '.transcripts');
-  const selected = path.join(vault, 'Selected transcript.md'), other = path.join(vault, 'Other transcript.md');
+  const selected = path.join(vault, 'a', 'Transcript.md'), other = path.join(vault, 'Other transcript.md');
+  await fs.mkdir(path.dirname(selected));
   // Keep an app-created stage/output hardlink pair and receipt for the selected export.
   // The controlled filesystem failure is at the approved OS boundary, after publication.
   await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'transcript-after-receipt' }));
