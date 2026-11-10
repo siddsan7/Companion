@@ -4,7 +4,7 @@ const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 let root, app, page;
 
 test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-deletion-')); });
@@ -109,7 +109,7 @@ test('source-only deletion inventories an unadmitted incoming conflict and its e
   expect(await fs.readFile(unrelated, 'utf8')).toBe('Independent vault writing outside the selected source.');
 });
 
-async function heldSourceInventory(testInfo, replacementCharacter = false) {
+async function heldSourceInventory(testInfo, replacementCharacter = false, prepareIncoming) {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
   await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
@@ -121,7 +121,7 @@ async function heldSourceInventory(testInfo, replacementCharacter = false) {
   const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
   const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures[sourceHash], destination = path.join(base, 'Captures', capture.file);
   expect(Object.keys(original.attempts)).toHaveLength(1);
-  await artifact('second', '2');
+  if (prepareIncoming) await prepareIncoming(); else await artifact('second', '2');
   if (replacementCharacter) {
     const folder = path.join(root, 'producer', 'second'), title = fixture.target.title + ' \uFFFD';
     await fs.writeFile(path.join(folder, 'first-pass-target.json'), JSON.stringify({ ...fixture.target, title }));
@@ -349,6 +349,61 @@ test('v2 source purge recovers after an actual first unlink and controlled autho
   for (const target of authority.targets) expect(await fs.access(path.join(root, 'vault', target.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   expect(await fs.readFile(unrelated, 'utf8')).toBe('Independent writing survives partial source purge.');
   expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+});
+
+test('source-only deletion inventories an unadmitted finalized acceptance with exact retained source text and known snapshot peers', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const reviewRoot = path.join(root, 'review-producer'), reviewFolder = path.join(reviewRoot, 'accept');
+  const selected = await heldSourceInventory(testInfo, false, async () => {
+    await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), reviewFolder, { recursive: true });
+    await page.getByLabel('Finalized review folder', { exact: true }).fill(reviewRoot);
+    await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+  });
+  const producerReview = await files(reviewRoot), sourceBytes = await fs.readFile(path.join(reviewFolder, 'source.json')), manifestBytes = await fs.readFile(path.join(reviewFolder, 'manifest.json'));
+  const manifest = JSON.parse(manifestBytes.toString('utf8')), revision = selected.transaction.revision;
+  expect(revision.identity).toBe('finalization:' + manifest.finalization_id);
+  expect(revision.review.decision).toBe('accept'); expect(revision.humanReview).toBe('accept');
+  expect(revision.reviewSourceText).toBe(sourceBytes.toString('utf8'));
+  expect(revision.reviewSourceText).toContain('9007199254740993');
+  expect(revision.reviewSourceText).toContain('13.0');
+  expect(revision.run.canonical_probe).toBeDefined();
+  expect(revision.manifest.files['source.json']).toBe(createHash('sha256').update(sourceBytes).digest('hex'));
+  expect(revision.fingerprint).toBe(createHash('sha256').update(manifestBytes).digest('hex'));
+  const beforeLedger = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(beforeLedger.attempts).toEqual(selected.original.attempts); expect(beforeLedger.attempts[revision.identity]).toBeUndefined();
+  expect(beforeLedger.captures[selected.sourceHash].currentRevision).toBe(selected.capture.currentRevision);
+  expect((await fs.stat(selected.snapshot)).nlink).toBe(2); expect((await fs.stat(selected.snapshotStage)).ino).toBe((await fs.stat(selected.snapshot)).ino);
+  const targets = [selected.destination, path.join(selected.base, 'Revisions', selected.capture.currentRevision + '.json'), selected.snapshot, selected.snapshotStage, selected.stage, path.join(selected.intake, selected.transaction.backup), selected.archive];
+  for (const file of targets) expect((await fs.stat(file)).isFile()).toBe(true);
+  await launch(); await expect(page.locator('#captures article')).toHaveCount(1);
+  const before = await files(selected.base), preview = page.getByLabel('Capture deletion preview');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
+  for (const file of targets) await expect(preview).toContainText(path.relative(path.join(root, 'vault'), file).split(path.sep).join('/'));
+  expect(await files(selected.base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(selected.base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')), authority = deleted.sourceAuthority[selected.capture.id];
+  expect(authority.phase).toBe('deleted'); expect(deleted.suppressed).toContain(selected.sourceHash);
+  expect(authority.purgedProducerAttempts).toEqual([{ identity: revision.identity, fingerprint: revision.fingerprint, sourceHash: selected.sourceHash, captureId: selected.capture.id, revisionId: revision.id, sourceGeneration: null, operationId: authority.operationId }]);
+  expect(deleted.attempts).toEqual(selected.original.attempts); expect(deleted.admissions).toEqual(selected.original.admissions);
+  expect(deleted.attempts[revision.identity]).toBeUndefined();
+  expect(deleted.blocks[selected.sourceHash]).toBeUndefined(); expect(deleted.pending[selected.sourceHash]).toBeUndefined();
+  for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await files(reviewRoot)).toEqual(producerReview); expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[selected.capture.id]).toEqual(authority);
+  expect(restarted.attempts).toEqual(selected.original.attempts); expect(restarted.admissions).toEqual(selected.original.admissions);
+  for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await files(reviewRoot)).toEqual(producerReview); expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
 });
 
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
