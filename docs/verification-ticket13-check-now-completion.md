@@ -20,3 +20,12 @@ Static verification: `node --check tests/repair.spec.js` passed with exit 0. The
 ## Actual controlled baseline RED
 
 At stagedtree2e7baf010c14eb1b1d3369b674cadef61bc3da61, the genuine first manual check completed and its actual repair native-owner callback reached held. Original5s disabled-button assertion FAILED: Check now remained ENABLED at tests/repair.spec.js:89. Complete result1failed/0skip/exit1/10298ms, raw Temp/companion-ticket13-check-completion-red-20261110. Finally released the original callback, awaited instance restoration, restored prototype/IPC/renderer wrappers and existing fixture cleanup completed. Later second-check/producer/persistence assertions were unreached. No additional lock, replay, fakeerror or source edit. This proves controlled UI lifecycle defect; the exact historical failed mixed owner remains unproved. Smallest frontend pending guard and unchangedGREEN remain next.
+
+
+## Initial pending guard milestone: one review finding open
+
+Root's frontend handler sets pending synchronously and retains it across actual check-intake and its own Refresh. Handler entry and button state block repeated action; finally enables explicit retry unless configuration remains busy. Configuration controls respect an in-flight check; success/error reporting is bound to the current configuration. Existing shared UIerror ownership field was renamed canReport for read/action use; no backendretry/lock/model/timer change.
+
+The UNCHANGED native-owner regression PASSED1/0skip/exit0/5493ms at stagedtreef9c3b71c61559f7b8a96d517249fff24e2b0ff43, including second explicit check, onecapture/revision and exactproducerbytes. Raw Temp/companion-ticket13-check-completion-green-20261110; runner completed/copied. An additional DOM-disabled entry guard at treee9a4b39f169921b04d1e07e6d16519b9f9386cb1 aligns configuration frontend blocking; subsequent combined checks remain pending.
+
+Independent review REQUESTED CHANGES for ONE P2: Check catch overwrites a Refresh error's stronger canReport (configuration+refreshEpoch) with configuration-only ownership, permitting a stale same-vault read error to report later. Temp/companion-ticket13-check-completion-bounded-review-20261110.md. Preserve this feature milestone separately; add a real-error/current-success regression and compose existing ownership predicates in a follow-up fix. This source is not approved for integration yet. Historical failedmixedowner remains unproved; observercleanup and clean/full gates still required.

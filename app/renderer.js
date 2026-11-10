@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
-let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0;
+let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0, checkingIntake = false;
 const status = message => { document.querySelector('[role=status]').textContent = message; };
-async function action(work) { try { await work(); } catch (error) { if (typeof error.refreshOwner === 'function' && !error.refreshOwner()) return; status(error.message.replace(/^Error invoking remote method '[^']+': Error: /, '')); } }
+async function action(work) { try { await work(); } catch (error) { if (typeof error.canReport === 'function' && !error.canReport()) return; status(error.message.replace(/^Error invoking remote method '[^']+': Error: /, '')); } }
 function day(instant, timezone) { return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(instant)); }
 async function refresh() {
   const owner = configurationEpoch; if (configurationBusy) return;
@@ -41,7 +41,7 @@ async function refresh() {
       if (note.type === 'reel_import') { const inspect = document.createElement('button'); inspect.textContent = 'Inspect source'; inspect.onclick = () => action(() => window.intakeView.inspect(note.id)); article.append(inspect); }
     }
     window.dispatchEvent(new CustomEvent('companion-base-refreshed', { detail: { configurationEpoch: owner, location: state.location } }));
-  } catch (error) { if (owned()) throw Object.assign(error, { refreshOwner: owned }); }
+  } catch (error) { if (owned()) throw Object.assign(error, { canReport: owned }); }
   finally { if (owned()) window.intakeView.settleRepairs(); }
 }
 const scheduleControls = ['enable', 'pause', 'resume', 'disable', 'repair'].map(operation => $('schedule-' + operation));
@@ -52,14 +52,14 @@ for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'pa
 });
 $('choose').onclick = () => action(async () => { selectedVault = await window.companion['choose-vault'](); $('vault').textContent = selectedVault || 'Selection cancelled.'; });
 $('configure').onclick = () => {
-  const owner = ++configurationEpoch; configurationBusy = true; $('configure').disabled = true; $('vault-repairs').replaceChildren();
+  const owner = ++configurationEpoch; configurationBusy = true; $('configure').disabled = true; $('check-intake').disabled = true; $('vault-repairs').replaceChildren();
   return action(async () => {
     try {
       await window.companion.configure({ vault: selectedVault, parent: $('parent').value });
       if (owner !== configurationEpoch) return;
       configurationBusy = false; await refresh(); if (owner === configurationEpoch) status('Vault ready.');
     } catch (error) { if (owner === configurationEpoch) throw error; }
-    finally { if (owner === configurationEpoch) { configurationBusy = false; $('configure').disabled = false; window.dispatchEvent(new Event('companion-vault-configured')); } }
+    finally { if (owner === configurationEpoch) { configurationBusy = false; $('configure').disabled = false; $('check-intake').disabled = checkingIntake; window.dispatchEvent(new Event('companion-vault-configured')); } }
   });
 };
 $('add-excerpt').onclick = () => { $('excerpt-label').hidden = false; $('excerpt').focus(); };
@@ -68,6 +68,19 @@ $('today').onclick = () => action(async () => { view = 'today'; await refresh();
 $('history').onclick = () => action(async () => { view = 'all'; await refresh(); });
 $('search').oninput = () => action(refresh); $('refresh').onclick = () => action(refresh);
 $('connect-drafts').onclick = () => action(async () => { const scan = $('first-scan').checked; await window.companion['connect-drafts']({ folder: $('draft-source').value, scan }); await refresh(); status(scan ? 'Intake check complete.' : 'Source connected. Use Check now when ready.'); });
-$('check-intake').onclick = () => action(async () => { await window.companion['check-intake'](); await refresh(); status('Intake check complete. Inspect held imports and source errors.'); });
+$('check-intake').onclick = () => {
+  if (checkingIntake || configurationBusy || $('check-intake').disabled) return;
+  const owner = configurationEpoch, owned = () => owner === configurationEpoch && !configurationBusy;
+  checkingIntake = true; $('check-intake').disabled = true; status('Checking intake...');
+  return action(async () => {
+    try {
+      await window.companion['check-intake']();
+      if (!owned()) return;
+      await refresh();
+      if (owned()) status('Intake check complete. Inspect held imports and source errors.');
+    } catch (error) { if (owned()) throw Object.assign(error, { canReport: owned }); }
+    finally { checkingIntake = false; $('check-intake').disabled = configurationBusy; }
+  });
+};
 $('connect-reviews').onclick = () => action(async () => { await window.companion['connect-reviews']({ folder: $('review-source').value, scan: false }); await refresh(); status('Source connected. Use Check now when ready.'); });
 window.addEventListener('focus', () => action(refresh)); setInterval(() => action(refresh), 60000); action(refresh);
