@@ -12,7 +12,7 @@ function backupName(before, terminal) {
   return path.posix.dirname(before) === path.posix.dirname(terminal) && name.startsWith(prefix) && name.endsWith('.bak') && uuid(name.slice(prefix.length, -4));
 }
 function validate(value, id) {
-  if (!explicit(value) || value.manual.captureId !== id || ['recovery', 'recoveryPointers', 'purgedProducerAttempts'].some(key => value[key] !== undefined) || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !exactKeys(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.titleProofs) || !value.titleProofs.length) fail();
+  if (!explicit(value) || value.manual.captureId !== id || ['recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleRecovery'].some(key => value[key] !== undefined) || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !exactKeys(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.titleProofs) || !value.titleProofs.length) fail();
   const captures = value.targets.filter(item => item.kind === 'capture'), backups = value.targets.filter(item => item.kind === 'source-title-backup');
   if (captures.length !== 1 || value.targets.length !== backups.length + 1 || value.titleProofs.length !== backups.length) fail();
   const terminal = captures[0], targets = new Map(), identities = new Set(); let previous;

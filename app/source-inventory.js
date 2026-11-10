@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { hash, validate, render, bound } = require('./intake-producer');
 const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
+const pendingTitle = require('./pending-title');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -24,11 +25,12 @@ function text(bytes) {
 function validateInventory(value, id) {
   if (value.inventoryVersion === 1) return require('./manual-title').validate(value, id);
   if (value.inventoryVersion === undefined) {
-    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
+    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs', 'titleRecovery'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
     return;
   }
   if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
   sourceTitle.validateProofs(value);
+  const titleRecovery = pendingTitle.validate(value, id);
   const targets = new Map(value.targets.map(item => [item.file, item])); let previous = '';
   for (const item of value.recovery) {
     if (!fields(item, ['file', 'format', 'transaction', 'captureId', 'sourceHash', 'revisionId', 'sourceGeneration']) || !safe(item.file) || !safe(item.transaction) || item.file <= previous || !formats.includes(item.format) || item.captureId !== id || item.sourceHash !== value.sourceHash || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !targets.has(item.file)) fail();
@@ -38,7 +40,7 @@ function validateInventory(value, id) {
     if (item.format === 'source-backup' ? targets.get(item.file).kind !== 'source-backup' : targets.get(item.file).kind !== 'source-recovery' && !(item.format === 'incoming-snapshot' && targets.get(item.file).kind === 'snapshot')) fail();
   }
   for (const item of value.targets) {
-    if (item.kind === 'source-recovery' && !value.recovery.some(entry => entry.file === item.file)) fail();
+    if (item.kind === 'source-recovery' && value.recovery.filter(entry => entry.file === item.file).length + pendingTitle.sidecars(titleRecovery).filter(file => file === item.file).length !== 1) fail();
     if (item.peers !== undefined) {
       if (!Array.isArray(item.peers) || item.peers.length < 2 || item.peers.length > 2 || !item.peers.includes(item.file) || !equal(item.peers, [...new Set(item.peers)].sort())) fail();
       for (const file of item.peers) {
@@ -155,13 +157,16 @@ function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
   return admission;
 }
 async function inventory(intake, ledger, capture, sourceHash, revisions, initial) {
+  const pending = await pendingTitle.inventory(intake, ledger, capture, sourceHash, revisions, initial);
+  if (pending) initial = pending.targets;
   const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;
   const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
   const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
-  if (!current || !titles.titleProofs.length && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
+  if (!current || !pending && !titles.titleProofs.length && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
   const entries = [];
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (name === 'ledger.json') continue;
+    if (pending?.titleRecovery.intent === relative(intake, path.join(intake.dir, name))) continue;
     const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
     if (!mentions(value.bytes, capture.id, sourceHash)) continue;
     entries.push({ name, file, value, text: text(value.bytes) });
@@ -223,7 +228,8 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     for (const item of group) item.peers = peers;
   }
   await inspectTargets(intake, { targets: result, recovery, sourceHash });
-  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations, titleProofs: titles.titleProofs };
+  if (pending) await pendingTitle.inspect(intake, ledger, { inventoryVersion: 2, sourceHash, targets: result, originGenerations: ledger.sourceAuthority?.[capture.id] ? [{ captureId: capture.id, generation: ledger.sourceAuthority[capture.id].generation }] : [], titleRecovery: pending.titleRecovery });
+  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations, titleProofs: titles.titleProofs, ...(pending ? { titleRecovery: pending.titleRecovery } : {}) };
 }
 async function inspectTargets(intake, authority) {
   for (const item of authority.recovery || []) layout(intake, authority, item);
