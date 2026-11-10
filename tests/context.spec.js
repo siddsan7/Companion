@@ -394,6 +394,81 @@ test('actual serialized package counts Unicode code points at 32000 and 32001 an
   await expect(page.locator('#context-summary')).toContainText('Application cap: 32000');
 });
 
+test('editing a shorter passage keeps the new text unapproved when an older approval arrives', async () => {
+  await launch();
+  const text = '# Shortening notes\n\nEDITSHORT older supported sentence.\nEDITSHORT newly selected sentence.\n\nSurrounding source material.\n';
+  const file = path.join(root, 'vault', 'shortening.md'); await fs.writeFile(file, text);
+  await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([file]));
+  await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+  await expect(page.locator('#context-notes')).toContainText(file);
+  await page.getByLabel('Context question', { exact: true }).fill('EDITSHORT');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const results = page.locator('#context-results');
+  await expect(results).toContainText('EDITSHORT older supported sentence.');
+  await results.getByRole('button', { name: 'Add to context', exact: true }).click();
+  const selected = page.locator('#context-selected');
+  const editor = selected.getByLabel('Shorter passage', { exact: true });
+  await editor.fill('EDITSHORT older supported sentence.');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed shortening requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-shorten');
+    if (!original) throw Error('Context shortening handler is unavailable.');
+    const gate = globalThis.__shorteningDelivery = { original, held: false, calls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-shorten', async function (...args) {
+      const first = ++gate.calls === 1;
+      const result = await Reflect.apply(original, this, args);
+      if (first) { gate.held = true; await delivery; }
+      return result;
+    });
+  });
+  try {
+    await page.evaluate(() => {
+      const button = [...document.querySelectorAll('#context-selected button')].find(node => node.textContent === 'Approve shorter passage');
+      const observation = window.__shorteningOnclickSettlement = { button, original: button.onclick, calls: 0, first: null };
+      button.onclick = function (...args) {
+        const first = ++observation.calls === 1;
+        const returned = Reflect.apply(observation.original, this, args);
+        if (first) observation.first = returned;
+        return returned;
+      };
+    });
+    await selected.getByRole('button', { name: 'Approve shorter passage', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__shorteningDelivery.held)).toBe(true);
+    await editor.fill('EDITSHORT newly selected sentence.');
+    await expect(selected).toContainText('Shortening needs explicit approval.');
+    await app.evaluate(() => globalThis.__shorteningDelivery.release());
+    await page.evaluate(() => window.__shorteningOnclickSettlement.first);
+    await expect(editor).toHaveValue('EDITSHORT newly selected sentence.');
+    await expect(selected).toContainText('Shortening needs explicit approval.');
+    await expect(selected).not.toContainText('Shortening approved.');
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    const preview = page.getByLabel('Actual context package', { exact: true });
+    await expect(preview).toHaveValue(/Surrounding source material\./);
+    await expect(preview).not.toHaveValue(/Explicitly shortened passage/);
+    await selected.getByRole('button', { name: 'Approve shorter passage', exact: true }).click();
+    await expect(selected).toContainText('Shortening approved.');
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    const sha = require('node:crypto').createHash('sha256').update(text).digest('hex');
+    const expected = `Question:\nEDITSHORT\n\nSources:\nExplicit vault note shortening.md; sha256 ${sha}; user selected; not independently verified; Explicitly shortened passage\nEDITSHORT newly selected sentence.`;
+    await expect(preview).toHaveValue(expected);
+    await expect(page.locator('#context-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__shorteningDelivery;
+      ipcMain._invokeHandlers.set('context-shorten', gate.original); gate.release();
+      delete globalThis.__shorteningDelivery;
+    });
+    await page.evaluate(async () => {
+      const observation = window.__shorteningOnclickSettlement;
+      if (observation) {
+        try { await observation.first; }
+        finally { observation.button.onclick = observation.original; delete window.__shorteningOnclickSettlement; }
+      }
+    });
+  }
+});
+
 test('oversized selections stay intact until the inspected shorter passage is explicitly approved and source changes revoke approval', async () => {
   test.setTimeout(60000);
   await launch(); await capture('Long excerpt:\n' + 'x'.repeat(32000) + '\nFinal supported sentence.');
