@@ -65,3 +65,27 @@ The native-link crash and pre-first-source-unlink missing-output guards are plan
 
 
 Root destination-collision control passed12045ms, exit0/no skips on stagedtree226093a3b62e56e7d453f48882295cf9eea63c16/productbe5e7f0 unchanged. Actual5origin setup preceded existingR destination with unique third writing; public collision HOLD/hiddenpreview, no authority/suppression/purge, full vault/ledger/physical identities and producers unchanged all passed. Evidence Temp/companion-ticket13-mixed-retention-collision-20261110. Actualstage/link/G/survivor/lifecycle guards remain. Independent lateadjacentpeer P1 reproduced17.6s separately and freshfixer2line sharedguard awaitsunchangedGREEN; that finding is NOTclosed by this collision pass.
+
+## Actual link before receipt with restored generation
+
+Root subsequently reported the late-adjacent-peer P1 reproduced and fixed through the existing shared peer guard, its regression GREEN, the happy-path/regression pair GREEN, independent review, and the composed happy/collision/P1 run passing 50422ms with no skips. Main preserving merge is `4d5f2961bf3de1984c26d32c50c32d172cec57a6`. The shared export/guard remains unchanged by this test-only next slice.
+
+New test: `mixed retention resumes an actual annotation link before receipt with original restored generation`. The first journey and collision bodies remain unchanged. The common guard fixture has an optional public delete/restore of finalized accepted A before Y/B. Its default legacy setup is unchanged. The restored branch saves the real fresh G admission/current/snapshot before checking its shape; original producer attempts remain literal. G compatibility is still unmeasured until root runs this test.
+
+After the real held five-origin repair, the test previews X/Y, cancels byte-exactly, opens a fresh visible preview and derives its actual output destinations. A native main-process `fs.promises.link` observer matches only those two reviewed destinations. It writes a durable before-link file with actual ledger/stage/origin identities, delegates the actual native link, then writes actual stage/output pair identities and unchanged authority/origins. It holds its return promise after the native link, so product publication-receipt advancement cannot execute. No product checkpoint or private validator is used.
+
+Assertions require a durable exact stage identity before native delegation, no publication receipts, actual single-link stage and absent destination before, the actual same-inode two-link pair after, all five ordinary source origins unchanged, original G in the descriptor/plans, deleting H distinct from G, and unchanged prior history. The test then records actual main/wrapper exit and confirms main PID disappearance. On normal restart it requires both receipts, exact recovery of the previously linked inode, both stages absent, complete source-origin purge, exact X/contiguous whole Y and V's original G header, unchanged original attempts/restored admissions/producers, B still unadmitted, no repair/stage/capture remnants and no extra annotation outputs.
+
+Syntax check passed; no runtime test or product source edit was performed for this slice. Root's exact next command:
+
+```powershell
+npx playwright test tests/mixed-retention-deletion.spec.js --grep "actual annotation link before receipt" --workers=1 --reporter=list
+```
+
+The pre-first-source-unlink missing-receipted-output and completed annotation-removal/restoration lifecycle guards are not authored yet. Their read-only plan remains in Temp `companion-mixed13-remaining-guards-plan.md`.
+
+
+Root first stage2/restored-G attempt failed43338ms/exit1 before restoration/held mixed setup: exact getByLabel for artifact kind did not match the actual wrapping select label, whose accessible name includes option text. Existing successful reviewed-restoration test uses role combobox with Selected producer artifact kind prefix. Root uses that same observed locator; no source/assertion/timeout/retry change. No restoredG/native link/crash proof was reached or claimed. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-20261110 retained separately as fixture failure; correctedstage2 runtime pending.
+
+
+Root corrected stage2 actualrestoredG/link-before-receipt crash GREEN31637ms, exit0/no skips, stagedtree1d11bdc3bff446911dd4438df91155f479ceae95/product4d5f296 unchanged. Actualseeddelete/explicitreviewrestore producedfreshG, nativeBEFORElink recordprovedstageIdentitydurable andreceiptabsent; ORIGINALfirstannotationlink createdactualstage/outputtwo-linkpair whileall5originsintact, thenactualmain/wrapperexit occurred before receipt. Normalrestartcompletedbothreceipts/purgedall5, boundrecoveredreceipt toSAME observedlinked inode andoriginalG!=deletingH, preservedhistory/admissions/producerfacts and suppression/no replay. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-v2-20261110. First43.3s dropdownlocatorfailure remainsfixtureonly/noGorcrashclaim. This newtest/helperoptionalrestoredGbranch leaves originalhappy/collision bodies unchanged. Missingreceiptedoutput verify-only HOLD, completedannotationremoval/restore/lifecycleowner, sourcecomposition/finalreviews remain.

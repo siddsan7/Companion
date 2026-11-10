@@ -187,7 +187,7 @@ test('deleting a held kept-current repair retains distinct annotation and whole 
 });
 
 // New guards share only the real writer setup. The first journey remains unchanged.
-async function heldMixedRepair(testInfo) {
+async function heldMixedRepair(testInfo, { restoredG = false } = {}) {
   await bundle('accept'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
   await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
@@ -196,7 +196,31 @@ async function heldMixedRepair(testInfo) {
   await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Source connected'); await check();
   const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
-  const acceptedLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), [sourceHash, capture] = Object.entries(acceptedLedger.captures)[0];
+  const originalAcceptedLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), [sourceHash, originalCapture] = Object.entries(originalAcceptedLedger.captures)[0];
+  let acceptedLedger = originalAcceptedLedger, capture = originalCapture, generation;
+  if (restoredG) {
+    await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+    await expect(page.getByLabel('Capture deletion preview')).toBeVisible();
+    await page.getByLabel('Capture deletion preview').getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture deleted');
+    await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+    const restoration = page.getByLabel('Source restoration');
+    await expect(restoration).toBeVisible();
+    await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(root, 'producer', 'accept'));
+    await restoration.getByRole('combobox', { name: /^Selected producer artifact kind/ }).selectOption('review');
+    await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+    await expect(restoration.getByRole('button', { name: 'Confirm source restoration', exact: true })).toBeVisible();
+    await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source restored');
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    acceptedLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')); capture = acceptedLedger.captures[sourceHash];
+    generation = acceptedLedger.sourceAuthority[capture.id].generation;
+    await save(testInfo, 'mixed-restored-G-observations.json', { observed: await observe(base), originalAcceptedLedger, acceptedLedger });
+    expect(acceptedLedger.sourceAuthority[capture.id].phase).toBe('active');
+    expect(acceptedLedger.admissions[capture.currentRevision].sourceGeneration).toBe(generation);
+    expect(capture.currentRevision).not.toBe(originalCapture.currentRevision);
+    expect(acceptedLedger.attempts).toEqual(originalAcceptedLedger.attempts);
+  }
   const current = path.join(base, 'Captures', capture.file), snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json');
   const managedA = await fs.readFile(current), snapshotA = await fs.readFile(snapshot);
   await fs.appendFile(current, '\nGUARDWHOLEY: Keep this complete local version with source quotation "Authored synthetic review fixture only."\n');
@@ -237,7 +261,7 @@ async function heldMixedRepair(testInfo) {
   expect(await exists(path.join(base, 'Revisions', original.revision.id + '.json'))).toBe(false);
   expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
   for (const name of ['transaction.json', 'repair-intent.json', `annotation-${intent.annotationId}.stage`]) expect(await exists(path.join(intake, name))).toBe(false);
-  return { base, intake, ledgerFile, capture, sourceHash, intent, origins, held, producer, wholeY };
+  return { base, intake, ledgerFile, capture, sourceHash, intent, origins, held, producer, wholeY, acceptedLedger, originalAcceptedLedger, generation };
 }
 
 test('mixed retention destination collision holds unique third writing without authority or purge', async ({}, testInfo) => {
@@ -262,4 +286,113 @@ test('mixed retention destination collision holds unique third writing without a
   expect(await fs.readFile(destination)).toEqual(thirdWriting);
   for (const file of origins) expect(await exists(file)).toBe(true);
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+});
+
+test('mixed retention resumes an actual annotation link before receipt with original restored generation', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const fixture = await heldMixedRepair(testInfo, { restoredG: true });
+  const { base, intake, ledgerFile, capture, sourceHash, intent, origins, producer, generation, acceptedLedger } = fixture;
+  const originBefore = await observe(base), beforeReview = contents(originBefore);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const preview = page.getByLabel('Capture deletion preview'); await expect(preview).toBeVisible();
+  expect(await preview.textContent()).toContain(intent.annotation); expect(await preview.textContent()).toContain(fixture.wholeY.toString('utf8'));
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(contents(await observe(base))).toEqual(beforeReview);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByLabel('Capture deletion preview')).toBeVisible();
+  const reviewedText = await page.getByLabel('Capture deletion preview').textContent();
+  const reviewedPaths = [...new Set(reviewedText.match(/Companion\/Annotations\/[a-f0-9-]{36}\.md/g) || [])]; expect(reviewedPaths).toHaveLength(2);
+  const outputs = reviewedPaths.map(file => path.join(root, 'vault', file));
+  const observerFile = testInfo.outputPath('mixed-native-link-observer.json'), beforeFile = testInfo.outputPath('mixed-native-link-before.json');
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), crypto = process.getBuiltinModule('crypto');
+    const nativeLink = io.link, selected = new Set(options.outputs.map(file => paths.resolve(file).toLowerCase()));
+    const snapshot = async file => {
+      try {
+        const bytes = await io.readFile(file), stat = await io.lstat(file, { bigint: true });
+        return { path: file, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), dev: String(stat.dev), ino: String(stat.ino), bytes: String(stat.size), nlink: String(stat.nlink), ordinary: stat.isFile() && !stat.isSymbolicLink() };
+      } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    };
+    io.link = async function (source, destination, ...args) {
+      if (typeof destination !== 'string' || !selected.has(paths.resolve(destination).toLowerCase())) return nativeLink.call(this, source, destination, ...args);
+      io.link = nativeLink;
+      const before = { ledger: JSON.parse(await io.readFile(options.ledgerFile, 'utf8')), stage: await snapshot(source), output: await snapshot(destination), origins: await Promise.all(options.origins.map(snapshot)) };
+      await io.writeFile(options.beforeFile, JSON.stringify({ boundary: 'before actual native annotation link', mainPid: process.pid, source, destination, nativeLinkReturned: false, before }, null, 2), { flush: true });
+      await nativeLink.call(this, source, destination, ...args);
+      const after = { ledger: JSON.parse(await io.readFile(options.ledgerFile, 'utf8')), stage: await snapshot(source), output: await snapshot(destination), origins: await Promise.all(options.origins.map(snapshot)) };
+      await io.writeFile(options.observerFile, JSON.stringify({ boundary: 'actual native annotation link returned; before publication receipt', mainPid: process.pid, source, destination, nativeLinkReturned: true, before, after }, null, 2), { flush: true });
+      // Hold return to the product after the real link, before it can commit its receipt.
+      await new Promise(() => {});
+    };
+  }, { outputs, ledgerFile, origins, observerFile, beforeFile });
+  await page.getByLabel('Capture deletion preview').getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(async () => {
+    try { return JSON.parse(await fs.readFile(observerFile, 'utf8')).nativeLinkReturned; }
+    catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return false; throw error; }
+  }).toBe(true);
+  const observation = JSON.parse(await fs.readFile(observerFile, 'utf8')), actualBefore = JSON.parse(await fs.readFile(beforeFile, 'utf8'));
+  const authority = observation.before.ledger.sourceAuthority[capture.id], afterAuthority = observation.after.ledger.sourceAuthority[capture.id];
+  const linkedPlan = authority.preservedWriting.find(plan => path.join(root, 'vault', plan.file) === observation.destination);
+  await save(testInfo, 'mixed-native-link-paused-vault.json', { observation, actualBefore, observed: await observe(base), fixtureGeneration: generation });
+  expect(actualBefore.nativeLinkReturned).toBe(false); expect(actualBefore.before).toEqual(observation.before);
+  expect(observation.mainPid).toBe(await app.evaluate(() => process.pid)); expect(outputs).toContain(observation.destination);
+  expect(authority.phase).toBe('deleting'); expect(authority.generation).not.toBe(generation);
+  expect(authority.originGenerations).toEqual([{ captureId: capture.id, generation }]); expect(authority.mixedRecovery.sourceGeneration).toBe(generation);
+  expect(authority.history).toEqual(acceptedLedger.sourceAuthority[capture.id].history);
+  expect(authority.preservedWriting.every(plan => plan.sourceGeneration === generation && !plan.publication)).toBe(true);
+  expect(authority.preservedWriting.filter(plan => plan.stageIdentity)).toHaveLength(1);
+  expect(linkedPlan.stageIdentity).toEqual({ sha256: observation.before.stage.sha256, dev: observation.before.stage.dev, ino: observation.before.stage.ino, bytes: observation.before.stage.bytes });
+  expect(path.join(root, 'vault', linkedPlan.stage)).toBe(observation.source);
+  expect(observation.before.stage.ordinary).toBe(true); expect(observation.before.stage.nlink).toBe('1'); expect(observation.before.output).toBeNull();
+  expect(afterAuthority).toEqual(authority);
+  for (const value of [observation.after.stage, observation.after.output]) {
+    expect(value.ordinary).toBe(true); expect(value.nlink).toBe('2');
+    for (const field of ['sha256', 'dev', 'ino', 'bytes']) expect(value[field]).toBe(linkedPlan.stageIdentity[field]);
+  }
+  for (const snapshots of [observation.before.origins, observation.after.origins]) {
+    expect(snapshots).toHaveLength(5);
+    for (const [index, value] of snapshots.entries()) {
+      const original = originBefore[portable(path.relative(base, origins[index]))];
+      expect(value.ordinary).toBe(true); expect(value.nlink).toBe('1');
+      for (const field of ['sha256', 'dev', 'ino', 'bytes']) expect(value[field]).toBe(original[field]);
+    }
+  }
+  const child = app.process(), mainPid = observation.mainPid;
+  const proof = { boundary: observation.boundary, mainPid, wrapperPid: child.pid, action: 'Electron app.exit(77)', nativeLinkReturned: true, allFiveOriginsPresentAtLink: true };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  proof.wrapperExit = await exited; await abrupt;
+  await save(testInfo, 'mixed-native-link-main-exit.json', proof);
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  proof.mainObservedExited = true; await save(testInfo, 'mixed-native-link-main-exit.json', proof); app = null;
+  await launch();
+  await expect.poll(async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8')).sourceAuthority[capture.id].phase).toBe('deleted');
+  const recovered = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), completed = recovered.sourceAuthority[capture.id], observed = await observe(base);
+  await save(testInfo, 'mixed-native-link-recovered.json', { observed, recovered, originalGeneration: generation, actualLinkedInode: observation.after.output });
+  expect(completed.operationId).toBe(authority.operationId); expect(completed.generation).toBe(authority.generation);
+  expect(completed.mixedRecovery).toEqual(authority.mixedRecovery); expect(completed.originGenerations).toEqual(authority.originGenerations); expect(completed.history).toEqual(authority.history);
+  expect(completed.preservedWriting.map(plan => ({ ...plan, stageIdentity: undefined, publication: undefined }))).toEqual(authority.preservedWriting.map(plan => ({ ...plan, stageIdentity: undefined, publication: undefined })));
+  expect(completed.preservedWriting.every(plan => plan.publication && plan.sourceGeneration === generation && plan.publicationOperationId === authority.operationId)).toBe(true);
+  const recoveredLink = completed.preservedWriting.find(plan => plan.file === linkedPlan.file);
+  expect(recoveredLink.stageIdentity).toEqual(linkedPlan.stageIdentity); expect(recoveredLink.publication).toEqual(linkedPlan.stageIdentity);
+  for (const plan of completed.preservedWriting) {
+    const value = observed[portable(path.relative(base, path.join(root, 'vault', plan.file)))];
+    expect(value.ordinary).toBe(true); expect(value.nlink).toBe('1');
+    for (const field of ['sha256', 'dev', 'ino', 'bytes']) expect(value[field]).toBe(plan.publication[field]);
+    expect(await exists(path.join(root, 'vault', plan.stage))).toBe(false);
+  }
+  expect(await fs.readFile(path.join(base, 'Annotations', intent.annotationId + '.md'))).toEqual(Buffer.from(intent.annotation));
+  const wholePlan = completed.preservedWriting.find(plan => plan.payloadKind === 'previous-whole-variant'), wholeBytes = await fs.readFile(path.join(root, 'vault', wholePlan.file));
+  expect(wholeBytes.includes(fixture.wholeY)).toBe(true);
+  const wholeHeader = YAML.parse(wholeBytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]); expect(wholeHeader.source_generation).toBe(generation);
+  expect(intent.annotation).not.toContain('source_generation:');
+  for (const file of origins) expect(await exists(file)).toBe(false);
+  expect(Object.keys(observed).filter(file => /^(Captures|Revisions)\//.test(file) || /^\.intake\/(?:repair-|conflict-|deletion-writing-)/.test(file))).toEqual([]);
+  expect(Object.keys(observed).filter(file => file.startsWith('.intake/') && file.endsWith('.stage'))).toEqual([]);
+  expect((await fs.readdir(path.join(base, 'Annotations'))).sort()).toEqual(completed.preservedWriting.map(plan => path.basename(plan.file)).sort());
+  expect(recovered.attempts).toEqual(fixture.originalAcceptedLedger.attempts); expect(recovered.admissions).toEqual(acceptedLedger.admissions);
+  expect(recovered.attempts[intent.tx.revision.identity]).toBeUndefined(); expect(recovered.admissions[intent.tx.revision.id]).toBeUndefined();
+  expect(recovered.suppressed).toContain(sourceHash); expect(recovered.blocks[sourceHash]).toBeUndefined(); expect(recovered.pending[sourceHash]).toBeUndefined();
+  expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+  await expect(page.locator('#captures article')).toHaveCount(0);
 });

@@ -192,6 +192,7 @@ async function inspect(intake, ledger, id, requirePublished = false) {
   const authority = ledger.sourceAuthority[id];
   if (authority.phase !== 'deleting') return [];
   await require('./source-recovery').sourceParents(intake, authority); inspectPointers(ledger, authority);
+  await require('./capture-deletion').inspectManualPeers(intake.vault, { captureId: id });
   const allowedStages = new Set();
   for (const plan of authority.preservedWriting) {
     const state = await writingState(intake, plan); if (state.stage) allowedStages.add(plan.stage);
