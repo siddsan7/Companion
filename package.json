@@ -6,7 +6,8 @@
   "scripts": {
     "start": "electron .",
     "test": "playwright test",
-    "check": "node --check app/main.js && node --check app/vault.js && node --check app/renderer.js"
+    "check": "node scripts/check-source.cjs",
+    "prepare:electron": "node scripts/prepare-electron.cjs"
   },
   "devDependencies": {
     "@playwright/test": "1.65.0",
