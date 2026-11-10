@@ -2,6 +2,10 @@
 
 Goal: finish siddsan7/Companion#1 and tickets 2–16 on integration/1-local-second-brain. Work is active after the user's resume. Original main base: 04ed4fb6a0451714ee0d64549ad86ec3eb4108d9. Initial planning commits e030e51/5a7f0c7 preceded worktrees; subsequent bounded plans are in this directory.
 
+## Current checkpoint — ticket 16 active
+
+Ticket 13 is integrated and closed after independent approval of `04d9561`. Preserving merges `6d51f7f` and `93aed38` match the approved tree and retain all commits. The exact source passed all 195 desktop/file cases across 22 files in 11.3 minutes. Read `docs/verification-ticket13-final.md` and `checkpoint-ticket13-final-gate.md`. Draft PR 17 lists 14 of 15 tickets integrated. Ticket 16 has no open blockers; use `plan-ticket16-release-verification.md`. Earlier ticket progress below is historical. Live sign-in stays deferred/readiness closed; hosted CI waived and unverified; no deployment. Final independent full-PR review, local gates and enforced rules precede the preserving main merge. Verify remote history, then pause.
+
 ## Authority
 
 Read publishing.md. Draft PR #17 targets main: https://github.com/siddsan7/Companion/pull/17. Finish all slices before final whole-PR review, ready status or merge. Preserve every ticket/helper commit and merge ancestry: no squash, amend, rebase, reset, force push, manufactured commits or date overrides. Before every commit/merge verify author and committer siddsan7 <siddsan7@gmail.com>, and absent GIT_AUTHOR_DATE/GIT_COMMITTER_DATE. GitHub has verified that identity links to siddsan7. Push verified milestones and maintain PR evidence/checklist.
