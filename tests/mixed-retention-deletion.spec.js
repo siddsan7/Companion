@@ -185,3 +185,81 @@ test('deleting a held kept-current repair retains distinct annotation and whole 
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
   await save(testInfo, 'mixed-completed-observations.json', { observed: await observe(base), restarted });
 });
+
+// New guards share only the real writer setup. The first journey remains unchanged.
+async function heldMixedRepair(testInfo) {
+  await bundle('accept'); await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Finalized review folder').fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected'); await check();
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const acceptedLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), [sourceHash, capture] = Object.entries(acceptedLedger.captures)[0];
+  const current = path.join(base, 'Captures', capture.file), snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json');
+  const managedA = await fs.readFile(current), snapshotA = await fs.readFile(snapshot);
+  await fs.appendFile(current, '\nGUARDWHOLEY: Keep this complete local version with source quotation "Authored synthetic review fixture only."\n');
+  const wholeY = await fs.readFile(current), annotationWriting = 'GUARDANNOTATIONX: Distinct chosen writing with source quotation "Authored synthetic review".';
+  await bundle('edit'); await check('held');
+  await expect(page.getByLabel('Vault repairs')).toContainText('GUARDWHOLEY');
+  const originalLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), originalArchive = path.join(intake, originalLedger.blocks[sourceHash].journal);
+  const producer = contents(await observe(path.join(root, 'producer')));
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'repair-intent-published' }));
+  await page.getByLabel('Transfer local writing').fill(annotationWriting);
+  await page.getByRole('button', { name: 'Save annotation and apply incoming', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('repair-intent-published');
+  const intent = JSON.parse(await fs.readFile(path.join(intake, 'repair-intent.json'), 'utf8'));
+  await save(testInfo, 'mixed-guard-intent-observations.json', { observed: await observe(base), acceptedLedger, originalLedger, producer });
+  const processProof = await exitMain(testInfo);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'kept-current-read', code: 'EACCES' }));
+  await launch();
+  await expect.poll(async () => !await exists(path.join(intake, 'repair-intent.json')) && await exists(path.join(intake, `repair-${intent.annotationId}.json`))).toBe(true);
+  const observed = await observe(base), held = JSON.parse(text(observed['.intake/ledger.json']));
+  const resolutionArchive = path.join(intake, held.blocks[sourceHash].journal), repairArchive = path.join(intake, `repair-${intent.annotationId}.json`);
+  const origins = [current, snapshot, originalArchive, resolutionArchive, repairArchive];
+  await save(testInfo, 'mixed-guard-held-observations.json', { observed, origins, acceptedLedger, originalLedger, held, producer, processProof });
+  await fs.unlink(path.join(root, 'faults.json'));
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect(Object.keys(observed).filter(file => /^(Captures|Revisions)\//.test(file) || /^\.intake\/(?:repair-|conflict-)/.test(file)).sort()).toEqual(origins.map(file => portable(path.relative(base, file))).sort());
+  const selected = origins.map(file => observed[portable(path.relative(base, file))]);
+  expect(selected.every(value => value?.ordinary && value.nlink === '1')).toBe(true);
+  expect(new Set(selected.map(value => `${value.dev}:${value.ino}`)).size).toBe(5);
+  expect(await fs.readFile(current)).toEqual(wholeY); expect(await fs.readFile(snapshot)).toEqual(snapshotA);
+  const original = JSON.parse(await fs.readFile(originalArchive, 'utf8')), resolution = JSON.parse(await fs.readFile(resolutionArchive, 'utf8'));
+  expect(original.retainOnly).toBe(true); expect(original.externalConflict).toBe(true);
+  expect(original.content).toBe(wholeY.toString('utf8')); expect(original.previous).toBe(wholeY.toString('utf8'));
+  expect(resolution.keptCurrent).toEqual(JSON.parse(snapshotA)); expect(resolution.previous).toBe(wholeY.toString('utf8')); expect(resolution.content).toBe(managedA.toString('utf8'));
+  expect(JSON.parse(await fs.readFile(repairArchive, 'utf8'))).toEqual(intent); expect(intent.tx).toEqual(resolution);
+  expect(intent.annotation).toContain(annotationWriting); expect(intent.annotation).not.toContain('GUARDWHOLEY');
+  expect(held.attempts).toEqual(acceptedLedger.attempts); expect(held.admissions).toEqual(acceptedLedger.admissions);
+  expect(held.attempts[original.revision.identity]).toBeUndefined(); expect(held.admissions?.[original.revision.id]).toBeUndefined();
+  expect(await exists(path.join(base, 'Revisions', original.revision.id + '.json'))).toBe(false);
+  expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
+  for (const name of ['transaction.json', 'repair-intent.json', `annotation-${intent.annotationId}.stage`]) expect(await exists(path.join(intake, name))).toBe(false);
+  return { base, intake, ledgerFile, capture, sourceHash, intent, origins, held, producer, wholeY };
+}
+
+test('mixed retention destination collision holds unique third writing without authority or purge', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const fixture = await heldMixedRepair(testInfo), { base, ledgerFile, capture, intent, origins, producer } = fixture;
+  const destination = path.join(base, 'Annotations', intent.annotationId + '.md');
+  const thirdWriting = Buffer.from(intent.annotation + '\nCOLLISIONTHIRDWRITING: Existing independently edited destination must stay exact.\n', 'utf8');
+  // This is an external file collision at the actual writer's destination, not new authority.
+  await fs.writeFile(destination, thirdWriting, { flag: 'wx', flush: true });
+  const before = await observe(base), originalLedgerBytes = await fs.readFile(ledgerFile);
+  await save(testInfo, 'mixed-collision-before.json', { observed: before, destination, origins, producer });
+  expect(thirdWriting.equals(Buffer.from(intent.annotation))).toBe(false); expect(thirdWriting.equals(fixture.wholeY)).toBe(false);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('collides with an unreviewed destination');
+  const after = await observe(base), ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  await save(testInfo, 'mixed-collision-held.json', { status: await page.getByRole('status').textContent(), preview: await page.getByLabel('Capture deletion preview').textContent(), observed: after, ledger, destination, origins });
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  await expect(page.getByRole('status')).toContainText(portable(path.relative(path.join(root, 'vault'), destination)));
+  expect(ledger.sourceAuthority?.[capture.id]).toBeUndefined(); expect(ledger.suppressed).not.toContain(fixture.sourceHash);
+  expect(await fs.readFile(ledgerFile)).toEqual(originalLedgerBytes);
+  expect(after).toEqual(before);
+  expect(await fs.readFile(destination)).toEqual(thirdWriting);
+  for (const file of origins) expect(await exists(file)).toBe(true);
+  expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+});

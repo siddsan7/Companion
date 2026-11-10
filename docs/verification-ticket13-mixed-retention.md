@@ -48,3 +48,20 @@ Root suppression-observer run failed27130ms/exit1 at the newly added outcome.sou
 
 
 Root full first mixed journey GREEN28177ms, exit0/no skips, on immutable stagedtree5c15e847736ad98ba0cd85da8280b57f77b22ea6. Product source is unchanged from first candidate4f7738d; only measured fixture observers were corrected in preserved test commits cb2fb13/dfb9020/fc55a3c. Complete actual5origin/X+wholeY preview and exact Cancel, both published byte-exact annotations/receipts at first actual unlink, contiguous wholeY and safe fence, all5origin purge/empty recovery stages, immutable A acceptance/Bunadmitted facts/producers, exact two held suppression outcomes, restart and output persistence all passed. Evidence Temp/companion-ticket13-mixed-retention-end-to-end-20261110. This validates bounded legacy-absence happy path, NOT pre-first-unlink ordering, stage/link crash recovery, missing-receipted-output HOLD, destination collision, completed annotation-removal/restore lifecycle, inherited-owner corruption, composition with pending/older, full13 or live readiness. Those required guards and independent reviews remain.
+
+## Destination collision guard
+
+Test-only next slice: `mixed retention destination collision holds unique third writing without authority or purge`. The first journey body is unchanged. A new common fixture for subsequent guards uses the same real finalized importer, transfer writer, actual main exit and held EACCES recovery, then saves and verifies all five origins before adding a collision. It does not create or edit authority or recovery records.
+
+The guard exclusively creates the actual R annotation destination using the real writer's exact annotation plus a unique third writing marker. It requires public collision HOLD and hidden preview, no deletion authority or suppression, byte-exact ledger and complete vault inventory, unchanged physical identities/link counts for all five origins and the collision, and unchanged producer buffers. This checks that a different existing destination cannot be overwritten, adopted, or used to authorize purge. It does not claim to measure the separate same-byte/different-inode pre-receipt stage boundary.
+
+Syntax check only; root must run this guard before the next slice. No product source changed. Exact command:
+
+```powershell
+npx playwright test tests/mixed-retention-deletion.spec.js --grep "destination collision" --workers=1 --reporter=list
+```
+
+The native-link crash and pre-first-source-unlink missing-output guards are planned but not authored in this slice. Their next checkpoints will be actual native file-operation observations, with actual main/wrapper exit evidence; no product checkpoint or private validator will be introduced.
+
+
+Root destination-collision control passed12045ms, exit0/no skips on stagedtree226093a3b62e56e7d453f48882295cf9eea63c16/productbe5e7f0 unchanged. Actual5origin setup preceded existingR destination with unique third writing; public collision HOLD/hiddenpreview, no authority/suppression/purge, full vault/ledger/physical identities and producers unchanged all passed. Evidence Temp/companion-ticket13-mixed-retention-collision-20261110. Actualstage/link/G/survivor/lifecycle guards remain. Independent lateadjacentpeer P1 reproduced17.6s separately and freshfixer2line sharedguard awaitsunchangedGREEN; that finding is NOTclosed by this collision pass.
