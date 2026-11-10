@@ -74,6 +74,8 @@ test('explicit removal previews one saved idea and its managed copies, cancels w
   await completedConversation();
   const selected = await saveIdea('Selected independent idea');
   const retained = await saveIdea('Retained independent idea');
+  const currentWriting = 'CURRENT_SAVED_IDEA_13: independently edited note writing must be reviewed before removal.';
+  await fs.writeFile(selected, (await fs.readFile(selected, 'utf8')).replace('Independent authored writing for Selected independent idea.', currentWriting), 'utf8');
   const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
   const sourceBytes = await bytesIn(path.join(vault, 'Captures'));
   const historyBytes = await bytesIn(path.join(root, 'conversations'));
@@ -91,6 +93,8 @@ test('explicit removal previews one saved idea and its managed copies, cancels w
   await article.getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
   const preview = page.getByLabel('Saved idea removal preview', { exact: true });
   await expect(preview).toContainText(metadata.companion_id);
+  await expect(preview).toContainText(currentWriting);
+  await expect(preview).toContainText('Independent authored writing for Selected independent idea.');
   for (const file of selectedCopies) await expect(preview).toContainText(file);
   await expect(preview).toContainText(/conversation.*retain|retain.*conversation/i);
   await expect(preview).toContainText(/external|backup/i);
@@ -245,6 +249,7 @@ test('a pending-only proposed idea can be explicitly previewed, cancelled and re
   const preview = page.getByLabel('Saved idea removal preview', { exact: true });
   await expect(preview).toContainText(id);
   await expect(preview).toContainText(intentFile); await expect(preview).toContainText(stage);
+  await expect(preview).toContainText('PENDING_ONLY_IDEA_13: independent proposed writing that was never published.');
   expect(await bytesIn(vault)).toEqual(before);
   await page.getByRole('button', { name: 'Cancel saved idea removal', exact: true }).click();
   await expect(preview).toBeHidden(); expect(await bytesIn(vault)).toEqual(before);
