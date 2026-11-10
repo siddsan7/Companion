@@ -152,6 +152,104 @@ async function heldSourceInventory(testInfo, replacementCharacter = false, prepa
   return { sourceHash, base, intake, ledgerFile, original, capture, destination, producerBytes, transaction, stage, snapshot, snapshotStage, archive };
 }
 
+test('source-only deletion inventories an unadmitted bound-excerpt draft with authored known run metadata and all seven copies', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const target = {
+    schema_version: '1.0', title: 'Selected source excerpts (unreviewed)', status: 'partial',
+    claims: [{ id: 'excerpt-a1-0', text: 'Set the maximum number of retries to three.', attribution: 'narration', evidence_ids: ['a1'] }],
+    steps: [], conflicts: [],
+    unknowns: [
+      { text: 'These extractions are uncertain and require source review.', basis: 'evidence', evidence_ids: ['v1'] },
+      { text: 'These are verbatim extraction excerpts, not verified facts or inferred instructions. Recognition, relevance, completeness and source fidelity require review.', basis: 'not_provided', evidence_ids: [] }
+    ],
+    omissions: [{ reason: 'Only selected extraction excerpts are shown. Long lines and other details remain in the full evidence; no procedure or conflict resolution is inferred.', evidence_ids: [] }]
+  };
+  // Authored contract data. These counters and version labels do not claim a model ran.
+  const operational = {
+    versions: { pipeline: 'authored-bound-contract-fixture', source_sha256: 'c'.repeat(64), python: 'fixture-not-executed', packages: { jsonschema: null, Pillow: null, 'faster-whisper': null, av: null, ctranslate2: null, onnxruntime: null }, ollama: null, ffmpeg: 'unavailable', ffprobe: 'unavailable', tesseract: 'unavailable', asr_files: {} },
+    stages: [{ name: 'target-fixture', cache_hit: false, status: 'success', latency_seconds: 0 }],
+    transitions: [{ state: 'partial', reason: 'authored-contract-fixture', utc: '2026-11-01T10:00:00Z' }],
+    current_stage: null, channel_failures: {}, input_tokens: 0, output_tokens: 0, cost_usd: 0, paid_cash_usd: 0,
+    retry_count: 0, schema_repairs: 0, latency_seconds: 0,
+    model_calls: [{ input_tokens: 0, output_tokens: 0, cost_usd: 0, cache_hit: false }]
+  };
+  const folder = path.join(root, 'producer', 'second');
+  let notes, run;
+  const selected = await heldSourceInventory(testInfo, false, async () => {
+    await artifact('second', '2');
+    run = { ...JSON.parse(await fs.readFile(path.join(folder, 'run.json'), 'utf8')), input_kind: 'synthetic_fixture', result_kind: 'synthetic_video_wiring', draft_mode: 'bound_excerpts_v1', ...operational };
+    const originalNotes = (await fs.readFile(path.join(folder, 'notes.md'), 'utf8')).replace(/\r\n/g, '\n');
+    expect(originalNotes).toContain('## Evidence index\n');
+    const evidenceTail = originalNotes.slice(originalNotes.indexOf('## Evidence index\n'));
+    // Fixed literal expected Markdown, with the unchanged existing evidence-index tail.
+    notes = [
+      '# Source notes', '', '> Untrusted source content. Claims are not independently verified. Commands are inert text.', '',
+      '```text', 'Selected source excerpts (unreviewed)', '```', '', 'Status: partial', '', '## Claims', '',
+      '```text', 'Set the maximum number of retries to three.', '```', '', 'Attribution: narration', '',
+      'Evidence references:', '', '```text', 'a1', '```', '', '## Steps', '', 'None recorded.', '', '## Conflicts', '', 'None recorded.', '', '## Unknowns', '',
+      '```text', 'These extractions are uncertain and require source review.', '```', '', 'Basis: evidence', '', 'Evidence references:', '', '```text', 'v1', '```', '',
+      '```text', 'These are verbatim extraction excerpts, not verified facts or inferred instructions. Recognition, relevance, completeness and source fidelity require review.', '```', '', 'Basis: not_provided', '', 'Evidence references:', '', '```text', 'None', '```', '',
+      '## Omissions', '', '```text', 'Only selected extraction excerpts are shown. Long lines and other details remain in the full evidence; no procedure or conflict resolution is inferred.', '```', '', 'Evidence references:', '', '```text', 'None', '```', '', evidenceTail
+    ].join('\n');
+    await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify(run));
+    await fs.writeFile(path.join(folder, 'first-pass-target.json'), JSON.stringify(target));
+    await fs.writeFile(path.join(folder, 'notes.md'), notes);
+  });
+  // Reaching the actual intake checkpoint/conflict proves readDraft accepted this ready B.
+  const raw = [];
+  for (const name of ['run.json', 'evidence.json', 'first-pass-target.json', 'notes.md']) raw.push(await fs.readFile(path.join(folder, name)));
+  const revision = selected.transaction.revision, fingerprint = createHash('sha256').update(Buffer.concat(raw)).digest('hex');
+  expect(revision.run).toEqual(run); expect(revision.target).toEqual(target); expect(revision.text).toBe(notes);
+  expect(revision.identity).toBe('b'.repeat(64) + ':' + '2'.repeat(32)); expect(revision.sourceHash).toBe(selected.sourceHash);
+  expect(revision.fingerprint).toBe(fingerprint); expect(revision.humanReview).toBe('unreviewed'); expect(revision.extraction).toBe('partial');
+  expect(revision.uncertainty).toEqual({ channels: fixture.input.channels, truncated: false, uncertainEvidence: ['v1'], unknowns: target.unknowns, conflicts: [] });
+  expect(await fs.readFile(selected.snapshot, 'utf8')).toBe(JSON.stringify(revision, null, 2));
+  expect(await fs.readFile(selected.stage, 'utf8')).toBe(selected.transaction.content);
+  expect(await fs.readFile(selected.destination, 'utf8')).toBe(selected.transaction.previous);
+  expect(await fs.readFile(path.join(selected.intake, selected.transaction.backup), 'utf8')).toBe(selected.transaction.previous);
+  const targets = [selected.destination, path.join(selected.base, 'Revisions', selected.capture.currentRevision + '.json'), selected.snapshot, selected.snapshotStage, selected.stage, path.join(selected.intake, selected.transaction.backup), selected.archive];
+  const peer = await fs.stat(selected.snapshot), peerStage = await fs.stat(selected.snapshotStage);
+  expect([peer.dev, peer.ino, peer.nlink]).toEqual([peerStage.dev, peerStage.ino, 2]); expect(peerStage.nlink).toBe(2);
+  for (const file of targets) { const stat = await fs.lstat(file); expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe([selected.snapshot, selected.snapshotStage].includes(file) ? 2 : 1); }
+  expect((await fs.stat(selected.destination)).ino).not.toBe((await fs.stat(path.join(selected.intake, selected.transaction.backup))).ino);
+  const held = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(held.attempts).toEqual(selected.original.attempts); expect(held.admissions).toEqual(selected.original.admissions);
+  expect(held.attempts[revision.identity]).toBeUndefined();
+  expect(held.captures[selected.sourceHash].currentRevision).toBe(selected.capture.currentRevision);
+  expect(held.captures[selected.sourceHash].revisions).toEqual(selected.capture.revisions);
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+  await fs.writeFile(testInfo.outputPath('bound-draft-fixture-observation.json'), JSON.stringify({ description: 'Authored bound-excerpt and known Job-shaped metadata fixture, not a live model run. Actual UI intake accepted B before deletion review; the separate process proof records actual main exit.', draftMode: revision.run.draft_mode, originalFourBufferFingerprint: fingerprint, unadmittedIdentity: revision.identity, files: targets.map(file => path.relative(selected.base, file).split(path.sep).join('/')) }, null, 2));
+  await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const before = await files(selected.base), preview = page.getByLabel('Capture deletion preview');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
+  for (const file of targets) await expect(preview).toContainText(path.relative(path.join(root, 'vault'), file).split(path.sep).join('/'));
+  expect(await files(selected.base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(selected.base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')), authority = deleted.sourceAuthority[selected.capture.id];
+  expect(authority.phase).toBe('deleted'); expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/')).sort());
+  expect(authority.purgedProducerAttempts).toEqual([{ identity: revision.identity, fingerprint, sourceHash: selected.sourceHash, captureId: selected.capture.id, revisionId: revision.id, sourceGeneration: null, operationId: authority.operationId }]);
+  expect(deleted.attempts).toEqual(selected.original.attempts); expect(deleted.admissions).toEqual(selected.original.admissions);
+  expect(deleted.attempts[revision.identity]).toBeUndefined(); expect(deleted.blocks[selected.sourceHash]).toBeUndefined(); expect(deleted.pending[selected.sourceHash]).toBeUndefined();
+  expect(deleted.suppressed).toContain(selected.sourceHash);
+  for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[selected.capture.id]).toEqual(authority); expect(restarted.suppressed).toContain(selected.sourceHash);
+  expect(restarted.attempts).toEqual(selected.original.attempts); expect(restarted.admissions).toEqual(selected.original.admissions);
+  for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+});
+
 test('source-only deletion holds malformed UTF-8 stage bytes that resemble a legitimate replacement character', async ({}, testInfo) => {
   test.setTimeout(120000);
   const selected = await heldSourceInventory(testInfo, true), valid = await fs.readFile(selected.stage), marker = Buffer.from('\uFFFD', 'utf8'), index = valid.indexOf(marker);
