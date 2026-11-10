@@ -1,0 +1,133 @@
+const { test, expect, _electron: electron } = require('@playwright/test');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
+const YAML = require('yaml');
+const fixture = require('./fixtures/reel-draft/example.json');
+const { withTitle } = require('../app/vault');
+let root, app, page;
+const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+const exists = file => fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-pending-title-')); });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+async function files(folder, prefix = '') {
+  const result = {};
+  for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
+    const file = path.join(folder, entry.name), relative = prefix + entry.name;
+    if (entry.isDirectory()) Object.assign(result, await files(file, relative + '/'));
+    else result[relative] = (await fs.readFile(file)).toString('base64');
+  }
+  return result;
+}
+async function launch() {
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  page = await app.firstWindow();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+}
+async function observe(file) {
+  const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+  expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1n);
+  return { sha256: sha(bytes), bytes: String(stat.size), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) };
+}
+
+test('staged imported title conflict reviews exactly five actual writer files before deletion without title replay', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const producer = path.join(root, 'producer'), folder = path.join(producer, 'first');
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify({ job_id: 'b'.repeat(64), attempt_id: '1'.repeat(32), started_utc: '2026-11-01T10:00:00Z', input_sha256: 'a'.repeat(64), input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed' }));
+  await fs.writeFile(path.join(folder, 'evidence.json'), JSON.stringify({ ...fixture.input, clip_id: 'b'.repeat(64) }));
+  await fs.writeFile(path.join(folder, 'first-pass-target.json'), JSON.stringify(fixture.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(folder, 'notes.md'));
+  const producerBytes = await files(producer);
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(producer);
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const ledgerBytes = await fs.readFile(ledgerFile), original = JSON.parse(ledgerBytes), sourceHash = 'a'.repeat(64), capture = original.captures[sourceHash];
+  expect(Object.keys(original.attempts)).toHaveLength(1); expect(capture.revisions).toHaveLength(1);
+  const admission = Object.values(original.attempts).find(item => item.revision === capture.currentRevision);
+  expect(admission.captureId).toBe(capture.id); expect(admission.sourceHash).toBe(sourceHash);
+  const current = path.join(base, 'Captures', capture.file), snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json');
+  const pending = current + '.pending', transactionFile = current + '.title-transaction.json', intentFile = path.join(intake, 'title-intent.json');
+  const targets = [current, snapshot, pending, transactionFile, intentFile], before = await fs.readFile(current), snapshotBytes = await fs.readFile(snapshot);
+  expect(sha(before)).toBe(capture.currentHash);
+  expect(sha(snapshotBytes)).toBe(admission.snapshotHash);
+  const revision = JSON.parse(snapshotBytes);
+  expect(revision.id).toBe(capture.currentRevision); expect(revision.sourceHash).toBe(sourceHash);
+  expect(revision.identity).toBe(admission.identity); expect(revision.fingerprint).toBe(admission.fingerprint);
+  const initialCurrent = await observe(current), initialSnapshot = await observe(snapshot);
+  const proposed = 'Pending B: [literal] *title*!', external = 'External C: [distinct] _title_?';
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'title-staged' }));
+  await page.getByLabel('Display title', { exact: true }).fill(proposed);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('title-staged');
+  const intentBytes = await fs.readFile(intentFile), transactionBytes = await fs.readFile(transactionFile);
+  const intent = JSON.parse(intentBytes), transaction = JSON.parse(transactionBytes);
+  const generation = admission.sourceGeneration;
+  expect(original.sourceAuthority?.[capture.id]?.generation).toBe(generation);
+  expect(intent).toEqual({ id: capture.id, before: before.toString('utf8'), previousHash: capture.currentHash, title: proposed, content: withTitle(before.toString('utf8'), proposed), ...(generation === undefined ? {} : { sourceGeneration: generation }) });
+  expect(Object.keys(transaction).sort()).toEqual(['expectedHash', 'content', 'backup', ...(generation === undefined ? [] : ['sourceGeneration'])].sort());
+  expect(intentBytes).toEqual(Buffer.from(JSON.stringify(intent))); expect(transactionBytes).toEqual(Buffer.from(JSON.stringify(transaction)));
+  expect(transaction.expectedHash).toBe(capture.currentHash); expect(transaction.content).toBe(intent.content);
+  expect(transaction.sourceGeneration).toBe(generation);
+  expect(await fs.readFile(pending)).toEqual(Buffer.from(intent.content)); expect(await fs.readFile(current)).toEqual(before);
+  expect(transaction.backup).toMatch(new RegExp('^' + path.basename(current).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\.before-title-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\\.bak$'));
+  const backup = path.join(path.dirname(current), transaction.backup); expect(await exists(backup)).toBe(false);
+  const changed = Buffer.from(withTitle(before.toString('utf8'), external));
+  // The sole synthetic source action is an external pure-title write, never a journal or ledger edit.
+  await fs.writeFile(current, changed);
+  const changedParts = changed.toString('utf8').match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/), beforeParts = before.toString('utf8').match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  expect(YAML.parse(changedParts[1])).toEqual({ ...YAML.parse(beforeParts[1]), title: external });
+  expect(changedParts[2].slice(changedParts[2].indexOf('\n', 1) + 1)).toBe(beforeParts[2].slice(beforeParts[2].indexOf('\n', 1) + 1));
+  await fs.writeFile(path.join(root, 'release.txt'), 'resume');
+  await expect(page.getByRole('status')).toContainText('External edit conflict. The note and previous version were preserved.');
+  await expect.poll(() => exists(current + '.lock')).toBe(false);
+  await fs.unlink(path.join(root, 'faults.json')); await fs.unlink(path.join(root, 'release.txt'));
+  expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes); expect(await files(producer)).toEqual(producerBytes);
+  expect(await fs.readFile(current)).toEqual(changed); expect(await fs.readFile(snapshot)).toEqual(snapshotBytes);
+  expect(await fs.readFile(pending)).toEqual(Buffer.from(intent.content)); expect(await fs.readFile(intentFile)).toEqual(intentBytes); expect(await fs.readFile(transactionFile)).toEqual(transactionBytes);
+  expect(await exists(backup)).toBe(false);
+  expect((await fs.readdir(path.dirname(current))).filter(name => name.startsWith(path.basename(current) + '.before-title-'))).toEqual([]);
+  expect((await fs.readdir(intake)).filter(name => /title-conflict|^transaction\.json$/.test(name))).toEqual([]);
+  const observations = Object.fromEntries(await Promise.all(targets.map(async file => [path.relative(base, file).split(path.sep).join('/'), await observe(file)])));
+  expect(new Set(Object.values(observations).map(item => item.dev + ':' + item.ino)).size).toBe(5);
+  expect(observations['Captures/' + capture.file].ino).toBe(initialCurrent.ino); expect(await observe(snapshot)).toEqual(initialSnapshot);
+  const relative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+  // Persist real writer evidence before the expected RED: opening raw preview currently rejects currentHash C.
+  await fs.writeFile(testInfo.outputPath('pending-title-writer-observation.json'), JSON.stringify({ description: 'Actual public Save B stopped at title-staged; controlled external pure-title C; actual writer conflict released its lock. No refresh/recovery preceded raw deletion preview.', captureId: capture.id, revisionId: capture.currentRevision, sourceGeneration: generation ?? null, ledgerSha256: sha(ledgerBytes), producerSha256: sha(JSON.stringify(producerBytes)), beforeSha256: sha(before), intentRawBase64: intentBytes.toString('base64'), transactionRawBase64: transactionBytes.toString('base64'), absentBackup: transaction.backup, targets: observations }, null, 2));
+  const retained = await files(base), preview = page.getByLabel('Capture deletion preview');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
+  expect((await preview.locator('p').filter({ hasText: /^Remove: / }).allTextContents()).sort()).toEqual(targets.map(file => 'Remove: ' + relative(file)).sort());
+  expect(await files(base)).toEqual(retained);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(retained);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(ledgerFile)), authority = deleted.sourceAuthority[capture.id];
+  expect(authority.phase).toBe('deleted'); expect(authority.inventoryVersion).toBe(2);
+  expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(relative).sort());
+  expect(authority.titleRecovery).toEqual({ format: 'imported-title-staged-v1', current: relative(current), pending: relative(pending), intent: relative(intentFile), transaction: relative(transactionFile), snapshot: relative(snapshot), revisionId: capture.currentRevision, sourceGeneration: generation ?? null });
+  expect(authority.titleRecovery.sourceGeneration).not.toBe(authority.generation);
+  expect(deleted.attempts).toEqual(original.attempts); expect(deleted.admissions).toEqual(original.admissions); expect(deleted.suppressed).toContain(sourceHash);
+  for (const file of [...targets, backup]) expect(await exists(file)).toBe(false);
+  expect(await files(producer)).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(ledgerFile));
+  expect(restarted.sourceAuthority[capture.id]).toEqual(authority); expect(restarted.attempts).toEqual(original.attempts); expect(restarted.admissions).toEqual(original.admissions);
+  for (const file of [...targets, backup]) expect(await exists(file)).toBe(false);
+  expect(await files(producer)).toEqual(producerBytes);
+});
