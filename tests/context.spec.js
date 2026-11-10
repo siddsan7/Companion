@@ -142,6 +142,82 @@ test('an older Find response cannot replace the results for the newer context qu
   }
 });
 
+for (const outcome of ['success', 'error']) {
+  test(`an older Refresh ${outcome} cannot replace a newer saved capture or its status`, async () => {
+    await launch(); await capture('REFRESHOLDER earlier capture.');
+    const scheduleFile = path.join(root, 'schedule.json');
+    const scheduleBefore = await fs.readFile(scheduleFile).catch(error => { if (error.code !== 'ENOENT') throw error; return null; });
+    const restoreSchedule = async () => {
+      if (outcome !== 'error') return;
+      if (scheduleBefore === null) await fs.rm(scheduleFile, { force: true });
+      else await fs.writeFile(scheduleFile, scheduleBefore);
+    };
+    await app.evaluate(({ ipcMain }) => {
+      if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed Refresh requires the disposable fixture.');
+      const original = ipcMain._invokeHandlers.get('state');
+      if (!original) throw Error('State handler is unavailable.');
+      const gate = globalThis.__refreshDelivery = { original, held: false, error: null, calls: 0 };
+      const delivery = new Promise(resolve => { gate.release = resolve; });
+      ipcMain._invokeHandlers.set('state', async function (...args) {
+        const first = ++gate.calls === 1;
+        let result;
+        try { result = await Reflect.apply(original, this, args); }
+        catch (error) {
+          if (first) { gate.error = error.message; gate.held = true; await delivery; }
+          throw error;
+        }
+        if (first) { gate.held = true; await delivery; }
+        return result;
+      });
+    });
+    try {
+      await page.evaluate(() => {
+        const button = document.getElementById('refresh');
+        const observation = window.__refreshOnclickSettlement = { original: button.onclick, calls: 0, first: null };
+        button.onclick = function (...args) {
+          const first = ++observation.calls === 1;
+          const returned = Reflect.apply(observation.original, this, args);
+          if (first) observation.first = returned;
+          return returned;
+        };
+      });
+      // The error comes from Schedule.load's real JSON parse, never a fabricated IPC rejection.
+      if (outcome === 'error') await fs.writeFile(scheduleFile, '{');
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await expect.poll(() => app.evaluate(() => globalThis.__refreshDelivery.held)).toBe(true);
+      if (outcome === 'error') expect(await app.evaluate(() => globalThis.__refreshDelivery.error)).toBe('Daily intake settings are unreadable. Preserve them for repair.');
+      await restoreSchedule();
+      await capture('REFRESHNEWER newly saved capture.');
+      const captures = page.locator('#captures');
+      await expect(captures).toContainText('REFRESHNEWER newly saved capture.');
+      await expect(page.getByRole('status')).toHaveText('Capture saved.');
+      const folder = path.join(root, 'vault', 'Companion', 'Captures');
+      const names = (await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort();
+      const before = await Promise.all(names.map(name => fs.readFile(path.join(folder, name), 'utf8')));
+      await app.evaluate(() => globalThis.__refreshDelivery.release());
+      await page.evaluate(() => window.__refreshOnclickSettlement.first);
+      await expect(captures).toContainText('REFRESHNEWER newly saved capture.');
+      await expect(page.getByRole('status')).toHaveText('Capture saved.');
+      expect((await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort()).toEqual(names);
+      expect(await Promise.all(names.map(name => fs.readFile(path.join(folder, name), 'utf8')))).toEqual(before);
+    } finally {
+      await restoreSchedule();
+      await app.evaluate(({ ipcMain }) => {
+        const gate = globalThis.__refreshDelivery;
+        ipcMain._invokeHandlers.set('state', gate.original); gate.release();
+        delete globalThis.__refreshDelivery;
+      });
+      await page.evaluate(async () => {
+        const observation = window.__refreshOnclickSettlement;
+        if (observation) {
+          try { await observation.first; }
+          finally { document.getElementById('refresh').onclick = observation.original; delete window.__refreshOnclickSettlement; }
+        }
+      });
+    }
+  });
+}
+
 test('local exact matches show reasons and manual selection previews the literal question and source provenance', async () => {
   await launch(); await capture('Spaced retrieval can revisit a learned chord.');
   await search('How can retrieval help MyTune?');
