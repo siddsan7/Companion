@@ -35,7 +35,13 @@ Root session `33780` passed all 21 coupled cases on unchanged `7989a203bf8a63360
 
 Independent Standards review approved that bounded tip. Independent Spec review remains blocked by P2: hardlink peer construction uses default string ordering, while strict marker validation requires locale ordering. A legal lowercase destination such as `a/Transcript.md` and its app-created `Companion/.transcripts` stage can produce removal authority that rejects its own peer order. The passing original gate does not cover that destination and is not final-tip approval.
 
-The focused regressions now use that lowercase destination for normal removal confirmation and for actual main-process exit after removal staging followed by explicit recovery. Both retain a real app-created output/stage hardlink pair from the controlled post-receipt export interruption. Production is unchanged pending root-observed RED and its test-only commit.
+The focused regressions use that lowercase destination for normal removal confirmation and for actual main-process exit after removal staging followed by explicit recovery. Both retain a real app-created output/stage hardlink pair from the controlled post-receipt export interruption.
+
+Root session `99195` reproduced both failures on unchanged production: exit 1. The recovery case took 30.3 seconds, recorded an actual main-process exit, and then found Resume disabled after restart. The normal case took 37.7 seconds, reached confirmation, and received the strict scope error without completing removal. Root retained the 222-byte actual-exit proof and failure evidence under `Temp/companion-ticket13-transcript-lowercase-red-20261109/`, then committed the tests and checkpoint as `33c30a1` before the fix.
+
+The minimum fix changes only the two hardlink peer construction sorts to use the existing locale comparator. Parent and target ordering, strict uniqueness validation, marker schema and immutable authority remain unchanged. This preserves previously valid marker ordering. Syntax passed.
+
+Root session `59030` passed both focused lowercase regressions on the unchanged candidate: exit 0, no skips, 1.1 minutes total. Actual stage-crash recovery took 30.0 seconds; normal removal took 34.4 seconds. Both workflows reached their final assertions, including explicit recovery, exact selected-copy removal, retained independent writing and restart stability. Root retained the 222-byte actual-main-exit proof and last-run result under `Temp/companion-ticket13-transcript-lowercase-green-20261109/`. The 21-case coupled rerun and fresh exact-tip independent approval on both review axes remain pending.
 
 ## Retained intent with missing output
 

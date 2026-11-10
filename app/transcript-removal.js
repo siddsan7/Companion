@@ -74,7 +74,7 @@ class TranscriptRemoval {
     }
     const targets = [], texts = new Map();
     for (const item of present) {
-      const peers = present.filter(peer => same(peer.stat, item.stat)).map(peer => this.relative(vault, peer.file)).sort();
+      const peers = present.filter(peer => same(peer.stat, item.stat)).map(peer => this.relative(vault, peer.file)).sort((a, b) => a.localeCompare(b));
       const read = await this.store.read(vault, intent.destination, item.file, parents, peers.length);
       if (!same(read.stat, item.stat)) throw held();
       if (['output', 'stage'].includes(item.kind) && read.text !== intent.text) throw held();
@@ -150,7 +150,7 @@ class TranscriptRemoval {
     ]);
     for (const target of marker.targets) {
       if (!exact(target, ['file', 'kind', 'sha256', 'dev', 'ino', 'bytes', 'peers']) || !digest(target.sha256) || !number(target.dev) || !number(target.ino) || !number(target.bytes) || allowed.get(this.absolute(vault, target.file)) !== target.kind || !Array.isArray(target.peers) || !sortedUnique(target.peers) || !target.peers.includes(target.file)) throw held();
-      const peers = marker.targets.filter(item => same(item, target)).map(item => item.file).sort();
+      const peers = marker.targets.filter(item => same(item, target)).map(item => item.file).sort((a, b) => a.localeCompare(b));
       if (JSON.stringify(peers) !== JSON.stringify(target.peers)) throw held();
     }
     if (!marker.targets.some(item => item.kind === 'intent')) throw held();
