@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const YAML = require('yaml');
 const { Intake } = require('./intake');
 const { parseAnnotation } = require('./vault');
 const { sourceMutation } = require('./source-mutation');
@@ -30,7 +31,7 @@ async function leaf(vault, file) {
   return { file: rel(vault, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), links: Number(before.nlink), raw: bytes, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
 }
 async function raw(vault) {
-  const notes = [], directories = [];
+  const notes = [], directories = [], malformed = new Set();
   async function visit(folder) {
     directories.push(await directory(vault, folder));
     for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
@@ -41,13 +42,22 @@ async function raw(vault) {
       else if (entry.isFile() && entry.name.endsWith('.md')) {
         const value = await leaf(vault, file), note = parseAnnotation(value.text);
         if (note) notes.push({ ...value, ...note });
+        else {
+          // A damaged capture binding cannot make a declared annotation copy
+          // disappear from consent checks. Only its first metadata block owns
+          // identity; ordinary body quotations remain independent writing.
+          const header = value.text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+          let fields; try { fields = header && YAML.parse(header[1]); } catch {}
+          if (fields?.artifact_type === 'annotation' && uuid(fields.companion_id)) malformed.add(fields.companion_id);
+        }
       }
     }
   }
-  await visit(vault.vault); return { notes, directories };
+  await visit(vault.vault); return { notes, directories, malformed };
 }
 async function inventory(vault, intake, id, captureId) {
   const scanned = await raw(vault), notes = scanned.notes.filter(note => note.id === id), candidates = [];
+  if (scanned.malformed.has(id)) throw changed();
   const bind = note => { if (note.id !== id || captureId && note.captureId !== captureId) throw changed(); captureId ||= note.captureId; };
   for (const note of notes) { bind(note); candidates.push({ ...note, kind: 'annotation-note' }); }
   const entries = new Map();
