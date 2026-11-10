@@ -83,6 +83,65 @@ test('a pending Find retires earlier context choices until current capture text 
   }
 });
 
+test('an older Find response cannot replace the results for the newer context question', async () => {
+  await launch();
+  await capture('OLDERQUESTION earlier capture text.');
+  await capture('NEWERQUESTION current capture text.');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed Find requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-find');
+    if (!original) throw Error('Context Find handler is unavailable.');
+    const gate = globalThis.__olderFindDelivery = { original, held: false, calls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-find', async function (...args) {
+      const first = ++gate.calls === 1;
+      const result = await Reflect.apply(original, this, args);
+      if (first) { gate.held = true; await delivery; }
+      return result;
+    });
+  });
+  try {
+    await page.evaluate(() => {
+      const button = document.getElementById('context-find');
+      const observation = window.__findOnclickSettlement = { original: button.onclick, calls: 0, first: null };
+      button.onclick = function (...args) {
+        const first = ++observation.calls === 1;
+        const returned = Reflect.apply(observation.original, this, args);
+        if (first) observation.first = returned;
+        return returned;
+      };
+    });
+    await page.getByLabel('Context question', { exact: true }).fill('OLDERQUESTION');
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__olderFindDelivery.held)).toBe(true);
+    await page.getByLabel('Context question', { exact: true }).fill('NEWERQUESTION');
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    const results = page.locator('#context-results');
+    await expect(results).toContainText('NEWERQUESTION current capture text.');
+    await expect(results).not.toContainText('OLDERQUESTION earlier capture text.');
+    await app.evaluate(() => globalThis.__olderFindDelivery.release());
+    // Await the first real renderer handler, including its publication/error/finally path.
+    await page.evaluate(() => window.__findOnclickSettlement.first);
+    await expect(page.getByLabel('Context question', { exact: true })).toHaveValue('NEWERQUESTION');
+    await expect(results).toContainText('NEWERQUESTION current capture text.');
+    await expect(results).not.toContainText('OLDERQUESTION earlier capture text.');
+    await expect(page.locator('#context-selected article')).toHaveCount(0);
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__olderFindDelivery;
+      ipcMain._invokeHandlers.set('context-find', gate.original); gate.release();
+      delete globalThis.__olderFindDelivery;
+    });
+    await page.evaluate(async () => {
+      const observation = window.__findOnclickSettlement;
+      if (observation) {
+        try { await observation.first; }
+        finally { document.getElementById('context-find').onclick = observation.original; delete window.__findOnclickSettlement; }
+      }
+    });
+  }
+});
+
 test('local exact matches show reasons and manual selection previews the literal question and source provenance', async () => {
   await launch(); await capture('Spaced retrieval can revisit a learned chord.');
   await search('How can retrieval help MyTune?');
