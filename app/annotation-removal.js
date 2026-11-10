@@ -114,7 +114,25 @@ class AnnotationRemoval {
   vault() { const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.'); return vault; }
   async list() {
     const vault = this.vault(), intake = new Intake(vault), ledger = await intake.load(), scanned = await raw(vault);
-    return scanned.notes.filter(note => !ledger.annotationRemovals?.[note.id]).map(note => ({ id: note.id, captureId: note.captureId, file: note.file, text: note.content }));
+    const notes = scanned.notes.filter(note => !ledger.annotationRemovals?.[note.id]).map(note => ({ id: note.id, captureId: note.captureId, file: note.file, text: note.content }));
+    const intentFile = path.join(intake.dir, 'annotation-intent.json');
+    const pending = await leaf(vault, intentFile).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    if (pending) {
+      const intent = JSON.parse(pending.text);
+      if (!strict(intent, ['schema', 'id', 'captureId', 'annotation']) || intent.schema !== 1 || !uuid(intent.id) || !uuid(intent.captureId) || typeof intent.annotation !== 'string') throw changed();
+      const annotation = parseAnnotation(intent.annotation);
+      if (!annotation || annotation.id !== intent.id || annotation.captureId !== intent.captureId) throw changed();
+      if (!ledger.annotationRemovals?.[intent.id]) {
+        const stage = await leaf(vault, path.join(intake.dir, `annotation-${intent.id}.stage`));
+        if (stage.text !== intent.annotation) throw changed();
+        // Reuse the raw classifier and exact parent/peer rules. Listing never
+        // completes the pending writer or materializes its absent note.
+        await inventory(vault, intake, intent.id, intent.captureId);
+        notes.push({ id: intent.id, captureId: intent.captureId, file: rel(vault, intentFile), text: intent.annotation, pending: true });
+      }
+    }
+    if (!intake.storage.matches(await intake.storage.view())) throw changed();
+    return notes;
   }
   async preview(id) {
     if (!uuid(id)) throw changed();

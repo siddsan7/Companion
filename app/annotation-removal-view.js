@@ -16,7 +16,7 @@
     for (const [id, copies] of grouped) {
       const article = document.createElement('article'), title = document.createElement('h3'), button = document.createElement('button'); title.textContent = id;
       article.append(title);
-      for (const note of copies) { const location = document.createElement('p'), text = document.createElement('pre'); location.textContent = note.file; text.textContent = note.text; article.append(location, text); }
+      for (const note of copies) { const location = document.createElement('p'), text = document.createElement('pre'); location.textContent = (note.pending ? 'Pending writing: ' : '') + note.file; text.textContent = note.text; article.append(location, text); }
       button.textContent = 'Preview annotation removal'; button.onclick = () => action(async () => {
         const selected = await window.annotationRemoval.preview(id); if (owner !== epoch) { await window.annotationRemoval.cancel(selected.token); return; }
         const scope = document.createElement('p'), paths = document.createElement('pre'), confirm = document.createElement('button'), cancel = document.createElement('button');
