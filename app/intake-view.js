@@ -1,4 +1,10 @@
 window.intakeView = {
+  retireRepairs() {
+    const section = document.getElementById('vault-repairs');
+    section.setAttribute('aria-busy', 'true');
+    for (const button of section.querySelectorAll('button')) button.disabled = true;
+  },
+  settleRepairs() { document.getElementById('vault-repairs').setAttribute('aria-busy', 'false'); },
   render(intake) {
     const state = document.getElementById('intake-state'), held = document.getElementById('held-imports'); state.replaceChildren(); held.replaceChildren();
     if (!intake) { state.textContent = 'Choose a vault before connecting sources.'; return; }
@@ -24,29 +30,29 @@ window.intakeView = {
         const article = document.createElement('article'), reason = document.createElement('p'), retry = document.createElement('button');
         reason.textContent = 'Annotation relationship paused: ' + item.file + ' — ' + item.reason + ' Current writing and relationship recovery versions are preserved. Retry changes only the current generated link; independent source intake can continue.';
         retry.textContent = 'Retry annotation relationship';
-        retry.onclick = () => action(async () => { const result = await window.companion['retry-annotation-link']({ id: item.id, token: item.token }); await refresh(); status(result.held ? 'Annotation relationship remains paused. Inspect the preserved writing before retrying.' : 'Annotation relationship retry complete. Independent writing and recovery versions are preserved.'); });
+        retry.onclick = () => action(async () => { if (!owned()) return; const result = await window.companion['retry-annotation-link']({ id: item.id, token: item.token }); await refresh(); status(result.held ? 'Annotation relationship remains paused. Inspect the preserved writing before retrying.' : 'Annotation relationship retry complete. Independent writing and recovery versions are preserved.'); });
         article.append(reason, retry); section.append(article); continue;
       }
       if (item.kind === 'missing') {
         const article = document.createElement('article'), reason = document.createElement('p'), scope = document.createElement('p'), restore = document.createElement('button'), remove = document.createElement('button');
         reason.textContent = item.reason; scope.textContent = 'Restore the last managed source revision, or confirm removal from active intake. Retain revision history and annotations, including recovery files. Removal suppresses automatic re-import; this action does not delete retained history.';
         restore.textContent = 'Restore last managed revision'; remove.textContent = 'Confirm missing capture removal from intake';
-        restore.onclick = () => action(async () => { await window.companion['restore-missing']({ id: item.id, token: item.token }); await refresh(); status('Missing capture restored from its verified last managed revision.'); });
-        remove.onclick = () => action(async () => { await window.companion['remove-missing']({ id: item.id, token: item.token }); await refresh(); status('Missing capture removed from active intake. History is retained and automatic re-import is suppressed.'); });
+        restore.onclick = () => action(async () => { if (!owned()) return; await window.companion['restore-missing']({ id: item.id, token: item.token }); await refresh(); status('Missing capture restored from its verified last managed revision.'); });
+        remove.onclick = () => action(async () => { if (!owned()) return; await window.companion['remove-missing']({ id: item.id, token: item.token }); await refresh(); status('Missing capture removed from active intake. History is retained and automatic re-import is suppressed.'); });
         article.append(reason, scope, restore, remove); section.append(article); continue;
       }
       if (item.kind === 'duplicate') {
         const article = document.createElement('article'), reason = document.createElement('p'); reason.textContent = item.reason; article.append(reason);
         for (const choice of item.files) {
           const choose = document.createElement('button'); choose.textContent = 'Use this file: ' + choice.file.replace(/\\/g, '/');
-          choose.onclick = () => action(async () => { await window.companion['choose-identity']({ id: item.id, file: choice.file, token: item.token }); await refresh(); status('Identity selection saved. Every copy remains preserved.'); }); article.append(choose);
+          choose.onclick = () => action(async () => { if (!owned()) return; await window.companion['choose-identity']({ id: item.id, file: choice.file, token: item.token }); await refresh(); status('Identity selection saved. Every copy remains preserved.'); }); article.append(choose);
         }
         section.append(article); continue;
       }
       const article = document.createElement('article'), reason = document.createElement('p'), local = document.createElement('pre'), incoming = document.createElement('pre'), label = document.createElement('label'), textarea = document.createElement('textarea'), apply = document.createElement('button');
       reason.textContent = item.reason; local.textContent = 'Local writing:\n' + (item.local || 'Missing local note'); incoming.textContent = 'Incoming revision ' + item.incomingRevision + '\n' + item.incoming;
       label.textContent = 'Transfer local writing'; textarea.value = item.local || ''; label.append(textarea); apply.textContent = 'Save annotation and apply incoming';
-      apply.onclick = () => action(async () => { const bytes = new TextEncoder().encode(item.local || ''); const digest = await crypto.subtle.digest('SHA-256', bytes); const localHash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join(''); await window.companion['resolve-conflict']({ sourceHash: item.sourceHash, text: textarea.value, localHash }); await refresh(); status('Conflict resolved. Local writing is preserved in an independent annotation.'); });
+      apply.onclick = () => action(async () => { if (!owned()) return; const text = textarea.value, bytes = new TextEncoder().encode(item.local || ''); const digest = await crypto.subtle.digest('SHA-256', bytes); if (!owned()) return; const localHash = [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, '0')).join(''); await window.companion['resolve-conflict']({ sourceHash: item.sourceHash, text, localHash }); await refresh(); status('Conflict resolved. Local writing is preserved in an independent annotation.'); });
       article.append(reason, local, incoming, label, apply); section.append(article);
     }
   },
