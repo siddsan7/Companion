@@ -1,4 +1,4 @@
-# Bounded source inspection — revised span awaiting verification
+# Bounded source inspection — narrow focused checks passed
 
 Goal: a reviewed Conversation waits for brief real source contention, reads fresh source bytes after admission, and fails closed when native ownership outlasts the two-second admission bound. Provider turns must never retry automatically. Source mutations keep their existing immediate refusal and sole native ownership boundary.
 
@@ -32,7 +32,8 @@ Both short cases wait for two actual same-address `EADDRINUSE` emissions in the 
 | Complete ticket / Context gate, whole-corpus span | HEAD `1aabd8f`, root-tested tree `f9a773` | STOPPED after 8 completed passes / 1 completed failure; 232,908 ms, exit 1. Existing in-flight annotation read/removal regression failed. |
 | Revised narrow-span syntax | Context / repairs correction after approved plan merge `d808925` | `node --check app/context.js` and `node --check app/repairs.js` passed |
 | Revised narrow-span FOUR | Exact root-tested tree `ede0e1e1110aad437be1bb9867484c7838a83d7a` | 94,747 ms, exit 0; unchanged annotation reader plus all three admission cases passed |
-| Revised original history/ledger and full gate | Narrow-span correction; admission helper and tests unchanged | Pending root execution; no complete-gate or final approval claimed |
+| Revised original TWO | Commit `30966c090fdeb042fdc98c906c0dd5825eceda06`, tree `757edb8668d6edf251d1869bd82f875f4f0b0653` | 112,029 ms, exit 0; unchanged original two-hop history and ledger preview identity guard passed |
+| Fresh corrected complete gate | 162 cases across 20 files | Pending root execution; complete-ticket checks, exact-tip Standards/Spec and merger approval required |
 
 Earlier actual full144 and controlled overlap results remain in `docs/verification-ticket13-history-contention.md`; this report does not reinterpret the original failure's unproved owner. The controlled RED in that report established a reachable contention seam, not a successful correction.
 
@@ -77,6 +78,8 @@ Root committed the revised independently approved plan as `d8da40a` and preserve
 
 Root ran the unchanged four-case set against exact tree `ede0e1e1110aad437be1bb9867484c7838a83d7a`: all four passed in 94,747 ms, exit 0. Evidence is in `%TEMP%/companion-source-inspection13-narrow-four-20261110`. The annotation reader case passed in 26.7 seconds, including durable removal authorization while its scan was held and stale-writing exclusion after release. The three admission cases passed in 19.2 / 26.8 / 21.1 seconds and retained their native event evidence. All original outcome assertions passed; no action, assertion or timeout changed.
 
-Independent bounded review of this exact narrow-span tree reported zero blockers, conditional on the four focused checks, which root has now validated. Original two-hop history and ledger preview identity controls, fresh full162, complete-ticket checks, independent exact-tip review and assigned merger approval remain pending. The earlier failed/stopped gates remain failed/stopped; these four passes establish only the focused correction. Product files, admission helper and tests are frozen for root's separate correction commit and subsequent checks.
+Independent bounded review of this exact narrow-span tree reported zero blockers, conditional on the four focused checks, which root has now validated. Root preserved the source correction and four-case report in `30966c090fdeb042fdc98c906c0dd5825eceda06`.
 
-Worker scope in this step: Context, repairs and this report only. `source-mutation.js` and all tests are unchanged. No staging, commit, installation, runtime test, GUI, or network action by this worker. Architecture/checkpoint updates are deferred to a separate step after root's actual results.
+Root then ran the two unchanged original controls at that commit, tree `757edb8668d6edf251d1869bd82f875f4f0b0653`: both passed in 112,029 ms, exit 0. Evidence is in `%TEMP%/companion-source-inspection13-narrow-original-two-20261110`. The two-hop history journey took about 1.5 minutes; the ledger preview identity guard took 22.9 seconds. The fresh corrected full162 / 20-file gate, complete-ticket checks, independent exact-tip Standards/Spec review and assigned merger approval remain pending. Earlier failed/stopped gates retain their results. Product files, admission helper and tests remain frozen.
+
+Worker scope in this step: this report, architecture and checkpoint docs only. No source or test edits, staging, commit, installation, runtime test, GUI, or network action by this worker.

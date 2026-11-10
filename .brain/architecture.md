@@ -61,7 +61,7 @@ Codex's separate `codex/managed-home` belongs to App Server and may contain mana
 
 `app/context.js` owns eligibility, deterministic exact-word paragraph matching, source/project association reasons, exact excerpt approvals and package serialization. `context-view.js` owns inspection/manual selection. The narrow `context-*` IPC never dispatches, authenticates or reads history. See ../docs/verification-ticket9.md for evidence and final gates.
 
-Context sourceInspection admits the entire fresh corpus through the existing native source owner, with a monotonic two-second admission bound and retries only before its callback begins; mutations retain immediate refusal, body errors never retry, and Conversation→required writing stores→Intake lock order is unchanged.
+Context sourceInspection admits the fresh source/revision core through the existing native owner within two seconds, then releases before independent annotation/Brief/Ideas/scope reads. Raw non-acquiring guards at core end and after all unlocked awaits compare the original Info physical ledger observation. Mutations remain fail-fast, bodies never replay, and Conversation→required writing stores→Intake lock order is unchanged.
 
 Intake identity wins over writable capture type. Imported support uses validated immutable snapshots plus current eligibility. Annotations carry their own content hash and an explicitly unversioned capture association; their creation revision is unknown. Explicit note scope is stored in application-data `context-settings-<vault-path hash>/notes.json`, published atomically under the existing kernel-owned helper keyed to that dedicated directory.
 
