@@ -27,7 +27,7 @@ Complete valid pending-only authority can be explicitly reviewed, revalidated an
 
 ## Remaining checks and scope
 
-The observed checks do not complete ticket 13. Required follow-up checks include changed files, unknown aliases and folder replacement guards. Independent review and relevant regression checks remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
+The observed checks do not complete ticket 13. The finite coupled gate and independent review remain required before integration. Complete ticket 13 and ticket 16 release gates remain separate obligations.
 
 ## Retained intent with missing output
 
@@ -63,3 +63,12 @@ The minimum fix remembers refused transcript IDs in the existing store instance,
 Root session `54007` passed the focused two-state rerun. Root verified durable `.last-run` state `passed` with no failed tests and inspected both actual diagnostics: directory identities stayed unchanged and `unexpectedReappearances` was empty. Fresh explicit export assertions also completed. No duration was recorded from this checkpoint. The behavior also checks exact preserved vault bytes after stale confirmation and unchanged originating conversation, source capture, other export, external backup and provider submissions.
 
 The cache lasts only for the process. External loss of every durable removal control across a process restart cannot be inferred from memory. This is an explicit limit; no cross-restart authority reconstruction is claimed.
+
+## Bounded ownership guards
+
+Root session `75924` passed both ownership states on unchanged `908f972` production: exit 0, 53.8 seconds total, 26.7 seconds per case, no skips. No production change or manufactured RED was needed.
+
+- An unknown external hardlink was added to the selected output after review. Confirm refused before creating removal authority. The alias, its bytes and the selected output's link count remained intact.
+- The known `.transcripts` folder was moved aside and replaced with an ordinary new folder containing independent writing after review. Confirm refused before creating removal authority. Both the retained original store and replacement-folder writing remained unchanged. The test closed the app and restored only its own fixture folder.
+
+Both cases verified the exact post-change vault bytes, all selected copies, other export, originating conversation, source capture, external backup and provider submissions remained unchanged. The final fixture vault matched its original bytes. The coupled regression gate and independent review are still pending; these two guards are not a full release gate.

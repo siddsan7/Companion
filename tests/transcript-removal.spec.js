@@ -204,6 +204,59 @@ for (const authority of ['intact', 'externally removed after observation']) {
     await expectProtocolIndependence(fixture);
   });
 }
+
+for (const ownership of ['unknown external hardlink', 'replaced known transcript parent']) {
+  test(`selected transcript removal preserves every copy after preview with an ownership change: ${ownership}`, async () => {
+    test.setTimeout(120000);
+    const fixture = await transcriptProtocolFixture();
+    const review = await reviewProtocolRemoval(fixture);
+    const marker = path.join(fixture.directory, `${fixture.intent.id}.removed.json`);
+    const alias = path.join(root, 'unselected-external-transcript-alias.md');
+    const retained = path.join(root, 'retained-original-transcript-store');
+    const sentinel = path.join(fixture.directory, 'independent-replacement-writing.txt');
+    const relativeFiles = async directory => Object.fromEntries(Object.entries(await files(directory)).map(([file, bytes]) => [path.relative(directory, file), bytes]));
+    const originalStore = await relativeFiles(fixture.directory);
+    let moved = false, replaced = false;
+    try {
+      if (ownership === 'unknown external hardlink') {
+        await fs.link(fixture.selected, alias);
+        expect((await fs.stat(fixture.selected)).nlink).toBe(2);
+      } else {
+        await fs.rename(fixture.directory, retained); moved = true;
+        await fs.mkdir(fixture.directory); replaced = true;
+        await fs.writeFile(sentinel, 'Independent replacement-folder writing must remain unchanged.\n');
+      }
+      const changedVault = await files(fixture.vault);
+      await review.getByRole('button', { name: 'Confirm transcript removal', exact: true }).click();
+      await expect(page.locator('#transcript-remove-status')).toContainText(ownership === 'unknown external hardlink' ? /linked|nonordinary|identity|scope/i : /folder|identity|ordinary/i);
+      expect(await files(fixture.vault)).toEqual(changedVault);
+      expect(await fs.stat(marker).catch(error => error.code)).toBe('ENOENT');
+      expect(await fs.stat(`${marker}.pending`).catch(error => error.code)).toBe('ENOENT');
+      expect(await fs.readFile(fixture.selected, 'utf8')).toBe(fixture.selectedBytes);
+      expect(await files(path.join(root, 'conversations'))).toEqual(fixture.history);
+      expect(await fs.readFile(fixture.backup, 'utf8')).toBe(fixture.selectedBytes);
+      expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+      for (const [file, bytes] of Object.entries(fixture.before)) {
+        if (!file.startsWith(`${fixture.directory}${path.sep}`)) expect((await fs.readFile(file)).toString('base64')).toBe(bytes);
+      }
+      if (ownership === 'unknown external hardlink') {
+        expect(await fs.readFile(alias, 'utf8')).toBe(fixture.selectedBytes);
+        expect((await fs.stat(fixture.selected)).nlink).toBe(2);
+        expect(await relativeFiles(fixture.directory)).toEqual(originalStore);
+      } else {
+        expect(await relativeFiles(retained)).toEqual(originalStore);
+        expect(await fs.readdir(fixture.directory)).toEqual([path.basename(sentinel)]);
+        expect(await fs.readFile(sentinel, 'utf8')).toBe('Independent replacement-folder writing must remain unchanged.\n');
+      }
+    } finally {
+      if (app) { await app.close(); app = null; }
+      if (replaced) { await fs.unlink(sentinel); await fs.rmdir(fixture.directory); }
+      if (moved) await fs.rename(retained, fixture.directory);
+    }
+    await expectProtocolIndependence(fixture);
+    expect(await files(fixture.vault)).toEqual(fixture.before);
+  });
+}
 test.afterEach(async () => {
   if (app) await app.close(); app = null;
   await fs.rm(root, { recursive: true, force: true });
