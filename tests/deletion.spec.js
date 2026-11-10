@@ -287,6 +287,70 @@ test('restoring selected A keeps purged unadmitted B suppressed while allowing a
   expect(producerCopies).toEqual(selected.producerBytes);
 });
 
+test('v2 source purge recovers after an actual first unlink and controlled authorized journal and peer omissions', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const selected = await heldSourceInventory(testInfo), unrelated = path.join(selected.base, 'independent-partial-purge.txt');
+  await fs.writeFile(unrelated, 'Independent writing survives partial source purge.');
+  await launch(); await expect(page.locator('#captures article')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('capture-deletion-unlinked');
+  const ledgerBytes = await fs.readFile(selected.ledgerFile, 'utf8'), committed = JSON.parse(ledgerBytes), authority = committed.sourceAuthority[selected.capture.id];
+  expect(authority.phase).toBe('deleting'); expect(authority.inventoryVersion).toBe(2);
+  expect(committed.suppressed).toContain(selected.sourceHash); expect(committed.attempts).toEqual(selected.original.attempts);
+  expect(authority.targets).toHaveLength(7);
+  const first = authority.targets[0], firstFile = path.join(root, 'vault', first.file);
+  expect(await fs.access(firstFile).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  const presentBeforeExit = [];
+  for (const target of authority.targets) if (await fs.access(path.join(root, 'vault', target.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) presentBeforeExit.push(target.file);
+  expect(presentBeforeExit).toHaveLength(6);
+  await exitMain('capture-deletion-unlinked', testInfo, 'source-inventory-first-unlink-processes.json');
+  const controlledUnlinks = [];
+  for (const file of [selected.archive, selected.snapshotStage]) {
+    const name = path.relative(path.join(root, 'vault'), file).split(path.sep).join('/'), target = authority.targets.find(item => item.file === name);
+    expect(target).toBeDefined();
+    let stat; try { stat = await fs.lstat(file, { bigint: true }); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (!stat) { expect(name).toBe(first.file); continue; }
+    expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false);
+    expect(String(stat.dev)).toBe(target.dev); expect(String(stat.ino)).toBe(target.ino);
+    await fs.unlink(file); controlledUnlinks.push(name);
+  }
+  const snapshotTarget = authority.targets.find(item => item.file === path.relative(path.join(root, 'vault'), selected.snapshot).split(path.sep).join('/'));
+  expect(snapshotTarget.peers).toHaveLength(2); expect(snapshotTarget.peers).toContain(snapshotTarget.file);
+  expect((await fs.stat(selected.snapshot)).nlink).toBe(1);
+  expect(await fs.readFile(selected.snapshot, 'utf8')).toBe(JSON.stringify(selected.transaction.revision, null, 2));
+  expect(await fs.readFile(selected.ledgerFile, 'utf8')).toBe(ledgerBytes);
+  expect(await fs.access(selected.archive).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await fs.access(selected.snapshotStage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  await fs.writeFile(testInfo.outputPath('source-inventory-partial-scope.json'), JSON.stringify({
+    actualAppUnlink: first.file, actualExitBoundary: 'capture-deletion-unlinked',
+    controlledUnlinksWhileMainAbsent: controlledUnlinks,
+    description: 'The application removed only the first target before actual exit. Any additional listed journal/peer omissions were controlled test actions within the committed scope; ledger bytes were unchanged.'
+  }, null, 2), 'utf8');
+  await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
+  await expect.poll(async () => JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8')).sourceAuthority[selected.capture.id].phase).toBe('deleted');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const deleted = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(deleted.sourceAuthority[selected.capture.id]).toEqual({ ...authority, phase: 'deleted' });
+  expect(deleted.attempts).toEqual(selected.original.attempts); expect(deleted.admissions).toEqual(selected.original.admissions);
+  expect(deleted.attempts[selected.transaction.revision.identity]).toBeUndefined();
+  expect(deleted.blocks[selected.sourceHash]).toBeUndefined(); expect(deleted.pending[selected.sourceHash]).toBeUndefined();
+  for (const target of authority.targets) expect(await fs.access(path.join(root, 'vault', target.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await fs.readFile(unrelated, 'utf8')).toBe('Independent writing survives partial source purge.');
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[selected.capture.id]).toEqual(deleted.sourceAuthority[selected.capture.id]);
+  expect(restarted.attempts).toEqual(selected.original.attempts); expect(restarted.suppressed).toContain(selected.sourceHash);
+  for (const target of authority.targets) expect(await fs.access(path.join(root, 'vault', target.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await fs.readFile(unrelated, 'utf8')).toBe('Independent writing survives partial source purge.');
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+});
+
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
