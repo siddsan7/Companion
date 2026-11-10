@@ -38,7 +38,14 @@
   function showRemoval(preview) {
     removalOperation = preview.operation; removalHeading.textContent = `Remove saved idea ${preview.id}`;
     removalFiles.replaceChildren();
-    for (const file of preview.files) { const line = document.createElement('p'); line.textContent = `${file.kind}: ${file.path}`; removalFiles.append(line); }
+    for (const file of preview.files) {
+      const line = document.createElement('p'); line.textContent = `${file.kind}: ${file.path}`; removalFiles.append(line);
+      const writing = preview.writing.find(item => item.path === file.path && item.kind === file.kind);
+      if (writing) {
+        const body = document.createElement('pre'); body.textContent = writing.text;
+        Object.assign(body.style, { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }); removalFiles.append(body);
+      }
+    }
     removalWarnings.textContent = preview.warnings.join(' '); removalPreview.hidden = false;
   }
   async function previewRemoval(id) {

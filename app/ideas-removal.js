@@ -98,7 +98,7 @@ class IdeasRemoval {
       return { bytes, stat, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
     } finally { fs.closeSync(handle); }
   }
-  scope(vault, id) {
+  scope(vault, id, writing = null) {
     if (!uuid(id)) held();
     const parents = this.ideas.guard(vault), directory = path.join(vault.root, '.ideas');
     if (!parents.has(directory)) throw Error('Saved idea removal requires the existing .ideas folder. No folder was created.');
@@ -164,6 +164,13 @@ class IdeasRemoval {
     });
     files.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     const parentRecords = [...parents].map(([file, stat]) => ({ path: this.relative(vault, file), dev: stat.dev.toString(), ino: stat.ino.toString() })).sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    // Preview writing comes only from the guarded, validated copies above. Keep
+    // it separate from the content-free scope cached and committed as authority.
+    if (writing) for (const file of files) {
+      const item = found.get(this.absolute(vault, file.path));
+      if (item.kind === 'receipt') continue;
+      writing.push({ path: item.file, kind: item.kind, text: item.kind === 'intent' ? intents.get(item.operation).text : item.loaded.text });
+    }
     return { parents: parentRecords, files };
   }
   validate(vault, value, id) {
@@ -230,10 +237,10 @@ class IdeasRemoval {
     if (!parents.has(directory)) throw Error('Saved idea removal requires the existing .ideas folder. No folder was created.');
     return withBriefMutation(directory, async () => {
       this.ideas.guard(vault, parents); this.allow(vault, id);
-      const scope = this.scope(vault, id); if (!scope.files.length) held();
+      const writing = [], scope = this.scope(vault, id, writing); if (!scope.files.length) held();
       const value = { schema: 1, kind: 'saved-idea-removal', ideaId: id, operation: randomUUID(), vault: vault.root, ...scope };
       this.validate(vault, value, id); this.previews.set(value.operation, value);
-      return this.describe(vault, value);
+      return { ...this.describe(vault, value), writing };
     });
   }
   cancel({ operation }) { this.previews.delete(operation); }
