@@ -1,5 +1,6 @@
 const { createHash } = require('node:crypto');
 const path = require('node:path');
+const { generations } = require('./source-generations');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const fail = () => { throw Error('History contains unsupported data. Preserve local files for repair; archive export was blocked.'); };
@@ -25,7 +26,11 @@ function packageRecord(value) {
   strings(value.warnings); strings(value.historyIds); strings(value.excludedHistory); scope(value.scope); pin(value.brief); root(value.vault);
   if (value.conversationGeneration !== undefined && value.conversationGeneration !== null && !uuid(value.conversationGeneration)) fail();
   if (!Array.isArray(value.dependencies) || !Array.isArray(value.historyExclusions)) fail();
-  for (const dep of value.dependencies) { object(dep, ['key', 'digest', 'captureId', 'revisionId']); if (typeof dep.key !== 'string' || !/^[a-f0-9]{64}$/.test(dep.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep, key) && !uuid(dep[key]))) fail(); }
+  for (const dep of value.dependencies) {
+    object(dep, ['key', 'digest', 'captureId', 'revisionId', 'sourceGenerations']);
+    if (typeof dep.key !== 'string' || !/^[a-f0-9]{64}$/.test(dep.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep, key) && !uuid(dep[key]))) fail();
+    try { generations(dep.sourceGenerations); } catch { fail(); }
+  }
   for (const item of value.historyExclusions) { object(item, ['id', 'reason']); if (!uuid(item.id) || typeof item.reason !== 'string') fail(); }
   if (value.historyRefs !== undefined) {
     if (!Array.isArray(value.historyRefs)) fail();

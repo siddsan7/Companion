@@ -6,6 +6,71 @@
   const pending = document.createElement('section'); pending.setAttribute('aria-label', 'Pending transcript exports');
   pending.innerHTML = '<h4>Pending transcript exports</h4><p>Retained proposals are never published automatically. Inspect the writing before explicitly resuming.</p><div id="transcript-pending"></div>';
   section.append(pending);
+  const removal = document.createElement('section'); removal.setAttribute('aria-label', 'Selected transcript removal');
+  removal.innerHTML = '<h4>Remove one transcript export</h4><p>Select a separately managed export. This removes only the displayed app-owned copies. The originating conversation, source captures, saved ideas, other exports and external backups remain independent. This does not promise automatic semantic erasure of quotations.</p><label>Retained transcript export<select id="transcript-remove-select"><option value="">Choose one export</option></select></label><button id="transcript-remove-preview">Preview transcript removal</button><section id="transcript-remove-review" aria-label="Transcript removal review" hidden><p>The originating conversation, source captures, saved ideas, other exports and external copies or backups are kept. Only these exact managed copies are selected:</p><ul id="transcript-remove-files"></ul><button id="transcript-remove-confirm">Confirm transcript removal</button><button id="transcript-remove-cancel">Cancel transcript removal</button></section><p id="transcript-remove-status" role="alert"></p><section aria-label="Pending transcript removals"><h4>Pending transcript removals</h4><div id="transcript-remove-pending"></div></section>';
+  section.append(removal);
+  let removalToken, removalGeneration = 0, removalListGeneration = 0;
+  function invalidateRemoval() {
+    removalGeneration++; const previous = removalToken; removalToken = null;
+    byId('transcript-remove-review').hidden = true; byId('transcript-remove-files').replaceChildren();
+    if (previous) window.companion['transcript-remove-cancel']({ token: previous }).catch(() => {});
+  }
+  function showRemoval(result) {
+    removalToken = result.token; byId('transcript-remove-files').replaceChildren();
+    const warning = document.createElement('li'); warning.textContent = result.warning || '';
+    if (result.warning) byId('transcript-remove-files').append(warning);
+    for (const file of result.files) { const row = document.createElement('li'); row.textContent = file; byId('transcript-remove-files').append(row); }
+    byId('transcript-remove-review').hidden = false;
+  }
+  async function refreshRemoval() {
+    const owner = vaultEpoch, current = ++removalListGeneration;
+    try {
+      const result = await window.companion['transcript-remove-list']();
+      if (owner !== vaultEpoch || current !== removalListGeneration) return;
+      const select = byId('transcript-remove-select'), selected = select.value;
+      select.replaceChildren(new Option('Choose one export', ''));
+      for (const record of result.records) select.add(new Option(record.destination, record.operation));
+      if (result.records.some(record => record.operation === selected)) select.value = selected;
+      byId('transcript-remove-pending').replaceChildren();
+      for (const issue of result.issues) { const row = document.createElement('p'); row.textContent = issue; byId('transcript-remove-pending').append(row); }
+      for (const record of result.pending) {
+        const article = document.createElement('article'), description = document.createElement('p'), resume = document.createElement('button');
+        description.textContent = `${record.id}: ${record.warning}`; resume.textContent = 'Resume transcript removal'; resume.disabled = !record.canResume;
+        resume.onclick = async () => {
+          if (owner !== vaultEpoch) return;
+          invalidateRemoval(); const current = removalGeneration; resume.disabled = true;
+          try {
+            const result = await window.companion['transcript-remove-resume']({ id: record.id });
+            if (current !== removalGeneration || owner !== vaultEpoch) { await window.companion['transcript-remove-cancel']({ token: result.token }); return; }
+            showRemoval(result);
+          } catch (error) { if (current === removalGeneration && owner === vaultEpoch) byId('transcript-remove-status').textContent = error.message; }
+          finally { if (owner === vaultEpoch) resume.disabled = !record.canResume; }
+        };
+        article.append(description, resume); byId('transcript-remove-pending').append(article);
+      }
+    } catch (error) { if (owner === vaultEpoch && current === removalListGeneration) byId('transcript-remove-status').textContent = error.message; }
+  }
+  byId('transcript-remove-select').onchange = invalidateRemoval;
+  byId('transcript-remove-preview').onclick = async () => {
+    invalidateRemoval(); const current = removalGeneration, owner = vaultEpoch;
+    byId('transcript-remove-status').textContent = '';
+    try {
+      const result = await window.companion['transcript-remove-preview']({ operation: byId('transcript-remove-select').value });
+      if (current !== removalGeneration || owner !== vaultEpoch) { await window.companion['transcript-remove-cancel']({ token: result.token }); return; }
+      showRemoval(result);
+    } catch (error) { if (current === removalGeneration && owner === vaultEpoch) byId('transcript-remove-status').textContent = error.message; }
+  };
+  byId('transcript-remove-cancel').onclick = () => { invalidateRemoval(); byId('transcript-remove-status').textContent = 'Transcript removal cancelled. No files were changed.'; };
+  byId('transcript-remove-confirm').onclick = async () => {
+    const current = removalGeneration, owner = vaultEpoch, approved = removalToken;
+    byId('transcript-remove-confirm').disabled = true;
+    try {
+      await window.companion['transcript-remove-confirm']({ token: approved });
+      if (current !== removalGeneration || owner !== vaultEpoch) return;
+      invalidateRemoval(); byId('transcript-remove-status').textContent = 'Transcript removed locally. The originating conversation and independent copies are kept.';
+    } catch (error) { if (current === removalGeneration && owner === vaultEpoch) byId('transcript-remove-status').textContent = error.message; }
+    finally { byId('transcript-remove-confirm').disabled = false; if (owner === vaultEpoch) { await refreshRemoval(); await refreshPending(); } }
+  };
   let token, generation = 0, vaultEpoch = 0, pendingGeneration = 0;
   function invalidateView() {
     generation++; const previous = token; token = null;
@@ -17,9 +82,9 @@
   byId('conversation-new').addEventListener('click', invalidateView);
   byId('conversation-select').addEventListener('change', invalidateView);
   byId('configure').addEventListener('click', () => {
-    vaultEpoch++; pendingGeneration++; invalidateView(); byId('transcript-pending').replaceChildren();
+    vaultEpoch++; pendingGeneration++; removalListGeneration++; invalidateView(); invalidateRemoval(); byId('transcript-pending').replaceChildren(); byId('transcript-remove-pending').replaceChildren(); byId('transcript-remove-select').replaceChildren(new Option('Choose one export', ''));
   });
-  window.addEventListener('companion-vault-configured', () => refreshPending());
+  window.addEventListener('companion-vault-configured', () => { refreshPending(); refreshRemoval(); });
   async function refreshPending() {
     const owner = vaultEpoch, current = ++pendingGeneration;
     try {
@@ -72,7 +137,8 @@
       if (current !== generation || owner !== vaultEpoch) return;
       token = null; byId('transcript-review').hidden = true; byId('transcript-status').textContent = `Transcript exported: ${result.destination}`;
     } catch (error) { if (current === generation && owner === vaultEpoch) byId('transcript-status').textContent = `${error.message} Proposed writing remains available; retry explicitly or copy it before closing.`; }
-    finally { if (current === generation && owner === vaultEpoch) byId('transcript-confirm').disabled = false; if (owner === vaultEpoch) await refreshPending(); }
+    finally { if (current === generation && owner === vaultEpoch) byId('transcript-confirm').disabled = false; if (owner === vaultEpoch) { await refreshPending(); await refreshRemoval(); } }
   };
   refreshPending();
+  refreshRemoval();
 })();

@@ -2,6 +2,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID, createHash } = require('node:crypto');
 const YAML = require('yaml');
+const { sourceMutation } = require('./source-mutation');
+const { assertPublication } = require('./source-authority');
 const hash = text => createHash('sha256').update(text).digest('hex');
 async function liveOwner(file) {
   try { const owner = JSON.parse(await fs.readFile(`${file}.lock`, 'utf8')); if (!Number.isInteger(owner.pid) || owner.pid < 1) return false; process.kill(owner.pid, 0); return true; } catch { return false; }
@@ -69,7 +71,7 @@ class Vault {
     const visit = async dir => {
       await this.contained(dir);
       for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        if (entry.name === '.intake' || entry.name === '.obsidian' || entry.name === '.git') continue;
+        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home'].includes(entry.name.toLowerCase())) continue;
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
@@ -83,6 +85,14 @@ class Vault {
     return notes;
   }
   async list() {
+    return sourceMutation(this.root, () => this.listOwned());
+  }
+  async publication(id, transaction = {}) {
+    const intake = new (require('./intake').Intake)(this), ledger = await intake.load();
+    await require('./source-recovery').pendingParents(intake, ledger);
+    assertPublication(ledger, id, transaction); return ledger.sourceAuthority?.[id]?.generation;
+  }
+  async listOwned() {
     const dir = path.join(this.root, 'Captures');
     await this.writable();
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Invalid capture metadata in '));
@@ -97,6 +107,9 @@ class Vault {
   }
   async find(id) { const note = (await this.list()).find(note => note.id === id); if (!note) throw Error('Capture is missing. Restore it before editing.'); return note; }
   async capture(input, now) {
+    return sourceMutation(this.root, () => this.captureOwned(input, now));
+  }
+  async captureOwned(input, now) {
     await this.writable();
     if (typeof input.text !== 'string' || !input.text.trim()) throw Error('Enter a thought or link before saving.');
     const text = input.text; const type = /^https?:\/\/\S+$/i.test(text.trim()) ? 'link' : 'thought';
@@ -106,7 +119,7 @@ class Vault {
     const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note), stage = `${file}.pending`;
     await this.acquire(file);
     try {
-      await fs.writeFile(stage, content, { flag: 'wx', flush: true }); await this.checkpoint('capture-staged'); await fs.link(stage, file);
+      await fs.writeFile(stage, content, { flag: 'wx', flush: true }); await this.checkpoint('capture-staged'); await this.publication(note.id); await fs.link(stage, file);
       // Publication is successful even if cleanup fails. A retry must not duplicate a saved note.
       await fs.unlink(stage).catch(() => this.warnings.push('Capture saved. Its staging file will be cleaned on restart.'));
     } catch (error) { await fs.unlink(stage).catch(() => {}); throw error; }
@@ -114,13 +127,17 @@ class Vault {
     this.expected.set(note.id, hash(content)); return note.id;
   }
   async title(id, title) {
+    return sourceMutation(this.root, () => this.titleOwned(id, title));
+  }
+  async titleOwned(id, title) {
     if (typeof title !== 'string' || !title.trim() || /[\r\n]/.test(title)) throw Error('Enter a title on one line.');
     const note = await this.find(id);
     if (hash(note.content) !== this.expected.get(id)) throw Error('This note changed outside Companion. Reopen Companion to inspect it before editing.');
     const content = withTitle(note.content, title.trim());
+    const authority = (await new (require('./intake').Intake)(this).load()).sourceAuthority?.[id];
     // Fully write ownership before publishing the exclusive lock. A crash cannot leave a partial lock.
     await this.acquire(note.file);
-    const transaction = { expectedHash: hash(note.content), content, backup: `${path.basename(note.file)}.before-title-${randomUUID()}.bak` };
+    const transaction = { expectedHash: hash(note.content), content, backup: `${path.basename(note.file)}.before-title-${randomUUID()}.bak`, ...(authority?.phase === 'active' ? { sourceGeneration: authority.generation } : {}) };
     try {
       const current = await fs.readFile(note.file, 'utf8'); if (hash(current) !== hash(note.content)) throw Error('The note changed. Your file was preserved.');
       await fs.writeFile(`${note.file}.title-transaction.json`, JSON.stringify(transaction), { flag: 'wx', flush: true });
@@ -131,19 +148,24 @@ class Vault {
     } finally { await this.release(note.file); }
   }
   async finishTitle(file, transaction) {
+    return sourceMutation(this.root, () => this.finishTitleOwned(file, transaction));
+  }
+  async finishTitleOwned(file, transaction) {
     const backup = path.join(path.dirname(file), transaction.backup);
     const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-    let verified = false;
+    let verified = false, authorityDenied = false;
     try {
       let old = await read(backup);
       const source = old === null ? await read(file) : old;
       const before = source === null ? null : parse(source), after = parse(transaction.content);
       if (source !== null && hash(source) !== transaction.expectedHash) throw Error('External edit conflict. The note and previous version were preserved.');
       if (!before || !after || before.id !== after.id || before.capturedAt !== after.capturedAt || before.type !== after.type || withTitle(source, after.title) !== transaction.content || !/^[a-f0-9]{64}$/.test(transaction.expectedHash)) throw Error('Invalid title recovery journal. Only a verified capture title can be recovered; all files were preserved.');
+      await this.publication(after.id, transaction);
       verified = true;
       const staged = await read(`${file}.pending`);
       if (staged !== null && staged !== transaction.content) throw Error('Unexpected staging file. It was preserved; inspect it before retrying the title save.');
       if (old === null) {
+        await this.publication(after.id, transaction);
         // The backup name is unique and must not exist before the atomic move.
         await fs.rename(file, backup);
         await this.checkpoint('title-moved');
@@ -151,30 +173,37 @@ class Vault {
       }
       let current = await read(file);
       if (hash(old) !== transaction.expectedHash) {
-        if (current === null) await fs.link(backup, file);
+        if (current === null) { await this.publication(after.id, transaction); await fs.link(backup, file); }
         throw Error('External edit conflict. Your content was preserved; inspect the note and its adjacent backup before retrying.');
       }
       if (current === null) {
         // Exclusive publication cannot replace a file another editor recreated after the move.
         if (staged === null) await fs.writeFile(`${file}.pending`, transaction.content, { flag: 'wx', flush: true });
+        await this.publication(after.id, transaction);
         try { await fs.link(`${file}.pending`, file); } catch (error) { if (error.code === 'EEXIST') throw Error('External edit conflict. The new file and previous version were preserved.'); throw error; }
         current = transaction.content;
       }
       if (current !== transaction.content) throw Error('External edit conflict. The current file and previous version were preserved.');
       if (hash(await read(backup)) !== transaction.expectedHash) throw Error('External edit conflict. Changes through an open editor were retained in the adjacent backup.');
     } catch (error) {
+      authorityDenied = error.code === 'SOURCE_AUTHORITY_DENIED';
       // A failed publication restores the previous file without replacing a concurrent edit.
-      if (verified && await read(file) === null && await read(backup) !== null) await fs.link(backup, file).catch(() => {});
+      if (verified && error.code !== 'SOURCE_AUTHORITY_DENIED' && await read(file) === null && await read(backup) !== null) {
+        await this.publication(parse(transaction.content).id, transaction); await fs.link(backup, file).catch(() => {});
+      }
       throw error;
     } finally {
       // Keep the durable journal if filesystem failure prevented restoration.
-      if (verified && await read(file) !== null && await read(`${file}.pending`) === transaction.content) {
+      if (verified && !authorityDenied && await read(file) !== null && await read(`${file}.pending`) === transaction.content) {
         await fs.unlink(`${file}.pending`).catch(error => { if (error.code !== 'ENOENT') throw error; });
         await fs.unlink(`${file}.title-transaction.json`).catch(error => { if (error.code !== 'ENOENT') throw error; });
       }
     }
   }
   async recover(dir) {
+    return sourceMutation(this.root, () => this.recoverOwned(dir));
+  }
+  async recoverOwned(dir) {
     for (const entry of await fs.readdir(dir)) {
       if (!entry.endsWith('.md.title-transaction.json')) continue;
       const file = path.join(dir, entry.slice(0, -'.title-transaction.json'.length));
@@ -213,6 +242,7 @@ class Vault {
         this.warnings.push(`Unrecognized staging file ${entry}. It was preserved for inspection.`); continue;
       }
       try {
+        await this.publication(note.id);
         await fs.link(stage, file);
         this.warnings.push('Recovered an interrupted capture save.');
       } catch (error) {
@@ -223,4 +253,4 @@ class Vault {
     }
   }
 }
-module.exports = { Vault, withTitle, captureHeading, parseAnnotation };
+module.exports = { Vault, withTitle, captureHeading, parseAnnotation, parse };

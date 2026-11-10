@@ -28,7 +28,7 @@
     if (select.value !== (conversationId || '')) select.value = conversationId || '';
   }
   function resetView() {
-    viewEpoch++; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
+    retireFind(); viewEpoch++; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
     excludedHistory.clear(); restoredHistory.clear(); restoredSources.clear(); excluded.clear(); selections = []; all = [];
     historySelections.clear(); byId('history-search-results').replaceChildren(); byId('history-selected').replaceChildren(); byId('history-search-status').textContent = '';
     byId('conversation-history').replaceChildren(); byId('conversation-error').textContent = '';
@@ -84,7 +84,7 @@
       if (request.status === 'failed' || request.status === 'interrupted') {
         const retry = document.createElement('button'); retry.textContent = 'Retry or edit request';
         retry.onclick = () => {
-          byId('context-question').value = request.question; byId('conversation-speculation').checked = request.speculation === true;
+          retireFind(); byId('context-question').value = request.question; byId('conversation-speculation').checked = request.speculation === true;
           selections = []; restoredSources.clear(); selected(); clearPreview();
           byId('conversation-summary').textContent = 'Explicit retry: inspect and select current sources, then preview and send a new request. Earlier partial output stays incomplete.';
         }; article.append(retry);
@@ -114,9 +114,37 @@
     }
     catch (error) { if (request === conversationGeneration && epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
   }
-  let selections = [], all = [], generation = 0; const excluded = new Set();
-  const clearPreview = () => { generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
+  let selections = [], all = [], generation = 0, findGeneration = 0;
+  const excluded = new Set();
+  const findFeedback = document.createElement('p');
+  findFeedback.setAttribute('aria-live', 'polite'); byId('context-find').after(findFeedback);
+  function retireFind() {
+    findGeneration++; all = [];
+    byId('context-results').replaceChildren(); byId('context-manual').replaceChildren();
+    byId('context-manual').disabled = true; byId('context-add-manual').disabled = true;
+    findFeedback.textContent = '';
+  }
+  retireFind();
+  let selectionAction = null;
+  const selectionControls = () => {
+    byId('context-preview').disabled = selectionAction !== null;
+    byId('conversation-preview').disabled = selectionAction !== null;
+  };
+  const clearPreview = () => { selectionAction = null; selectionControls(); generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
   const run = async work => { try { byId('context-error').textContent = ''; await work(); } catch (error) { clearPreview(); byId('context-error').textContent = error.message; } };
+  async function selectPassage(work) {
+    clearPreview(); byId('context-error').textContent = '';
+    const action = selectionAction = { generation, epoch: viewEpoch };
+    const current = () => selectionAction === action && generation === action.generation && viewEpoch === action.epoch;
+    selectionControls(); byId('context-summary').textContent = 'Passage approval pending. Wait before previewing the package.';
+    try { await work(current); }
+    catch (error) {
+      if (!current()) return;
+      clearPreview(); byId('context-error').textContent = error.message;
+    } finally {
+      if (selectionAction === action) { selectionAction = null; selectionControls(); }
+    }
+  }
   const dependentOn = (item, key) => [item.associated, ...(item.associatedIds || [])].some(id => `capture:${id}` === key) || item.projectVersion !== undefined && `brief:${item.projectVersion}` === key;
   function revoke(item) { delete item.approval; delete item.approvedText; delete item.approvalLabel; }
   function add(source) {
@@ -134,8 +162,10 @@
       const proposal = () => { proposed.textContent = `${source.provenance}; ${source.approvalLabel || 'Explicitly shortened passage'}\n${editor.value}`; };
       proposal(); state.textContent = source.approval ? 'Shortening approved. Preview the complete package.' : 'Inspect the exact proposed outgoing selection, then approve it to use it in the package.';
       editor.oninput = () => { delete source.approval; delete source.approvedText; delete source.approvalLabel; state.textContent = 'Shortening needs explicit approval.'; proposal(); clearPreview(); };
-      approve.textContent = 'Approve shorter passage'; approve.onclick = () => run(async () => {
-        const approved = await window.companion['context-shorten']({ key: source.key, digest: source.digest, text: editor.value });
+      approve.textContent = 'Approve shorter passage'; approve.onclick = () => selectPassage(async current => {
+        const text = editor.value;
+        const approved = await window.companion['context-shorten']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, text });
+        if (!current() || !selections.includes(source) || editor.value !== text) return;
         source.approval = approved.approval; source.approvedText = approved.text; source.approvalLabel = 'Explicitly shortened passage'; state.textContent = 'Shortening approved. Preview the complete package.'; clearPreview();
       });
       const full = document.createElement('button'); full.textContent = 'Use full source'; full.onclick = () => { delete source.approval; delete source.approvedText; delete source.approvalLabel; selected(); clearPreview(); };
@@ -143,33 +173,58 @@
     }
   }
   async function find() {
-    clearPreview(); const result = await window.companion['context-find']({ question: byId('context-question').value }); all = result.all;
-    byId('context-results').replaceChildren(); byId('context-manual').replaceChildren(); byId('context-notes').replaceChildren();
-    byId('context-error').textContent = result.issues.join('\n');
-    for (const note of result.included) {
-      const row = document.createElement('p'), remove = document.createElement('button'); row.textContent = note.file; remove.textContent = 'Exclude note';
-      remove.onclick = () => run(async () => { await window.companion['context-exclude'](note.key); selections = selections.filter(source => source.key !== note.key); selected(); await find(); }); row.append(remove); byId('context-notes').append(row);
-    }
-    for (const source of all) { const option = document.createElement('option'); option.value = source.key; option.textContent = source.title; byId('context-manual').append(option); }
-    for (const source of result.matches) {
-      const article = document.createElement('article'), title = document.createElement('h3'), reason = document.createElement('p'), passage = document.createElement('pre'), button = document.createElement('button');
-      title.textContent = source.title; reason.textContent = `${source.reason}; ${source.provenance}`; passage.textContent = source.text; button.textContent = 'Add to context';
-      button.onclick = () => add(source); article.append(title, reason);
-      for (const match of source.passages || []) {
-        const row = document.createElement('div'), anchor = document.createElement('p'), excerpt = document.createElement('pre'), choose = document.createElement('button'); row.className = 'context-passage';
-        anchor.textContent = `Matching passage lines ${match.start}-${match.end}; Text match: ${match.matched.join(', ')}; source sha256 ${source.digest}`; excerpt.textContent = match.text; choose.textContent = 'Add passage';
-        choose.onclick = () => run(async () => { const approved = await window.companion['context-passage']({ key: source.key, digest: source.digest, start: match.start, end: match.end }); add({ ...source, approval: approved.approval, approvedText: approved.text, approvalLabel: approved.label }); });
-        row.append(anchor, excerpt, choose); article.append(row);
+    retireFind(); clearPreview();
+    const request = findGeneration, epoch = viewEpoch, question = byId('context-question').value;
+    const current = () => request === findGeneration && epoch === viewEpoch && question === byId('context-question').value;
+    byId('context-error').textContent = ''; byId('context-notes').replaceChildren();
+    findFeedback.textContent = 'Finding context\u2026';
+    try {
+      const result = await window.companion['context-find']({ question });
+      if (!current()) return;
+      all = result.all;
+      byId('context-error').textContent = result.issues.join('\n');
+      for (const note of result.included) {
+        const row = document.createElement('p'), remove = document.createElement('button'); row.textContent = note.file; remove.textContent = 'Exclude note';
+        remove.onclick = () => run(async () => { clearPreview(); await window.companion['context-exclude'](note.key); selections = selections.filter(source => source.key !== note.key); selected(); await find(); }); row.append(remove); byId('context-notes').append(row);
       }
-      const full = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Inspect full eligible source'; full.append(summary, passage); article.append(full, button); byId('context-results').append(article);
+      for (const source of all) { const option = document.createElement('option'); option.value = source.key; option.textContent = source.title; byId('context-manual').append(option); }
+      for (const source of result.matches) {
+        const article = document.createElement('article'), title = document.createElement('h3'), reason = document.createElement('p'), passage = document.createElement('pre'), button = document.createElement('button');
+        title.textContent = source.title; reason.textContent = `${source.reason}; ${source.provenance}`; passage.textContent = source.text; button.textContent = 'Add to context';
+        button.onclick = () => { if (current()) add(source); }; article.append(title, reason);
+        for (const match of source.passages || []) {
+          const row = document.createElement('div'), anchor = document.createElement('p'), excerpt = document.createElement('pre'), choose = document.createElement('button'); row.className = 'context-passage';
+          anchor.textContent = `Matching passage lines ${match.start}-${match.end}; Text match: ${match.matched.join(', ')}; source sha256 ${source.digest}`; excerpt.textContent = match.text; choose.textContent = 'Add passage';
+          choose.onclick = () => {
+            if (!current()) return;
+            return selectPassage(async owned => {
+              const approved = await window.companion['context-passage']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, start: match.start, end: match.end });
+              if (owned()) add({ ...source, approval: approved.approval, approvedText: approved.text, approvalLabel: approved.label });
+            });
+          };
+          row.append(anchor, excerpt, choose); article.append(row);
+        }
+        const full = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Inspect full eligible source'; full.append(summary, passage); article.append(full, button); byId('context-results').append(article);
+      }
+      if (!result.matches.length) byId('context-results').textContent = 'No Relevant Context. Try another search or add a source manually. Local text matching can miss differently worded relevant material.';
+      findFeedback.textContent = 'Context search complete.';
+    } catch (error) {
+      if (!current()) return;
+      byId('context-error').textContent = error.message;
+      findFeedback.textContent = 'Context search failed. Try Find context again.';
+    } finally {
+      if (current()) {
+        byId('context-manual').disabled = !all.length;
+        byId('context-add-manual').disabled = !all.length;
+      }
     }
-    if (!result.matches.length) byId('context-results').textContent = 'No Relevant Context. Try another search or add a source manually. Local text matching can miss differently worded relevant material.';
   }
-  byId('context-find').onclick = () => run(find);
-  byId('context-include').onclick = () => run(async () => { await window.companion['context-include'](); await find(); });
-  byId('context-add-manual').onclick = () => add(all.find(source => source.key === byId('context-manual').value));
-  byId('context-question').oninput = clearPreview;
+  byId('context-find').onclick = find;
+  byId('context-include').onclick = () => run(async () => { clearPreview(); await window.companion['context-include'](); await find(); });
+  byId('context-add-manual').onclick = () => { if (!byId('context-add-manual').disabled) add(all.find(source => source.key === byId('context-manual').value)); };
+  byId('context-question').oninput = () => { retireFind(); clearPreview(); };
   byId('context-preview').onclick = async () => {
+    if (selectionAction) return;
     clearPreview(); const request = generation; byId('context-error').textContent = '';
     const outdated = () => {
       if (request === generation) return false;
@@ -179,7 +234,7 @@
       return true;
     };
     try {
-      const preview = await window.companion['context-preview']({ question: byId('context-question').value, excludedSources: [...excluded], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})) });
+      const preview = await window.companion['context-preview']({ question: byId('context-question').value, excludedSources: [...excluded], selections: selections.map(({key,digest,approval,sourceGenerations}) => ({key,digest,...(sourceGenerations ? {sourceGenerations} : {}),...(approval ? {approval} : {})})) });
       if (outdated()) return;
       byId('context-package').value = preview.text;
       byId('context-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized: remove sources or explicitly shorten a selection.' : 'Within limit'} · Application cap: 32000. Serialized line endings: LF. ${preview.boundEvidence} Local preview only; chat readiness is separate. ${(preview.warnings || []).join(' ')}`;
@@ -190,7 +245,7 @@
   };
   byId('conversation-brief').oninput = invalidateConversation;
   byId('conversation-speculation').onchange = invalidateConversation;
-  const conversationInput = () => ({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval}) => ({key,digest,...(approval ? {approval} : {})})), historySelections: [...historySelections.values()].map(({conversationId,requestId,digest}) => ({conversationId,requestId,digest})) });
+  const conversationInput = () => ({ conversationId, briefVersion: Number(byId('conversation-brief').value), question: byId('context-question').value, speculation: byId('conversation-speculation').checked, excludedHistory: [...excludedHistory], restoreHistory: [...restoredHistory], excludedSources: [...excluded], restoreSources: [...restoredSources], selections: selections.map(({key,digest,approval,sourceGenerations}) => ({key,digest,...(sourceGenerations ? {sourceGenerations} : {}),...(approval ? {approval} : {})})), historySelections: [...historySelections.values()].map(({conversationId,requestId,digest}) => ({conversationId,requestId,digest})) });
   function selectedHistory() {
     byId('history-selected').replaceChildren();
     for (const [key, item] of historySelections) {
@@ -218,6 +273,7 @@
     } catch (error) { if (version === conversationGeneration) byId('history-search-status').textContent = error.message; }
   };
   byId('conversation-preview').onclick = async () => {
+    if (selectionAction) return;
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
       const preview = await window.companion['conversation-preview'](conversationInput());

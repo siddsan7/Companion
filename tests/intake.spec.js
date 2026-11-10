@@ -354,6 +354,7 @@ test('restored capture recovery preserves a backup recreated after its final own
   expect(await fs.readFile(path.join(intake, hold.evidence.find(item => item.role === 'independent-editor-writing').file), 'utf8')).toBe(recreated);
   expect((await fs.readdir(intake)).filter(name => name.endsWith('.detach.json'))).toEqual([]);
   await app.close(); app = null; await fs.unlink(path.join(root, 'faults.json')); await launch();
+  await expect(page.locator('#idea-support-status')).toHaveText('Current support inspected. Warnings do not change note ownership or independently verify claims.');
   const unrelated = await artifact('z-independent', '3'.repeat(32));
   const run = JSON.parse(await fs.readFile(path.join(unrelated, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
   await fs.writeFile(path.join(unrelated, 'run.json'), JSON.stringify(run));

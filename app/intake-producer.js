@@ -131,4 +131,4 @@ async function readDraft(folder) {
   const second = await read(); if (bytes.some((value, i) => !value.equals(second[i]))) fail('Producer files changed during admission. Retry after transfer completes.');
   return { sourceHash: run.input_sha256, identity: `${run.job_id}:${run.attempt_id}`, fingerprint: hash(Buffer.concat(bytes)), run, evidence: packet, target, text, locator: folder, humanReview: 'unreviewed', extraction: target.status, uncertainty: { channels: packet.channels, truncated: packet.truncated, uncertainEvidence: packet.evidence.filter(x => x.review_flag === 'uncertain').map(x => x.id), unknowns: target.unknowns, conflicts: target.conflicts } };
 }
-module.exports = { readDraft, hash, schema, validate, validateEvidence, render };
+module.exports = { readDraft, hash, schema, validate, validateEvidence, render, bound };

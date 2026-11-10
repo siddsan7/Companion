@@ -8,12 +8,280 @@ test.beforeEach(async () => {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
 });
 test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+async function settledStartup(window) {
+  // A new window starts with an empty status. This current-epoch completion
+  // follows its accepted base refresh and all initial saved-idea support reads.
+  await expect(window.locator('#idea-support-status')).toContainText('Current support inspected.');
+}
 async function launch(configure = true) {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
   if (configure) { await page.getByRole('button', { name: 'Choose vault' }).click(); await page.getByRole('button', { name: 'Use this folder' }).click(); await expect(page.getByRole('status')).toContainText('Vault ready.'); }
+  else await settledStartup(page);
 }
 async function capture(text) { await page.getByLabel('Thought or link', { exact: true }).fill(text); await page.getByRole('button', { name: 'Save capture', exact: true }).click(); await expect(page.getByLabel('Thought or link', { exact: true })).toHaveValue(''); await expect(page.getByRole('status')).toContainText('Capture saved.'); }
-async function search(question) { await page.getByLabel('Context question', { exact: true }).fill(question); await page.getByRole('button', { name: 'Find context', exact: true }).click(); }
+async function search(question) {
+  const completed = page.getByRole('region', { name: 'Context discovery', exact: true }).getByText('Context search complete.', { exact: true });
+  await page.getByLabel('Context question', { exact: true }).fill(question);
+  await expect(completed).toHaveCount(0);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(completed).toBeVisible();
+}
+test('a pending Find retires earlier context choices until current capture text is ready for explicit selection', async () => {
+  await launch(); await capture('FINDCOMPLETION earlier capture text.');
+  await search('FINDCOMPLETION');
+  const results = page.locator('#context-results');
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await expect(results.getByRole('button', { name: 'Add to context', exact: true })).toBeEnabled();
+  await expect(manual.locator('option')).toHaveText(['FINDCOMPLETION earlier capture text.']);
+  await expect(page.getByRole('button', { name: 'Add manual source', exact: true })).toBeEnabled();
+  const captures = path.join(root, 'vault', 'Companion', 'Captures');
+  const file = path.join(captures, (await fs.readdir(captures)).find(name => name.endsWith('.md')));
+  await fs.appendFile(file, '\nFINDCOMPLETION newly inspected capture text.\n');
+
+  // Hold delivery only after actual discovery has read the changed file.
+  // Preserve the real handler's result/error and call it once per invocation.
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed Find requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-find');
+    if (!original) throw Error('Context Find handler is unavailable.');
+    const gate = globalThis.__contextFindDelivery = { original, held: false, calls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-find', async function (...args) {
+      gate.calls++;
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true;
+      await delivery;
+      return result;
+    });
+  });
+  try {
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__contextFindDelivery.held)).toBe(true);
+    await expect(page.locator('#context-results button:enabled, #context-add-manual:enabled')).toHaveCount(0);
+    await expect(manual).toBeDisabled();
+    const discovery = page.getByRole('region', { name: 'Context discovery', exact: true });
+    await expect(discovery.getByText('Finding context…', { exact: true })).toBeVisible();
+    await expect(page.locator('#context-selected article')).toHaveCount(0);
+    await app.evaluate(() => globalThis.__contextFindDelivery.release());
+    await expect(discovery.getByText('Context search complete.', { exact: true })).toBeVisible();
+    await expect(results).toContainText('FINDCOMPLETION newly inspected capture text.');
+    await expect(manual).toBeEnabled();
+    await results.getByRole('button', { name: 'Add to context', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(/FINDCOMPLETION newly inspected capture text\./);
+    await expect(page.locator('#context-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__contextFindDelivery;
+      ipcMain._invokeHandlers.set('context-find', gate.original);
+      gate.release();
+      delete globalThis.__contextFindDelivery;
+    });
+  }
+});
+
+test('an older Find response cannot replace the results for the newer context question', async () => {
+  await launch();
+  await capture('OLDERQUESTION earlier capture text.');
+  await capture('NEWERQUESTION current capture text.');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed Find requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-find');
+    if (!original) throw Error('Context Find handler is unavailable.');
+    const gate = globalThis.__olderFindDelivery = { original, held: false, calls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-find', async function (...args) {
+      const first = ++gate.calls === 1;
+      const result = await Reflect.apply(original, this, args);
+      if (first) { gate.held = true; await delivery; }
+      return result;
+    });
+  });
+  try {
+    await page.evaluate(() => {
+      const button = document.getElementById('context-find');
+      const observation = window.__findOnclickSettlement = { original: button.onclick, calls: 0, first: null };
+      button.onclick = function (...args) {
+        const first = ++observation.calls === 1;
+        const returned = Reflect.apply(observation.original, this, args);
+        if (first) observation.first = returned;
+        return returned;
+      };
+    });
+    await page.getByLabel('Context question', { exact: true }).fill('OLDERQUESTION');
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__olderFindDelivery.held)).toBe(true);
+    await page.getByLabel('Context question', { exact: true }).fill('NEWERQUESTION');
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    const results = page.locator('#context-results');
+    await expect(results).toContainText('NEWERQUESTION current capture text.');
+    await expect(results).not.toContainText('OLDERQUESTION earlier capture text.');
+    await app.evaluate(() => globalThis.__olderFindDelivery.release());
+    // Await the first real renderer handler, including its publication/error/finally path.
+    await page.evaluate(() => window.__findOnclickSettlement.first);
+    await expect(page.getByLabel('Context question', { exact: true })).toHaveValue('NEWERQUESTION');
+    await expect(results).toContainText('NEWERQUESTION current capture text.');
+    await expect(results).not.toContainText('OLDERQUESTION earlier capture text.');
+    await expect(page.locator('#context-selected article')).toHaveCount(0);
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__olderFindDelivery;
+      ipcMain._invokeHandlers.set('context-find', gate.original); gate.release();
+      delete globalThis.__olderFindDelivery;
+    });
+    await page.evaluate(async () => {
+      const observation = window.__findOnclickSettlement;
+      if (observation) {
+        try { await observation.first; }
+        finally { document.getElementById('context-find').onclick = observation.original; delete window.__findOnclickSettlement; }
+      }
+    });
+  }
+});
+
+for (const outcome of ['success', 'error']) {
+  test(`an older Refresh ${outcome} cannot replace a newer saved capture or its status`, async () => {
+    await launch(); await capture('REFRESHOLDER earlier capture.');
+    const scheduleFile = path.join(root, 'schedule.json');
+    const scheduleBefore = await fs.readFile(scheduleFile).catch(error => { if (error.code !== 'ENOENT') throw error; return null; });
+    const restoreSchedule = async () => {
+      if (outcome !== 'error') return;
+      if (scheduleBefore === null) await fs.rm(scheduleFile, { force: true });
+      else await fs.writeFile(scheduleFile, scheduleBefore);
+    };
+    await app.evaluate(({ ipcMain }) => {
+      if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed Refresh requires the disposable fixture.');
+      const original = ipcMain._invokeHandlers.get('state');
+      if (!original) throw Error('State handler is unavailable.');
+      const gate = globalThis.__refreshDelivery = { original, held: false, error: null, calls: 0 };
+      const delivery = new Promise(resolve => { gate.release = resolve; });
+      ipcMain._invokeHandlers.set('state', async function (...args) {
+        const first = ++gate.calls === 1;
+        let result;
+        try { result = await Reflect.apply(original, this, args); }
+        catch (error) {
+          if (first) { gate.error = error.message; gate.held = true; await delivery; }
+          throw error;
+        }
+        if (first) { gate.held = true; await delivery; }
+        return result;
+      });
+    });
+    try {
+      await page.evaluate(() => {
+        const button = document.getElementById('refresh');
+        const observation = window.__refreshOnclickSettlement = { original: button.onclick, calls: 0, first: null };
+        button.onclick = function (...args) {
+          const first = ++observation.calls === 1;
+          const returned = Reflect.apply(observation.original, this, args);
+          if (first) observation.first = returned;
+          return returned;
+        };
+      });
+      // The error comes from Schedule.load's real JSON parse, never a fabricated IPC rejection.
+      if (outcome === 'error') await fs.writeFile(scheduleFile, '{');
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await expect.poll(() => app.evaluate(() => globalThis.__refreshDelivery.held)).toBe(true);
+      if (outcome === 'error') expect(await app.evaluate(() => globalThis.__refreshDelivery.error)).toBe('Daily intake settings are unreadable. Preserve them for repair.');
+      await restoreSchedule();
+      await capture('REFRESHNEWER newly saved capture.');
+      const captures = page.locator('#captures');
+      await expect(captures).toContainText('REFRESHNEWER newly saved capture.');
+      await expect(page.getByRole('status')).toHaveText('Capture saved.');
+      const folder = path.join(root, 'vault', 'Companion', 'Captures');
+      const names = (await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort();
+      const before = await Promise.all(names.map(name => fs.readFile(path.join(folder, name), 'utf8')));
+      await app.evaluate(() => globalThis.__refreshDelivery.release());
+      await page.evaluate(() => window.__refreshOnclickSettlement.first);
+      await expect(captures).toContainText('REFRESHNEWER newly saved capture.');
+      await expect(page.getByRole('status')).toHaveText('Capture saved.');
+      expect((await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort()).toEqual(names);
+      expect(await Promise.all(names.map(name => fs.readFile(path.join(folder, name), 'utf8')))).toEqual(before);
+    } finally {
+      await restoreSchedule();
+      await app.evaluate(({ ipcMain }) => {
+        const gate = globalThis.__refreshDelivery;
+        ipcMain._invokeHandlers.set('state', gate.original); gate.release();
+        delete globalThis.__refreshDelivery;
+      });
+      await page.evaluate(async () => {
+        const observation = window.__refreshOnclickSettlement;
+        if (observation) {
+          try { await observation.first; }
+          finally { document.getElementById('refresh').onclick = observation.original; delete window.__refreshOnclickSettlement; }
+        }
+      });
+    }
+  });
+}
+
+test('a failed Check refresh cannot replace a newer saved capture status when its error reports later', async () => {
+  await reviewBundle('accept'); await launch();
+  await page.getByLabel('Finalized review folder').fill(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  const settings = path.join(root, 'schedule.json');
+  const previous = await fs.readFile(settings).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  const restoreSettings = () => previous === null ? fs.rm(settings, { force: true }) : fs.writeFile(settings, previous);
+  await app.evaluate(({ ipcMain, app: mainApp }) => {
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const io = load('node:fs/promises'), paths = load('node:path');
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Check error control requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('check-intake');
+    const control = globalThis.__checkReporting = { original, calls: 0 };
+    ipcMain._invokeHandlers.set('check-intake', async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      if (++control.calls === 1) await io.writeFile(paths.join(process.env.COMPANION_TEST_ROOT, 'schedule.json'), '{');
+      return result;
+    });
+  });
+  await page.evaluate(() => {
+    const control = window.__checkReporting = { originalAction: window.action, originalCheck: document.getElementById('check-intake').onclick, inCheck: false, claimed: false, held: false };
+    control.wait = new Promise(resolve => { control.release = resolve; });
+    window.action = function (work, ...args) {
+      if (!control.inCheck || control.claimed) return Reflect.apply(control.originalAction, this, [work, ...args]);
+      control.claimed = true;
+      // Hold the genuine work rejection before the unchanged outer action reports it.
+      return Reflect.apply(control.originalAction, this, [async () => {
+        try { return await work(); }
+        catch (error) { control.error = error.message; control.held = true; await control.wait; throw error; }
+      }, ...args]);
+    };
+    document.getElementById('check-intake').onclick = function (...args) {
+      control.inCheck = true;
+      try { const returned = Reflect.apply(control.originalCheck, this, args); control.first = returned; return returned; }
+      finally { control.inCheck = false; }
+    };
+  });
+  try {
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => window.__checkReporting.held)).toBe(true);
+    expect(await page.evaluate(() => window.__checkReporting.error)).toContain('Daily intake settings are unreadable');
+    await restoreSettings();
+    await page.evaluate(() => { window.action = window.__checkReporting.originalAction; });
+    await capture('CHECKREPORT newer saved capture.');
+    await expect(page.locator('#captures')).toContainText('CHECKREPORT newer saved capture.');
+    const folder = path.join(root, 'vault', 'Companion', 'Captures');
+    const names = (await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort();
+    const bytes = await Promise.all(names.map(name => fs.readFile(path.join(folder, name))));
+    await page.evaluate(() => window.__checkReporting.release());
+    await page.evaluate(() => window.__checkReporting.first);
+    await expect(page.getByRole('status')).toHaveText('Capture saved.');
+    await expect(page.locator('#captures')).toContainText('CHECKREPORT newer saved capture.');
+    expect(await app.evaluate(() => globalThis.__checkReporting.calls)).toBe(1);
+    expect((await fs.readdir(folder)).filter(name => name.endsWith('.md')).sort()).toEqual(names);
+    expect(await Promise.all(names.map(name => fs.readFile(path.join(folder, name))))).toEqual(bytes);
+  } finally {
+    await restoreSettings();
+    await app.evaluate(({ ipcMain }) => { ipcMain._invokeHandlers.set('check-intake', globalThis.__checkReporting.original); delete globalThis.__checkReporting; });
+    await page.evaluate(async () => {
+      const control = window.__checkReporting; control.release();
+      try { await control.first; }
+      finally { window.action = control.originalAction; document.getElementById('check-intake').onclick = control.originalCheck; delete window.__checkReporting; }
+    });
+  }
+});
+
 test('local exact matches show reasons and manual selection previews the literal question and source provenance', async () => {
   await launch(); await capture('Spaced retrieval can revisit a learned chord.');
   await search('How can retrieval help MyTune?');
@@ -266,6 +534,81 @@ test('actual serialized package counts Unicode code points at 32000 and 32001 an
   await expect(page.locator('#context-summary')).toContainText('Application cap: 32000');
 });
 
+test('editing a shorter passage keeps the new text unapproved when an older approval arrives', async () => {
+  await launch();
+  const text = '# Shortening notes\n\nEDITSHORT older supported sentence.\nEDITSHORT newly selected sentence.\n\nSurrounding source material.\n';
+  const file = path.join(root, 'vault', 'shortening.md'); await fs.writeFile(file, text);
+  await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([file]));
+  await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+  await expect(page.locator('#context-notes')).toContainText(file);
+  await page.getByLabel('Context question', { exact: true }).fill('EDITSHORT');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const results = page.locator('#context-results');
+  await expect(results).toContainText('EDITSHORT older supported sentence.');
+  await results.getByRole('button', { name: 'Add to context', exact: true }).click();
+  const selected = page.locator('#context-selected');
+  const editor = selected.getByLabel('Shorter passage', { exact: true });
+  await editor.fill('EDITSHORT older supported sentence.');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed shortening requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-shorten');
+    if (!original) throw Error('Context shortening handler is unavailable.');
+    const gate = globalThis.__shorteningDelivery = { original, held: false, calls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-shorten', async function (...args) {
+      const first = ++gate.calls === 1;
+      const result = await Reflect.apply(original, this, args);
+      if (first) { gate.held = true; await delivery; }
+      return result;
+    });
+  });
+  try {
+    await page.evaluate(() => {
+      const button = [...document.querySelectorAll('#context-selected button')].find(node => node.textContent === 'Approve shorter passage');
+      const observation = window.__shorteningOnclickSettlement = { button, original: button.onclick, calls: 0, first: null };
+      button.onclick = function (...args) {
+        const first = ++observation.calls === 1;
+        const returned = Reflect.apply(observation.original, this, args);
+        if (first) observation.first = returned;
+        return returned;
+      };
+    });
+    await selected.getByRole('button', { name: 'Approve shorter passage', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__shorteningDelivery.held)).toBe(true);
+    await editor.fill('EDITSHORT newly selected sentence.');
+    await expect(selected).toContainText('Shortening needs explicit approval.');
+    await app.evaluate(() => globalThis.__shorteningDelivery.release());
+    await page.evaluate(() => window.__shorteningOnclickSettlement.first);
+    await expect(editor).toHaveValue('EDITSHORT newly selected sentence.');
+    await expect(selected).toContainText('Shortening needs explicit approval.');
+    await expect(selected).not.toContainText('Shortening approved.');
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    const preview = page.getByLabel('Actual context package', { exact: true });
+    await expect(preview).toHaveValue(/Surrounding source material\./);
+    await expect(preview).not.toHaveValue(/Explicitly shortened passage/);
+    await selected.getByRole('button', { name: 'Approve shorter passage', exact: true }).click();
+    await expect(selected).toContainText('Shortening approved.');
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    const sha = require('node:crypto').createHash('sha256').update(text).digest('hex');
+    const expected = `Question:\nEDITSHORT\n\nSources:\nExplicit vault note shortening.md; sha256 ${sha}; user selected; not independently verified; Explicitly shortened passage\nEDITSHORT newly selected sentence.`;
+    await expect(preview).toHaveValue(expected);
+    await expect(page.locator('#context-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__shorteningDelivery;
+      ipcMain._invokeHandlers.set('context-shorten', gate.original); gate.release();
+      delete globalThis.__shorteningDelivery;
+    });
+    await page.evaluate(async () => {
+      const observation = window.__shorteningOnclickSettlement;
+      if (observation) {
+        try { await observation.first; }
+        finally { observation.button.onclick = observation.original; delete window.__shorteningOnclickSettlement; }
+      }
+    });
+  }
+});
+
 test('oversized selections stay intact until the inspected shorter passage is explicitly approved and source changes revoke approval', async () => {
   test.setTimeout(60000);
   await launch(); await capture('Long excerpt:\n' + 'x'.repeat(32000) + '\nFinal supported sentence.');
@@ -292,6 +635,56 @@ test('oversized selections stay intact until the inspected shorter passage is ex
   await page.getByRole('button', { name: 'Preview context', exact: true }).click();
   await expect(page.locator('#context-error')).toContainText('changed or is unavailable');
   await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue('');
+});
+
+test('pending passage approval keeps both previews unavailable until the inspected passage is selected', async () => {
+  await launch();
+  const text = '# Field notes\n\nUnrelated opening material.\n\nSpaced retrieval revisits a learned chord.\nA short practice check measures recall.\n\nUnrelated closing material.\n';
+  const file = path.join(root, 'vault', 'field.md'); await fs.writeFile(file, text);
+  await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([file]));
+  await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+  await search('retrieval recall');
+  const passage = page.locator('#context-results .context-passage').first();
+  await expect(passage).toContainText('lines 5-6');
+  await expect(passage).toContainText('Spaced retrieval revisits a learned chord.');
+  await expect(passage).toContainText('A short practice check measures recall.');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed passage requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-passage');
+    if (!original) throw Error('Context passage handler is unavailable.');
+    const gate = globalThis.__contextPassageDelivery = { original, held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-passage', async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true;
+      await delivery;
+      return result;
+    });
+  });
+  try {
+    await passage.getByRole('button', { name: 'Add passage', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__contextPassageDelivery.held)).toBe(true);
+    await expect(page.getByRole('button', { name: 'Preview context', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Preview conversation', exact: true })).toBeDisabled();
+    await expect(page.locator('#context-selected article')).toHaveCount(0);
+    await app.evaluate(() => globalThis.__contextPassageDelivery.release());
+    await expect(page.locator('#context-selected').getByLabel('Shorter passage', { exact: true })).toHaveValue('Spaced retrieval revisits a learned chord.\nA short practice check measures recall.');
+    await expect(page.locator('#context-selected')).toContainText('Explicit passage lines 5-6');
+    await expect(page.getByRole('button', { name: 'Preview context', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Preview conversation', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    const sha = require('node:crypto').createHash('sha256').update(text).digest('hex');
+    const expected = `Question:\nretrieval recall\n\nSources:\nExplicit vault note field.md; sha256 ${sha}; user selected; not independently verified; Explicit passage lines 5-6\nSpaced retrieval revisits a learned chord.\nA short practice check measures recall.`;
+    await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(expected);
+    await expect(page.locator('#context-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__contextPassageDelivery;
+      ipcMain._invokeHandlers.set('context-passage', gate.original);
+      gate.release();
+      delete globalThis.__contextPassageDelivery;
+    });
+  }
 });
 
 test('ranked matching paragraphs expose exact line anchors and explicit passage selection preserves the inspected text', async () => {
@@ -382,6 +775,7 @@ test('two desktop instances preserve an explicit scope exclusion during an overl
   const secondApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   try {
     const second = await secondApp.firstWindow();
+    await settledStartup(second);
     await second.getByLabel('Context question', { exact: true }).fill('BASESCOPECANARY');
     await second.getByRole('button', { name: 'Find context', exact: true }).click();
     await expect(second.locator('#context-notes')).toContainText(base);

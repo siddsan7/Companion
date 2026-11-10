@@ -12,6 +12,8 @@ const { installArchives } = require('./archives');
 const { installIdeas } = require('./ideas');
 const { installTranscripts } = require('./transcripts');
 const { installComparisons } = require('./comparisons');
+const { installCaptureDeletion } = require('./capture-deletion');
+const { installAnnotationRemoval } = require('./annotation-removal');
 const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
 let codex, conversationProvider;
@@ -96,24 +98,34 @@ app.whenReady().then(async () => {
   installBriefs({ ipcMain, dialog, fs, path, testRoot, getVault: () => vault, clock });
   const evidence = new ConversationEvidence({ setup: codex, getVault: () => vault, settingsPath, testRoot });
   const getEvidence = () => evidence.read();
-  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData'), getEvidence });
+  let ideas;
+  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData'), getEvidence, ideaEligibility: (selected, id) => {
+    if (!ideas || ideas.getVault()?.root !== selected.root) throw Error('Selected vault changed. Inspect saved idea context again.');
+    ideas.guard(selected);
+    if (id) ideas.removal.allow(selected, id);
+  } });
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
   const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
+  installCaptureDeletion({ ipcMain, getVault: () => vault, conversations, clearApprovals: context.clearApprovals, clock });
+  installAnnotationRemoval({ ipcMain, getVault: () => vault, clearApprovals: context.clearApprovals });
   installTranscripts({ ipcMain, conversations, getVault: () => vault, getContext: context.store, clock, checkpoint, choose: async selected => {
     const selection = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'transcript-selection.json'), 'utf8')) : await dialog.showSaveDialog({ title: 'Export readable conversation transcript', defaultPath: path.join(selected.vault, 'Conversation transcript.md'), filters: [{ name: 'Markdown transcript', extensions: ['md'] }] });
     return selection.canceled ? null : selection.filePath;
   } });
   installArchives({ ipcMain, history: conversations, settingsPath, dialog, testRoot, clock, checkpoint, appVersion: app.getVersion(), invalidateContextApprovals: context.clearApprovals, getSchedule: () => new Schedule(path.join(conversations.dataRoot, 'schedule.json'), vault, scheduleOptions()) });
-  installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
+  ideas = installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
   installComparisons({ ipcMain, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, getEvidence });
-  const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
+  const fixtureRendering = testRoot ? { backgroundThrottling: false } : {};
+  const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { ...fixtureRendering, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
   await window.loadFile(path.join(__dirname, 'index.html'));
+  // Give disposable desktop fixtures normal frame cadence without taking focus.
+  if (testRoot) window.showInactive();
 });
 app.on('before-quit', () => { codex?.close(); conversationProvider?.close(); });
 app.on('window-all-closed', () => app.quit());

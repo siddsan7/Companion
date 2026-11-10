@@ -1,9 +1,24 @@
 (() => {
-  const view = document.getElementById('brief-view'); let state;
+  const view = document.getElementById('brief-view');
+  let actionEpoch = 0, readEpoch = 0, busy = false, configuring = false, configurationReadPending = false, approvalRetired = false, displayedProposal = null;
+  const actionButtons = ['brief-readme', 'brief-add', 'brief-propose', 'brief-check'].map(id => document.getElementById(id));
   function element(tag, text) { const e = document.createElement(tag); e.textContent = text; return e; }
-  async function act(work) {
-    try { await work(); }
-    catch (error) { document.getElementById('brief-error').textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+  const showError = error => { document.getElementById('brief-error').textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); };
+  function controls() {
+    actionButtons.forEach(button => { button.disabled = busy || configuring; });
+    if (displayedProposal) displayedProposal.approve.disabled = busy || configuring || approvalRetired;
+  }
+  async function change(work, { retire = false, renew = false } = {}) {
+    if (busy || configuring) return;
+    const owner = ++actionEpoch; readEpoch++; busy = true; configurationReadPending = false;
+    if (retire) approvalRetired = true;
+    document.getElementById('brief-error').textContent = ''; controls();
+    try {
+      await work();
+      if (owner !== actionEpoch) return;
+      if (await refresh(owner, true) && owner === actionEpoch && renew) approvalRetired = false;
+    } catch (error) { if (owner === actionEpoch) showError(error); }
+    finally { if (owner === actionEpoch) { busy = false; controls(); } }
   }
   function showRecord(record, target, edit) {
     const sourceDetails = document.createElement('details');
@@ -37,8 +52,20 @@
     }
     target.append(sourceDetails);
   }
-  async function refresh() {
-    state = await window.companion['brief-state'](); view.replaceChildren();
+  async function refresh(owner = actionEpoch, duringAction = false) {
+    if (configuring || busy && !duringAction) return false;
+    const read = ++readEpoch;
+    let state;
+    try { state = await window.companion['brief-state'](); }
+    catch (error) { if (owner === actionEpoch && read === readEpoch && !configuring) showError(error); return false; }
+    if (owner !== actionEpoch || read !== readEpoch || configuring) return false;
+    if (configurationReadPending) { approvalRetired = Boolean(state.failure); configurationReadPending = false; }
+    else if (state.failure) approvalRetired = true;
+    const location = document.getElementById('location').textContent;
+    const prior = displayedProposal;
+    const edits = prior && prior.location === location && prior.record.id === state.proposed?.id && prior.record.digest === state.proposed.digest
+      ? { sections: [...prior.node.querySelectorAll('textarea')].map(e => e.value), references: [...prior.node.querySelectorAll('input[data-references]')].map(e => e.value) } : null;
+    displayedProposal = null; view.replaceChildren();
     view.append(element('p', 'Offline source extraction. Review every section and its passages. Edits are user writing, not independent verification. A section needs passage references or an explicit Gap:. No Codex setup required.'));
     view.append(element('p', `Selected documents: ${state.selected.join('; ') || 'none'}`));
     view.append(element('p', state.approved.length ? `Approved version ${state.approved[0].version} available for pinning by conversations.` : 'No approved brief'));
@@ -46,13 +73,20 @@
     if (state.issues.length) view.append(element('p', `Outdated approved brief. ${state.issues.join(' ')} Propose a refresh, or continue inspecting the preserved version.`));
     if (state.proposalIssues.length) view.append(element('p', `Refresh approval blocked. ${state.proposalIssues.join(' ')}`));
     if (state.proposed) {
+      const record = state.proposed;
       const proposed = document.createElement('article'); proposed.id = 'brief-proposal';
-      proposed.append(element('h3', 'Proposed brief')); showRecord(state.proposed, proposed, true);
+      proposed.append(element('h3', 'Proposed brief')); showRecord(record, proposed, true);
+      if (edits) {
+        [...proposed.querySelectorAll('textarea')].forEach((input, index) => { input.value = edits.sections[index]; });
+        [...proposed.querySelectorAll('input[data-references]')].forEach((input, index) => { input.value = edits.references[index]; });
+      }
       const approve = element('button', 'Approve proposed brief');
-      approve.onclick = () => act(async () => {
-        await window.companion['brief-approve']({ id: state.proposed.id, digest: state.proposed.digest, sections: [...proposed.querySelectorAll('textarea')].map(e => e.value), references: [...proposed.querySelectorAll('input[data-references]')].map(e => e.value) });
-        await refresh();
-      });
+      approve.onclick = () => {
+        if (busy || configuring || approvalRetired || displayedProposal?.node !== proposed) return;
+        const input = { id: record.id, digest: record.digest, sections: [...proposed.querySelectorAll('textarea')].map(e => e.value), references: [...proposed.querySelectorAll('input[data-references]')].map(e => e.value) };
+        return change(() => window.companion['brief-approve'](input));
+      };
+      displayedProposal = { node: proposed, record, approve, location };
       proposed.append(approve); view.append(proposed);
     }
     for (const record of state.approved) {
@@ -60,11 +94,20 @@
       details.append(element('summary', `Approved version ${record.version} | pin ${record.version}`));
       showRecord(record, details, false); view.append(details);
     }
+    controls(); return true;
   }
-  document.getElementById('brief-readme').onclick = () => act(async () => { await window.companion['brief-select']('readme'); await refresh(); });
-  document.getElementById('brief-add').onclick = () => act(async () => { await window.companion['brief-select']('additional'); await refresh(); });
-  document.getElementById('brief-propose').onclick = () => act(async () => { document.getElementById('brief-error').textContent = ''; await window.companion['brief-propose'](); await refresh(); });
-  document.getElementById('brief-check').onclick = () => act(refresh);
-  document.getElementById('configure').addEventListener('click', () => setTimeout(() => act(refresh), 150));
-  window.addEventListener('focus', () => act(refresh)); act(refresh);
+  document.getElementById('brief-readme').onclick = () => change(() => window.companion['brief-select']('readme'), { retire: true });
+  document.getElementById('brief-add').onclick = () => change(() => window.companion['brief-select']('additional'), { retire: true });
+  document.getElementById('brief-propose').onclick = () => change(() => window.companion['brief-propose'](), { retire: true, renew: true });
+  document.getElementById('brief-check').onclick = () => refresh();
+  document.getElementById('configure').addEventListener('click', () => {
+    actionEpoch++; readEpoch++; busy = false; configuring = true; configurationReadPending = true; approvalRetired = true; controls();
+    setTimeout(() => refresh(), 150);
+  });
+  window.addEventListener('companion-vault-configured', async () => {
+    configuring = false; busy = true; const owner = actionEpoch; controls();
+    await refresh(owner, true);
+    if (owner === actionEpoch) { busy = false; controls(); }
+  });
+  window.addEventListener('focus', () => refresh()); refresh();
 })();

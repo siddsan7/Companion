@@ -23,9 +23,10 @@ async function bundle(name = 'accept') {
   await fs.cp(path.join(__dirname, 'fixtures/reel-review', name), dir, { recursive: true });
   return dir;
 }
-async function launch() {
+async function launch(settledStartup = false) {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+  if (settledStartup) await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
 }
 async function setup() {
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
@@ -65,7 +66,7 @@ test('portable finalized acceptance retains actual review findings and immutable
   await expect(inspection).toContainText('Acceptance does not verify every claim');
   const before = await snapshots(); expect(before).toHaveLength(1);
   expect(before[0].review.decision).toBe('accept'); expect(before[0].supportEligible).toBe(true);
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch(true); await check();
   expect(await snapshots()).toEqual(before);
   await expect(page.locator('#held-imports')).toHaveText('No held imports.');
 });
@@ -109,7 +110,7 @@ test('competing reviewed successors preserve current content until an explicit d
   expect(await captureText()).toContain('human_review: "edit"');
   expect(await snapshots()).toHaveLength(2);
   expect((await snapshots()).find(x => x.id === firstSnapshots[0].id)).toEqual(firstSnapshots[0]);
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch(true); await check();
   expect(await captureText()).toContain('human_review: "edit"');
   await expect(page.locator('#held-imports')).toHaveText('No held imports.');
   await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
@@ -144,7 +145,7 @@ test('rejection without a first-pass target remains inspectable and excluded fro
   await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Source connected'); await check();
   expect(await snapshots()).toHaveLength(2); expect(await captureText()).toContain('human_review: "reject"');
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch(true); await check();
   const ledger = JSON.parse(await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8'));
   expect(Object.values(ledger.captures)[0].supportEligible).toBe(false);
   expect(Object.values(ledger.captures)[0].rejected).toBe(true);
@@ -255,7 +256,7 @@ test('one producer root can connect drafts and finalized reviews without losing 
   expect(await snapshots()).toHaveLength(2);
   expect(await captureText()).toContain('human_review: "accept"'); expect(await captureText()).toContain(capturedAt);
   await expect(page.locator('#captures article')).toHaveCount(1);
-  await app.close(); app = null; await launch(); await check();
+  await app.close(); app = null; await launch(true); await check();
   expect(await snapshots()).toHaveLength(2);
   await expect(page.locator('#intake-state')).toContainText('Drafts:');
   await expect(page.locator('#intake-state')).toContainText('Finalized reviews:');
