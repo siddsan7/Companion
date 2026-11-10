@@ -184,7 +184,7 @@ test('deleting persistent detached editor writing retains one whole local annota
   // Observe the native filesystem boundary before the FIRST source-origin unlink.
   // This test instrumentation does not fabricate a receipt or change product authority.
   await app.evaluate(({ }, { targets, marker, release }) => {
-    const nativeFs = require('node:fs/promises'), nativeUnlink = nativeFs.unlink;
+    const nativeFs = process.getBuiltinModule('fs').promises, nativeUnlink = nativeFs.unlink;
     let observed = false;
     nativeFs.unlink = async function(file, ...args) {
       if (!observed && targets.includes(String(file))) {
