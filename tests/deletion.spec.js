@@ -746,8 +746,7 @@ test('completed reviewed Make current deletion inventories actual selection copi
   expect(await files(producer)).toEqual(producerBytes);
 });
 
-test('interrupted reviewed Make current deletion inventories the actual accepted selection transaction without new acceptance', async ({}, testInfo) => {
-  test.setTimeout(150000);
+async function heldReviewedSelection(testInfo) {
   const producer = path.join(root, 'producer');
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
   await launch();
@@ -821,6 +820,12 @@ test('interrupted reviewed Make current deletion inventories the actual accepted
   expect(held.captures[sourceHash].selectionHistory).toEqual(retainedCapture.selectionHistory);
   expect((await fs.readdir(intake)).sort()).toEqual(['ledger.json', path.basename(archive), path.basename(stage), path.basename(snapshotStage), path.basename(backup)].sort());
   expect(await files(producer)).toEqual(producerBytes);
+  return { producer, producerBytes, sourceHash, base, ledgerFile, capture, retained, retainedCapture, archive, tx, targets, check };
+}
+
+test('interrupted reviewed Make current deletion inventories the actual accepted selection transaction without new acceptance', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const { producer, producerBytes, sourceHash, base, ledgerFile, capture, retained, retainedCapture, targets, check } = await heldReviewedSelection(testInfo);
   const before = await files(base), preview = page.getByLabel('Capture deletion preview');
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await expect(preview).toBeVisible();
@@ -852,6 +857,46 @@ test('interrupted reviewed Make current deletion inventories the actual accepted
   expect(restarted.captures[sourceHash].selectionHistory).toEqual(retainedCapture.selectionHistory);
   for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   expect(await files(producer)).toEqual(producerBytes);
+});
+
+test('interrupted reviewed selection deletion holds a known-shape journal with a contradictory history transition', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const selected = await heldReviewedSelection(testInfo);
+  await app.close(); app = null;
+  const { archive, tx, base, ledgerFile, capture, retained, retainedCapture, targets, producer, producerBytes, sourceHash } = selected;
+  const before = await files(base), identity = async file => { const stat = await fs.lstat(file); expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); return [stat.dev, stat.ino, stat.nlink]; };
+  const identities = await Promise.all(targets.map(identity)), altered = JSON.parse(await fs.readFile(archive, 'utf8'));
+  expect(altered).toEqual(tx); expect(altered.capture.currentRevision).not.toBe(retainedCapture.currentRevision);
+  expect(altered.capture.selectionHistory.at(-1).revision).toBe(altered.revision.id);
+  // Controlled post-exit edit: use actual admitted A, with selected B and all source bytes unchanged.
+  altered.capture.selectionHistory.at(-1).revision = retainedCapture.currentRevision;
+  expect(retainedCapture.revisions).toContain(altered.capture.selectionHistory.at(-1).revision);
+  const restoredHistory = JSON.parse(JSON.stringify(altered));
+  restoredHistory.capture.selectionHistory.at(-1).revision = tx.revision.id;
+  expect(restoredHistory).toEqual(tx);
+  const { Intake } = require('../app/intake'), intake = new Intake({ root: base, vault: path.join(root, 'vault') });
+  expect(() => intake.validateTransaction(altered)).not.toThrow();
+  expect(altered.content).toBe(tx.content); expect(altered.previous).toBe(tx.previous);
+  expect(altered.capture.currentHash).toBe(createHash('sha256').update(altered.content).digest('hex'));
+  const changedBytes = Buffer.from(JSON.stringify(altered)), relative = path.relative(base, archive).split(path.sep).join('/');
+  await fs.writeFile(archive, changedBytes);
+  expect(await Promise.all(targets.map(identity))).toEqual(identities);
+  const edited = await files(base);
+  for (const [name, bytes] of Object.entries(before)) if (name !== relative) expect(edited[name]).toBe(bytes);
+  expect(await fs.readFile(archive)).toEqual(changedBytes); expect(await files(producer)).toEqual(producerBytes);
+  await fs.writeFile(testInfo.outputPath('interrupted-selection-history-guard-observation.json'), JSON.stringify({ description: 'Controlled canonical journal edit after the actual archived selection conflict, not writer output. Only the last intended history revision changed from selected B to actual accepted current A; Intake.validateTransaction still accepts all general shape/render/hash checks.', changedFile: relative, selectedRevision: tx.revision.id, contradictoryHistoryRevision: retainedCapture.currentRevision, literalSha256: createHash('sha256').update(changedBytes).digest('hex'), identities }, null, 2));
+  await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1); expect(await files(base)).toEqual(edited);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source recovery inventory');
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(base)).toEqual(edited); expect(await Promise.all(targets.map(identity))).toEqual(identities);
+  const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(held.sourceAuthority).toBeUndefined(); expect(held.suppressed || []).not.toContain(sourceHash);
+  expect(held.attempts).toEqual(retained.attempts); expect(held.admissions).toEqual(retained.admissions);
+  expect(held.captures[sourceHash].currentRevision).toBe(retainedCapture.currentRevision);
+  expect(held.captures[sourceHash].selectionHistory).toEqual(retainedCapture.selectionHistory);
+  expect(held.captures[sourceHash].id).toBe(capture.id); expect(await files(producer)).toEqual(producerBytes);
 });
 
 test('completed imported title deletion reviews its three source files and binds the original admitted generation without replay', async () => {
