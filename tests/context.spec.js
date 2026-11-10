@@ -8,9 +8,15 @@ test.beforeEach(async () => {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
 });
 test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+async function settledStartup(window) {
+  // A new window starts with an empty status. This current-epoch completion
+  // follows its accepted base refresh and all initial saved-idea support reads.
+  await expect(window.locator('#idea-support-status')).toContainText('Current support inspected.');
+}
 async function launch(configure = true) {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
   if (configure) { await page.getByRole('button', { name: 'Choose vault' }).click(); await page.getByRole('button', { name: 'Use this folder' }).click(); await expect(page.getByRole('status')).toContainText('Vault ready.'); }
+  else await settledStartup(page);
 }
 async function capture(text) { await page.getByLabel('Thought or link', { exact: true }).fill(text); await page.getByRole('button', { name: 'Save capture', exact: true }).click(); await expect(page.getByLabel('Thought or link', { exact: true })).toHaveValue(''); await expect(page.getByRole('status')).toContainText('Capture saved.'); }
 async function search(question) { await page.getByLabel('Context question', { exact: true }).fill(question); await page.getByRole('button', { name: 'Find context', exact: true }).click(); }
@@ -382,6 +388,7 @@ test('two desktop instances preserve an explicit scope exclusion during an overl
   const secondApp = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   try {
     const second = await secondApp.firstWindow();
+    await settledStartup(second);
     await second.getByLabel('Context question', { exact: true }).fill('BASESCOPECANARY');
     await second.getByRole('button', { name: 'Find context', exact: true }).click();
     await expect(second.locator('#context-notes')).toContainText(base);
