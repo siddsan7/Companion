@@ -204,9 +204,11 @@ function install(Intake, { hash, read, noteText }) {
     });
   };
   Intake.prototype.annotations = async function (captureId) {
-    const ledger = await this.load();
+    // Keep this read's authority separate from an outer writer's CAS baseline.
+    const reader = new Intake(this.vault), ledger = await reader.load(), observed = reader.storage.expected;
     const notes = (await this.vault.scan({ annotations: true })).filter(note => (!captureId || note.captureId === captureId) && !annotationRemoved(ledger, note.id));
     for (const note of notes) await this.ownedFile(note.file, [], 'Annotation');
+    if (!reader.storage.matches(await reader.storage.view(), observed)) throw Error('Intake ledger changed during the annotation read. Retry context discovery against the current authority.');
     return notes;
   };
   const inspect = Intake.prototype.inspect;
