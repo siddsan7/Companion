@@ -502,6 +502,20 @@ test('standalone annotation removal after source deletion excludes private fixtu
     const bytes = Buffer.from(`---\ncompanion_id: ${JSON.stringify(id)}\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ${JSON.stringify(selected.metadata.capture_id)}\n---\n\n# Synthetic private fixture\n\n${sentinel} retained private writing.\n`, 'utf8');
     await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, bytes); privateNotes.push({ file, bytes, id, sentinel });
   }
+  await expect(page.locator('#context-manual option')).toHaveCount(0);
+  await page.getByLabel('Context question', { exact: true }).fill('SELECTSOURCEGONE PRIVATECODEXANNOTATIONCANARY PRIVATEMANAGEDANNOTATIONCANARY');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-manual option').filter({ hasText: selected.metadata.companion_id })).toHaveCount(1);
+  await expect(page.locator('#context-results')).toContainText('SELECTSOURCEGONE');
+  for (const note of privateNotes) {
+    await expect(page.locator('#context-manual option').filter({ hasText: note.id })).toHaveCount(0);
+    await expect(page.locator('#context-results')).not.toContainText(note.sentinel);
+    await expect(page.locator('#context-results')).not.toContainText(note.id);
+    expect(await fs.readFile(note.file)).toEqual(note.bytes);
+  }
+  await expect(page.getByLabel('Vault repairs')).not.toContainText('private-annotation.md');
+  await expect(page.getByLabel('Vault repairs')).not.toContainText('Annotation relationship paused');
+  expect(Object.keys(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).linkHolds || {})).toHaveLength(0);
   const producer = await files(path.join(root, 'producer'));
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
