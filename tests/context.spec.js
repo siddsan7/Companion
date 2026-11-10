@@ -363,6 +363,56 @@ test('oversized selections stay intact until the inspected shorter passage is ex
   await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue('');
 });
 
+test('pending passage approval keeps both previews unavailable until the inspected passage is selected', async () => {
+  await launch();
+  const text = '# Field notes\n\nUnrelated opening material.\n\nSpaced retrieval revisits a learned chord.\nA short practice check measures recall.\n\nUnrelated closing material.\n';
+  const file = path.join(root, 'vault', 'field.md'); await fs.writeFile(file, text);
+  await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([file]));
+  await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+  await search('retrieval recall');
+  const passage = page.locator('#context-results .context-passage').first();
+  await expect(passage).toContainText('lines 5-6');
+  await expect(passage).toContainText('Spaced retrieval revisits a learned chord.');
+  await expect(passage).toContainText('A short practice check measures recall.');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed passage requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-passage');
+    if (!original) throw Error('Context passage handler is unavailable.');
+    const gate = globalThis.__contextPassageDelivery = { original, held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-passage', async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true;
+      await delivery;
+      return result;
+    });
+  });
+  try {
+    await passage.getByRole('button', { name: 'Add passage', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__contextPassageDelivery.held)).toBe(true);
+    await expect(page.getByRole('button', { name: 'Preview context', exact: true })).toBeDisabled();
+    await expect(page.getByRole('button', { name: 'Preview conversation', exact: true })).toBeDisabled();
+    await expect(page.locator('#context-selected article')).toHaveCount(0);
+    await app.evaluate(() => globalThis.__contextPassageDelivery.release());
+    await expect(page.locator('#context-selected').getByLabel('Shorter passage', { exact: true })).toHaveValue('Spaced retrieval revisits a learned chord.\nA short practice check measures recall.');
+    await expect(page.locator('#context-selected')).toContainText('Explicit passage lines 5-6');
+    await expect(page.getByRole('button', { name: 'Preview context', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Preview conversation', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    const sha = require('node:crypto').createHash('sha256').update(text).digest('hex');
+    const expected = `Question:\nretrieval recall\n\nSources:\nExplicit vault note field.md; sha256 ${sha}; user selected; not independently verified; Explicit passage lines 5-6\nSpaced retrieval revisits a learned chord.\nA short practice check measures recall.`;
+    await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(expected);
+    await expect(page.locator('#context-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__contextPassageDelivery;
+      ipcMain._invokeHandlers.set('context-passage', gate.original);
+      gate.release();
+      delete globalThis.__contextPassageDelivery;
+    });
+  }
+});
+
 test('ranked matching paragraphs expose exact line anchors and explicit passage selection preserves the inspected text', async () => {
   await launch();
   const text = '# Field notes\r\n\r\nUnrelated opening material.\r\n\r\nSpaced retrieval revisits a learned chord.\r\nA short practice check measures recall.\r\n\r\nUnrelated closing material.\r\n';
