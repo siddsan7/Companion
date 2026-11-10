@@ -21,6 +21,7 @@ function text(bytes) {
 // Pure shape checks for the content-free proof committed before any unlink.
 // Recovery verifies its surviving exact leaves; it does not need a removed journal.
 function validateInventory(value, id) {
+  if (value.inventoryVersion === 1) return require('./manual-title').validate(value, id);
   if (value.inventoryVersion === undefined) {
     if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
     return;
