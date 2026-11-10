@@ -1,91 +1,94 @@
-# Ticket 13: first mixed retained-writing tracer
+# Ticket 13: kept-current mixed retention verification
 
-Status: root measured actual first feature RED below. Syntax passed; product source remains unchanged at e527b9c. No passing behavior, review approval or ticket completion is claimed.
+The bounded kept-current repair flow and its material guards have passed. The schema correction has independent approval. The lifecycle test passed without a product change. Primary/editor composition with the 141-case gate, final Standards/Spec review, and final merge remain open. This report does not claim ticket completion or live readiness.
 
-Run from this worktree with the existing project dependencies:
+Earlier “pending,” “syntax only,” and “not authored” statements are superseded by the measured results below. All failed runs remain part of the record. Source failures and test-observer failures are distinguished explicitly.
+
+## Scope and measured behavior
+
+The fixture uses the real finalized-review importer, public transfer and deletion UI, persisted vault files, existing fault/checkpoint controls, and actual Electron main/wrapper exits. It imports accepted A, appends whole local version Y, then imports distinct same-source B into a conflict. Transfer proposes different annotation X. The real writer publishes a repair intent; after actual main exit, restart with `kept-current-read` EACCES archives the held repair before annotation publication. Removing the fault does not replay transfer or reconcile intake before deletion review.
+
+The five actual ordinary, single-link origins are current Y, A's snapshot, original B conflict, B/R resolution conflict, and R repair. Evidence records raw buffers, paths, SHA-256, device/inode/size/link count, producer bytes, admission facts and process exits before family-count and feature assertions. A remains admitted; B has no admission or snapshot. Unexpected or missing leaves fail fixture verification.
+
+The implementation preserves exact X at original annotation R and complete Y inside a separate visible annotation V titled `Retained whole local version`. Preview shows both complete variants, concrete IDs/paths, all five origins and the source-quotation disclosure. Cancel preserves vault/ledger bytes. The original journey checks contiguous Y, including its source text/frontmatter and six-backtick stress case, a longer safe fence, complete purge, truthful suppression outcomes, immutable producer/admission facts, and output persistence across restart.
+
+The first journey observes both receipts immediately after the first actual source unlink. Its original ordering limitation remains explicit: that observation alone does not prove the pre-unlink barrier. The later native observer measures both receipts and absent stages before any source unlink is delegated.
+
+## Publication and authority contract
+
+`mixedRecovery` proves the exact five-origin writer relation. Two `preservedWriting` plans bind fixed payload roles, payload/output hashes and sizes, output IDs/paths, creation time, source link, original generation and immutable publication owner. Three JSON origins use target kind `mixed-recovery`. Authority contains no payload bodies. Unknown fields, additional variants, unsupported title/selection/detach combinations and extra source copies HOLD. Other-capture repair records do not authorize selected-sidecar reads.
+
+Preview chooses V, its timestamp and publication owner in memory; confirm reuses them during scope revalidation. Ordinary output/stage parents are bound before consent. Deletion commits suppression and both plans before staging. An exclusive flushed stage receives a durable identity before destination linking. The exact link pair receives a publication receipt before stage cleanup. Receipted output is verify only: disappearance, edits, replacement or extra aliases HOLD without recreation. Both outputs, receipts, parents, sources, unknown-copy checks, raw owned ledger baseline and annotation fences are checked before each source unlink and completion. Automatic continuation stays within Intake and does not acquire Conversation.
+
+Completed receipts are historical metadata. Restoring/active plans must match exactly one deleted historical owner. Their original owner, stage paths and origin G do not change to the restoration operation/generation. Pure history validation does not read retained output files or apply live removal fences. The lifecycle test measures this distinction.
+
+## Run ledger
+
+All listed runs had no skips. Durations are exact launcher `durationMs` values from each `exit.json`; counts come from recorded stdout. Every evidence name below is a directory under `C:/Users/sidds/AppData/Local/Temp`, containing `exit.json`, `run.stdout.log` and per-test observations. A directory name containing “green” does not establish a pass; the result column is authoritative.
+
+| Run | Result / exit | Duration (ms) | Tested tree | Evidence directory |
+| --- | --- | ---: | --- | --- |
+| First feature RED | 1 failed / 1 | 23,404 | `73e04491a0a19e69f43dc8cdeac695d0ba14da89` | `companion-ticket13-mixed-retention-first-20261110` |
+| First product candidate; stale preview observer | 1 failed / 1 | 24,166 | `4f7738d664b1a3d075748fcbd836725cf5546632` | `companion-ticket13-mixed-retention-first-candidate-20261110` |
+| Corrected preview; suppression observer | 1 failed / 1 | 29,937 | `60c6b2d33940b2dcb71f6d48b309294c5b6ff62b` | `companion-ticket13-mixed-retention-corrected-review-20261110` |
+| Unsupported outcome-field observer | 1 failed / 1 | 27,130 | `45dbebc695f261335e5e2a141519b98594b78360` | `companion-ticket13-mixed-retention-suppression-20261110` |
+| Complete first journey | 1 passed / 0 | 28,177 | `5c15e847736ad98ba0cd85da8280b57f77b22ea6` | `companion-ticket13-mixed-retention-end-to-end-20261110` |
+| Destination collision | 1 passed / 0 | 12,045 | `226093a3b62e56e7d453f48882295cf9eea63c16` | `companion-ticket13-mixed-retention-collision-20261110` |
+| Late adjacent-copy P1 RED | 1 failed / 1 | 17,628 | `a812f472295a08dba683130053ad3cbeb7b7d2ae` | `companion-ticket13-mixed-peer-red-20261110` |
+| P1 fix; exact-lock observer failure | 1 failed / 1 | 15,068 | `33ac1cf2a20f3b3228e4747801426cb1e06c3141` | `companion-ticket13-mixed-peer-green-20261110` |
+| Corrected P1 regression | 1 passed / 0 | 16,039 | `b2126c85bd59ffb10fe5f41c9e52f70362c5c57e` | `companion-ticket13-mixed-peer-corrected-20261110` |
+| Happy path + P1 | 2 passed / 0 | 36,969 | `fc0b3266b2fe5c04eafd9189002d7e97e942ac38` | `companion-ticket13-mixed-peer-coupled-20261110` |
+| Integrated happy/collision/P1 | 3 passed / 0 | 50,422 | `1bc8ad81c4399c860163ea92134fd260a7fd7d99` | `companion-ticket13-mixed-peer-integrated-three-20261110` |
+| Restored-G setup; locator failure | 1 failed / 1 | 43,338 | `a9651b60bd5efe23e6e203bd7347415f9cfa3321` | `companion-ticket13-mixed-retention-link-before-receipt-20261110` |
+| Restored-G real link before receipt | 1 passed / 0 | 31,637 | `1d11bdc3bff446911dd4438df91155f479ceae95` | `companion-ticket13-mixed-retention-link-before-receipt-v2-20261110` |
+| Missing receipted output | 1 passed / 0 | 23,429 | `fa4b9fe7eb34a4fc8d80ba92a0b6f74a71ea741b` | `companion-ticket13-mixed-retention-missing-output-20261110` |
+| Malformed proof-object RED | 1 failed / 1 | 16,373 | `62b6230df18cf12a3b05d2056994e378750ff671` | `companion-ticket13-mixed-proof-schema-red-20261110` |
+| Unchanged schema regression after fix | 1 passed / 0 | 14,655 | `0893f930e6178e09d8a4a09a3d2e75fda6f12f9a` | `companion-ticket13-mixed-proof-schema-green-20261110` |
+| Schema-fix coupled gate | 6 passed / 0 | 117,459 | `83e0f0168ea20eb8b2ab968b91630c941a929c03` | `companion-ticket13-mixed-schema-coupled-six-20261110` |
+| Completed-retention lifecycle | 1 passed / 0 | 38,127 | `f336d0f7074447c36e1ab13d7d1bc4e75c16a2f6` | `companion-ticket13-mixed-lifecycle-20261110` |
+
+## Failures and corrections
+
+The first feature RED ran on base `e527b9cb4f7e58aa1f08042bdc53431916e03045`. Actual five-origin, distinct-inode, A-only admission, B-unadmitted, X/Y/transaction and process-exit assertions passed. Preview visibility failed at line 124. The final status was “Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.” The immediate click observation was empty because the response had not settled. No positive preview, Cancel, publication or purge assertion had been reached. This was a feature gap after a verified writer fixture, not a fixture failure or authorization to weaken ordinary current-hash checks. Root then authorized the bounded implementation; test-first milestone `a3aabf3` is preserved.
+
+Three observer failures followed on unchanged candidate product source:
+
+| Failure | What had already passed | Correction and scope |
+| --- | --- | --- |
+| Stale V path after Cancel | Complete X/Y/five-origin preview, exact Cancel, confirm, first actual unlink; both files and both receipts existed | `cb2fb13` waits for the fresh visible review before reading paths. The hidden old DOM had supplied canceled V. No source publication was missing; no product/assertion/timeout change. |
+| Expected `complete`, actual `held` after Check now | Both outputs, safe fence, all-origin purge, deleted phase, suppression, immutable facts and no recovery remnants | `dfb9020` requires existing suppression behavior: exactly two original producer locators, `held`, exact reason and current `checkedAt`. Root reassessed after two observer failures; no product fallback, retry or timeout change. |
+| Added `outcome.sourceHash` assertion | All physical checks and truthful held classification | `fc55a3c` removes only that unsupported field assertion and saves post-suppression evidence. The ordinary catch writer stores status/reason/locator/checkedAt. Ledger source binding and all count/locator/reason/time checks remain. |
+
+The first full journey passed after those test-only corrections. Its product source matched the first candidate tree `4f7738d`; feature commit `be5e7f004cf09f5d9d0852bc0890e26189896471` preserves that implementation. The collision guard also passed on unchanged product. It creates actual R's destination with X plus unique third writing, then requires collision HOLD, hidden preview, no authority/suppression/purge, and exact vault/ledger/physical/producer preservation. It does not independently measure an unknown same-byte stage with a different inode.
+
+The independent late adjacent-copy P1 was a separate real defect: a new pending copy of actual Y added after consent survived while deletion completed. The two-line fix exports existing `inspectManualPeers` and invokes it inside each live mixed inspection before publication/mutation. The first fixed run held correctly but failed a full-tree assertion because confirm legitimately released its exact owned current lock. The correction binds that ordinary single-link JSON lock to actual main PID and permits only its removal; all other entries remain exact. The corrected regression, two-case gate and integrated three-case gate passed. Independent non-author review approved helper `c40ecc831cb59611378ac816130a88c096c77aed` and preserving merge `4d5f2961bf3de1984c26d32c50c32d172cec57a6` (committed tree `5a62c923102aee8bb6378dda7e9b01d1e223b798`). See Temp `companion-mixed13-peer-final-review.md`. The title-transaction suffix was code-inspected in that review, not independently exercised by this peer test.
+
+The first restored-G attempt failed before restoration/held-family setup: exact `getByLabel` did not match the select's wrapping accessible name, which includes option text. Root used the already tested combobox role with the artifact-kind name prefix. No assertion, timeout, retry or product source changed; that failed run proves no G or crash behavior.
+
+## Crash, verify-only, schema and lifecycle evidence
+
+The corrected restored-G test first deletes and explicitly restores accepted A through public controls. It records fresh G and an additive admission while original producer acceptance stays literal. A native `fs.promises.link` observer durably records stage identity and absent publication receipt before delegating the actual first annotation link. It records the resulting same-inode two-link pair and all five unchanged origins, then holds its return before receipt advancement. Actual main/wrapper exit follows. Normal restart completes both receipts, keeps the observed linked inode, purges all origins, preserves original G distinct from deleting H, leaves X exact with its original absent generation header, gives V original G, and preserves history/admissions/producers. Commit: `4a218271ca794a4a22c279a4a9036ab109029df7`; product remained unchanged from `4d5f296`.
+
+The missing-output test pauses the exact first source unlink before delegation. Its native observation proves both durable receipts, both outputs, absent stages and all five origins. It is labeled `before-native-unlink`, not an actual source unlink. After actual main/wrapper exit, only receipted X is removed offline. Normal startup, public recovery and explicit Resume HOLD with the same authority, all five origins, Y and producer facts intact; X is not recreated despite surviving repair X. Full-tree comparison permits only cleanup of the exact lock owned by the exited main. Commit: `63e64d6b07ea283ac3fc996a7db4314fa5f0aefd`; product remained unchanged from `4a21827`.
+
+The detached-editor interface audit identified that `titleProofs?.length` accepted malformed objects/null. The schema regression pauses a real authorized deletion before outputs, records main exit, and adds only `titleProofs = { unreviewedSourceCopy: actualWholeY }` offline. It saves actual terminal evidence before feature assertions. The RED reached deleted phase, purged all five origins and published both outputs while the nested source body remained in authority; the expected deleting assertion failed at line 558. Later preservation checks were not reached. Test-first commit: `fdf6c85640ed1017fe3b19f70df54509fa3b0bd7`.
+
+The separate one-line fix rejects own `titleProofs` or `titleRecovery` properties in this canonical mixed format. It does not strip fields, repair scope, reconstruct payloads, rewrite history or broaden classification. Syntax passed. The unchanged regression then held with exact corrupted ledger, all five origins/producers and no outputs/stages. The six-case gate also passed. Independent review approved `b83700c5414fe892bf57d2163df9ab63606a5114`, committed tree `03de08cc4d95b426454fb1e62ca2e64a7cb23adc`; app/test bytes match both tested fix trees. See Temp `companion-mixed13-schema-final-review.md` and the originating `companion-detached-editor13-base-interface-audit.md`. This is bounded schema approval, not final composition approval.
+
+The lifecycle test passed on product unchanged from `b83700c`. It completes deletion with original G, publicly removes exact R, restarts, loads suppressed source state and explicitly restores original A as a fresh source generation. R stays absent; V's bytes/inode, historical descriptors/plans/receipts/publication owner/origin G and literal producer facts remain unchanged. Exactly one matching deleted entry is added to history; only the fresh restoration admission is additive, and B stays unadmitted.
+
+Its final public pure-load control reaches the specific inherited-owner check. Both plan owners and derived stage paths change to one well-shaped UUID. The matching current B purge-observation owner changes with them so the earlier incoming-owner check cannot mask history validation. The active restoration operation and deleted history remain literal; reversing only those fields yields the exact valid ledger. `captureDeletion.suppressed` rejects at `inherited retention owner`, with no file mutation or R republication. No private validator is imported. Lifecycle milestone: `54bdbb0`; full lifecycle commit recorded by root after the 38,127 ms pass.
+
+## Remaining integration work
+
+Run the primary/editor composition's 141-case gate on its frozen candidate, complete independent Standards/Spec review of the composed diff, and obtain final merge approval. Preserve the separate P1 and schema-fix histories. These are the current pending steps; earlier planned collision, crash, missing-output, schema and lifecycle guards above are measured.
+
+Live sign-in and inference were deferred and are not claimed. This bounded family does not establish arbitrary mixed-family support, changed-consent rescoping, arbitrary external-copy inventory, release approval or full ticket-13 readiness.
+
+For local reproduction with the project's existing dependencies:
 
 ```powershell
-npx playwright test tests/mixed-retention-deletion.spec.js --workers=1 --reporter=list
+npx playwright test tests/mixed-retention-deletion.spec.js tests/mixed-peer-deletion.spec.js --workers=1 --reporter=list
 ```
 
-The one test uses the actual finalized review importer, public transfer UI, existing repair-intent checkpoint, actual Electron main exit, restart with the existing kept-current-read EACCES fault, and public capture deletion UI. It edits only a managed current note to model external writing. It does not author recovery records, ledger authority, or admissions.
-
-Accepted A and same-source incoming B come from the existing finalized review fixtures. Whole local Y includes the complete original note, source quotations, a distinct writing marker, and six consecutive backticks. Chosen annotation X contains a different writing marker and a source quotation. The real repair writer creates X and both conflict transactions. The test observes the held writer before removing its fault; it never invokes transfer or reconciliation again before deletion preview.
-
-Evidence is written to Playwright's per-test output folder before the five-origin count and public preview assertions: all actual vault buffers in base64, full paths, SHA-256, device/inode/size/link count, ordinary-file status, producer buffers, ledger facts, original intent, and process-exit facts. The expected family is current Y, A snapshot, original B conflict, B/R resolution conflict, and R repair. Assertions also require no published annotation, B admission/snapshot, active intent, or transaction. A remains the admitted current revision. Missing or extra leaves fail fixture verification rather than being silently omitted.
-
-The expected first feature failure is visibility of the public Capture deletion preview after Delete capture. Current changed-current validation is expected to HOLD before inventorying this family. Root must record the actual first failure and distinguish it from a fixture or process failure. A generic HOLD does not establish writing coverage. The preview status, text, and vault observations are saved before this assertion.
-
-The unchanged positive continuation requires both complete X and whole Y, all five origins, concrete annotation IDs/paths, and retained-source-quotation disclosure in preview. Cancel must preserve every vault/ledger byte and create no files. After fresh review, the first existing capture-deletion-unlinked checkpoint observes both output bytes while four origins survive. It then checks whole-Y contiguous bytes and a fence longer than the payload's backticks, completion, suppression, unchanged acceptance/admissions/producer files, and both output bytes across reconciliation/restart.
-
-Limitation: the first-unlink checkpoint observes outputs immediately after the first unlink; it does not independently prove both durable receipts existed before that unlink. The test records the actual authority without guessing a future receipt schema. Root may add an approved native pre-unlink observer after the implementation settles. No crash matrix, changed-retention flow, lifecycle removal/restore gate, live sign-in, or inference check is included in this first slice.
-
-
-Root actual first run exited1/no skips after23404ms on stagedtree73e04491a0a19e69f43dc8cdeac695d0ba14da89. All actual five-origin, ordinary/distinct inode, A-only acceptance/admission, B-unadmitted/no-snapshot/no-output, exact X/wholeY/transaction and actual main/wrapper exit assertions passed before the public preview visibility assertion failed at line124. Final diagnostic UI status was “Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.” The immediate pre-assertion preview/status observation was empty because the asynchronous click response had not yet settled; final diagnostic captures the HOLD. Later positive preview/Cancel/publication/purge assertions were NOT reached. Evidence Temp/companion-ticket13-mixed-retention-first-20261110 includes actual writer/raw buffers/process exits and failure diagnostic. This is feature RED after a verified actual writer family, not fixture failure, unsafe purge, live model proof, or permission to weaken ordinary current-hash checks. Root approves minimum implementation under the committed mixed-retention protocol, including BOTH writing variants and lifecycle/fence/receipt obligations.
-
-## First implementation candidate
-
-Product edits are authored after that measured RED. No test was changed. Syntax checks passed for `app/mixed-deletion.js`, `app/capture-deletion.js`, `app/capture-delete-view.js`, `app/source-inventory.js`, `app/source-authority.js`, and `app/source-recovery.js`. Root must run the unchanged desktop tracer; no GREEN is claimed here.
-
-The new helper recognizes only the verified five-file kept-current repair relation with one admitted finalized revision A and a distinct unadmitted finalized revision B. It checks the actual canonical original/resolution/wrapper JSON, normalized source records, pure admission/snapshot equality, exact known capture transformations, whole-Y occurrences, original X writer shape, pointer/outcome hashes, generation binding, ordinary files, single links, and absence of extra selected recovery leaves. Moved current paths, earlier revision sets, selection/title/detach families, additional repairs, unknown fields and different previous variants HOLD. Other-capture repair records are not parsed into selected-sidecar reads.
-
-Imported-v2 authority gains `mixedRecovery` and exactly two `preservedWriting` plans; the three mixed JSON targets use `mixed-recovery`. The descriptor binds fixed current/snapshot/conflict/repair roles, A's admission digest, B's revision/identity/fingerprint, R, original generation or null, and exact held pointer/outcome digests. Plans bind fixed payload-role references, payload/full-output hashes and byte size, annotation IDs/destinations, creation instant, source link, generation and immutable publication operation owner. No payload bodies enter authority. Stage and publication receipts each bind SHA-256/device/inode/byte size. Inherited restoring/active plans require exactly one identical deleted historical owner; completed deletion requires both receipts. Pure history validation does not read retained outputs or apply removal fences.
-
-Preview chooses V, time and publication owner in memory. Confirm reuses them while rebuilding the same scope; Cancel persists nothing. Preview includes complete X and the complete visible whole-Y wrapper, concrete output IDs/paths, all origins, and quotation disclosure. Existing ordinary parents for both output/stage paths are bound before consent.
-
-Deletion commits suppression and both plans before creating stages. Each stage is exclusive and flushed; its identity is persisted before exclusive destination linking. The exact link pair is checked before the durable output receipt, then only its recorded stage is removed. An unknown pre-receipt same-byte file HOLDs. A receipted destination is verify only: missing, edited, replaced or extra-alias output HOLDs without recreation. Both receipts, cleaned stages, fresh output/parent/source checks, unknown-copy scans, the owned raw ledger baseline and pure annotation fences are required immediately before every source unlink and completion. Automatic continuation stays inside the existing Intake kernel and never acquires Conversation. Receipt validation no longer needs source payloads after publication, so partial-purge continuation uses surviving leaves plus committed metadata.
-
-Root still owns all runtime verification, Git, synchronization with pending/older-title work, crash/changed-retention/lifecycle gates and independent review. This candidate remains a bounded tracer implementation, not ticket completion.
-
-
-Root first implementation-candidate run failed24166ms/exit1/no skips on stagedtree4f7738d664b1a3d075748fcbd836725cf5546632. It passed actual writer setup, full X/wholeY/five-origin preview, byte-exact Cancel, fresh confirm and first-unlink observation (one removed/four survivors). Saved first-unlink evidence shows BOTH actual output files and BOTH stage/publication receipts. Failure at reading wholeOutput used the earlier canceled preview V path: the test read hidden stale DOM immediately after second Delete click, before the asynchronous fresh review was visible. No source publication was missing in saved actual authority. Root test-onlycb2fb13 adds one visible-current-review wait before reading confirmedText/paths; it changes no assertions/timeouts/product source. Evidence Temp/companion-ticket13-mixed-retention-first-candidate-20261110 preserves failure/raw receipts. This is partial candidate behavior plus a measured fixture observer failure, not a passing end-to-end test. Corrected run pending.
-
-
-Root corrected-review run on SAME product failed29937ms/exit1 at final Check now observer, after complete X/wholeY preview/Cancel, both receipted outputs, actual first unlink, exact wholeY fence, all-five-origin purge, deleted phase/suppression, unchanged admissions/producer facts and no recovery remnants passed. Expected lastCheck complete conflicted with actual held; Intake.admit deliberately throws the existing explicit suppression reason for both original producers, matching other reviewed deletion controls. Root reassessed against actual code/evidence after these two observer failures; no product fallback, retry or timeout change. Test-onlydfb9020 now requires held PLUS exactly two original-locator outcomes with exact suppression reason/sourceHash/current checkedAt. This strengthens the suppression assertion; product unchanged. Evidence Temp/companion-ticket13-mixed-retention-corrected-review-20261110. Restart/final end-to-end pass still unmeasured until next run.
-
-
-Root suppression-observer run failed27130ms/exit1 at the newly added outcome.sourceHash assertion; ordinary held-outcome writer stores status/reason/locator/checkedAt and does not publish sourceHash there. Root introduced that unsupported-field assertion, inspected both reconcile catch writers and the remaining continuation, then corrected only that field check and added durable post-suppression evidence. Existing ledger sourceHash/suppression, both exact outcome locators/count/reasons/times and every physical/producer check remain. Same product again passed all physical preview/publication/purge checks and truthful held classification before this fixture assertion. Evidence Temp/companion-ticket13-mixed-retention-suppression-20261110; no passing full journey claimed.
-
-
-Root full first mixed journey GREEN28177ms, exit0/no skips, on immutable stagedtree5c15e847736ad98ba0cd85da8280b57f77b22ea6. Product source is unchanged from first candidate4f7738d; only measured fixture observers were corrected in preserved test commits cb2fb13/dfb9020/fc55a3c. Complete actual5origin/X+wholeY preview and exact Cancel, both published byte-exact annotations/receipts at first actual unlink, contiguous wholeY and safe fence, all5origin purge/empty recovery stages, immutable A acceptance/Bunadmitted facts/producers, exact two held suppression outcomes, restart and output persistence all passed. Evidence Temp/companion-ticket13-mixed-retention-end-to-end-20261110. This validates bounded legacy-absence happy path, NOT pre-first-unlink ordering, stage/link crash recovery, missing-receipted-output HOLD, destination collision, completed annotation-removal/restore lifecycle, inherited-owner corruption, composition with pending/older, full13 or live readiness. Those required guards and independent reviews remain.
-
-## Destination collision guard
-
-Test-only next slice: `mixed retention destination collision holds unique third writing without authority or purge`. The first journey body is unchanged. A new common fixture for subsequent guards uses the same real finalized importer, transfer writer, actual main exit and held EACCES recovery, then saves and verifies all five origins before adding a collision. It does not create or edit authority or recovery records.
-
-The guard exclusively creates the actual R annotation destination using the real writer's exact annotation plus a unique third writing marker. It requires public collision HOLD and hidden preview, no deletion authority or suppression, byte-exact ledger and complete vault inventory, unchanged physical identities/link counts for all five origins and the collision, and unchanged producer buffers. This checks that a different existing destination cannot be overwritten, adopted, or used to authorize purge. It does not claim to measure the separate same-byte/different-inode pre-receipt stage boundary.
-
-Syntax check only; root must run this guard before the next slice. No product source changed. Exact command:
-
-```powershell
-npx playwright test tests/mixed-retention-deletion.spec.js --grep "destination collision" --workers=1 --reporter=list
-```
-
-The native-link crash and pre-first-source-unlink missing-output guards are planned but not authored in this slice. Their next checkpoints will be actual native file-operation observations, with actual main/wrapper exit evidence; no product checkpoint or private validator will be introduced.
-
-
-Root destination-collision control passed12045ms, exit0/no skips on stagedtree226093a3b62e56e7d453f48882295cf9eea63c16/productbe5e7f0 unchanged. Actual5origin setup preceded existingR destination with unique third writing; public collision HOLD/hiddenpreview, no authority/suppression/purge, full vault/ledger/physical identities and producers unchanged all passed. Evidence Temp/companion-ticket13-mixed-retention-collision-20261110. Actualstage/link/G/survivor/lifecycle guards remain. Independent lateadjacentpeer P1 reproduced17.6s separately and freshfixer2line sharedguard awaitsunchangedGREEN; that finding is NOTclosed by this collision pass.
-
-## Actual link before receipt with restored generation
-
-Root subsequently reported the late-adjacent-peer P1 reproduced and fixed through the existing shared peer guard, its regression GREEN, the happy-path/regression pair GREEN, independent review, and the composed happy/collision/P1 run passing 50422ms with no skips. Main preserving merge is `4d5f2961bf3de1984c26d32c50c32d172cec57a6`. The shared export/guard remains unchanged by this test-only next slice.
-
-New test: `mixed retention resumes an actual annotation link before receipt with original restored generation`. The first journey and collision bodies remain unchanged. The common guard fixture has an optional public delete/restore of finalized accepted A before Y/B. Its default legacy setup is unchanged. The restored branch saves the real fresh G admission/current/snapshot before checking its shape; original producer attempts remain literal. G compatibility is still unmeasured until root runs this test.
-
-After the real held five-origin repair, the test previews X/Y, cancels byte-exactly, opens a fresh visible preview and derives its actual output destinations. A native main-process `fs.promises.link` observer matches only those two reviewed destinations. It writes a durable before-link file with actual ledger/stage/origin identities, delegates the actual native link, then writes actual stage/output pair identities and unchanged authority/origins. It holds its return promise after the native link, so product publication-receipt advancement cannot execute. No product checkpoint or private validator is used.
-
-Assertions require a durable exact stage identity before native delegation, no publication receipts, actual single-link stage and absent destination before, the actual same-inode two-link pair after, all five ordinary source origins unchanged, original G in the descriptor/plans, deleting H distinct from G, and unchanged prior history. The test then records actual main/wrapper exit and confirms main PID disappearance. On normal restart it requires both receipts, exact recovery of the previously linked inode, both stages absent, complete source-origin purge, exact X/contiguous whole Y and V's original G header, unchanged original attempts/restored admissions/producers, B still unadmitted, no repair/stage/capture remnants and no extra annotation outputs.
-
-Syntax check passed; no runtime test or product source edit was performed for this slice. Root's exact next command:
-
-```powershell
-npx playwright test tests/mixed-retention-deletion.spec.js --grep "actual annotation link before receipt" --workers=1 --reporter=list
-```
-
-The pre-first-source-unlink missing-receipted-output and completed annotation-removal/restoration lifecycle guards are not authored yet. Their read-only plan remains in Temp `companion-mixed13-remaining-guards-plan.md`.
-
-
-Root first stage2/restored-G attempt failed43338ms/exit1 before restoration/held mixed setup: exact getByLabel for artifact kind did not match the actual wrapping select label, whose accessible name includes option text. Existing successful reviewed-restoration test uses role combobox with Selected producer artifact kind prefix. Root uses that same observed locator; no source/assertion/timeout/retry change. No restoredG/native link/crash proof was reached or claimed. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-20261110 retained separately as fixture failure; correctedstage2 runtime pending.
-
-
-Root corrected stage2 actualrestoredG/link-before-receipt crash GREEN31637ms, exit0/no skips, stagedtree1d11bdc3bff446911dd4438df91155f479ceae95/product4d5f296 unchanged. Actualseeddelete/explicitreviewrestore producedfreshG, nativeBEFORElink recordprovedstageIdentitydurable andreceiptabsent; ORIGINALfirstannotationlink createdactualstage/outputtwo-linkpair whileall5originsintact, thenactualmain/wrapperexit occurred before receipt. Normalrestartcompletedbothreceipts/purgedall5, boundrecoveredreceipt toSAME observedlinked inode andoriginalG!=deletingH, preservedhistory/admissions/producerfacts and suppression/no replay. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-v2-20261110. First43.3s dropdownlocatorfailure remainsfixtureonly/noGorcrashclaim. This newtest/helperoptionalrestoredGbranch leaves originalhappy/collision bodies unchanged. Missingreceiptedoutput verify-only HOLD, completedannotationremoval/restore/lifecycleowner, sourcecomposition/finalreviews remain.
+The six-case coupled run preceded lifecycle addition. The lifecycle pass is separately recorded; this command is a reproduction target, not a claim that the now-expanded set has already run together.
