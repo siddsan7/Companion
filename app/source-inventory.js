@@ -29,7 +29,7 @@ function validateInventory(value, id) {
     return;
   }
   if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
-  sourceTitle.validateProofs(value);
+  sourceTitle.validateProofs(value, id);
   const titleRecovery = pendingTitle.validate(value, id);
   const targets = new Map(value.targets.map(item => [item.file, item])); let previous = '';
   for (const item of value.recovery) {
@@ -169,7 +169,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;
   const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
   const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
-  if (!current || !pending && !titles.titleProofs.length && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
+  if (!current || !pending && !titles.verifiedCurrent && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
   const entries = [];
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (name === 'ledger.json') continue;
@@ -189,6 +189,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     const descriptor = { transaction: journal, captureId: capture.id, sourceHash, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null };
     const add = (file, format, content, kind = 'source-recovery') => {
       const item = { file: relative(intake, file), format, ...descriptor }; layout(intake, { sourceHash }, item);
+      if (titles.proofFiles.has(item.file)) fail();
       const prior = expected.get(item.file);
       if (prior && (prior.content !== content || prior.item.revisionId !== item.revisionId || prior.item.sourceGeneration !== item.sourceGeneration)) fail();
       // A live transaction/archive pair shares one canonical transaction descriptor.
@@ -202,14 +203,23 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     transactions.set(journal, tx);
     if (!admission) observations.push({ identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, sourceHash, captureId: capture.id, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null });
   }
-  // Source-only legacy before-files without a retained transaction keep the
-  // existing admitted-snapshot exact rendering rule.
+  // Completed title before-files must match the first guarded observation;
+  // other legacy before-files retain the exact admitted-snapshot renderer.
+  const observedTitleBackups = new Set();
   for (const entry of entries) if (!expected.has(relative(intake, entry.file))) {
+    const proven = titles.sourceBackups.get(relative(intake, entry.file));
+    if (proven) {
+      // A completed title path grants no filename exemption. The second
+      // observation must be the exact bytes and ordinary physical leaf proved.
+      if (entry.name !== path.posix.basename(proven.target.file) || !entry.value.bytes.equals(proven.bytes) || entry.value.nlink !== 1 || ['file', 'sha256', 'dev', 'ino', 'bytes'].some(key => entry.value.target[key] !== proven.target[key])) fail();
+      observedTitleBackups.add(proven.target.file); targets.set(proven.target.file, proven.target); continue;
+    }
     if (!new RegExp(`^${capture.id}-[a-f0-9-]{36}\\.before(?:-[a-f0-9-]{36})?\\.md$`).test(entry.name)) fail();
     const { parse } = require('./vault'), { noteText } = require('./intake'); const note = parse(entry.text);
     if (!note || note.id !== capture.id || ![...revisions.values()].some(revision => entry.value.bytes.equals(Buffer.from(noteText({ ...capture, title: note.title, capturedAt: note.capturedAt }, revision), 'utf8'))) || entry.value.nlink !== 1) fail();
     targets.set(relative(intake, entry.file), { ...entry.value.target, kind: 'source-backup' });
   }
+  if (observedTitleBackups.size !== titles.sourceBackups.size) fail();
   for (const { item, content, kind } of expected.values()) {
     let value; try { value = await leaf(intake, path.join(intake.vault.vault, item.file), kind); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     if (!value.bytes.equals(Buffer.from(content, 'utf8'))) fail();
@@ -233,7 +243,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   for (const item of result) { const key = `${item.dev}:${item.ino}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(item); }
   for (const group of groups.values()) if (group.length > 1) {
     const peers = group.map(item => item.file).sort();
-    if (group.length !== 2 || !knownPair(proof, peers) || group.some(item => item.sha256 !== group[0].sha256 || item.bytes !== group[0].bytes)) fail();
+    if (group.some(item => titles.proofFiles.has(item.file)) || group.length !== 2 || !knownPair(proof, peers) || group.some(item => item.sha256 !== group[0].sha256 || item.bytes !== group[0].bytes)) fail();
     for (const item of group) item.peers = peers;
   }
   await inspectTargets(intake, { targets: result, recovery, sourceHash });
