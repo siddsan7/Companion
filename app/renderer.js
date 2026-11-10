@@ -7,9 +7,13 @@ function scopeError(error, owned) {
 }
 async function action(work) { try { await work(); } catch (error) { if (typeof error.canReport === 'function' && !error.canReport()) return; status(error.message.replace(/^Error invoking remote method '[^']+': Error: /, '')); } }
 function day(instant, timezone) { return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(instant)); }
+function retireCaptureLinks() {
+  for (const open of $('captures').querySelectorAll('[data-open-capture]')) open.disabled = true;
+}
 async function refresh() {
   const owner = configurationEpoch; if (configurationBusy) return;
   const request = ++refreshEpoch, owned = () => request === refreshEpoch && owner === configurationEpoch && !configurationBusy;
+  retireCaptureLinks();
   window.intakeView.retireRepairs();
   try {
     const snapshot = await window.companion.state();
@@ -36,7 +40,15 @@ async function refresh() {
       content.textContent = note.content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
       label.textContent = 'Display title'; input.value = note.title; label.append(input); save.textContent = 'Save title'; open.textContent = 'Open in Obsidian';
       save.onclick = () => action(async () => { await window.companion.title({ id: note.id, title: input.value }); await refresh(); status('Title saved.'); });
-      open.onclick = () => action(async () => { await window.companion['open-note'](note.id); status('Requested Obsidian to open the note.'); });
+      open.dataset.openCapture = '';
+      open.onclick = () => action(async () => {
+        const current = () => owned() && open.isConnected && !open.disabled;
+        if (!current()) return;
+        try {
+          await window.companion['open-note'](note.id);
+          if (current()) status('Requested Obsidian to open the note.');
+        } catch (error) { if (current()) throw scopeError(error, current); }
+      });
       article.append(heading, details, content, label, save, open); $('captures').append(article);
       if (['thought', 'link', 'reel_import'].includes(note.type)) {
         const remove = document.createElement('button'); remove.textContent = 'Delete capture';
@@ -57,6 +69,7 @@ for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'pa
 $('choose').onclick = () => action(async () => { selectedVault = await window.companion['choose-vault'](); $('vault').textContent = selectedVault || 'Selection cancelled.'; });
 $('configure').onclick = () => {
   const owner = ++configurationEpoch; configurationBusy = true; $('configure').disabled = true; $('check-intake').disabled = true; $('vault-repairs').replaceChildren();
+  retireCaptureLinks();
   return action(async () => {
     try {
       await window.companion.configure({ vault: selectedVault, parent: $('parent').value });
