@@ -741,6 +741,64 @@ for (const timing of ['before preview', 'after preview']) test(`annotation remov
   expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions); expect(await files(path.join(root, 'producer'))).toEqual(producer);
 });
 
+for (const timing of ['before preview', 'after preview']) test(`annotation removal holds an uppercase Markdown selected annotation alias added ${timing}`, async () => {
+  test.setTimeout(90000);
+  const base = await importedCapture(), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  for (const text of ['SELECTUPPERCASEALIAS selected independent writing.', 'RETAINUPPERCASEALIAS other independent writing.']) {
+    await page.getByLabel('New annotation', { exact: true }).fill(text);
+    await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Annotation saved.');
+    await expect(page.getByLabel('New annotation', { exact: true })).toHaveValue('');
+  }
+  const notes = await Promise.all((await fs.readdir(annotationFolder)).filter(name => name.endsWith('.md')).map(async name => {
+    const file = path.join(annotationFolder, name), bytes = await fs.readFile(file), text = bytes.toString('utf8');
+    return { file, bytes, text, metadata: YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]) };
+  }));
+  expect(notes).toHaveLength(2);
+  const selected = notes.find(note => note.text.includes('SELECTUPPERCASEALIAS')), retained = notes.find(note => note.text.includes('RETAINUPPERCASEALIAS'));
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  const review = page.getByLabel('Annotation removal review', { exact: true }), row = review.getByRole('article').filter({ hasText: selected.metadata.companion_id });
+  await expect(row).toContainText('SELECTUPPERCASEALIAS');
+  const preview = page.getByLabel('Annotation removal preview', { exact: true }), status = page.getByRole('status');
+  if (timing === 'after preview') {
+    await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+    await expect(preview).toBeVisible();
+    await expect(preview).toContainText(path.relative(path.join(root, 'vault'), selected.file).split(path.sep).join('/'));
+    await expect(preview).not.toContainText(retained.metadata.companion_id);
+  }
+  const alias = path.join(root, 'vault', 'Notes', 'selected-copy.MD'), independentWriting = 'UPPERCASEALIASONLYCOPY independent writing in the uppercase Markdown copy.';
+  await fs.mkdir(path.dirname(alias), { recursive: true }); await fs.copyFile(selected.file, alias);
+  expect(await fs.readFile(alias)).toEqual(selected.bytes);
+  await fs.appendFile(alias, '\n' + independentWriting + '\n');
+  const aliasBytes = await fs.readFile(alias), aliasText = aliasBytes.toString('utf8'), metadata = YAML.parse(aliasText.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]);
+  expect(metadata).toEqual(selected.metadata);
+  expect(metadata.capture_id).toBe(selected.metadata.capture_id);
+  expect(metadata.companion_id).toBe(selected.metadata.companion_id); expect(metadata.artifact_type).toBe('annotation');
+  expect(aliasText).toContain('SELECTUPPERCASEALIAS'); expect(aliasText).toContain(independentWriting);
+  const before = await files(path.join(root, 'vault')), ledgerBytes = await fs.readFile(ledgerFile), source = await files(path.join(base, 'Captures')), revisions = await files(path.join(base, 'Revisions')), producer = await files(path.join(root, 'producer'));
+  expect(JSON.parse(ledgerBytes.toString('utf8')).annotationRemovals?.[selected.metadata.companion_id]).toBeUndefined();
+  if (timing === 'before preview') {
+    await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+    await expect.poll(async () => (await status.textContent()).includes('scope changed') || await preview.isVisible()).toBe(true);
+    if (await preview.isVisible()) {
+      // Exercise any incorrectly offered consent so the no-authority assertion
+      // detects a completed partial purge rather than merely a misleading view.
+      await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+      await expect(status).toContainText(/Annotation removed|scope changed/);
+    }
+  } else {
+    await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+    await expect(status).toContainText(/Annotation removed|scope changed/);
+  }
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).annotationRemovals?.[selected.metadata.companion_id]).toBeUndefined();
+  await expect(status).toContainText('scope changed');
+  if (timing === 'before preview') await expect(preview).toBeHidden();
+  expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes); expect(await files(path.join(root, 'vault'))).toEqual(before);
+  expect(await fs.readFile(selected.file)).toEqual(selected.bytes); expect(await fs.readFile(retained.file)).toEqual(retained.bytes); expect(await fs.readFile(alias)).toEqual(aliasBytes);
+  expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions); expect(await files(path.join(root, 'producer'))).toEqual(producer);
+});
+
 for (const ownership of ['unknown hardlink', 'replaced annotation parent']) test(`annotation removal holds ${ownership} without authority or file mutation`, async () => {
   test.setTimeout(90000);
   const base = await importedCapture(), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(base, '.intake', 'ledger.json');
