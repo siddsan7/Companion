@@ -1,5 +1,6 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { isDeepStrictEqual } = require('node:util');
 const { hash, validate, render, bound } = require('./intake-producer');
 const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
@@ -22,6 +23,7 @@ function text(bytes) {
 // Pure shape checks for the content-free proof committed before any unlink.
 // Recovery verifies its surviving exact leaves; it does not need a removed journal.
 function validateInventory(value, id) {
+  if (value.inventoryVersion === 1) return require('./manual-title').validate(value, id);
   if (value.inventoryVersion === undefined) {
     if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs', 'titleRecovery'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
     return;
@@ -104,9 +106,36 @@ function normalizedDraft(revision, capture, sourceHash) {
   const uncertainty = { channels: revision.evidence.channels, truncated: revision.evidence.truncated, uncertainEvidence: revision.evidence.evidence.filter(item => item.review_flag === 'uncertain').map(item => item.id), unknowns: revision.target.unknowns, conflicts: revision.target.conflicts };
   if (!equal(revision.uncertainty, uncertainty)) fail();
 }
+function selectionTransaction(tx, ledger, capture, sourceHash, revisions) {
+  if (!fields(tx, ['schema', 'resolution', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || !uuid(tx.resolution) || tx.retainOnly !== false || tx.sourceHash !== sourceHash || tx.revision.id === capture.currentRevision || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'reviewChoices', 'selectionHistory']) || !date(tx.capture.updatedAt)) fail();
+  const block = ledger.blocks[sourceHash], outcome = ledger.outcomes[tx.key];
+  const journal = `conflict-${tx.revision.id}-${tx.resolution}.json`;
+  if (!fields(block, ['reason', 'journal', 'incomingRevision']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  const authority = ledger.sourceAuthority?.[capture.id];
+  if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
+  const { revisionAdmission } = require('./source-authority'), { noteText } = require('./intake');
+  const admitted = revision => {
+    if (!revision?.review || !capture.revisions.includes(revision.id)) fail();
+    validateNormalizedReview(revision, capture.id, sourceHash);
+    const known = revisionAdmission(ledger, revision.id), accepted = ledger.attempts[revision.identity];
+    if (!known || known.status !== 'imported' || known.revision !== revision.id || known.captureId !== capture.id || known.sourceHash !== sourceHash || known.identity !== revision.identity || known.fingerprint !== revision.fingerprint || known.snapshotHash !== hash(JSON.stringify(revision, null, 2)) || known.sourceGeneration !== tx.sourceGeneration || !accepted || accepted.status !== 'imported' || accepted.captureId !== capture.id || accepted.sourceHash !== sourceHash || accepted.fingerprint !== revision.fingerprint) fail();
+    return known;
+  };
+  const current = revisions.get(capture.currentRevision), selected = revisions.get(tx.revision.id);
+  admitted(current); const admission = admitted(selected);
+  if (!isDeepStrictEqual(tx.revision, selected) || capture.reviewed !== true || capture.rejected !== (current.humanReview === 'reject')) fail();
+  if (capture.selectionHistory !== undefined && (!Array.isArray(capture.selectionHistory) || capture.selectionHistory.some(item => !fields(item, ['revision', 'selectedAt']) || !uuid(item.revision) || !capture.revisions.includes(item.revision) || !date(item.selectedAt)))) fail();
+  const expected = { ...capture, currentRevision: selected.id, reviewed: true, rejected: selected.humanReview === 'reject', supportEligible: selected.supportEligible !== false, reviewChoices: [], updatedAt: tx.capture.updatedAt, currentHash: hash(tx.content), selectionHistory: [...(capture.selectionHistory || []), { revision: selected.id, selectedAt: tx.capture.updatedAt }] };
+  // archiveConflict adds this one field after selection was staged; its exact
+  // pointer/reason binding above is retired only by the committed deletion.
+  delete expected.conflict;
+  if (!isDeepStrictEqual(tx.capture, expected) || tx.previous !== noteText(capture, current) || tx.previousHash !== capture.currentHash || tx.content !== noteText(expected, selected)) fail();
+  return admission;
+}
 function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
   intake.validateTransaction(tx);
   if (tx.revision.review !== undefined) validateNormalizedReview(tx.revision, capture.id, sourceHash); else normalizedDraft(tx.revision, capture, sourceHash);
+  if (tx.resolution !== undefined) return selectionTransaction(tx, ledger, capture, sourceHash, revisions);
   const retainOnly = tx.retainOnly === true;
   if (!fields(tx, ['schema', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || tx.sourceHash !== sourceHash || tx.externalConflict !== false || typeof tx.retainOnly !== 'boolean' || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', ...(retainOnly ? ['reviewChoices'] : [])]) || tx.capture.id !== capture.id || tx.capture.file !== capture.file || tx.capture.relative !== capture.relative || tx.capture.capturedAt !== capture.capturedAt || tx.capture.title !== capture.title || !date(tx.capture.updatedAt) || tx.capture.currentRevision !== (retainOnly ? capture.currentRevision : tx.revision.id) || !Array.isArray(tx.capture.revisions) || !equal(tx.capture.revisions, [...capture.revisions.filter(id => id !== tx.revision.id), tx.revision.id])) fail();
   const authority = ledger.sourceAuthority?.[capture.id];

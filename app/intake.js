@@ -7,6 +7,7 @@ const { sourceMutation } = require('./source-mutation');
 const { withTitle, captureHeading } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission } = require('./source-authority');
 const { IntakeLedger } = require('./intake-ledger');
+const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold } = require('./source-recovery');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -26,10 +27,11 @@ class Intake {
     const text = await this.storage.read(); if (text === null) return empty();
     let ledger; try { ledger = JSON.parse(text); } catch { throw Error('Intake ledger is unreadable. Preserve .intake and restore a vault backup before checking sources.'); }
     if (ledger.schema !== 1 || !Array.isArray(ledger.sources) || !ledger.captures || !ledger.attempts || !ledger.blocks || !ledger.pending || !ledger.outcomes || !Array.isArray(ledger.suppressed)) throw Error('Unsupported intake ledger. Preserve it for repair.');
-    validateAuthority(ledger); return ledger;
+    validateAuthority(ledger); validateAnnotationRemovals(ledger); return ledger;
   }
   async save(ledger) {
     validateAuthority(ledger);
+    validateAnnotationRemovals(ledger);
     await this.storage.replace(JSON.stringify(ledger, null, 2));
   }
   async publishJournal(file, value) {

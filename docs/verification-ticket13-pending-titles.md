@@ -38,6 +38,20 @@ Root measured actual unrelated-D RED: 16099, hidden D preview at 13.8 seconds af
 
 The minimum fix performs the existing guarded intent leaf read once, parses it once, and checks exact writer keys and literal canonical JSON before using its owner. An intent naming another ledger-owned capture returns no selected pending variant before opening selected sidecars. The original selected-id/sourceHash byte scanner still examines the unexempted other-owned intent and can HOLD mixed/selected-source references. Strict selected proof checks remain in place; no other capture path is followed. The regression is unchanged. `node --check app/pending-title.js` passed; root GREEN measurement pending.
 
+## Synchronized union controls (test-only freeze)
+
+Root synchronized reviewed primary e527 and manual aacfc4b into the pending-title tree and added the required manual-v1 titleRecovery blacklist. Independent bounded merger review approved staged tree 266f0676eeadf33fde3e1df9bc862b017ab3488e for runtime. This addresses the earlier missing manual validator seam in code; integrated runtime evidence is still required.
+
+Three controls are added without changing product source or any prior test assertion:
+
+- Actual restored-G staged-title first-unlink/main-exit fixture, then one controlled copy of actual surviving pending-note bytes to a new `.BeFoRe-TiTlE-UUID.bak` adjacent alias. Restart must HOLD through the shared prefix guard, preserve exact committed authority/four survivors/alias, and keep the actually consented missing role absent.
+- Fresh manual-v1 authority rejects a foreign titleRecovery. First obtain a valid descriptor from an actual imported staged-title purge. Save another real manual thought and title it through the UI. Confirm its actual valid manual-v1 deletion and pause at authorization before any source unlink; observe actual main/wrapper exit. Only then add the earlier imported descriptor to this manual authority. Fresh load must report the manual-title validation error, preserve all actual manual source bytes/identities and altered ledger, and keep the earlier imported purge complete.
+- The same controlled foreign-field action against an actual untitled manual authority with absent inventoryVersion. Fresh load must report the source-inventory legacy validation error, with the same preservation checks. No sourceHash, capture id, generation, acceptance, manifest, or missing source file is fabricated.
+
+All added controls record actual setup/exit/offline-edit evidence separately. Helper syntax check `node --check tests/pending-title-deletion.spec.js` passed. Root owns the eight-case integrated runtime run: `npx playwright test tests/pending-title-deletion.spec.js`. No integrated runtime pass is claimed here.
+
+Root's first integrated eight-case run 88721 exited 1 after 3.3 minutes: six passed, two new foreign-field fixtures failed before manual authorization/offline edit/rejection. All five existing cases and the new actual first-unlink mixed-case alias HOLD passed. Evidence is retained at `C:/Users/sidds/AppData/Local/Temp/companion-ticket13-pending-title-eight-20261110`. The two failures were test setup errors, not product RED: the manual phase reused an imported-phase locator bound to a page closed by the intervening restart. A fresh manualPreview locator on the current page now serves only its manual preview visibility/scope/confirm steps. Source preview controls, product code, assertions, timeouts and retry policy are unchanged. Syntax check passed. The foreign-field constraints remain unverified until root's corrected eight-case run.
+
 ## Required later evidence
 
 After actual RED and root GO: minimal imported helper; then same fixture positive. Add current-C BODY-writing HOLD with no authority/unlink; restored original-G actual first-unlink process exit and automatic survivor completion; focused malformed descriptor/ownership/disjoint-union guards. Synchronize primary annotation and manual helper changes before final review, including explicit manual-v1 rejection of titleRecovery.
@@ -53,3 +67,36 @@ Root duplicate persisted role guard35811 passed1/1, exit0/no skips,26.4s (case25
 Root unrelated imported D regression16099 actual RED13.8s, exit1/no skips: D-only raw preview hidden AFTER both real A/D admissions, actual A staged-title5file conflict, D ordinary2files/no sidecars, no intervening refresh, exact A/D/ledger/producer facts and selected-D evidence. Later preview/Cancel invariants were not reached. Evidence Temp/companion-ticket13-pending-title-unrelated-red-20261110. Independent candidate P2 is reproduced: global A intent triggered attempts to open selected D title sidecars before owner scoping. Product9eedd74 unchanged before RED. Next minimum guarded intent-owner scoping fix preserves existing selected-byte scanner and strict selected proof; no global malformed-intent ignore.
 
 Root unchanged unrelated-D regression GREEN42005 passed1/1, exit0/no skips,11.2s (case10.7s). While actual A5 staged files/globalintent stayed exact, D preview listed ONLY its2 normal sourcefiles; raw preview/Cancel preserved whole vault/ledger/A5/D2/producers and noauthority. Evidence Temp/companion-ticket13-pending-title-unrelated-green-20261110. Minimum guardedcanonicalintent-owner scoping precedes selectedsidecarreads; otherownedintent remains subjecttoexistingselectedid/sourceHash byte scanner. Duplicate/malformedJSON cannot use owner exclusion. Original selectedsourceproof unchanged. Manual synchronization/rejection and full coupled/exacttip review remain.
+
+
+## Corrected integrated gates and independent coverage review
+
+Root corrected full eight-case gate passed8/8, exit0/no skips,209199ms (3.5m) on stagedtreea58dd3c; product source equals reviewed266f. The earlier6pass/2stale-page fixture failures remain separately recorded. All five original pending cases, pending mixed-case survivor HOLD, manual-v1 and legacy foreign-field rejection passed. Evidence Temp/companion-ticket13-pending-title-eight-v2-20261110.
+
+Root combined gate on the SAME immutable a58dd3c passed33/33, exit0/no skips,09:41:43.069Z to09:55:28.145Z (825076ms/13.7m). It includes all four manual-title cases, both shared case-prefix recovery guards, imported completed/repeated titles and BODY/original-G controls, all three archived reviewed-selection controls, ordinary capture deletion preserving annotation writing, and manual restoration/retirement/legacy-parent failure cases. Evidence Temp/companion-ticket13-pending-title-coupled-20261110. This is a focused coupled gate, not whole13/fullPR completion.
+
+Independent Standards review of a58dd3c approved with two nonblocking naming/duplication observations. Independent Spec found no product defect/scope creep but blocked integration on missing planned unowned/double-owned recovery and completed/pending-union rejection coverage. Fresh test-only implementer prepared the following controls; existing eight test bytes and product source remain unchanged. No passing new-control result is claimed until root runtime.
+
+## Applied pending-title union guards: runtime pending
+
+Status: root applied the Temp additions after the frozen 33-case gate completed. Syntax passed and original eight tests/product blobs remain unchanged; new controls are NOT yet runtime verified. Root owns runtime, integration, Git and final review.
+
+Additions: three cases through actual Electron UI/persisted writer authority, with one offline metadata-field corruption only after observed actual main/wrapper exit. Two new parameterized cases reuse the existing restored-G actual first-native-unlink sequence; the third first purges real pending A, independently admits D, completes D's title through Save title and pauses D's actual consent at capture-deletion-authorized.
+
+- unowned-sidecars: remove only titleRecovery; orphan all three actual source-recovery sidecars, preserving real manifest targets and actual removed/surviving files. No claim that exactly one sidecar is orphaned.
+- double-owned-transaction: add one deliberately false self-journal recovery claim for the actual transaction already owned by its real pending descriptor. The corrupt claim is test metadata, not described as writer output. Expected ordinary shape validation succeeds until exclusive ownership rejects count two.
+- mixed completed/pending: add only real initial-admission A's pending descriptor to actual initial-admission D completed-title deleting authority. D has an unchanged real completed proof and backup, and null original generation matches A descriptor's null generation. Expected completed shape checks pass; pending disjointness rejects the nonempty completed family before lookup of foreign pending paths. This is a foreign actual-family combination control, not same-owner combination coverage.
+
+Every case asserts startup and explicit Refresh rejection; exact altered ledger and vault bytes; physical identity/bytes of retained source targets; unchanged producer material; no further unlink, reconstruction or title replay. The first two assert the actual first removed source remains missing. Mixing asserts D's entire consented family stays intact and A's already purged source roles remain absent.
+
+Static check: node --check on Temp companion-pending13-union-combined.cjs PASSED. This combined file consists of the current candidate test file plus the addition; no existing test was edited. No private validator, product source, dependency, Git, runtime or network action was used.
+
+Pending root checks: inspect appended diff; run all three focused cases; retain passing evidence for the original eight; update this report with exact candidate/result paths and measured outcomes. These are expected GREEN rejection controls against unchanged product, not RED/GREEN product-fix claims. Formal Spec coverage remains unclosed until runtime confirms these public controls.
+
+
+Root focused union guard gate passed3/3, exit0/no skips,88469ms (29.6s/29.5s/27.5s) on stagedtree787ff7ca89fbedbb4a51de7954f6645420bf5dcd. Both actual-first-unlink orphan/double-ownership controls and the actual completed-D/foreign-pending-A combination reached expected fresh-load and Refresh refusals, preserved altered authority/vault/producers/survivor identities and never resumed purge/replayed titles. No product edit or manufactured RED/fix. Evidence Temp/companion-ticket13-pending-title-union-guards-20261110. Original8/source unchanged; full11 gate and final exact-tip independent approval remain.
+
+
+## Final composed pending-title gate
+
+Root full11 gate passed11/11, exit0/no skips,282531ms (4.7m) on immutable stagedtree394e0e9c1b4fb93b678b4ffe3930b0b7f8504bd8. All original eight and three added ownership/disjoint-union cases passed together. Durable discovery/stdout/stderr/exit/results: Temp/companion-ticket13-pending-title-eleven-20261110. Product6blobs still equal reviewed266f; original8testprefix unchanged. Alongside the same-product33case combined gate and new3case guard gate, measured prerequisites for bounded synchronization are complete. Exact final composed Standards/Spec and merger approval remain required before merge; this report grants no whole13/finalPR/live readiness approval.

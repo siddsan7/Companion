@@ -60,7 +60,7 @@ An explicit period of a capture's eligibility as evidence. Restoring deleted mat
 Acceptance of a particular source revision into a source generation. A restored admission does not change the original producer attempt or restore earlier citations.
 
 **Title Proof**
-Evidence that a retained capture copy differs from its admitted source only by a display-title change. It distinguishes a title-only copy from independent writing.
+Evidence that a retained capture copy differs only by its display title from an admitted imported source revision or the selected manual capture. It distinguishes a title-only copy from independent writing.
 
 **Discovery Corpus**
 The material eligible for automatic context discovery. It includes Companion-managed captures, annotations, saved ideas, approved briefs, and other notes explicitly included by the user.
