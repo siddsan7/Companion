@@ -28,6 +28,8 @@ function validateAuthority(ledger) {
     }
     require('./source-inventory').validateInventory(value, id);
     for (const item of value.purgedProducerAttempts || []) {
+      const accepted = ledger.attempts?.[item.identity];
+      if (accepted && (accepted.captureId !== item.captureId || accepted.sourceHash !== item.sourceHash || accepted.fingerprint !== item.fingerprint)) throw Error('Purged producer observation contradicts original acceptance. Preserve source authority for repair.');
       const prior = purgedIdentities.get(item.identity);
       if (prior && (prior.captureId !== item.captureId || prior.sourceHash !== item.sourceHash || prior.fingerprint !== item.fingerprint)) throw Error('Purged producer identity is ambiguous.');
       purgedIdentities.set(item.identity, item);
@@ -37,7 +39,7 @@ function validateAuthority(ledger) {
       if (!Array.isArray(value.history)) throw Error('Source deletion history needs repair.');
       for (const prior of value.history) {
         if (prior?.phase !== 'deleted' || prior.history !== undefined || prior.restoration !== undefined) throw Error('Source deletion history needs repair.');
-        validateAuthority({ sourceAuthority: { [id]: prior } });
+        validateAuthority({ sourceAuthority: { [id]: prior }, attempts: ledger.attempts });
       }
     }
     if (value.phase === 'restoring') {

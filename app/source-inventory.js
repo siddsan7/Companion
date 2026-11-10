@@ -10,6 +10,11 @@ const fail = () => { throw Object.assign(Error('Source recovery inventory contai
 const equal = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const date = value => typeof value === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
 const formats = ['transaction', 'capture-stage', 'snapshot-stage', 'incoming-snapshot', 'source-backup'];
+const mentions = (bytes, id, sourceHash) => bytes.includes(Buffer.from(id, 'utf8')) || bytes.includes(Buffer.from(sourceHash, 'utf8'));
+function text(bytes) {
+  try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
+  catch { fail(); }
+}
 
 // Pure shape checks for the content-free proof committed before any unlink.
 // Recovery verifies its surviving exact leaves; it does not need a removed journal.
@@ -97,6 +102,8 @@ function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
   const authority = ledger.sourceAuthority?.[capture.id];
   if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
   normalizedDraft(tx.revision, capture, sourceHash);
+  const accepted = ledger.attempts[tx.revision.identity];
+  if (accepted && (accepted.fingerprint !== tx.revision.fingerprint || accepted.captureId !== capture.id || accepted.sourceHash !== sourceHash)) fail();
   const { noteText } = require('./intake');
   if (tx.previous !== null && ![...revisions.values()].some(revision => noteText(capture, revision) === tx.previous)) fail();
   const admission = require('./source-authority').revisionAdmission(ledger, tx.revision.id);
@@ -110,12 +117,16 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   const entries = [];
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (name === 'ledger.json') continue;
-    const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery'), text = value.bytes.toString('utf8');
-    if (!text.includes(capture.id) && !text.includes(sourceHash)) continue;
-    entries.push({ name, file, value, text });
+    const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
+    if (!mentions(value.bytes, capture.id, sourceHash)) continue;
+    entries.push({ name, file, value, text: text(value.bytes) });
   }
   for (const entry of entries.filter(item => item.name === 'transaction.json' || /^(?:conflict|pending)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.name))) {
-    const tx = JSON.parse(entry.text), admission = transaction(intake, tx, ledger, capture, sourceHash, revisions), journal = relative(intake, entry.file);
+    const tx = JSON.parse(entry.text);
+    // publishJournal writes JSON.stringify(tx); conflict/pending archives link
+    // those exact bytes. Do not discard duplicate-key or formatting payloads.
+    if (!entry.value.bytes.equals(Buffer.from(JSON.stringify(tx), 'utf8'))) fail();
+    const admission = transaction(intake, tx, ledger, capture, sourceHash, revisions), journal = relative(intake, entry.file);
     const descriptor = { transaction: journal, captureId: capture.id, sourceHash, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null };
     const add = (file, format, content, kind = 'source-recovery') => {
       const item = { file: relative(intake, file), format, ...descriptor }; layout(intake, { sourceHash }, item);
@@ -137,12 +148,12 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   for (const entry of entries) if (!expected.has(relative(intake, entry.file))) {
     if (!new RegExp(`^${capture.id}-[a-f0-9-]{36}\\.before(?:-[a-f0-9-]{36})?\\.md$`).test(entry.name)) fail();
     const { parse } = require('./vault'), { noteText } = require('./intake'); const note = parse(entry.text);
-    if (!note || note.id !== capture.id || ![...revisions.values()].some(revision => noteText({ ...capture, title: note.title, capturedAt: note.capturedAt }, revision) === entry.text) || entry.value.nlink !== 1) fail();
+    if (!note || note.id !== capture.id || ![...revisions.values()].some(revision => entry.value.bytes.equals(Buffer.from(noteText({ ...capture, title: note.title, capturedAt: note.capturedAt }, revision), 'utf8'))) || entry.value.nlink !== 1) fail();
     targets.set(relative(intake, entry.file), { ...entry.value.target, kind: 'source-backup' });
   }
   for (const { item, content, kind } of expected.values()) {
     let value; try { value = await leaf(intake, path.join(intake.vault.vault, item.file), kind); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
-    if (value.bytes.toString('utf8') !== content) fail();
+    if (!value.bytes.equals(Buffer.from(content, 'utf8'))) fail();
     targets.set(item.file, value.target); recovery.push(item);
   }
   // Every present descriptor must point at a present, strictly classified journal.
@@ -157,8 +168,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   const result = [...targets.values()].sort((a, b) => a.file.localeCompare(b.file)), proof = { targets: result, recovery };
   for (const name of await fs.readdir(path.join(intake.vault.root, 'Revisions'))) {
     const file = path.join(intake.vault.root, 'Revisions', name), value = await leaf(intake, file, 'snapshot');
-    const text = value.bytes.toString('utf8');
-    if ((text.includes(capture.id) || text.includes(sourceHash)) && !targets.has(relative(intake, file))) fail();
+    if (mentions(value.bytes, capture.id, sourceHash) && !targets.has(relative(intake, file))) fail();
   }
   const groups = new Map();
   for (const item of result) { const key = `${item.dev}:${item.ino}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(item); }
