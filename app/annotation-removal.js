@@ -71,7 +71,11 @@ async function inventory(vault, intake, id, captureId) {
       const note = parseAnnotation(value.text); if (!note) throw changed(); bind(note); candidates.push({ ...value, kind: 'annotation-stage' }); continue;
     }
     if (name === 'link-intent.json' || /^link-[a-f0-9-]{36}\.json$/.test(name)) {
-      if (!strict(object, ['schema', 'id', 'file', 'before', 'content', 'relative']) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /[\\:]/.test(object.file) || object.file.split('/').some(part => !part || part === '.' || part === '..')) throw changed();
+      if (!strict(object, ['schema', 'id', 'file', 'before', 'content', 'relative']) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      // Journals retain their native serialized path. Only manifest paths use
+      // canonical separators; the normal destination boundary validates both.
+      const destination = intake.destination({ relative: object.file });
+      await vault.contained(path.dirname(destination));
       const before = parseAnnotation(object.before), after = parseAnnotation(object.content); if (!before || !after || after.id !== id || after.captureId !== before.captureId) throw changed(); bind(before);
       if (sourceLink(object.before, object.relative) !== object.content) throw changed();
       if (name !== 'link-intent.json' && name !== `link-${object.id}.json`) throw changed();
