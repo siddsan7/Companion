@@ -48,8 +48,16 @@ async function raw(vault) {
           // identity. Only the first metadata block owns that identity; body
           // quotations remain independent writing.
           const header = value.text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-          let fields; try { fields = header && YAML.parse(header[1]); } catch {}
-          if (fields?.artifact_type === 'annotation' && uuid(fields.companion_id)) unsupported.add(fields.companion_id);
+          const document = header && YAML.parseDocument(header[1]);
+          if (YAML.isMap(document?.contents)) {
+            // Parser errors cannot erase explicit identity evidence. Read only
+            // direct scalar declarations, without resolving aliases or merges;
+            // this withholds deletion and never establishes ownership.
+            const declarations = document.contents.items.filter(pair => YAML.isScalar(pair.key) && YAML.isScalar(pair.value));
+            if (declarations.some(pair => pair.key.value === 'artifact_type' && pair.value.value === 'annotation')) {
+              for (const pair of declarations) if (pair.key.value === 'companion_id' && uuid(pair.value.value)) unsupported.add(pair.value.value);
+            }
+          }
         }
       }
     }
