@@ -71,6 +71,26 @@ function scores(source, review) {
   const technical = facts.filter(fact => fact.important && fact.input_available && fact.technical_value !== null), answerable = facts.filter(fact => fact.input_available);
   return { synthesis_recall: ratio(count(available, fact => recovered(fact, true)), available.length), end_to_end_recall: ratio(count(important, fact => recovered(fact)), important.length), unsupported_claim_rate: ratio(count(factual, unit => unit.input_support !== 'full'), factual.length), source_error_rate: ratio(count(factual, unit => !unit.source_consistent), factual.length), citation_support_precision: ratio(count(links, link => link.supports), links.length), reference_validity: ratio(count(refs, ref => typeof ref === 'string' && ids.has(ref)), refs.length), technical_item_accuracy: ratio(count(technical, fact => fact.recovered_by.some(key => units.get(key).source_consistent && units.get(key).text === fact.technical_value)), technical.length), conflict_recall: ratio(count(review.conflicts, item => item.represented), review.conflicts.length), uncertainty_recall: ratio(count(review.gaps, item => item.represented), review.gaps.length), unnecessary_uncertainty: ratio(count(answerable, fact => fact.incorrectly_unknown), answerable.length) };
 }
+function normalizeReview(manifest, sourceText, review, metrics) {
+  const source = parse(sourceText);
+  if (manifest.review_id !== review.review_id) fail('Finalized review identity mismatch.');
+  if (hash(Buffer.from(sourceText, 'utf8')) !== manifest.files['source.json']) fail('Finalized source bytes do not match the manifest.');
+  if (hash(canonical(parse(sourceText, true))) !== review.source_digest) fail('Finalized source digest mismatch.');
+  validateReview(source, review);
+  for (const asset of source.assets) if (!asset || typeof asset.file !== 'string' || !asset.file.startsWith('assets/') || !sha(asset.sha256) || manifest.files[asset.file] !== asset.sha256) fail('Finalization is missing a source asset.');
+  if (source.video && (!sha(source.video.sha256) || !source.assets.some(asset => asset.file === source.video.file && asset.sha256 === source.video.sha256))) fail('Finalized video identity is not verified.');
+  if (!equal(scores(source, review), metrics)) fail('Stored scores do not match original annotations.');
+  const sourceHash = source.run.input_sha256 || source.video?.sha256;
+  if (!sha(sourceHash) || source.video && source.video.sha256 !== sourceHash) fail('Missing or inconsistent source byte identity. Produce a finalized bundle with a source hash.');
+  if (!uuid(source.run.attempt_id) || !sha(source.run.job_id) || typeof source.run.started_utc !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(source.run.started_utc) || !Number.isFinite(Date.parse(source.run.started_utc))) fail('Missing or unsupported original attempt identity.');
+  if (source.evidence.clip_id !== source.run.job_id) fail('Finalized evidence does not match the original attempt identity.');
+  const target = review.decision === 'edit' ? review.corrected_target : source.target;
+  if (review.decision === 'reject') {
+    if (Object.hasOwn(manifest.files, 'reviewed-target.json') || Object.hasOwn(manifest.files, 'reviewed-notes.md')) fail('Rejection must not publish reviewed exports.');
+  } else if (!['reviewed-target.json', 'reviewed-notes.md'].every(name => Object.hasOwn(manifest.files, name))) fail('Finalization is missing reviewed exports.');
+  const notes = review.decision === 'reject' ? '> Human review rejected this source. Ineligible as supporting evidence. Original material remains inspectable in revision history.\n' : render(source.evidence, target);
+  return { sourceHash, identity: `finalization:${manifest.finalization_id}`, run: source.run, evidence: source.evidence, target, text: notes, synthetic: source.synthetic, humanReview: review.decision, extraction: ['complete', 'partial', 'insufficient_evidence'].includes(target?.status) ? target.status : 'unknown', processing: source.run.state || 'unknown', supportEligible: review.decision !== 'reject', review, manifest, metrics, reviewSourceText: sourceText, uncertainty: { channels: source.evidence.channels, truncated: source.evidence.truncated, uncertainEvidence: source.evidence.evidence.filter(item => item.review_flag === 'uncertain').map(item => item.id), unknowns: target?.unknowns || [], conflicts: target?.conflicts || [] } };
+}
 async function readReview(folder) {
   const root = await fs.realpath(folder), captured = new Map(); let total = 0;
   const read = async (name, limit = 16 * 1024 * 1024) => {
@@ -87,30 +107,15 @@ async function readReview(folder) {
   if (manifest.schema_version !== '1.0' || !uuid(manifest.finalization_id) || !uuid(manifest.review_id) || typeof manifest.finalized_utc !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(manifest.finalized_utc) || !Number.isFinite(Date.parse(manifest.finalized_utc)) || !manifest.files || Array.isArray(manifest.files) || typeof manifest.files !== 'object' || Object.keys(manifest.files).length > 1005) fail('Unsupported finalization manifest identity or structure.');
   if (!['source.json', 'review.json', 'scores.json'].every(name => Object.hasOwn(manifest.files, name)) || Object.hasOwn(manifest.files, 'manifest.json')) fail('Incomplete finalization manifest.');
   for (const [name, expected] of Object.entries(manifest.files)) if (!sha(expected) || hash(await read(name, name.startsWith('assets/') ? 100 * 1024 * 1024 : undefined)) !== expected) fail('Finalized review integrity mismatch.');
-  const text = name => decode(captured.get(name)), sourceText = text('source.json'), source = parse(sourceText), review = parse(text('review.json')), metrics = parse(text('scores.json'));
-  if (manifest.review_id !== review.review_id) fail('Finalized review identity mismatch.');
-  if (hash(canonical(parse(sourceText, true))) !== review.source_digest) fail('Finalized source digest mismatch.');
-  validateReview(source, review);
-  for (const asset of source.assets) if (!asset || typeof asset.file !== 'string' || !asset.file.startsWith('assets/') || !sha(asset.sha256) || manifest.files[asset.file] !== asset.sha256) fail('Finalization is missing a source asset.');
-  if (source.video && (!sha(source.video.sha256) || !source.assets.some(asset => asset.file === source.video.file && asset.sha256 === source.video.sha256))) fail('Finalized video identity is not verified.');
-  if (!equal(scores(source, review), metrics)) fail('Stored scores do not match original annotations.');
-  const sourceHash = source.run.input_sha256 || source.video?.sha256;
-  if (!sha(sourceHash) || source.video && source.video.sha256 !== sourceHash) fail('Missing or inconsistent source byte identity. Produce a finalized bundle with a source hash.');
-  if (!uuid(source.run.attempt_id) || !sha(source.run.job_id) || typeof source.run.started_utc !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(source.run.started_utc) || !Number.isFinite(Date.parse(source.run.started_utc))) fail('Missing or unsupported original attempt identity.');
-  if (source.evidence.clip_id !== source.run.job_id) fail('Finalized evidence does not match the original attempt identity.');
-  const target = review.decision === 'edit' ? review.corrected_target : source.target;
-  let notes;
+  const text = name => decode(captured.get(name)), sourceText = text('source.json'), review = parse(text('review.json')), metrics = parse(text('scores.json'));
+  const normalized = normalizeReview(manifest, sourceText, review, metrics);
   if (review.decision !== 'reject') {
-    if (!['reviewed-target.json', 'reviewed-notes.md'].every(name => Object.hasOwn(manifest.files, name))) fail('Finalization is missing reviewed exports.');
-    if (!equal(parse(text('reviewed-target.json')), target) || text('reviewed-notes.md').replace(/\r\n/g, '\n') !== render(source.evidence, target)) fail('Reviewed exports do not match the selected reviewed target.');
-    notes = text('reviewed-notes.md').replace(/\r\n/g, '\n');
-  } else {
-    if (Object.hasOwn(manifest.files, 'reviewed-target.json') || Object.hasOwn(manifest.files, 'reviewed-notes.md')) fail('Rejection must not publish reviewed exports.');
-    notes = '> Human review rejected this source. Ineligible as supporting evidence. Original material remains inspectable in revision history.\n';
+    if (!equal(parse(text('reviewed-target.json')), normalized.target) || text('reviewed-notes.md').replace(/\r\n/g, '\n') !== normalized.text) fail('Reviewed exports do not match the selected reviewed target.');
   }
   // A second complete read prevents accepting a mixed transfer. Hashes are not signatures.
   total = 0;
   for (const [name, bytes] of captured) if (!(await read(name, name.startsWith('assets/') ? 100 * 1024 * 1024 : undefined)).equals(bytes)) fail('Finalized files changed during admission.');
-  return { sourceHash, identity: `finalization:${manifest.finalization_id}`, fingerprint: hash(manifestBytes), run: source.run, evidence: source.evidence, target, text: notes, locator: folder, synthetic: source.synthetic, humanReview: review.decision, extraction: ['complete', 'partial', 'insufficient_evidence'].includes(target?.status) ? target.status : 'unknown', processing: source.run.state || 'unknown', supportEligible: review.decision !== 'reject', review, manifest, metrics, reviewSourceText: sourceText, uncertainty: { channels: source.evidence.channels, truncated: source.evidence.truncated, uncertainEvidence: source.evidence.evidence.filter(item => item.review_flag === 'uncertain').map(item => item.id), unknowns: target?.unknowns || [], conflicts: target?.conflicts || [] } };
+  const { sourceHash, identity, run, evidence, target, text: notes, synthetic, humanReview, extraction, processing, supportEligible, uncertainty } = normalized;
+  return { sourceHash, identity, fingerprint: hash(manifestBytes), run, evidence, target, text: notes, locator: folder, synthetic, humanReview, extraction, processing, supportEligible, review, manifest, metrics, reviewSourceText: sourceText, uncertainty };
 }
-module.exports = { readReview };
+module.exports = { readReview, normalizeReview };

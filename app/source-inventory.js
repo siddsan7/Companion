@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { hash, validate, render } = require('./intake-producer');
+const { validateNormalizedReview } = require('./source-review');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -50,7 +51,7 @@ function validateInventory(value, id) {
   }
   previous = '';
   for (const item of value.purgedProducerAttempts) {
-    if (!fields(item, ['identity', 'fingerprint', 'sourceHash', 'captureId', 'revisionId', 'sourceGeneration', 'operationId']) || typeof item.identity !== 'string' || !/^[a-f0-9]{64}:[a-f0-9]{32}$/.test(item.identity) || item.identity <= previous || !sha(item.fingerprint) || item.sourceHash !== value.sourceHash || item.captureId !== id || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !uuid(item.operationId)) fail();
+    if (!fields(item, ['identity', 'fingerprint', 'sourceHash', 'captureId', 'revisionId', 'sourceGeneration', 'operationId']) || typeof item.identity !== 'string' || !/^(?:[a-f0-9]{64}:[a-f0-9]{32}|finalization:[a-f0-9]{32})$/.test(item.identity) || item.identity <= previous || !sha(item.fingerprint) || item.sourceHash !== value.sourceHash || item.captureId !== id || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !uuid(item.operationId)) fail();
     previous = item.identity;
   }
   for (const prior of value.history || []) for (const item of prior.purgedProducerAttempts || []) if (!value.purgedProducerAttempts.some(current => equal(current, item))) fail();
@@ -98,10 +99,10 @@ function normalizedDraft(revision, capture, sourceHash) {
 }
 function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
   intake.validateTransaction(tx);
-  if (!fields(tx, ['schema', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || tx.sourceHash !== sourceHash || tx.externalConflict !== false || tx.retainOnly !== false || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash']) || tx.capture.id !== capture.id || tx.capture.file !== capture.file || tx.capture.relative !== capture.relative || tx.capture.capturedAt !== capture.capturedAt || tx.capture.title !== capture.title || !date(tx.capture.updatedAt) || tx.capture.currentRevision !== tx.revision.id || tx.capture.reviewed !== false || tx.capture.rejected !== false || tx.capture.supportEligible !== true || !Array.isArray(tx.capture.revisions) || !equal(tx.capture.revisions, [...capture.revisions.filter(id => id !== tx.revision.id), tx.revision.id])) fail();
+  if (tx.revision.review !== undefined) validateNormalizedReview(tx.revision, capture.id, sourceHash); else normalizedDraft(tx.revision, capture, sourceHash);
+  if (!fields(tx, ['schema', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || tx.sourceHash !== sourceHash || tx.externalConflict !== false || tx.retainOnly !== false || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash']) || tx.capture.id !== capture.id || tx.capture.file !== capture.file || tx.capture.relative !== capture.relative || tx.capture.capturedAt !== capture.capturedAt || tx.capture.title !== capture.title || !date(tx.capture.updatedAt) || tx.capture.currentRevision !== tx.revision.id || tx.capture.reviewed !== !!tx.revision.review || tx.capture.rejected !== (tx.revision.humanReview === 'reject') || tx.capture.supportEligible !== (tx.revision.supportEligible !== false) || !Array.isArray(tx.capture.revisions) || !equal(tx.capture.revisions, [...capture.revisions.filter(id => id !== tx.revision.id), tx.revision.id])) fail();
   const authority = ledger.sourceAuthority?.[capture.id];
   if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
-  normalizedDraft(tx.revision, capture, sourceHash);
   const accepted = ledger.attempts[tx.revision.identity];
   if (accepted && (accepted.fingerprint !== tx.revision.fingerprint || accepted.captureId !== capture.id || accepted.sourceHash !== sourceHash)) fail();
   const { noteText } = require('./intake');
