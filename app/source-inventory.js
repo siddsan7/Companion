@@ -22,6 +22,11 @@ function text(bytes) {
 // Pure shape checks for the content-free proof committed before any unlink.
 // Recovery verifies its surviving exact leaves; it does not need a removed journal.
 function validateInventory(value, id) {
+  if (value.mixedRecovery !== undefined || value.preservedWriting !== undefined || value.targets.some(item => item.kind === 'mixed-recovery')) {
+    if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
+    require('./mixed-deletion').validate(value, id);
+    validateObservations(value, id); return;
+  }
   if (value.inventoryVersion === 1) return require('./manual-title').validate(value, id);
   if (value.inventoryVersion === undefined) {
     if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
@@ -53,7 +58,10 @@ function validateInventory(value, id) {
     if (!fields(item, ['kind', 'journal', 'sha256', 'captureConflictSha256']) || !['blocks', 'pending'].includes(item.kind) || pointerKinds.has(item.kind) || item.kind <= previousKind || !sha(item.sha256) || !(item.captureConflictSha256 === null || sha(item.captureConflictSha256)) || !value.recovery.some(entry => entry.file === item.journal && entry.format === 'transaction')) fail();
     pointerKinds.add(item.kind); previousKind = item.kind;
   }
-  previous = '';
+  validateObservations(value, id);
+}
+function validateObservations(value, id) {
+  let previous = '';
   for (const item of value.purgedProducerAttempts) {
     if (!fields(item, ['identity', 'fingerprint', 'sourceHash', 'captureId', 'revisionId', 'sourceGeneration', 'operationId']) || typeof item.identity !== 'string' || !/^(?:[a-f0-9]{64}:[a-f0-9]{32}|finalization:[a-f0-9]{32})$/.test(item.identity) || item.identity <= previous || !sha(item.fingerprint) || item.sourceHash !== value.sourceHash || item.captureId !== id || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !uuid(item.operationId)) fail();
     previous = item.identity;
@@ -245,6 +253,7 @@ async function inspectTarget(intake, authority, target) {
   if (!remaining.some(item => item.file === target.file)) fail();
 }
 function inspectPointers(ledger, authority) {
+  if (authority.mixedRecovery) return require('./mixed-deletion').inspectPointers(ledger, authority);
   const capture = ledger.captures[authority.sourceHash];
   for (const item of authority.recoveryPointers || []) {
     const pointer = ledger[item.kind][authority.sourceHash];
@@ -255,6 +264,7 @@ function inspectPointers(ledger, authority) {
   for (const kind of ['blocks', 'pending']) if (ledger[kind][authority.sourceHash] && !authority.recoveryPointers.some(item => item.kind === kind)) fail();
 }
 function retirePointers(ledger, authority) {
+  if (authority.mixedRecovery) return require('./mixed-deletion').retirePointers(ledger, authority);
   inspectPointers(ledger, authority);
   const capture = ledger.captures[authority.sourceHash];
   for (const item of authority.recoveryPointers || []) delete ledger[item.kind][authority.sourceHash];

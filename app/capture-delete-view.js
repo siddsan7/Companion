@@ -87,6 +87,12 @@
       const scope = document.createElement('p'); scope.textContent = `${preview.revisions} revision snapshots. Automatic re-import stays suppressed until explicit restoration. Independent writing and its quotations remain with unavailable-evidence warnings. Original producer files, videos and separate exports/backups remain.`;
       section.append(title, label, scope);
       for (const file of preview.targets) { const item = document.createElement('p'); item.textContent = 'Remove: ' + file; section.append(item); }
+      for (const writing of preview.retainedWriting || []) {
+        const item = document.createElement('article'), heading = document.createElement('h3'), disclosure = document.createElement('p'), text = document.createElement('pre');
+        heading.textContent = `Retain ${writing.title}: ${writing.id} · ${writing.file}`;
+        disclosure.textContent = 'These retained copies still contain source quotations. Supporting source evidence becomes unavailable. The complete retained text follows.';
+        text.textContent = writing.text; item.append(heading, disclosure, text); section.append(item);
+      }
       for (const dependent of preview.dependents || preview.annotations.map(annotation => ({ ...annotation, kind: 'annotation', attribution: 'affected' }))) {
         const item = document.createElement('article'), heading = document.createElement('h3'), state = document.createElement('p'), text = document.createElement('pre');
         heading.textContent = 'Preserve ' + dependent.kind + ': ' + dependent.file;

@@ -1,9 +1,9 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
-function requiredDirectories(intake, targets) {
+function requiredDirectories(intake, targets, preservedWriting = []) {
   const vault = intake.vault, result = new Set();
-  for (const start of [intake.dir, path.join(vault.root, 'Captures'), path.join(vault.root, 'Revisions'), ...targets.map(target => path.dirname(path.join(vault.vault, target.file)))]) {
+  for (const start of [intake.dir, path.join(vault.root, 'Captures'), path.join(vault.root, 'Revisions'), ...targets.map(target => path.dirname(path.join(vault.vault, target.file))), ...preservedWriting.flatMap(plan => [plan.file, plan.stage]).map(file => path.dirname(path.join(vault.vault, file)))]) {
     let directory = start;
     while (true) {
       const name = relative(vault, directory);
@@ -22,7 +22,7 @@ async function directory(intake, name) {
 }
 async function sourceParents(intake, authority, reviewMissing = false) {
   if (await fs.realpath(intake.vault.vault) !== authority.root) throw Error('Source recovery vault identity changed. All files were preserved.');
-  const required = requiredDirectories(intake, authority.targets), found = new Set();
+  const required = requiredDirectories(intake, authority.targets, authority.preservedWriting), found = new Set();
   for (const item of authority.directories) {
     if (!required.has(item.file) || found.has(item.file) || JSON.stringify(await directory(intake, item.file)) !== JSON.stringify(item)) throw Error('Source recovery parent identity changed. All files were preserved.');
     found.add(item.file);
