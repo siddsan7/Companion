@@ -1757,8 +1757,8 @@ test('history archives roundtrip exact source generations without rolling back t
 });
 
 // Temporary case-local probe: observe native ownership, without acquiring or retrying it.
-async function observeHistoryContention() {
-  await app.evaluate(({ app: mainApp }) => {
+async function observeHistoryContention(controlledOverlap = false) {
+  await app.evaluate(({ app: mainApp }, controlledOverlap) => {
     const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
     const { Conversations } = load('./conversations'), { Intake } = load('./intake'), { Vault } = load('./vault');
     const { AsyncLocalStorage } = process.getBuiltinModule('async_hooks'), net = process.getBuiltinModule('net');
@@ -1779,6 +1779,32 @@ async function observeHistoryContention() {
       if (details.error) { if (trace.errors.length === 32) trace.errors.shift(); trace.errors.push(entry); }
     };
     const errorDetails = error => ({ message: error?.message, code: error?.code, stack: error?.stack });
+    let overlap;
+    if (controlledOverlap) {
+      const state = trace.controlledOverlap = { armed: false, entered: false, released: false, deadlineExpired: false };
+      let release, deadline;
+      const promise = new Promise(resolve => { release = resolve; });
+      overlap = {
+        state, promise,
+        arm() { if (state.entered || state.released) throw Error('History overlap gate is one-shot'); state.armed = true; record('overlap-armed'); },
+        release(reason) {
+          if (state.released) return;
+          state.armed = false; state.released = true; clearTimeout(deadline);
+          record('overlap-released', { reason }); release();
+        },
+        enter(parent) {
+          const stack = trace.callers.find(entry => entry.id === parent?.caller)?.stack || '';
+          if (!state.armed || state.entered || parent?.name !== 'Intake.locked' || !stack.includes('Intake.info') || !/[\\/]app[\\/]main\.js:\d+:\d+/.test(stack)) return false;
+          const server = trace.events.findLast(entry => entry.event === 'kernel-listening' && entry.parent === parent.id);
+          if (!server || trace.events.some(entry => entry.event === 'kernel-close' && entry.id === server.id)) return false;
+          Object.assign(state, { armed: false, entered: true, owner: parent.id, server: server.id, caller: parent.caller });
+          record('overlap-owned-gate', { owner: parent.id, server: server.id });
+          deadline = setTimeout(() => { state.deadlineExpired = true; overlap.release('10000 ms safety deadline'); }, 10000);
+          return true;
+        }
+      };
+      globalThis.__historyContentionOverlap = overlap;
+    }
     function observe(type, method) {
       const original = type.prototype[method], name = `${type.name}.${method}`;
       type.prototype[method] = function (...args) {
@@ -1797,6 +1823,7 @@ async function observeHistoryContention() {
       type.prototype[method] = function (...args) {
         // Entry is evidence of a granted sourceMutation call, not merely a lock attempt.
         record('owned-entry', { method: `${type.name}.${method}`, parent: scope.getStore()?.id, caller: caller() });
+        if (method === 'recover' && overlap?.enter(scope.getStore())) return overlap.promise.then(() => original.apply(this, args));
         return original.apply(this, args);
       };
     }
@@ -1815,7 +1842,7 @@ async function observeHistoryContention() {
       return emit.call(this, event, ...args);
     };
     globalThis.__historyContentionTrace = trace;
-  });
+  }, controlledOverlap);
   await page.evaluate(() => {
     const trace = { installedAt: Date.now(), timeOrigin: performance.timeOrigin, events: [], dropped: 0 };
     let sequence = 0;
@@ -1847,12 +1874,38 @@ async function historyContentionSnapshot() {
   return snapshot;
 }
 
+async function releaseHistoryContentionOverlap() {
+  // Release the real owner even when checkpoint cleanup fails, before collecting evidence.
+  try { await fs.writeFile(path.join(root, 'release.txt'), 'release controlled history dispatch', 'utf8'); }
+  finally {
+    await app.evaluate(() => globalThis.__historyContentionOverlap?.release('test finally'));
+  }
+  await fs.writeFile(path.join(root, 'faults.json'), '{}', 'utf8');
+}
+
+async function overlapHistoryRefreshWithDispatch() {
+  try {
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('conversation-before-dispatch');
+    await app.evaluate(() => globalThis.__historyContentionOverlap.arm());
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__historyContentionOverlap.state.entered)).toBe(true);
+    await fs.writeFile(path.join(root, 'release.txt'), 'release send into owned refresh', 'utf8');
+    await expect.poll(() => app.evaluate(() => {
+      const trace = globalThis.__historyContentionTrace, gate = trace.controlledOverlap;
+      const owner = trace.events.find(event => event.event === 'kernel-listening' && event.id === gate.server);
+      return !gate.released && owner && !trace.events.some(event => event.event === 'kernel-close' && event.id === gate.server) && trace.events.some(event => event.event === 'kernel-error' && event.address === owner.address && event.error?.code === 'EADDRINUSE' && trace.events.some(call => call.event === 'start' && call.id === event.parent && call.name === 'Vault.list'));
+    })).toBe(true);
+  } finally { await releaseHistoryContentionOverlap(); }
+}
+
 test('same-byte restoration revokes a two-hop foreign history closure and its stale reviewed dispatch without changing retained dialogue', async ({}, testInfo) => {
   test.setTimeout(180000);
   const fixture = await manualConversationForRestoration(), generation = await restoreManualConversation(fixture);
+  const controlledOverlap = process.env.COMPANION_TEST_HISTORY_CONTENTION_OVERLAP === '1';
+  let overlapArmed = false;
   let beforeRestart;
   try {
-  await observeHistoryContention();
+  await observeHistoryContention(controlledOverlap);
   const region = () => page.getByRole('region', { name: 'Prior conversation search', exact: true });
   for (const [ancestor, reply] of [['FRESHIDEAGENERATION', 'FOREIGNGENERATION_B authored synthetic first derived turn.'], ['FOREIGNGENERATION_B', 'FOREIGNGENERATION_C authored synthetic second derived turn.']]) {
     await page.getByRole('button', { name: 'New conversation', exact: true }).click();
@@ -1864,7 +1917,13 @@ test('same-byte restoration revokes a two-hop foreign history closure and its st
     await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
     await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
     await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply }), 'utf8');
+    if (controlledOverlap && ancestor === 'FOREIGNGENERATION_B') {
+      overlapArmed = true;
+      for (const name of ['release.txt', 'checkpoint.txt']) await fs.unlink(path.join(root, name)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-before-dispatch' }), 'utf8');
+    }
     await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    if (overlapArmed) await overlapHistoryRefreshWithDispatch();
     await expect(page.locator('#conversation-history')).toContainText(reply);
     await expect(page.locator('#conversation-history')).toContainText('completed');
   }
@@ -1922,7 +1981,10 @@ test('same-byte restoration revokes a two-hop foreign history closure and its st
   expect(calls).toHaveLength(5); expect(calls.at(-1).text).toBe(reviewed);
   for (const [name, bytes] of Object.entries(originals)) expect((await fs.readFile(path.join(historyDirectory, name))).toString('base64')).toBe(bytes);
   } finally {
-    const evidence = { description: 'Temporary bounded observation of the existing two-hop case. A passing probe can mask contention and does not establish a fix.', beforeRestart, final: await historyContentionSnapshot(), conversations: {}, collectionErrors: [] };
+    const collectionErrors = [];
+    try { if (overlapArmed) await releaseHistoryContentionOverlap(); }
+    catch (error) { collectionErrors.push(error.stack); }
+    const evidence = { description: 'Temporary bounded observation of the existing two-hop case. A passing probe can mask contention and does not establish a fix.', controlledOverlap, beforeRestart, final: await historyContentionSnapshot(), conversations: {}, collectionErrors };
     const directory = path.join(root, 'conversations');
     try {
       for (const name of (await fs.readdir(directory)).filter(name => name.endsWith('.json'))) {
