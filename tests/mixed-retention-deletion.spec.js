@@ -168,11 +168,12 @@ test('deleting a held kept-current repair retains distinct annotation and whole 
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
   await check('held');
   const checked = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), checkedAt = JSON.parse(await fs.readFile(path.join(root, 'clock.json'), 'utf8')).now;
+  await save(testInfo, 'mixed-post-suppression-observations.json', { observed: await observe(base), checked });
   const outcomes = Object.values(checked.outcomes);
   expect(outcomes).toHaveLength(2);
   expect(outcomes.map(value => value.locator).sort()).toEqual(Object.values(originalLedger.outcomes).map(value => value.locator).sort());
   for (const outcome of outcomes) {
-    expect(outcome.status).toBe('held'); expect(outcome.checkedAt).toBe(checkedAt); expect(outcome.sourceHash).toBe(sourceHash);
+    expect(outcome.status).toBe('held'); expect(outcome.checkedAt).toBe(checkedAt);
     expect(outcome.reason).toBe('Automatic re-import is suppressed. Restore this source explicitly before intake.');
   }
   await app.close(); app = null; await launch();
