@@ -87,7 +87,13 @@
       const scope = document.createElement('p'); scope.textContent = `${preview.revisions} revision snapshots. Automatic re-import stays suppressed until explicit restoration. Independent writing and its quotations remain with unavailable-evidence warnings. Original producer files, videos and separate exports/backups remain.`;
       section.append(title, label, scope);
       for (const file of preview.targets) { const item = document.createElement('p'); item.textContent = 'Remove: ' + file; section.append(item); }
-      for (const annotation of preview.annotations) { const item = document.createElement('pre'); item.textContent = 'Preserve annotation: ' + annotation.file + '\n' + annotation.text; section.append(item); }
+      for (const dependent of preview.dependents || preview.annotations.map(annotation => ({ ...annotation, kind: 'annotation', attribution: 'affected' }))) {
+        const item = document.createElement('article'), heading = document.createElement('h3'), state = document.createElement('p'), text = document.createElement('pre');
+        heading.textContent = 'Preserve ' + dependent.kind + ': ' + dependent.file;
+        state.textContent = `${dependent.id || ''}${dependent.requestId ? ' · request ' + dependent.requestId : ''}. ${dependent.attribution === 'unknown' ? 'Dependency attribution is unknown. Preserve and inspect this writing; no removal is authorized.' : 'Independent writing and its quotations remain. Supporting evidence becomes unavailable for future context.'}`;
+        text.textContent = dependent.text; item.append(heading, state, text); section.append(item);
+      }
+      const further = document.createElement('p'); further.textContent = 'Further removal needs a separate explicit scope. Use the saved idea, annotation, or readable transcript removal controls where available. Use local conversation deletion only when you intend to remove the whole conversation, including its other requests. Local history archives, comparison records, separate exports/backups and previous provider submissions are separately managed and may retain copies. This preview does not inventory arbitrary external copies.'; section.append(further);
       const confirm = document.createElement('button'), cancel = document.createElement('button');
       confirm.textContent = 'Confirm capture deletion'; cancel.textContent = 'Cancel capture deletion';
       cancel.onclick = () => action(async () => { await window.captureDeletion.cancel({ token: preview.token }); section.hidden = true; });
