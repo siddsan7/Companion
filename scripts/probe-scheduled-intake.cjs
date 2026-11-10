@@ -25,8 +25,13 @@ async function main() {
     await fs.writeFile(path.join(producer, 'first-pass-target.json'), JSON.stringify(fixture.target));
     await fs.copyFile(path.join(repository, 'tests/fixtures/reel-draft/notes.md'), path.join(producer, 'notes.md'));
     await fs.writeFile(path.join(directory, 'fixture-label.json'), JSON.stringify({ authored: true, purpose: 'Windows worker wiring/source-file access; not a real Reel to MD producer handoff.' }, null, 2));
-    const desktop = await electron.launch({ args: [repository], env: { ...process.env, COMPANION_TEST_ROOT: directory, COMPANION_NATIVE_SCHEDULER: '1' } });
+    const profile = path.join(directory, 'electron-profile'), roaming = path.join(directory, 'roaming'), localData = path.join(directory, 'local');
+    await Promise.all([profile, roaming, localData].map(folder => fs.mkdir(folder)));
+    const desktop = await electron.launch({ args: [`--user-data-dir=${profile}`, repository], env: { ...process.env, APPDATA: roaming, LOCALAPPDATA: localData, COMPANION_TEST_ROOT: directory, COMPANION_NATIVE_SCHEDULER: '1' } });
     try {
+      const paths = await desktop.evaluate(({ app }) => ({ userData: app.getPath('userData'), sessionData: app.getPath('sessionData') }));
+      if (Object.values(paths).some(folder => path.resolve(folder).toLowerCase() !== profile.toLowerCase())) throw Error('Electron profile is outside the disposable root.');
+      await fs.writeFile(path.join(directory, 'electron-paths.json'), JSON.stringify(paths, null, 2));
       const page = await desktop.firstWindow();
       await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
       await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
