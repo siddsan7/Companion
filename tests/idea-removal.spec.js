@@ -424,3 +424,62 @@ for (const control of ['intact', 'externally missing']) {
   });
 }
 
+for (const changed of ['unknown external hardlink', 'replaced known store folder']) {
+  test(`saved idea removal holds after preview for an ${changed}`, async ({}, testInfo) => {
+    test.setTimeout(120000);
+    await completedConversation();
+    const title = 'Selected idea whose ownership changes';
+    const selected = await saveIdea(title), retained = await saveIdea('Retained idea beside changed ownership');
+    const selectedBytes = await fs.readFile(selected, 'utf8'), retainedBytes = await fs.readFile(retained, 'utf8');
+    const id = YAML.parse(selectedBytes.match(/^---\n([\s\S]*?)\n---\n/)[1]).companion_id;
+    const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas');
+    const history = await bytesIn(path.join(root, 'conversations')), sources = await bytesIn(path.join(vault, 'Captures'));
+    const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+    await page.locator('#saved-ideas article').filter({ hasText: title }).getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+    await expect(page.getByLabel('Saved idea removal preview', { exact: true })).toContainText(id);
+    const originalParent = await fs.stat(directory, { bigint: true });
+    const alias = path.join(root, 'independent-idea-alias.md'), displaced = path.join(vault, '.ideas-original-held-13');
+    const sentinel = path.join(directory, 'independent-replacement-writing.txt'), sentinelBytes = 'Independent replacement folder writing must stay exact.';
+    let replacementParent;
+    if (changed === 'unknown external hardlink') {
+      await fs.link(selected, alias); expect((await fs.stat(selected)).nlink).toBe(2);
+    } else {
+      await fs.rename(directory, displaced); await fs.mkdir(directory);
+      await fs.writeFile(sentinel, sentinelBytes, { flag: 'wx' }); replacementParent = await fs.stat(directory, { bigint: true });
+      expect([replacementParent.dev, replacementParent.ino]).not.toEqual([originalParent.dev, originalParent.ino]);
+    }
+    try {
+      const before = await bytesIn(vault);
+      await page.getByRole('button', { name: 'Confirm saved idea removal', exact: true }).click();
+      await expect(page.getByLabel('Saved idea removal preview', { exact: true })).toBeHidden();
+      await expect(page.locator('#idea-status')).toContainText(/removal.*held|ordinary contained folders|linked copies/i);
+      const exists = async file => !!await fs.lstat(file).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      const controls = [directory, ...(replacementParent ? [displaced] : [])].flatMap(folder => [`${id}.removed.json`, `${id}.removed.json.pending`].map(name => path.join(folder, name)));
+      const markerPresence = await Promise.all(controls.map(exists));
+      await fs.writeFile(testInfo.outputPath('idea-removal-ownership.json'), JSON.stringify({
+        changed, status: await page.locator('#idea-status').innerText(), markerPresence,
+        originalParent: { dev: String(originalParent.dev), ino: String(originalParent.ino) },
+        replacementParent: replacementParent ? { dev: String(replacementParent.dev), ino: String(replacementParent.ino) } : null
+      }, null, 2), 'utf8');
+      expect(markerPresence.every(present => !present)).toBe(true);
+      expect(await bytesIn(vault)).toEqual(before);
+      expect(await fs.readFile(selected, 'utf8')).toBe(selectedBytes); expect(await fs.readFile(retained, 'utf8')).toBe(retainedBytes);
+      if (replacementParent) expect(await fs.readFile(sentinel, 'utf8')).toBe(sentinelBytes);
+      else { expect(await fs.readFile(alias, 'utf8')).toBe(selectedBytes); expect((await fs.stat(selected)).nlink).toBe(2); }
+      expect(await bytesIn(path.join(vault, 'Captures'))).toEqual(sources);
+      expect(await bytesIn(path.join(root, 'conversations'))).toEqual(history);
+      expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+    } finally {
+      if (replacementParent) {
+        if (app) { await app.close(); app = null; }
+        // Restore only this fixture's exact replacement, after checking its
+        // ordinary directory identity and sole independently written sentinel.
+        const current = await fs.lstat(directory, { bigint: true });
+        if (current.isDirectory() && !current.isSymbolicLink() && current.dev === replacementParent.dev && current.ino === replacementParent.ino && JSON.stringify(await fs.readdir(directory)) === JSON.stringify([path.basename(sentinel)]) && await fs.readFile(sentinel, 'utf8') === sentinelBytes) {
+          await fs.unlink(sentinel); await fs.rmdir(directory); await fs.rename(displaced, directory);
+        }
+      }
+    }
+  });
+}
+

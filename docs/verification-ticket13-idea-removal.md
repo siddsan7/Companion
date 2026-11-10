@@ -32,6 +32,12 @@ The minimum fix remembers refused idea UUIDs in the existing removal instance, k
 
 Root session `62737` passed both unchanged stale-save states in 1.4 minutes, exit 0 with no skips: intact controls in 43.0 seconds and externally lost controls in 42.9 seconds. Both diagnostics showed `destinationExists: false`, no changed files and unchanged parent identities. Fresh explicit save assertions completed under new UUIDs. Source captures, originating conversation/history, the other saved idea and provider submissions remained exact. Root retained the distinct 570-byte and 560-byte diagnostics plus `.last-run` under `Temp/companion-ticket13-idea-stale-green-20261109`.
 
+## Changed ownership after preview
+
+Root session `64737` passed the finite ownership pair against unchanged production `52cb753`: two passes in 1.1 minutes, exit 0 with no skips. The unknown external hardlink case passed in 32.8 seconds; replacement of the already-known `.ideas` folder passed in 34.7 seconds. Neither case required a production fix or a manufactured RED.
+
+Both cases altered ownership only after a populated removal preview. Confirmation held before creating any final or staged removal marker. Every vault byte, both saved ideas, source captures, originating conversation/history and provider submissions remained exact. The unknown external alias stayed linked and unchanged. The replacement-folder case preserved both the moved original store and the replacement's independent sentinel. Its cleanup closed the app and restored only the fixture's verified ordinary replacement inode with its sole exact sentinel; no unknown addition was overwritten.
+
 ## Approved authority protocol
 
 The existing `.ideas` mutation lock serializes preview, confirmation and recovery. Raw removal preview does not call context or recovery-mutating list helpers, and does not create a missing store.
@@ -44,5 +50,5 @@ Ideas guards retain each observed `.ideas` directory identity for the process li
 
 ## Remaining checks
 
-- Additional changed-file and unknown-hardlink cases, stale operation publication and same-session store replacement still need focused regression evidence. The demonstrated changed-scope case covers a new orphan stage after preview.
+- The focused checks cover a new orphan stage, an unknown external hardlink and same-session store replacement after preview, plus stale normal publication. The finite coupled regression gate and independent review remain required before integration.
 - Full ticket review, integration, release checks and live provider/isolation checks remain with the root agent. No live provider, authentication, merge or deployment was performed by this worker.
