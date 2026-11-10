@@ -417,7 +417,7 @@ async function finishDeletion(intake, ledger, id) {
     const file = path.join(vault.vault, target.file);
     if (authority.inventoryVersion === 2 || manualTitle.explicit(authority)) {
       await inspectDeletion(intake, ledger, id);
-      if (!intake.storage.matches(await intake.storage.view())) throw changed();
+      await intake.storage.guard();
       await sourceParents(intake, authority);
       if (manualTitle.explicit(authority)) {
         if (!(await manualTitle.inspect(intake, authority)).some(item => item.file === target.file)) throw changed();
@@ -428,7 +428,7 @@ async function finishDeletion(intake, ledger, id) {
   }
   if (authority.inventoryVersion === 2 || manualTitle.explicit(authority)) {
     if ((await inspectDeletion(intake, ledger, id)).length) throw changed();
-    if (!intake.storage.matches(await intake.storage.view())) throw changed();
+    await intake.storage.guard();
     if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
     if (authority.inventoryVersion === 2) sourceInventory.retirePointers(ledger, authority);
   }
