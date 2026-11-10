@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { hash, validate, render } = require('./intake-producer');
 const { validateNormalizedReview } = require('./source-review');
+const sourceTitle = require('./source-title');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -21,10 +22,11 @@ function text(bytes) {
 // Recovery verifies its surviving exact leaves; it does not need a removed journal.
 function validateInventory(value, id) {
   if (value.inventoryVersion === undefined) {
-    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || item.kind === 'source-recovery') || value.history?.some(item => item.inventoryVersion === 2)) fail();
+    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
     return;
   }
   if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
+  sourceTitle.validateProofs(value);
   const targets = new Map(value.targets.map(item => [item.file, item])); let previous = '';
   for (const item of value.recovery) {
     if (!fields(item, ['file', 'format', 'transaction', 'captureId', 'sourceHash', 'revisionId', 'sourceGeneration']) || !safe(item.file) || !safe(item.transaction) || item.file <= previous || !formats.includes(item.format) || item.captureId !== id || item.sourceHash !== value.sourceHash || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !targets.has(item.file)) fail();
@@ -121,9 +123,10 @@ function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
   return admission;
 }
 async function inventory(intake, ledger, capture, sourceHash, revisions, initial) {
+  const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;
   const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
   const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
-  if (!current || !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
+  if (!current || !titles.titleProofs.length && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
   const entries = [];
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (name === 'ledger.json') continue;
@@ -188,7 +191,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     for (const item of group) item.peers = peers;
   }
   await inspectTargets(intake, { targets: result, recovery, sourceHash });
-  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations };
+  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations, titleProofs: titles.titleProofs };
 }
 async function inspectTargets(intake, authority) {
   for (const item of authority.recovery || []) layout(intake, authority, item);

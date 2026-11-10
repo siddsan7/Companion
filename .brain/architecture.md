@@ -118,3 +118,8 @@ Active/unsaved history blocks export until local recovery. Unresolved pending fi
 `Ideas.list` computes current support warnings without changing note ownership or bytes; unique independent notes remain openable. Fatal storage/list errors retain the established live diagnostic under current-view guards. Initial support inspection follows a real successful base refresh; configuration epochs reject old results and failed reads preserve only prior same-vault repair rows.
 
 Exact schemas, source-copy inventory, failed runs, focused corrections, composite verification and review status are in [verification-ticket12.md](../docs/verification-ticket12.md) and state.md. These local checks do not promote deferred production readiness. #13 must preserve current control authority and only-copy writing during capture purge; #16 owns the complete final release gate.
+
+
+## Ticket 13 completed imported title recovery
+
+`source-title.js` verifies exact admitted source rendering, the existing `withTitle` transformation and the actual current/backup bytes. The existing source authority stores only generation-bound references to manifested current, backup and snapshot targets. Recovery validates immutable admission facts and surviving targets without reconstructing purged content. CaptureDeletion passes only proven backup paths through its adjacent-copy guard; the affected-writing inventory remains intact. The first three-file workflow passed; body-edit and partial-unlink checks are still pending. Manual, interrupted, repeated/older-revision title families remain held.
