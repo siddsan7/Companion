@@ -4,7 +4,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { createHash } = require('node:crypto');
 const YAML = require('yaml');
-const actionOrder = require('./helpers/visible-action-order').visibleActionOrder();
+const actionOrder = require('./helpers/mixed-check-phase').mixedCheckPhase();
 let root, app, page, checks;
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const exists = file => fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
@@ -27,6 +27,7 @@ async function check(status = 'complete') {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · ${status}`);
+  if (checks === 2) await actionOrder.saveSetup(test.info());
 }
 async function observe(folder, prefix = '') {
   const result = {};
