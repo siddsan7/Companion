@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require('node:util');
 const { hash, validate, render, bound } = require('./intake-producer');
 const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
+const pendingTitle = require('./pending-title');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -30,15 +31,16 @@ function validateInventory(value, id) {
   }
   if (value.inventoryVersion === 1) return require('./manual-title').validate(value, id);
   if (value.inventoryVersion === undefined) {
-    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
+    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs', 'titleRecovery'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
     return;
   }
   if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
-  sourceTitle.validateProofs(value);
-  validateRecovery(value, id);
+  sourceTitle.validateProofs(value, id);
+  const titleRecovery = pendingTitle.validate(value, id);
+  validateRecovery(value, id, titleRecovery);
   validateObservations(value, id);
 }
-function validateRecovery(value, id) {
+function validateRecovery(value, id, titleRecovery) {
   const targets = new Map(value.targets.map(item => [item.file, item])); let previous = '';
   for (const item of value.recovery) {
     if (!fields(item, ['file', 'format', 'transaction', 'captureId', 'sourceHash', 'revisionId', 'sourceGeneration']) || !safe(item.file) || !safe(item.transaction) || item.file <= previous || !formats.includes(item.format) || item.captureId !== id || item.sourceHash !== value.sourceHash || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !targets.has(item.file)) fail();
@@ -48,7 +50,7 @@ function validateRecovery(value, id) {
     if (item.format === 'source-backup' ? targets.get(item.file).kind !== 'source-backup' : targets.get(item.file).kind !== 'source-recovery' && !(item.format === 'incoming-snapshot' && targets.get(item.file).kind === 'snapshot')) fail();
   }
   for (const item of value.targets) {
-    if (item.kind === 'source-recovery' && !value.recovery.some(entry => entry.file === item.file)) fail();
+    if (item.kind === 'source-recovery' && value.recovery.filter(entry => entry.file === item.file).length + pendingTitle.sidecars(titleRecovery).filter(file => file === item.file).length !== 1) fail();
     if (item.peers !== undefined) {
       if (!Array.isArray(item.peers) || item.peers.length < 2 || item.peers.length > 2 || !item.peers.includes(item.file) || !equal(item.peers, [...new Set(item.peers)].sort())) fail();
       for (const file of item.peers) {
@@ -118,9 +120,16 @@ function normalizedDraft(revision, capture, sourceHash) {
 }
 function selectionTransaction(tx, ledger, capture, sourceHash, revisions) {
   if (!fields(tx, ['schema', 'resolution', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || !uuid(tx.resolution) || tx.retainOnly !== false || tx.sourceHash !== sourceHash || tx.revision.id === capture.currentRevision || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'reviewChoices', 'selectionHistory']) || !date(tx.capture.updatedAt)) fail();
-  const block = ledger.blocks[sourceHash], outcome = ledger.outcomes[tx.key];
-  const journal = `conflict-${tx.revision.id}-${tx.resolution}.json`;
-  if (!fields(block, ['reason', 'journal', 'incomingRevision']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  const block = ledger.blocks[sourceHash], pending = ledger.pending[sourceHash], outcome = ledger.outcomes[tx.key];
+  if (block === undefined) {
+    // The native destination-to-backup rename failed before capture staging.
+    // Bind only that deferred selection; deleting it does not complete it.
+    const reason = 'Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.';
+    if (!fields(pending, ['reason', 'journal', 'key']) || pending.reason !== reason || pending.journal !== `pending-${tx.revision.id}-${tx.resolution}.json` || pending.key !== tx.key || capture.conflict !== undefined || !isDeepStrictEqual(outcome, { status: 'held', reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  } else {
+    const journal = `conflict-${tx.revision.id}-${tx.resolution}.json`;
+    if (!fields(block, ['reason', 'journal', 'incomingRevision']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  }
   const authority = ledger.sourceAuthority?.[capture.id];
   if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
   const { revisionAdmission } = require('./source-authority'), { noteText } = require('./intake');
@@ -233,13 +242,16 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   return inventorySources(intake, ledger, capture, sourceHash, revisions, initial);
 }
 async function inventorySources(intake, ledger, capture, sourceHash, revisions, initial, detachedEditor = null) {
+  const pending = await pendingTitle.inventory(intake, ledger, capture, sourceHash, revisions, initial);
+  if (pending) initial = pending.targets;
   const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;
   const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
   const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
-  if (!current || !titles.titleProofs.length && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
+  if (!current || !pending && !titles.verifiedCurrent && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
   const entries = [];
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (name === 'ledger.json') continue;
+    if (pending?.titleRecovery.intent === relative(intake, path.join(intake.dir, name))) continue;
     const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
     if (detachedEditor && accountDetachedLeaf(detachedEditor, value)) {
       targets.set(value.target.file, { ...value.target, kind: 'mixed-recovery' }); continue;
@@ -253,9 +265,12 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     // those exact bytes. Do not discard duplicate-key or formatting payloads.
     if (!entry.value.bytes.equals(Buffer.from(JSON.stringify(tx), 'utf8'))) fail();
     const admission = transaction(intake, tx, ledger, capture, sourceHash, revisions), journal = relative(intake, entry.file);
+    const deferredSelection = tx.resolution !== undefined && ledger.blocks[sourceHash] === undefined;
+    if (deferredSelection && (entry.name !== ledger.pending[sourceHash].journal || !entries.some(item => item.name === tx.revision.id + '.snapshot.stage') || entries.some(item => [tx.revision.id + '.stage', tx.backup].includes(item.name)))) fail();
     const descriptor = { transaction: journal, captureId: capture.id, sourceHash, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null };
     const add = (file, format, content, kind = 'source-recovery') => {
       const item = { file: relative(intake, file), format, ...descriptor }; layout(intake, { sourceHash }, item);
+      if (titles.proofFiles.has(item.file)) fail();
       const prior = expected.get(item.file);
       if (prior && (prior.content !== content || prior.item.revisionId !== item.revisionId || prior.item.sourceGeneration !== item.sourceGeneration)) fail();
       // A live transaction/archive pair shares one canonical transaction descriptor.
@@ -269,14 +284,23 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     transactions.set(journal, tx);
     if (!admission) observations.push({ identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, sourceHash, captureId: capture.id, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null });
   }
-  // Source-only legacy before-files without a retained transaction keep the
-  // existing admitted-snapshot exact rendering rule.
+  // Completed title before-files must match the first guarded observation;
+  // other legacy before-files retain the exact admitted-snapshot renderer.
+  const observedTitleBackups = new Set();
   for (const entry of entries) if (!expected.has(relative(intake, entry.file))) {
+    const proven = titles.sourceBackups.get(relative(intake, entry.file));
+    if (proven) {
+      // A completed title path grants no filename exemption. The second
+      // observation must be the exact bytes and ordinary physical leaf proved.
+      if (entry.name !== path.posix.basename(proven.target.file) || !entry.value.bytes.equals(proven.bytes) || entry.value.nlink !== 1 || ['file', 'sha256', 'dev', 'ino', 'bytes'].some(key => entry.value.target[key] !== proven.target[key])) fail();
+      observedTitleBackups.add(proven.target.file); targets.set(proven.target.file, proven.target); continue;
+    }
     if (!new RegExp(`^${capture.id}-[a-f0-9-]{36}\\.before(?:-[a-f0-9-]{36})?\\.md$`).test(entry.name)) fail();
     const { parse } = require('./vault'), { noteText } = require('./intake'); const note = parse(entry.text);
     if (!note || note.id !== capture.id || ![...revisions.values()].some(revision => entry.value.bytes.equals(Buffer.from(noteText({ ...capture, title: note.title, capturedAt: note.capturedAt }, revision), 'utf8'))) || entry.value.nlink !== 1) fail();
     targets.set(relative(intake, entry.file), { ...entry.value.target, kind: 'source-backup' });
   }
+  if (observedTitleBackups.size !== titles.sourceBackups.size) fail();
   for (const { item, content, kind } of expected.values()) {
     let value; try { value = await leaf(intake, path.join(intake.vault.vault, item.file), kind); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     if (!value.bytes.equals(Buffer.from(content, 'utf8'))) fail();
@@ -300,11 +324,12 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
   for (const item of result) { const key = `${item.dev}:${item.ino}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(item); }
   for (const group of groups.values()) if (group.length > 1) {
     const peers = group.map(item => item.file).sort();
-    if (group.length !== 2 || !knownPair(proof, peers) || group.some(item => item.sha256 !== group[0].sha256 || item.bytes !== group[0].bytes)) fail();
+    if (group.some(item => titles.proofFiles.has(item.file)) || group.length !== 2 || !knownPair(proof, peers) || group.some(item => item.sha256 !== group[0].sha256 || item.bytes !== group[0].bytes)) fail();
     for (const item of group) item.peers = peers;
   }
   await inspectTargets(intake, { targets: result, recovery, sourceHash });
-  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations, titleProofs: titles.titleProofs };
+  if (pending) await pendingTitle.inspect(intake, ledger, { inventoryVersion: 2, sourceHash, targets: result, originGenerations: ledger.sourceAuthority?.[capture.id] ? [{ captureId: capture.id, generation: ledger.sourceAuthority[capture.id].generation }] : [], titleRecovery: pending.titleRecovery });
+  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations, titleProofs: titles.titleProofs, ...(pending ? { titleRecovery: pending.titleRecovery } : {}) };
 }
 async function inspectTargets(intake, authority) {
   for (const item of authority.recovery || []) layout(intake, authority, item);
