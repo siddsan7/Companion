@@ -117,6 +117,7 @@ test('deleting persistent detached editor writing retains one whole local annota
   await fs.unlink(path.join(root, 'release.txt'));
   await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
   await expect(page.getByRole('button', { name: 'Delete capture', exact: true })).toBeVisible();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
   const targets = [current, snapshotA, snapshotB, snapshotStage, incoming, archive, independent, retained, holdArchive];
   const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
   const recovered = await observe(testInfo, 'persistent-family-before-count', base, {
@@ -325,6 +326,7 @@ async function heldDetachedEditorForAlias(testInfo) {
   await fs.unlink(path.join(root, 'release.txt'));
   await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
   await expect(page.getByRole('button', { name: 'Delete capture', exact: true })).toBeVisible();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
   const targets = [current, snapshotA, snapshotB, snapshotStage, incoming, archive, independent, retained, holdArchive];
   const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
   const recovered = await observe(testInfo, 'persistent-family-before-count', base, {
@@ -571,6 +573,7 @@ test('restored draft A retains detached editor writing with fresh admission and 
   await fs.unlink(path.join(root, 'release.txt'));
   await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
   await expect(page.getByRole('button', { name: 'Delete capture', exact: true })).toBeVisible();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
   const targets = [current, snapshotA, snapshotB, snapshotStage, incoming, archive, independent, retained, holdArchive];
   const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
   const recovered = await observe(testInfo, 'persistent-family-before-count', base, {
