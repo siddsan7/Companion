@@ -147,7 +147,7 @@ async function inventory(vault, conversations, captureId) {
       else {
         const value = await io.read(file), data = metadata(value.text);
         if (['annotation', 'saved_idea', 'conversation_transcript'].includes(data?.artifact_type)) add(data.artifact_type, value.value.file, value.text, data);
-        else if (!data && [path.join(vault.root, 'Annotations'), path.join(vault.root, 'Ideas')].includes(directory)) add('unknown writing', value.value.file, value.text, null);
+        else if ([path.join(vault.root, 'Annotations'), path.join(vault.root, 'Ideas')].includes(directory)) add('unknown writing', value.value.file, value.text, data);
       }
     }
   };
@@ -167,12 +167,14 @@ async function inventory(vault, conversations, captureId) {
   for (const entry of await io.list(intake, entry => /^(?:annotation-intent\.json|annotation-[a-f0-9-]{36}\.stage|(?:link|repair)-(?:intent|[a-f0-9-]{36})\.json|link-[a-f0-9-]{36}\.(?:before\.md|stage|held-.*\.md))$/.test(entry.name))) {
     const value = await io.read(path.join(intake, entry.name)); let retained;
     if (entry.name.endsWith('.json')) { try { retained = JSON.parse(value.text); } catch {} }
+    let recognized = false;
     if (retained) {
       for (const key of ['annotation', 'before', 'content']) if (typeof retained[key] === 'string') {
         const data = metadata(retained[key]);
-        if (data?.artifact_type === 'annotation') add('retained annotation ' + key, value.value.file, retained[key], data);
+        if (data?.artifact_type === 'annotation') { add('retained annotation ' + key, value.value.file, retained[key], data); recognized = true; }
       }
-    } else add('retained annotation writing', value.value.file, value.text, metadata(value.text));
+    }
+    if (!recognized) add('retained annotation writing', value.value.file, value.text, metadata(value.text));
   }
   const dependency = dep => {
     if (!dep || typeof dep !== 'object') return 'unknown';
