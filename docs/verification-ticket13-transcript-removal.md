@@ -41,7 +41,11 @@ Root session `99195` reproduced both failures on unchanged production: exit 1. T
 
 The minimum fix changes only the two hardlink peer construction sorts to use the existing locale comparator. Parent and target ordering, strict uniqueness validation, marker schema and immutable authority remain unchanged. This preserves previously valid marker ordering. Syntax passed.
 
-Root session `59030` passed both focused lowercase regressions on the unchanged candidate: exit 0, no skips, 1.1 minutes total. Actual stage-crash recovery took 30.0 seconds; normal removal took 34.4 seconds. Both workflows reached their final assertions, including explicit recovery, exact selected-copy removal, retained independent writing and restart stability. Root retained the 222-byte actual-main-exit proof and last-run result under `Temp/companion-ticket13-transcript-lowercase-green-20261109/`. The 21-case coupled rerun and fresh exact-tip independent approval on both review axes remain pending.
+Root session `59030` passed both focused lowercase regressions on the unchanged candidate: exit 0, no skips, 1.1 minutes total. Actual stage-crash recovery took 30.0 seconds; normal removal took 34.4 seconds. Both workflows reached their final assertions, including explicit recovery, exact selected-copy removal, retained independent writing and restart stability. Root retained the 222-byte actual-main-exit proof and last-run result under `Temp/companion-ticket13-transcript-lowercase-green-20261109/`.
+
+Root session `8420` then passed the final coupled gate at `4edd61b`: 21 of 21 cases, exit 0, no skips, 9.9 minutes. After the gate, root passed syntax checks for all five changed JavaScript files, the project's `npm check`, and the diff check. Root retained three actual-exit proofs (223, 221 and 226 bytes), two stale-confirmation diagnostics (656 and 688 bytes), and the last-run result under `Temp/companion-ticket13-transcript-final-coupled-green-20261109/`.
+
+The remaining bounded-helper step is fresh independent review on both axes at the final documentation tip. These results do not claim merge authorization or whole-ticket approval; complete ticket 13 and ticket 16 obligations remain separate.
 
 ## Retained intent with missing output
 
