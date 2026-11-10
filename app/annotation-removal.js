@@ -34,7 +34,7 @@ async function raw(vault) {
   async function visit(folder) {
     directories.push(await directory(vault, folder));
     for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
-      if (['.git', '.obsidian', '.intake', '.codex', 'managed-home'].includes(entry.name)) continue;
+      if (['.git', '.obsidian', '.intake', '.codex', 'managed-home'].includes(entry.name.toLowerCase())) continue;
       const file = path.join(folder, entry.name);
       if (entry.isSymbolicLink()) throw changed();
       if (entry.isDirectory()) await visit(file);

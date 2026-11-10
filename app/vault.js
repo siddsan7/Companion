@@ -71,7 +71,7 @@ class Vault {
     const visit = async dir => {
       await this.contained(dir);
       for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home'].includes(entry.name)) continue;
+        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home'].includes(entry.name.toLowerCase())) continue;
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
