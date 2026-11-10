@@ -76,38 +76,40 @@ async function installCitation13Probe(application) {
       } catch (error) { return { parseError: String(error) }; }
     };
 
-    const nativeView = IntakeLedger.prototype.view;
-    IntakeLedger.prototype.view = async function (...args) {
-      const call = ++state.operation;
-      add('ledger.view.start', { call, file: args[0] || this.file });
-      try {
-        const value = await nativeView.apply(this, args);
-        // Observe precisely what the real read returned. Do not reread the file.
-        add('ledger.view.return', { call, file: args[0] || this.file, identity: copy(value.identity), phases: phases(value.text) });
-        return value;
-      } catch (error) { add('ledger.view.error', { call, error: errorData(error) }); throw error; }
-    };
+    if (process.env.COMPANION_CITATION_LIGHT_PROBE !== '1') {
+      const nativeView = IntakeLedger.prototype.view;
+      IntakeLedger.prototype.view = async function (...args) {
+        const call = ++state.operation;
+        add('ledger.view.start', { call, file: args[0] || this.file });
+        try {
+          const value = await nativeView.apply(this, args);
+          // Observe precisely what the real read returned. Do not reread the file.
+          add('ledger.view.return', { call, file: args[0] || this.file, identity: copy(value.identity), phases: phases(value.text) });
+          return value;
+        } catch (error) { add('ledger.view.error', { call, error: errorData(error) }); throw error; }
+      };
 
-    const nativeReplace = IntakeLedger.prototype.replace;
-    IntakeLedger.prototype.replace = async function (...args) {
-      const call = ++state.operation;
-      add('ledger.replace.start', { call, file: this.file, expectedIdentity: copy(this.expected?.identity), proposedDigest: createHash('sha256').update(args[0]).digest('hex'), caller: new Error('ledger replace caller').stack });
-      try {
-        const value = await nativeReplace.apply(this, args);
-        add('ledger.replace.return', { call, identity: copy(this.expected?.identity) });
-        return value;
-      } catch (error) { add('ledger.replace.error', { call, error: errorData(error) }); throw error; }
-    };
+      const nativeReplace = IntakeLedger.prototype.replace;
+      IntakeLedger.prototype.replace = async function (...args) {
+        const call = ++state.operation;
+        add('ledger.replace.start', { call, file: this.file, expectedIdentity: copy(this.expected?.identity), proposedDigest: createHash('sha256').update(args[0]).digest('hex'), caller: new Error('ledger replace caller').stack });
+        try {
+          const value = await nativeReplace.apply(this, args);
+          add('ledger.replace.return', { call, identity: copy(this.expected?.identity) });
+          return value;
+        } catch (error) { add('ledger.replace.error', { call, error: errorData(error) }); throw error; }
+      };
 
-    const nativeInfo = Intake.prototype.info;
-    Intake.prototype.info = async function (...args) {
-      const call = ++state.operation;
-      add('intake.info.start', { call, caller: new Error('info caller').stack });
-      try {
-        const value = await nativeInfo.apply(this, args);
-        add('intake.info.return', { call }); return value;
-      } catch (error) { add('intake.info.error', { call, error: errorData(error) }); throw error; }
-    };
+      const nativeInfo = Intake.prototype.info;
+      Intake.prototype.info = async function (...args) {
+        const call = ++state.operation;
+        add('intake.info.start', { call, caller: new Error('info caller').stack });
+        try {
+          const value = await nativeInfo.apply(this, args);
+          add('intake.info.return', { call }); return value;
+        } catch (error) { add('intake.info.error', { call, error: errorData(error) }); throw error; }
+      };
+    }
 
     const nativeInventory = CaptureDeletion.prototype.inventory;
     CaptureDeletion.prototype.inventory = async function (...args) {
