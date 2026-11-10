@@ -234,7 +234,8 @@ test('deleting persistent detached editor writing retains one whole local annota
   const deleted = await verifyDeleted('confirmed-purge');
   expect(deleted.sourceAuthority[capture.id].targets.map(target => target.file).sort()).toEqual(expectedPaths);
   expect(deleted.sourceAuthority[capture.id].purgedProducerAttempts.find(item => item.identity === tx.revision.identity)).toEqual({ identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, sourceHash, captureId: capture.id, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null, operationId: deleted.sourceAuthority[capture.id].operationId });
-  const checkedAt = '2026-11-08T06:59:01.000Z';
+  const checkedAt = new Date(Date.parse(deleted.lastCheck.at) + 1000).toISOString();
+  await expect(page.locator('#intake-state')).not.toContainText(`Last check: ${checkedAt} · manual · held`);
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: checkedAt, timezone: 'America/Phoenix' }));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.locator('#intake-state')).toContainText(`Last check: ${checkedAt} · manual · held`);
