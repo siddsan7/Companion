@@ -64,4 +64,4 @@ function validateNormalizedReview(revision, captureId, sourceHash) {
   // Original manifest/review/export bytes are not retained here. Their recorded
   // fingerprint is checked against acceptance elsewhere, never reconstructed.
 }
-module.exports = { validateNormalizedReview };
+module.exports = { validateNormalizedReview, knownRun };

@@ -1,7 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { hash, validate, render } = require('./intake-producer');
-const { validateNormalizedReview } = require('./source-review');
+const { hash, validate, render, bound } = require('./intake-producer');
+const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -93,8 +93,11 @@ async function leaf(intake, file, kind) {
 function normalizedDraft(revision, capture, sourceHash) {
   if (!fields(revision, ['schema', 'id', 'captureId', 'importedAt', 'sourceHash', 'identity', 'fingerprint', 'run', 'evidence', 'target', 'text', 'locator', 'humanReview', 'extraction', 'uncertainty']) || revision.schema !== 1 || !uuid(revision.id) || revision.captureId !== capture.id || revision.sourceHash !== sourceHash || !date(revision.importedAt) || !sha(revision.fingerprint) || typeof revision.locator !== 'string' || revision.humanReview !== 'unreviewed') fail();
   const run = revision.run;
-  if (!fields(run, ['job_id', 'attempt_id', 'started_utc', 'input_sha256', 'input_kind', 'result_kind', 'state', 'validation', 'draft_mode']) || !sha(run.job_id) || !/^[a-f0-9]{32}$/.test(run.attempt_id) || run.input_sha256 !== sourceHash || revision.identity !== `${run.job_id}:${run.attempt_id}` || revision.evidence?.clip_id !== run.job_id || !date(run.started_utc) || !['local_video', 'synthetic_fixture'].includes(run.input_kind) || run.result_kind !== (run.input_kind === 'local_video' ? 'local_video_unreviewed' : 'synthetic_video_wiring') || run.validation !== 'passed' || run.draft_mode !== undefined) fail();
+  knownRun(run);
+  // Finalized provenance permits failed/conservative runs; a ready draft does not.
+  if (run.input_sha256 !== sourceHash || revision.identity !== `${run.job_id}:${run.attempt_id}` || revision.evidence?.clip_id !== run.job_id || !['local_video', 'synthetic_fixture'].includes(run.input_kind) || run.result_kind !== (run.input_kind === 'local_video' ? 'local_video_unreviewed' : 'synthetic_video_wiring') || !['complete', 'partial'].includes(run.state) || run.validation !== 'passed' || run.draft_mode !== undefined && run.draft_mode !== 'bound_excerpts_v1') fail();
   validate(revision.evidence, revision.target);
+  if (run.draft_mode === 'bound_excerpts_v1') bound(revision.evidence, revision.target);
   if (revision.text !== render(revision.evidence, revision.target) || revision.extraction !== revision.target.status || run.state !== (revision.target.status === 'complete' ? 'complete' : 'partial')) fail();
   const uncertainty = { channels: revision.evidence.channels, truncated: revision.evidence.truncated, uncertainEvidence: revision.evidence.evidence.filter(item => item.review_flag === 'uncertain').map(item => item.id), unknowns: revision.target.unknowns, conflicts: revision.target.conflicts };
   if (!equal(revision.uncertainty, uncertainty)) fail();
