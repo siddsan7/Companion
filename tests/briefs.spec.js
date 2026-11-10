@@ -12,6 +12,54 @@ test.beforeEach(async () => {
 });
 test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function launch() { app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow(); }
+test('an unfinished brief refresh cannot approve the previously displayed proposal', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  const folder = path.join(root, 'vault', 'Companion', 'Briefs');
+  const first = path.join(folder, (await fs.readdir(folder)).find(name => name.startsWith('approved-1-')));
+  const approvedBytes = await fs.readFile(first);
+  await fs.writeFile(readme, '# MyTune\n\nA rhythm practice coach.\n');
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed brief refresh requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('brief-propose');
+    const gate = globalThis.__briefProposalDelivery = { original, held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('brief-propose', async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true;
+      await delivery;
+      return result;
+    });
+  });
+  try {
+    await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__briefProposalDelivery.held)).toBe(true);
+    await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeDisabled();
+    expect(await fs.readFile(first)).toEqual(approvedBytes);
+    await app.evaluate(() => globalThis.__briefProposalDelivery.release());
+    await expect(page.getByLabel('Project purpose', { exact: true })).toHaveValue('A rhythm practice coach.');
+    await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+    await expect(page.locator('#brief-view')).toContainText('Approved version 2');
+    expect(await fs.readFile(first)).toEqual(approvedBytes);
+    const second = path.join(folder, (await fs.readdir(folder)).find(name => name.startsWith('approved-2-')));
+    expect(await fs.readFile(second, 'utf8')).toContain('A rhythm practice coach.');
+    await expect(page.locator('#brief-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__briefProposalDelivery;
+      ipcMain._invokeHandlers.set('brief-propose', gate.original);
+      gate.release();
+      delete globalThis.__briefProposalDelivery;
+    });
+  }
+});
+
 test('selected README produces a locally inspectable proposal and explicit immutable approval across restart', async () => {
   await launch();
   await page.getByRole('button', { name: 'Choose vault' }).click();
