@@ -363,3 +363,88 @@ require(${JSON.stringify(path.join(appDirectory, 'main'))});
   expect(await fs.readFile(retained.file)).toEqual(retained.bytes);
   expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
 });
+
+test('pending-only annotation writing can be reviewed and removed without ever publishing its note', async () => {
+  test.setTimeout(90000);
+  readerEntry = path.join(root, 'annotation-pending-main.cjs');
+  await fs.writeFile(readerEntry, `
+const io = require('node:fs/promises');
+const local = require('node:fs');
+const path = require('node:path');
+const root = process.env.COMPANION_TEST_ROOT, originalLink = io.link;
+let selectedId;
+io.link = async function (from, to) {
+  const match = typeof from === 'string' && path.basename(from).match(/^annotation-([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\\.stage$/);
+  if (match && typeof to === 'string') {
+    const id = match[1], stage = path.join(root, 'vault', 'Companion', '.intake', 'annotation-' + id + '.stage'), output = path.join(root, 'vault', 'Companion', 'Annotations', id + '.md');
+    if (path.resolve(from) === stage && path.resolve(to) === output && (selectedId === id || !selectedId && local.existsSync(path.join(root, 'pending-link-arm.txt')))) {
+      const stat = await io.lstat(stage);
+      if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1) {
+        selectedId ||= id;
+        const outputAbsent = await io.lstat(output).then(() => false, error => { if (error.code === 'ENOENT') return true; throw error; });
+        await io.writeFile(path.join(root, 'pending-link-checkpoint.json'), JSON.stringify({ id, from, to, outputAbsent }));
+        throw Object.assign(Error('Controlled unpublished annotation link failure.'), { code: 'EACCES' });
+      }
+    }
+  }
+  return originalLink.call(this, from, to);
+};
+require(${JSON.stringify(path.resolve(__dirname, '..', 'app', 'main'))});
+`, 'utf8');
+  const base = await importedCapture(), intake = path.join(base, '.intake'), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(intake, 'ledger.json');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation', { exact: true }).fill('Retained published independent writing.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved.');
+  await expect(page.getByLabel('New annotation', { exact: true })).toHaveValue('');
+  const retained = path.join(annotationFolder, (await fs.readdir(annotationFolder)).find(name => name.endsWith('.md'))), retainedBytes = await fs.readFile(retained);
+  const pendingText = 'PENDINGONLYCANARY independent writing has never been published.';
+  await fs.writeFile(path.join(root, 'pending-link-arm.txt'), 'fail this actual annotation publication');
+  await page.getByLabel('New annotation', { exact: true }).fill(pendingText);
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Controlled unpublished annotation link failure.');
+  const fault = JSON.parse(await fs.readFile(path.join(root, 'pending-link-checkpoint.json'), 'utf8'));
+  expect(fault.outputAbsent).toBe(true);
+  const intentFile = path.join(intake, 'annotation-intent.json'), stage = path.join(intake, `annotation-${fault.id}.stage`), output = path.join(annotationFolder, fault.id + '.md');
+  expect(fault.from).toBe(stage); expect(fault.to).toBe(output);
+  const intentBytes = await fs.readFile(intentFile), intent = JSON.parse(intentBytes.toString('utf8')), stageBytes = await fs.readFile(stage);
+  expect(Object.keys(intent).sort()).toEqual(['annotation', 'captureId', 'id', 'schema']);
+  expect(intent.schema).toBe(1); expect(intent.id).toBe(fault.id); expect(intent.annotation).toContain(pendingText);
+  const metadata = YAML.parse(intent.annotation.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]);
+  expect(metadata.companion_id).toBe(intent.id); expect(metadata.capture_id).toBe(intent.captureId);
+  expect(stageBytes.toString('utf8')).toBe(intent.annotation);
+  for (const file of [intentFile, stage]) { const stat = await fs.lstat(file); expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1); }
+  expect(await fs.access(output).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), before = await files(base), source = await files(path.join(base, 'Captures')), revisions = await files(path.join(base, 'Revisions')), producer = await files(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  const review = page.getByLabel('Annotation removal review', { exact: true }), row = review.getByRole('article').filter({ hasText: intent.id });
+  await expect(row).toContainText(pendingText);
+  await expect(row).toContainText('Pending');
+  await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const preview = page.getByLabel('Annotation removal preview', { exact: true }); await expect(preview).toBeVisible();
+  for (const file of [intentFile, stage]) await expect(preview).toContainText(path.relative(path.join(root, 'vault'), file).split(path.sep).join('/'));
+  await expect(preview).not.toContainText(path.relative(path.join(root, 'vault'), retained).split(path.sep).join('/'));
+  expect(await files(base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel annotation removal', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  expect(await fs.access(output).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation removed');
+  for (const file of [intentFile, stage, output]) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  const removed = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(removed.annotationRemovals[intent.id].phase).toBe('removed');
+  for (const key of ['captures', 'attempts', 'admissions', 'sourceAuthority', 'suppressed']) expect(removed[key]).toEqual(original[key]);
+  expect(await fs.readFile(retained)).toEqual(retainedBytes); expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
+  expect(await files(path.join(root, 'producer'))).toEqual(producer);
+  await fs.unlink(path.join(root, 'pending-link-arm.txt'));
+  await closeApp('pending-only-restart'); app = null; await launch();
+  expect(await fs.access(output).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation', { exact: true }).fill('Fresh independent writing with a new identity.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved.');
+  const published = (await fs.readdir(annotationFolder)).filter(name => name.endsWith('.md'));
+  expect(published).toHaveLength(2); expect(published).not.toContain(intent.id + '.md');
+  expect(await fs.readFile(retained)).toEqual(retainedBytes);
+});
