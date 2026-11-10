@@ -123,3 +123,6 @@ Exact schemas, source-copy inventory, failed runs, focused corrections, composit
 ## Ticket 13 completed imported title recovery
 
 `source-title.js` verifies exact admitted source rendering, the existing `withTitle` transformation and the actual current/backup bytes. The existing source authority stores only generation-bound references to manifested current, backup and snapshot targets. Recovery validates immutable admission facts and surviving targets without reconstructing purged content. CaptureDeletion passes only proven backup paths through its adjacent-copy guard; the affected-writing inventory remains intact. The first three-file workflow passed; body-edit and partial-unlink checks are still pending. Manual, interrupted, repeated/older-revision title families remain held.
+
+
+Repeated completed-title copies use the same content-free proof shape as a finite physical-node path: canonical admitted baseline, every remaining ordinary backup, then current. Each actual withTitle edge must match literal bytes; equal-byte files retain distinct identities. Metadata validation enforces one fully covered acyclic path with one terminal and shared original admission, without chronology or search assumptions. The six-file normal workflow passed; its intermediate-body guard and refreshed coupled checks remain pending.
