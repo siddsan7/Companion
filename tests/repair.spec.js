@@ -33,6 +33,54 @@ async function connect(scan = false) {
   await expect(page.getByRole('status')).toContainText(scan ? 'Intake check complete' : 'Source connected');
 }
 
+for (const channel of ['state', 'vault-repairs']) test(`repair choices wait for current ${channel} inspection before accepting a changed-copy selection`, async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
+  const name = (await fs.readdir(captures)).find(file => file.endsWith('.md'));
+  const original = path.join(captures, name), before = await fs.readFile(original, 'utf8');
+  const copy = path.join(root, 'vault', 'Projects', 'Preserved duplicate.md');
+  await fs.mkdir(path.dirname(copy), { recursive: true });
+  await fs.writeFile(copy, before + '\nKeep independent copied writing.\n');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  const choice = page.getByRole('button', { name: `Use this file: Companion/Captures/${name}`, exact: true });
+  await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
+  await expect(choice).toBeEnabled();
+  const previousChoice = await choice.elementHandle();
+  await fs.appendFile(copy, '\nLater independent copy writing changes the reviewed inventory.\n');
+  const copied = await fs.readFile(copy, 'utf8');
+  await app.evaluate(({ ipcMain }, channel) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed repair inspection requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get(channel);
+    const gate = globalThis.__repairInspectionDelivery = { original, channel, held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set(channel, async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true; await delivery; return result;
+    });
+  }, channel);
+  try {
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__repairInspectionDelivery.held)).toBe(true);
+    await expect(choice).toBeDisabled();
+    expect(await fs.readFile(original, 'utf8')).toBe(before);
+    expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+    await app.evaluate(() => globalThis.__repairInspectionDelivery.release());
+    await expect.poll(() => previousChoice.evaluate(node => node.isConnected)).toBe(false);
+    await expect(choice).toBeEnabled();
+    await choice.click();
+    await expect(page.getByRole('status')).toContainText('Identity selection saved');
+    expect(await fs.readFile(original, 'utf8')).toBe(before);
+    expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__repairInspectionDelivery;
+      ipcMain._invokeHandlers.set(gate.channel, gate.original); gate.release();
+      delete globalThis.__repairInspectionDelivery;
+    });
+    await previousChoice.dispose();
+  }
+});
+
 test('external writing survives restart and transfers to an annotation before incoming source applies', async () => {
   await artifact(); await launch(); await setup(); await connect(true);
   const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
