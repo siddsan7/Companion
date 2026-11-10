@@ -8,6 +8,7 @@ const titles = new Set([
   'ranked matching paragraphs expose exact line anchors and explicit passage selection preserves the inspected text',
   'source inspection reads changed capture bytes after a Refresh wait and requires fresh review without a turn',
   'same-byte manual restoration preserves the literal hash while excluding its earlier conversation from the next package',
+  'mixed retention holds a missing receipted output before first native source unlink without republication',
 ]);
 
 async function observationRead(read, label) {
@@ -41,9 +42,9 @@ function visibleActionOrder() {
           const fingerprint = text => { let h = 2166136261; for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619); return (h >>> 0).toString(16); };
           if (!process.env.COMPANION_TEST_ROOT) throw Error('Visible-action observation requires the disposable fixture.');
           const channels = ['state', 'vault-repairs', 'choose-identity', 'context-find', 'context-passage', 'context-preview', 'conversation-list', 'conversation-preview', 'brief-propose', 'brief-state', 'brief-approve', 'idea-list', 'check-intake', 'connect-reviews', 'add-annotation'];
-          const ownershipOnly = new Set(['idea-list', 'check-intake', 'connect-reviews', 'add-annotation']);
-          const scalar = new Set(['id', 'key', 'digest', 'sha256', 'hash', 'token', 'approval', 'captureId', 'generation', 'sourceGeneration', 'conversationGeneration', 'version', 'briefVersion', 'conversationId', 'requestId', 'packageId', 'historyDigest', 'status', 'kind', 'start', 'end', 'count', 'limit', 'blocked', 'sourceHash', 'revisionId']);
-          const nested = new Set(['all', 'matches', 'selections', 'sourceGenerations', 'sources', 'files', 'copies', 'proposed', 'approved', 'conversations', 'requests', 'package', 'brief', 'issues', 'proposalIssues', 'identityIssues', 'repairs', 'excludedSources', 'excludedHistory', 'historyExclusions', 'historyRefs', 'dependencies', 'scope']);
+          const ownershipOnly = new Set(['idea-list', 'connect-reviews', 'add-annotation']);
+          const scalar = new Set(['id', 'key', 'digest', 'sha256', 'hash', 'token', 'approval', 'captureId', 'generation', 'sourceGeneration', 'conversationGeneration', 'version', 'briefVersion', 'conversationId', 'requestId', 'packageId', 'historyDigest', 'status', 'kind', 'start', 'end', 'count', 'limit', 'blocked', 'sourceHash', 'revisionId', 'at', 'now', 'trigger']);
+          const nested = new Set(['all', 'matches', 'selections', 'sourceGenerations', 'sources', 'files', 'copies', 'proposed', 'approved', 'conversations', 'requests', 'package', 'brief', 'issues', 'proposalIssues', 'identityIssues', 'repairs', 'excludedSources', 'excludedHistory', 'historyExclusions', 'historyRefs', 'dependencies', 'scope', 'lastCheck', 'lastSuccess', 'intake']);
           // No full source, request, reply, body, settings, or directory is retained.
           function summary(value, depth = 0, field = '') {
             if (depth > 12) return { truncated: true };
@@ -146,8 +147,8 @@ function installRenderer() {
   const identity = node => { if (!identities.has(node)) identities.set(node, ++nextIdentity); return identities.get(node); };
   // Small deterministic fingerprint, deliberately labelled rather than called SHA-256.
   const fingerprint = text => { text = String(text || ''); let h = 2166136261; for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619); return { length: text.length, fnv1a: (h >>> 0).toString(16) }; };
-  const selectors = ['#context-results', '#context-selected', '#context-manual', '#vault-repairs', '#brief-proposal', '#conversation-history'];
-  const statusIds = ['context-error', 'context-summary', 'conversation-error', 'conversation-summary', 'brief-error'];
+  const selectors = ['#context-results', '#context-selected', '#context-manual', '#vault-repairs', '#brief-proposal', '#conversation-history', '#intake-state'];
+  const statusIds = ['context-error', 'context-summary', 'conversation-error', 'conversation-summary', 'brief-error', 'idea-support-status'];
   function snapshot() {
     const result = { status: document.querySelector('[role="status"]')?.textContent.slice(0, 768), sendEnabled: !document.getElementById('conversation-send')?.disabled };
     for (const id of statusIds) result[id] = document.getElementById(id)?.textContent.slice(0, 768);
@@ -174,7 +175,7 @@ function installRenderer() {
   const region = '#context-section,#conversation-section,#brief-view,#vault-repairs';
   const wrapped = new WeakSet();
   function wrapHandlers() {
-    for (const node of document.querySelectorAll(`${region.split(',').map(selector => `${selector} button`).join(',')},#context-find,#context-preview,#conversation-preview,#brief-propose,#refresh`)) {
+    for (const node of document.querySelectorAll(`${region.split(',').map(selector => `${selector} button`).join(',')},#context-find,#context-preview,#conversation-preview,#brief-propose,#refresh,#check-intake,#connect-reviews`)) {
       if (!node.onclick || wrapped.has(node.onclick)) continue;
       const original = node.onclick;
       const wrapper = function (...args) {
