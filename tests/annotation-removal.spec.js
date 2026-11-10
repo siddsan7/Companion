@@ -1,18 +1,90 @@
 const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
-let root, app, page, readerEntry;
+let root, app, page, readerEntry, diagnosticFile;
+function diagnostic(event, details = {}) { local.appendFileSync(diagnosticFile, JSON.stringify({ timestamp: Date.now(), source: 'test', event, ...details }) + '\n'); }
 
-test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-annotation-removal-')); readerEntry = null; });
-test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.beforeEach(async ({}, testInfo) => {
+  diagnosticFile = testInfo.outputPath('annotation-lifecycle.jsonl'); local.mkdirSync(path.dirname(diagnosticFile), { recursive: true });
+  diagnostic('test-start', { title: testInfo.title });
+  root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-annotation-removal-')); readerEntry = null;
+});
+test.afterEach(async ({}, testInfo) => {
+  diagnostic('afterEach-start', { status: testInfo.status, expectedStatus: testInfo.expectedStatus });
+  if (app) await closeApp('afterEach'); app = null; await fs.rm(root, { recursive: true, force: true });
+  diagnostic('afterEach-complete', { status: testInfo.status });
+});
+async function closeApp(reason) {
+  diagnostic('intentional-app-close-start', { reason });
+  try { await app.close(); diagnostic('intentional-app-close-complete', { reason }); }
+  catch (error) { diagnostic('intentional-app-close-error', { reason, name: error.name }); throw error; }
+}
+async function observeLifecycle() {
+  const child = app.process(), pid = child.pid;
+  diagnostic('electron-launched', { pid });
+  for (const event of ['exit', 'close']) child.on(event, (code, signal) => diagnostic('child-' + event, { pid, code, signal }));
+  child.on('error', error => diagnostic('child-error', { pid, code: error.code, name: error.name }));
+  for (const stream of ['stdout', 'stderr']) for (const event of ['end', 'close']) child[stream]?.on(event, () => diagnostic(stream + '-' + event, { pid }));
+  app.on('close', () => diagnostic('electron-application-close', { pid }));
+  const context = app.context(); context.on('close', () => diagnostic('browser-context-close', { pid }));
+  context.browser()?.on('disconnected', () => diagnostic('browser-disconnected', { pid }));
+  await app.evaluate(({ app: electronApp, BrowserWindow }, file) => {
+    const io = process.getBuiltinModule('fs');
+    const write = (event, details = {}) => io.appendFileSync(file, JSON.stringify({ timestamp: Date.now(), source: 'main', pid: process.pid, event, ...details }) + '\n');
+    const scalarListener = (event, details) => () => write(event, details);
+    const goneListener = (event, ids = {}) => (_event, details) => write(event, { ...ids, reason: details.reason, exitCode: details.exitCode, type: details.type, serviceName: details.serviceName });
+    function attach(window) {
+      const windowId = window.id, contentsId = window.webContents.id;
+      write('observed-window', { windowId, contentsId });
+      for (const event of ['close', 'closed', 'unresponsive', 'responsive']) window.on(event, scalarListener('window-' + event, { windowId }));
+      for (const event of ['destroyed', 'unresponsive', 'responsive']) window.webContents.on(event, scalarListener('webcontents-' + event, { windowId, contentsId }));
+      window.webContents.on('render-process-gone', goneListener('webcontents-render-process-gone', { windowId, contentsId }));
+    }
+    for (const event of ['before-quit', 'will-quit', 'window-all-closed']) electronApp.on(event, scalarListener('app-' + event, {}));
+    electronApp.on('quit', (_event, code) => write('app-quit', { code }));
+    electronApp.on('render-process-gone', (_event, contents, details) => write('app-render-process-gone', { contentsId: contents.id, reason: details.reason, exitCode: details.exitCode }));
+    electronApp.on('child-process-gone', goneListener('app-child-process-gone'));
+    electronApp.on('browser-window-created', (_event, window) => attach(window));
+    BrowserWindow.getAllWindows().forEach(attach);
+    process.on('exit', code => write('process-exit', { code }));
+    process.on('uncaughtExceptionMonitor', error => write('uncaught-exception-monitor', { name: error.name, code: error.code }));
+    write('main-observers-ready');
+  }, diagnosticFile);
+}
+async function boundary(name) {
+  const child = app.process(); diagnostic('workflow-boundary', { name, exitCode: child.exitCode, signalCode: child.signalCode, pageClosed: page.isClosed() });
+  if (page.isClosed()) return;
+  try {
+    const state = await page.evaluate(() => {
+      const review = document.querySelector('[aria-label="Annotation removal review"]'), preview = document.querySelector('[aria-label="Annotation removal preview"]');
+      return { reviewHidden: review?.hidden, previewHidden: preview?.hidden, rowCount: review?.querySelectorAll('article').length, buttons: [...(review?.querySelectorAll('button') || [])].map(button => ({ connected: button.isConnected, disabled: button.disabled, hidden: button.hidden })), status: document.querySelector('[role="status"]')?.textContent };
+    }); diagnostic('workflow-dom', { name, ...state });
+  } catch (error) { diagnostic('workflow-dom-unavailable', { name, error: error.name }); }
+}
 async function launch() {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
   app = await electron.launch({ args: [readerEntry || '.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  await observeLifecycle();
   page = await app.firstWindow();
+  for (const event of ['close', 'crash']) page.on(event, () => diagnostic('page-' + event));
+  page.on('pageerror', error => diagnostic('page-error', { name: error.name }));
+  page.on('console', message => { if (message.text().startsWith('[DEBUG-annotation13]')) diagnostic('renderer-observation', { details: message.text().slice(20) }); });
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  await page.evaluate(() => {
+    const write = details => console.debug('[DEBUG-annotation13]' + JSON.stringify({ timestamp: Date.now(), ...details }));
+    document.addEventListener('click', event => {
+      const button = event.target.closest?.('button');
+      if (button && ['Preview annotation removal', 'Cancel annotation removal', 'Confirm annotation removal'].includes(button.textContent)) write({ event: 'click-dispatch', action: button.textContent });
+    }, { capture: true, passive: true });
+    for (const label of ['Annotation removal review', 'Annotation removal preview']) {
+      const node = document.querySelector(`[aria-label="${label}"]`); if (!node) continue;
+      new MutationObserver(changes => write({ event: 'section-mutation', label, hidden: node.hidden, connected: node.isConnected, changeCount: changes.length })).observe(node, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden', 'disabled', 'class', 'style'] });
+    }
+  });
 }
 async function files(folder, prefix = '') {
   const result = {};
@@ -71,9 +143,12 @@ test('separately selected annotation removal previews and cancels without mutati
   await expect(preview).toContainText(path.relative(path.join(root, 'vault'), selected.file).split(path.sep).join('/'));
   await expect(preview).not.toContainText(retained.id);
   expect(await files(base)).toEqual(before);
+  await boundary('before-cancel');
   await preview.getByRole('button', { name: 'Cancel annotation removal', exact: true }).click();
   await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  await boundary('before-second-preview');
   await selectedRow.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  await boundary('after-second-preview');
   await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Annotation removed');
   expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
@@ -82,7 +157,7 @@ test('separately selected annotation removal previews and cancels without mutati
   expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
   const removed = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
   for (const key of ['captures', 'attempts', 'admissions', 'sourceAuthority', 'suppressed']) expect(removed[key]).toEqual(original[key]);
-  await app.close(); app = null; await launch();
+  await closeApp('normal-restart'); app = null; await launch();
   await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
   const restartedReview = page.getByLabel('Annotation removal review', { exact: true });
   await expect(restartedReview).toContainText(retained.id); await expect(restartedReview).not.toContainText(selected.id);
@@ -191,7 +266,7 @@ test('selected annotation removal accepts an actual native Windows relationship 
   expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
   expect(await files(path.join(root, 'producer'))).toEqual(producer);
   expect(await files(path.join(root, 'conversations')).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toEqual(history);
-  await app.close(); app = null; await launch();
+  await closeApp('native-hold-restart'); app = null; await launch();
   for (const file of [selected, journal]) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   expect(await fs.readFile(retained)).toEqual(retainedBytes); expect(await fs.readFile(moved)).toEqual(movedBytes);
 });
