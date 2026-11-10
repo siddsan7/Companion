@@ -34,10 +34,15 @@ async function inspect(intake, ledger, authority) {
 }
 async function inventory(intake, ledger, capture, sourceHash, revisions, initial) {
   const intentFile = path.join(intake.dir, 'title-intent.json');
-  try { await fs.lstat(intentFile); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  const currentFile = intake.destination(capture), snapshotFile = path.join(intake.vault.root, 'Revisions', capture.currentRevision + '.json');
   const { leaf } = require('./source-title');
-  const current = await leaf(intake, currentFile, 'capture'), pending = await leaf(intake, currentFile + '.pending', 'source-recovery'), intent = await leaf(intake, intentFile, 'source-recovery'), transaction = await leaf(intake, currentFile + '.title-transaction.json', 'source-recovery'), snapshot = await leaf(intake, snapshotFile, 'snapshot');
+  let intent; try { intent = await leaf(intake, intentFile, 'source-recovery'); } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  let a; try { a = JSON.parse(intent.text); } catch { fail(); }
+  if (!a || !exact(a, ['id', 'before', 'previousHash', 'title', 'content', ...(Object.hasOwn(a, 'sourceGeneration') ? ['sourceGeneration'] : [])]) || !intent.bytes.equals(Buffer.from(JSON.stringify(a)))) fail();
+  // The global intent can belong to a different admitted capture. Its bytes still
+  // pass the selected-source scanner; ownership alone exempts no selected copy.
+  if (a.id !== capture.id && Object.values(ledger.captures).some(owner => owner.id === a.id)) return;
+  const currentFile = intake.destination(capture), snapshotFile = path.join(intake.vault.root, 'Revisions', capture.currentRevision + '.json');
+  const current = await leaf(intake, currentFile, 'capture'), pending = await leaf(intake, currentFile + '.pending', 'source-recovery'), transaction = await leaf(intake, currentFile + '.title-transaction.json', 'source-recovery'), snapshot = await leaf(intake, snapshotFile, 'snapshot');
   for (const value of [current, snapshot]) {
     const prior = initial.find(item => item.file === value.target.file);
     if (!prior || Object.keys(value.target).some(key => prior[key] !== value.target[key])) fail();
@@ -45,7 +50,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   const known = require('./source-authority').revisionAdmission(ledger, capture.currentRevision), revision = revisions.get(capture.currentRevision), authority = ledger.sourceAuthority?.[capture.id], generation = authority?.phase === 'active' ? authority.generation : undefined;
   if (!revision || !known || known.status !== 'imported' || known.captureId !== capture.id || known.sourceHash !== revision.sourceHash || known.sourceHash !== sourceHash || known.snapshotHash !== snapshot.target.sha256 || known.identity !== revision.identity || known.fingerprint !== revision.fingerprint || known.sourceGeneration !== generation) fail();
   if (!snapshot.bytes.equals(Buffer.from(JSON.stringify(revision, null, 2)))) fail();
-  let a, b; try { a = JSON.parse(intent.text); b = JSON.parse(transaction.text); } catch { fail(); }
+  let b; try { b = JSON.parse(transaction.text); } catch { fail(); }
   const generationKeys = generation === undefined ? [] : ['sourceGeneration'];
   if (!exact(a, ['id', 'before', 'previousHash', 'title', 'content', ...generationKeys]) || !exact(b, ['expectedHash', 'content', 'backup', ...generationKeys]) || !intent.bytes.equals(Buffer.from(JSON.stringify(a))) || !transaction.bytes.equals(Buffer.from(JSON.stringify(b))) || a.id !== capture.id || a.sourceGeneration !== generation || b.sourceGeneration !== generation || typeof a.title !== 'string' || !a.title || a.title !== a.title.trim() || /[\r\n]/.test(a.title)) fail();
   const { noteText } = require('./intake'), { parse, withTitle } = require('./vault');
