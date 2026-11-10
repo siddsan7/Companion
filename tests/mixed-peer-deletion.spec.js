@@ -139,12 +139,22 @@ test('mixed deletion holds when an adjacent whole local recovery copy arrives af
   await fs.writeFile(arriving, actualCurrent, { flag: 'wx' });
   const arrivedFiles = await observe(base), arrived = arrivedFiles[arrivingRelative];
   const producerAtArrival = await observe(path.join(root, 'producer'));
+  const mainPid = await app.evaluate(() => process.pid);
+  const ownedLock = current + '.lock', ownedLockRelative = portable(path.relative(base, ownedLock));
+  const lockAtArrival = arrivedFiles[ownedLockRelative];
+  const expectedAfterRelease = { ...arrivedFiles };
+  // Confirm releases this exact acquired lock in its finally block, even on HOLD.
+  delete expectedAfterRelease[ownedLockRelative];
   await save(testInfo, 'mixed-peer-authorized-arrival.json', {
     checkpoint: await fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8'),
-    mainPid: await app.evaluate(() => process.pid), processProof, origins, reviewed, outputPaths,
+    mainPid, processProof, origins, reviewed, outputPaths,
     authorizedFiles, committed, arrivedFiles, producerAtArrival,
+    ownedLock: { file: ownedLockRelative, observed: lockAtArrival }, expectedAfterRelease,
     controlledArrival: { file: arrivingRelative, copiedFrom: portable(path.relative(base, current)), ...arrived }
   });
+  expect(lockAtArrival).toBeDefined();
+  expect(lockAtArrival.ordinary).toBe(true); expect(lockAtArrival.nlink).toBe('1');
+  expect(JSON.parse(text(lockAtArrival))).toEqual({ pid: mainPid });
   expect(authority.phase).toBe('deleting'); expect(authority.targets).toHaveLength(5);
   expect(authority.targets.map(value => value.file).sort()).toEqual(origins.map(file => portable(path.relative(path.join(root, 'vault'), file))).sort());
   for (const file of origins) {
@@ -176,7 +186,8 @@ test('mixed deletion holds when an adjacent whole local recovery copy arrives af
   expect(terminal.status).toContain('preview the scope again');
   expect(terminal.ledger).toEqual(committed);
   expect(terminal.ledger.sourceAuthority[capture.id].phase).toBe('deleting');
-  expect(terminal.observed).toEqual(arrivedFiles);
+  expect(await exists(ownedLock)).toBe(false);
+  expect(terminal.observed).toEqual(expectedAfterRelease);
   expect(terminal.producer).toEqual(producerAtArrival);
   // A fresh public recovery inspection must still report the same unfinished scope.
   await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
@@ -184,5 +195,6 @@ test('mixed deletion holds when an adjacent whole local recovery copy arrives af
   await expect(recovery).toContainText(capture.id);
   await expect(recovery).toContainText('Capture deletion files changed or contain unreviewed writing.');
   await expect(recovery.getByRole('button', { name: 'Resume confirmed capture deletion', exact: true })).toBeEnabled();
-  expect(await observe(base)).toEqual(arrivedFiles);
+  expect(await exists(ownedLock)).toBe(false);
+  expect(await observe(base)).toEqual(expectedAfterRelease);
 });
