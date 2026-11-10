@@ -1,6 +1,6 @@
 (() => {
   const view = document.getElementById('brief-view');
-  let actionEpoch = 0, readEpoch = 0, busy = false, configuring = false, approvalRetired = false, displayedProposal = null;
+  let actionEpoch = 0, readEpoch = 0, busy = false, configuring = false, configurationReadPending = false, approvalRetired = false, displayedProposal = null;
   const actionButtons = ['brief-readme', 'brief-add', 'brief-propose', 'brief-check'].map(id => document.getElementById(id));
   function element(tag, text) { const e = document.createElement(tag); e.textContent = text; return e; }
   const showError = error => { document.getElementById('brief-error').textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); };
@@ -10,7 +10,7 @@
   }
   async function change(work, { retire = false, renew = false } = {}) {
     if (busy || configuring) return;
-    const owner = ++actionEpoch; readEpoch++; busy = true;
+    const owner = ++actionEpoch; readEpoch++; busy = true; configurationReadPending = false;
     if (retire) approvalRetired = true;
     document.getElementById('brief-error').textContent = ''; controls();
     try {
@@ -59,9 +59,11 @@
     try { state = await window.companion['brief-state'](); }
     catch (error) { if (owner === actionEpoch && read === readEpoch && !configuring) showError(error); return false; }
     if (owner !== actionEpoch || read !== readEpoch || configuring) return false;
-    if (state.failure) approvalRetired = true;
+    if (configurationReadPending) { approvalRetired = Boolean(state.failure); configurationReadPending = false; }
+    else if (state.failure) approvalRetired = true;
+    const location = document.getElementById('location').textContent;
     const prior = displayedProposal;
-    const edits = prior && prior.record.id === state.proposed?.id && prior.record.digest === state.proposed.digest
+    const edits = prior && prior.location === location && prior.record.id === state.proposed?.id && prior.record.digest === state.proposed.digest
       ? { sections: [...prior.node.querySelectorAll('textarea')].map(e => e.value), references: [...prior.node.querySelectorAll('input[data-references]')].map(e => e.value) } : null;
     displayedProposal = null; view.replaceChildren();
     view.append(element('p', 'Offline source extraction. Review every section and its passages. Edits are user writing, not independent verification. A section needs passage references or an explicit Gap:. No Codex setup required.'));
@@ -84,7 +86,7 @@
         const input = { id: record.id, digest: record.digest, sections: [...proposed.querySelectorAll('textarea')].map(e => e.value), references: [...proposed.querySelectorAll('input[data-references]')].map(e => e.value) };
         return change(() => window.companion['brief-approve'](input));
       };
-      displayedProposal = { node: proposed, record, approve };
+      displayedProposal = { node: proposed, record, approve, location };
       proposed.append(approve); view.append(proposed);
     }
     for (const record of state.approved) {
@@ -99,12 +101,13 @@
   document.getElementById('brief-propose').onclick = () => change(() => window.companion['brief-propose'](), { retire: true, renew: true });
   document.getElementById('brief-check').onclick = () => refresh();
   document.getElementById('configure').addEventListener('click', () => {
-    actionEpoch++; readEpoch++; busy = false; configuring = true; approvalRetired = true; controls();
+    actionEpoch++; readEpoch++; busy = false; configuring = true; configurationReadPending = true; approvalRetired = true; controls();
     setTimeout(() => refresh(), 150);
   });
   window.addEventListener('companion-vault-configured', async () => {
-    configuring = false; const owner = actionEpoch;
-    if (await refresh(owner) && owner === actionEpoch) { approvalRetired = false; controls(); }
+    configuring = false; busy = true; const owner = actionEpoch; controls();
+    await refresh(owner, true);
+    if (owner === actionEpoch) { busy = false; controls(); }
   });
   window.addEventListener('focus', () => refresh()); refresh();
 })();
