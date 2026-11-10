@@ -364,7 +364,7 @@ require(${JSON.stringify(path.join(appDirectory, 'main'))});
   expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
 });
 
-test('pending-only annotation writing can be reviewed and removed without ever publishing its note', async () => {
+for (const ambiguous of [false, true]) test(ambiguous ? 'duplicate annotation journal members hold removal and preserve undisplayed independent writing' : 'pending-only annotation writing can be reviewed and removed without ever publishing its note', async () => {
   test.setTimeout(90000);
   readerEntry = path.join(root, 'annotation-pending-main.cjs');
   await fs.writeFile(readerEntry, `
@@ -415,9 +415,38 @@ require(${JSON.stringify(path.resolve(__dirname, '..', 'app', 'main'))});
   expect(stageBytes.toString('utf8')).toBe(intent.annotation);
   for (const file of [intentFile, stage]) { const stat = await fs.lstat(file); expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1); }
   expect(await fs.access(output).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  let changedIntent;
+  if (ambiguous) {
+    // One external edit adds hidden, unrelated writing before the real writer's
+    // original members. JSON.parse still yields the original last member.
+    changedIntent = Buffer.from('{"annotation":' + JSON.stringify('UNSELECTEDJOURNALCANARY unrelated independent writing must remain.') + ',' + intentBytes.toString('utf8').slice(1), 'utf8');
+    expect(JSON.parse(changedIntent.toString('utf8'))).toEqual(intent);
+    await fs.writeFile(intentFile, changedIntent);
+    expect(await fs.readFile(stage)).toEqual(stageBytes);
+  }
   const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), before = await files(base), source = await files(path.join(base, 'Captures')), revisions = await files(path.join(base, 'Revisions')), producer = await files(path.join(root, 'producer'));
   await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
   const review = page.getByLabel('Annotation removal review', { exact: true }), row = review.getByRole('article').filter({ hasText: intent.id });
+  if (ambiguous) {
+    const status = page.getByRole('status'), preview = page.getByLabel('Annotation removal preview', { exact: true }), button = row.getByRole('button', { name: 'Preview annotation removal', exact: true });
+    await expect.poll(async () => (await status.textContent()).includes('scope changed') || await button.isVisible()).toBe(true);
+    if (await button.isVisible()) {
+      await button.click();
+      const confirm = preview.getByRole('button', { name: 'Confirm annotation removal', exact: true });
+      await expect.poll(async () => (await status.textContent()).includes('scope changed') || await confirm.isVisible()).toBe(true);
+      if (await confirm.isVisible()) { await confirm.click(); await expect(status).toContainText(/Annotation removed|scope changed/); }
+    }
+    const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+    expect(held.annotationRemovals?.[intent.id]).toBeUndefined();
+    await expect(status).toContainText('scope changed');
+    expect(await fs.readFile(intentFile)).toEqual(changedIntent); expect(await fs.readFile(stage)).toEqual(stageBytes);
+    expect(await files(base)).toEqual(before);
+    expect(await fs.access(output).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+    expect(await fs.readFile(retained)).toEqual(retainedBytes); expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
+    expect(await files(path.join(root, 'producer'))).toEqual(producer);
+    for (const key of ['captures', 'attempts', 'admissions', 'sourceAuthority', 'suppressed']) expect(held[key]).toEqual(original[key]);
+    return;
+  }
   await expect(row).toContainText(pendingText);
   await expect(row).toContainText('Pending');
   await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
