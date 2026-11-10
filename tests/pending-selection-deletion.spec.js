@@ -180,3 +180,90 @@ test('deferred reviewed Make current can be deleted before Check now without com
   for (const name of names) expect(await exists(path.join(base, name))).toBe(false);
   expect(await files(producer)).toEqual(producerBytes);
 });
+
+test('pending reviewed selection deletion holds a contradictory prospective history without changing any retained file', async ({}, testInfo) => {
+  test.skip(process.platform !== 'win32', 'Requires a real Windows FileShare.Read handle that denies native rename/delete.');
+  test.setTimeout(150000);
+  const producer = path.join(root, 'producer');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(producer);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  for (let index = 1; index <= 2; index++) {
+    if (index === 2) await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(producer, 'edit'), { recursive: true });
+    const instant = `2026-11-08T06:59:0${index}.000Z`;
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · complete`);
+  }
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const retained = JSON.parse(await fs.readFile(ledgerFile)), capture = retained.captures[sourceHash], current = path.join(base, 'Captures', capture.file), currentA = await fs.readFile(current);
+  const producerBytes = await files(producer), revisionB = capture.revisions.find(id => id !== capture.currentRevision), observerFile = path.join(root, 'guard-native-rename.json');
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalRename = io.rename;
+    io.rename = async function (from, to, ...args) {
+      try { return await originalRename.call(this, from, to, ...args); }
+      catch (error) {
+        if (typeof from === 'string' && paths.resolve(from).toLowerCase() === paths.resolve(options.current).toLowerCase()) {
+          io.rename = originalRename;
+          await io.writeFile(options.observerFile, JSON.stringify({ mainPid: process.pid, from, to, code: error.code, syscall: error.syscall, message: error.message, delegatedOriginal: true }));
+        }
+        throw error;
+      }
+    };
+  }, { current, observerFile });
+  const native = await holdCurrent(current);
+  try {
+    await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+    await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture destination is locked or inaccessible');
+  } finally { await native.release(); handle = null; }
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const ledgerBytes = await fs.readFile(ledgerFile), pendingLedger = JSON.parse(ledgerBytes), journal = path.join(intake, pendingLedger.pending[sourceHash].journal), originalJournal = await fs.readFile(journal), tx = JSON.parse(originalJournal);
+  await app.close(); app = null;
+  const before = await files(base), altered = JSON.parse(originalJournal);
+  // The sole controlled edit changes B to already admitted A in the uncommitted history.
+  altered.capture.selectionHistory.at(-1).revision = capture.currentRevision;
+  const alteredBytes = Buffer.from(JSON.stringify(altered));
+  await fs.writeFile(journal, alteredBytes);
+  const names = Object.keys(before).filter(name => /^(Captures\/|Revisions\/|\.intake\/)/.test(name) && name !== '.intake/ledger.json').sort();
+  const observe = async () => Promise.all(names.map(async name => {
+    const file = path.join(base, name), bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    return { file: name, bytesBase64: bytes.toString('base64'), sha256: sha(bytes), ordinary: stat.isFile() && !stat.isSymbolicLink(), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) };
+  }));
+  const observations = await observe(), edited = await files(base), nativeRename = JSON.parse(await fs.readFile(observerFile));
+  await fs.writeFile(testInfo.outputPath('pending-selection-history-guard-observation.json'), JSON.stringify({ description: 'Actual native deferred Make current and normal pending restart; then one controlled prospective history revision edit while main was closed.', nativeHandle: native.proof, nativeRename, sourceHash, currentRevisionA: capture.currentRevision, selectedRevisionB: revisionB, originalJournalBase64: originalJournal.toString('base64'), alteredJournalBase64: alteredBytes.toString('base64'), ledgerBase64: ledgerBytes.toString('base64'), pendingLedger, producerBytes, observations }, null, 2));
+  // All actual file/native facts are recorded before the guard's feature assertions.
+  expect(names).toHaveLength(5); expect(nativeRename.delegatedOriginal).toBe(true); expect(['EACCES', 'EPERM', 'EBUSY']).toContain(nativeRename.code);
+  expect(native.proof.exit).toEqual({ code: 0, signal: null }); expect(native.proof.stdout).toContain(`RELEASED:${native.proof.pid}`);
+  expect(pendingLedger.captures[sourceHash]).toEqual(capture); expect(pendingLedger.attempts).toEqual(retained.attempts); expect(pendingLedger.admissions).toEqual(retained.admissions);
+  expect(tx.capture.currentRevision).toBe(revisionB); expect(tx.capture.selectionHistory.at(-1).revision).toBe(revisionB); expect(tx.previous).toBe(currentA.toString());
+  const restored = JSON.parse(alteredBytes); restored.capture.selectionHistory.at(-1).revision = revisionB;
+  expect(restored).toEqual(tx); expect(altered.capture.currentRevision).toBe(revisionB);
+  for (const [name, bytes] of Object.entries(before)) if (name !== path.relative(base, journal).split(path.sep).join('/')) expect(edited[name]).toBe(bytes);
+  expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes); expect(await fs.readFile(current)).toEqual(currentA);
+  for (const item of observations) { expect(item.ordinary).toBe(true); expect(item.nlink).toBe('1'); }
+  expect(new Set(observations.map(item => item.dev + ':' + item.ino)).size).toBe(5);
+  const snapshotB = path.join(base, 'Revisions', revisionB + '.json'), stageB = path.join(intake, revisionB + '.snapshot.stage');
+  expect(await fs.readFile(stageB)).toEqual(await fs.readFile(snapshotB));
+  await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source recovery inventory');
+  const raw = await page.evaluate(async id => { try { const value = await window.captureDeletion.preview({ id }); await window.captureDeletion.cancel({ token: value.token }); return { value }; } catch (error) { return { error: error.message }; } }, capture.id);
+  await fs.writeFile(testInfo.outputPath('pending-selection-history-guard-preview.json'), JSON.stringify({ renderedStatus: await page.getByRole('status').textContent(), renderedVisible: await page.getByLabel('Capture deletion preview').isVisible(), raw, observationsAfter: await observe() }, null, 2));
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden(); expect(raw.error).toContain('Source recovery inventory');
+  expect(await files(base)).toEqual(edited); expect(await observe()).toEqual(observations);
+  expect(await fs.readFile(journal)).toEqual(alteredBytes); expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes);
+  const held = JSON.parse(await fs.readFile(ledgerFile));
+  expect(held.sourceAuthority).toBeUndefined(); expect(held.suppressed).not.toContain(sourceHash);
+  expect(held.pending).toEqual(pendingLedger.pending); expect(held.captures).toEqual(pendingLedger.captures);
+  expect(held.attempts).toEqual(retained.attempts); expect(held.admissions).toEqual(retained.admissions); expect(await files(producer)).toEqual(producerBytes);
+});
