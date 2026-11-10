@@ -645,3 +645,58 @@ test('explicit annotation removal resumes its exact linked publication scope aft
   expect(published).toHaveLength(2); expect(published).not.toContain(intent.id + '.md');
   expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).annotationRemovals[intent.id]).toEqual({ ...operation, phase: 'removed' });
 });
+
+for (const ownership of ['unknown hardlink', 'replaced annotation parent']) test(`annotation removal holds ${ownership} without authority or file mutation`, async () => {
+  test.setTimeout(90000);
+  const base = await importedCapture(), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  for (const text of ['SELECTOWNERSHIP selected independent writing.', 'RETAINOWNERSHIP other independent writing.']) {
+    await page.getByLabel('New annotation', { exact: true }).fill(text);
+    await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Annotation saved.');
+    await expect(page.getByLabel('New annotation', { exact: true })).toHaveValue('');
+  }
+  const notes = await Promise.all((await fs.readdir(annotationFolder)).filter(name => name.endsWith('.md')).map(async name => {
+    const file = path.join(annotationFolder, name), bytes = await fs.readFile(file), text = bytes.toString('utf8');
+    return { file, name, bytes, id: YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id, selected: text.includes('SELECTOWNERSHIP') };
+  }));
+  const selected = notes.find(note => note.selected), retained = notes.find(note => !note.selected), selectedIdentity = await fs.stat(selected.file, { bigint: true }), parentIdentity = await fs.stat(annotationFolder, { bigint: true });
+  const producer = await files(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  await page.getByLabel('Annotation removal review', { exact: true }).getByRole('article').filter({ hasText: selected.id }).getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const preview = page.getByLabel('Annotation removal preview', { exact: true }); await expect(preview).toBeVisible();
+  const fixtureRoot = await fs.realpath(root); let outside;
+  if (ownership === 'unknown hardlink') {
+    outside = path.join(fixtureRoot, 'unknown-selected-peer.md');
+    expect(path.relative(fixtureRoot, outside)).toBe('unknown-selected-peer.md');
+    await fs.link(selected.file, outside);
+    const peer = await fs.stat(outside, { bigint: true }), current = await fs.stat(selected.file, { bigint: true });
+    expect(current.nlink).toBe(2n); expect(peer.nlink).toBe(2n);
+    expect([peer.dev, peer.ino]).toEqual([selectedIdentity.dev, selectedIdentity.ino]);
+  } else {
+    outside = path.join(fixtureRoot, 'reviewed-annotation-originals');
+    expect(path.relative(fixtureRoot, outside)).toBe('reviewed-annotation-originals');
+    expect(await fs.realpath(path.dirname(annotationFolder))).toBe(await fs.realpath(base));
+    await fs.rename(annotationFolder, outside); await fs.mkdir(annotationFolder);
+    for (const note of notes) await fs.copyFile(path.join(outside, note.name), path.join(annotationFolder, note.name));
+    const movedParent = await fs.stat(outside, { bigint: true }), replacementParent = await fs.stat(annotationFolder, { bigint: true }), replacementNote = await fs.stat(selected.file, { bigint: true });
+    expect([movedParent.dev, movedParent.ino]).toEqual([parentIdentity.dev, parentIdentity.ino]);
+    expect(replacementParent.ino).not.toBe(parentIdentity.ino); expect(replacementNote.ino).not.toBe(selectedIdentity.ino);
+    expect((await fs.stat(path.join(outside, selected.name), { bigint: true })).ino).toBe(selectedIdentity.ino);
+  }
+  const outsideBefore = ownership === 'unknown hardlink' ? await fs.readFile(outside) : await files(outside), before = await files(path.join(root, 'vault')), ledgerBytes = await fs.readFile(ledgerFile);
+  await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation removal scope changed');
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).annotationRemovals?.[selected.id]).toBeUndefined();
+  expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes);
+  expect(await files(path.join(root, 'vault'))).toEqual(before);
+  expect(await fs.readFile(selected.file)).toEqual(selected.bytes); expect(await fs.readFile(retained.file)).toEqual(retained.bytes);
+  if (ownership === 'unknown hardlink') {
+    expect(await fs.readFile(outside)).toEqual(outsideBefore); expect((await fs.stat(outside)).nlink).toBe(2); expect((await fs.stat(selected.file)).nlink).toBe(2);
+  } else {
+    expect(await files(outside)).toEqual(outsideBefore);
+    for (const note of notes) expect(await fs.readFile(path.join(outside, note.name))).toEqual(note.bytes);
+    expect((await fs.stat(outside, { bigint: true })).ino).toBe(parentIdentity.ino);
+  }
+  expect(await files(path.join(root, 'producer'))).toEqual(producer);
+});
