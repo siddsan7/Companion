@@ -1,0 +1,213 @@
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const { hash, validate, render } = require('./intake-producer');
+const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
+const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
+const safe = value => typeof value === 'string' && !!value && !/[\\:]/.test(value) && value.split('/').every(part => part && part !== '.' && part !== '..');
+const relative = (intake, file) => path.relative(intake.vault.vault, file).split(path.sep).join('/');
+const fail = () => { throw Object.assign(Error('Source recovery inventory contains changed or unsupported writing. Preserve it for explicit review.'), { code: 'SOURCE_FILE_CHANGED' }); };
+const equal = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+const date = value => typeof value === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
+const formats = ['transaction', 'capture-stage', 'snapshot-stage', 'incoming-snapshot', 'source-backup'];
+
+// Pure shape checks for the content-free proof committed before any unlink.
+// Recovery verifies its surviving exact leaves; it does not need a removed journal.
+function validateInventory(value, id) {
+  if (value.inventoryVersion === undefined) {
+    if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || item.kind === 'source-recovery') || value.history?.some(item => item.inventoryVersion === 2)) fail();
+    return;
+  }
+  if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
+  const targets = new Map(value.targets.map(item => [item.file, item])); let previous = '';
+  for (const item of value.recovery) {
+    if (!fields(item, ['file', 'format', 'transaction', 'captureId', 'sourceHash', 'revisionId', 'sourceGeneration']) || !safe(item.file) || !safe(item.transaction) || item.file <= previous || !formats.includes(item.format) || item.captureId !== id || item.sourceHash !== value.sourceHash || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !targets.has(item.file)) fail();
+    previous = item.file;
+    const journal = value.recovery.find(peer => peer.file === item.transaction);
+    if (!journal || journal.format !== 'transaction' || journal.transaction !== journal.file || journal.revisionId !== item.revisionId || journal.sourceGeneration !== item.sourceGeneration || targets.get(journal.file)?.kind !== 'source-recovery') fail();
+    if (item.format === 'source-backup' ? targets.get(item.file).kind !== 'source-backup' : targets.get(item.file).kind !== 'source-recovery' && !(item.format === 'incoming-snapshot' && targets.get(item.file).kind === 'snapshot')) fail();
+  }
+  for (const item of value.targets) {
+    if (item.kind === 'source-recovery' && !value.recovery.some(entry => entry.file === item.file)) fail();
+    if (item.peers !== undefined) {
+      if (!Array.isArray(item.peers) || item.peers.length < 2 || item.peers.length > 2 || !item.peers.includes(item.file) || !equal(item.peers, [...new Set(item.peers)].sort())) fail();
+      for (const file of item.peers) {
+        const peer = targets.get(file);
+        if (!peer || !equal(peer.peers, item.peers) || ['dev', 'ino', 'sha256', 'bytes'].some(key => peer[key] !== item[key])) fail();
+      }
+      if (!knownPair(value, item.peers)) fail();
+    }
+  }
+  const pointerKinds = new Set(); let previousKind = '';
+  for (const item of value.recoveryPointers) {
+    if (!fields(item, ['kind', 'journal', 'sha256', 'captureConflictSha256']) || !['blocks', 'pending'].includes(item.kind) || pointerKinds.has(item.kind) || item.kind <= previousKind || !sha(item.sha256) || !(item.captureConflictSha256 === null || sha(item.captureConflictSha256)) || !value.recovery.some(entry => entry.file === item.journal && entry.format === 'transaction')) fail();
+    pointerKinds.add(item.kind); previousKind = item.kind;
+  }
+  previous = '';
+  for (const item of value.purgedProducerAttempts) {
+    if (!fields(item, ['identity', 'fingerprint', 'sourceHash', 'captureId', 'revisionId', 'sourceGeneration', 'operationId']) || typeof item.identity !== 'string' || !/^[a-f0-9]{64}:[a-f0-9]{32}$/.test(item.identity) || item.identity <= previous || !sha(item.fingerprint) || item.sourceHash !== value.sourceHash || item.captureId !== id || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !uuid(item.operationId)) fail();
+    previous = item.identity;
+  }
+  for (const prior of value.history || []) for (const item of prior.purgedProducerAttempts || []) if (!value.purgedProducerAttempts.some(current => equal(current, item))) fail();
+}
+function knownPair(authority, files) {
+  const descriptors = files.map(file => authority.recovery.find(item => item.file === file));
+  if (descriptors.every(item => item?.format === 'transaction') && descriptors[0].revisionId === descriptors[1].revisionId && descriptors[0].sourceGeneration === descriptors[1].sourceGeneration) return true;
+  if (descriptors.every(Boolean) && descriptors[0].transaction === descriptors[1].transaction) {
+    const kinds = descriptors.map(item => item.format).sort().join(',');
+    if (['incoming-snapshot,snapshot-stage', 'transaction,transaction'].includes(kinds)) return true;
+  }
+  const capture = files.find(file => authority.targets.find(item => item.file === file)?.kind === 'capture');
+  return !!capture && descriptors.some(item => item && ['source-backup', 'capture-stage'].includes(item.format));
+}
+function layout(intake, authority, item) {
+  const directory = relative(intake, intake.dir), suffix = /^(?:conflict|pending)-([a-f0-9-]{36})(?:-([a-f0-9-]{36}))?\.json$/.exec(path.posix.basename(item.transaction));
+  const journal = path.posix.basename(item.transaction);
+  if (item.transaction !== `${directory}/${journal}` || journal !== 'transaction.json' && (!suffix || suffix[1] !== item.revisionId || !uuid(suffix[1]) || suffix[2] !== undefined && !uuid(suffix[2]))) fail();
+  const resolution = suffix?.[2], revision = item.revisionId;
+  const expected = {
+    transaction: item.transaction,
+    'capture-stage': `${directory}/${revision}.stage`,
+    'snapshot-stage': `${directory}/${revision}.snapshot.stage`,
+    'incoming-snapshot': relative(intake, path.join(intake.vault.root, 'Revisions', revision + '.json')),
+    'source-backup': `${directory}/${item.captureId}-${revision}.before${resolution ? `-${resolution}` : ''}.md`
+  };
+  if (item.file !== expected[item.format] || item.sourceHash !== authority.sourceHash) fail();
+}
+async function leaf(intake, file, kind) {
+  await intake.vault.contained(file);
+  const before = await fs.lstat(file, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink()) fail();
+  const bytes = await fs.readFile(file), after = await fs.lstat(file, { bigint: true });
+  if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.nlink !== after.nlink || BigInt(bytes.length) !== after.size) fail();
+  return { target: { file: relative(intake, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), kind }, bytes, nlink: Number(after.nlink) };
+}
+function normalizedDraft(revision, capture, sourceHash) {
+  if (!fields(revision, ['schema', 'id', 'captureId', 'importedAt', 'sourceHash', 'identity', 'fingerprint', 'run', 'evidence', 'target', 'text', 'locator', 'humanReview', 'extraction', 'uncertainty']) || revision.schema !== 1 || !uuid(revision.id) || revision.captureId !== capture.id || revision.sourceHash !== sourceHash || !date(revision.importedAt) || !sha(revision.fingerprint) || typeof revision.locator !== 'string' || revision.humanReview !== 'unreviewed') fail();
+  const run = revision.run;
+  if (!fields(run, ['job_id', 'attempt_id', 'started_utc', 'input_sha256', 'input_kind', 'result_kind', 'state', 'validation', 'draft_mode']) || !sha(run.job_id) || !/^[a-f0-9]{32}$/.test(run.attempt_id) || run.input_sha256 !== sourceHash || revision.identity !== `${run.job_id}:${run.attempt_id}` || revision.evidence?.clip_id !== run.job_id || !date(run.started_utc) || !['local_video', 'synthetic_fixture'].includes(run.input_kind) || run.result_kind !== (run.input_kind === 'local_video' ? 'local_video_unreviewed' : 'synthetic_video_wiring') || run.validation !== 'passed' || run.draft_mode !== undefined) fail();
+  validate(revision.evidence, revision.target);
+  if (revision.text !== render(revision.evidence, revision.target) || revision.extraction !== revision.target.status || run.state !== (revision.target.status === 'complete' ? 'complete' : 'partial')) fail();
+  const uncertainty = { channels: revision.evidence.channels, truncated: revision.evidence.truncated, uncertainEvidence: revision.evidence.evidence.filter(item => item.review_flag === 'uncertain').map(item => item.id), unknowns: revision.target.unknowns, conflicts: revision.target.conflicts };
+  if (!equal(revision.uncertainty, uncertainty)) fail();
+}
+function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
+  intake.validateTransaction(tx);
+  if (!fields(tx, ['schema', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || tx.sourceHash !== sourceHash || tx.externalConflict !== false || tx.retainOnly !== false || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash']) || tx.capture.id !== capture.id || tx.capture.file !== capture.file || tx.capture.relative !== capture.relative || tx.capture.capturedAt !== capture.capturedAt || tx.capture.title !== capture.title || !date(tx.capture.updatedAt) || tx.capture.currentRevision !== tx.revision.id || tx.capture.reviewed !== false || tx.capture.rejected !== false || tx.capture.supportEligible !== true || !Array.isArray(tx.capture.revisions) || !equal(tx.capture.revisions, [...capture.revisions.filter(id => id !== tx.revision.id), tx.revision.id])) fail();
+  const authority = ledger.sourceAuthority?.[capture.id];
+  if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
+  normalizedDraft(tx.revision, capture, sourceHash);
+  const { noteText } = require('./intake');
+  if (tx.previous !== null && ![...revisions.values()].some(revision => noteText(capture, revision) === tx.previous)) fail();
+  const admission = require('./source-authority').revisionAdmission(ledger, tx.revision.id);
+  if (admission && (admission.snapshotHash !== hash(JSON.stringify(tx.revision, null, 2)) || admission.captureId !== capture.id || admission.sourceHash !== sourceHash || admission.identity !== tx.revision.identity || admission.fingerprint !== tx.revision.fingerprint)) fail();
+  return admission;
+}
+async function inventory(intake, ledger, capture, sourceHash, revisions, initial) {
+  const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
+  const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
+  if (!current || !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
+  const entries = [];
+  for (const name of (await fs.readdir(intake.dir)).sort()) {
+    if (name === 'ledger.json') continue;
+    const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery'), text = value.bytes.toString('utf8');
+    if (!text.includes(capture.id) && !text.includes(sourceHash)) continue;
+    entries.push({ name, file, value, text });
+  }
+  for (const entry of entries.filter(item => item.name === 'transaction.json' || /^(?:conflict|pending)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.name))) {
+    const tx = JSON.parse(entry.text), admission = transaction(intake, tx, ledger, capture, sourceHash, revisions), journal = relative(intake, entry.file);
+    const descriptor = { transaction: journal, captureId: capture.id, sourceHash, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null };
+    const add = (file, format, content, kind = 'source-recovery') => {
+      const item = { file: relative(intake, file), format, ...descriptor }; layout(intake, { sourceHash }, item);
+      const prior = expected.get(item.file);
+      if (prior && (prior.content !== content || prior.item.revisionId !== item.revisionId || prior.item.sourceGeneration !== item.sourceGeneration)) fail();
+      // A live transaction/archive pair shares one canonical transaction descriptor.
+      if (!prior) expected.set(item.file, { item, content, kind });
+    };
+    add(entry.file, 'transaction', entry.text);
+    add(path.join(intake.dir, tx.revision.id + '.stage'), 'capture-stage', tx.content);
+    add(path.join(intake.dir, tx.revision.id + '.snapshot.stage'), 'snapshot-stage', JSON.stringify(tx.revision, null, 2));
+    add(path.join(intake.vault.root, 'Revisions', tx.revision.id + '.json'), 'incoming-snapshot', JSON.stringify(tx.revision, null, 2), admission ? 'snapshot' : 'source-recovery');
+    if (tx.previous !== null) add(path.join(intake.dir, tx.backup), 'source-backup', tx.previous, 'source-backup');
+    transactions.set(journal, tx);
+    if (!admission) observations.push({ identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, sourceHash, captureId: capture.id, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null });
+  }
+  // Source-only legacy before-files without a retained transaction keep the
+  // existing admitted-snapshot exact rendering rule.
+  for (const entry of entries) if (!expected.has(relative(intake, entry.file))) {
+    if (!new RegExp(`^${capture.id}-[a-f0-9-]{36}\\.before(?:-[a-f0-9-]{36})?\\.md$`).test(entry.name)) fail();
+    const { parse } = require('./vault'), { noteText } = require('./intake'); const note = parse(entry.text);
+    if (!note || note.id !== capture.id || ![...revisions.values()].some(revision => noteText({ ...capture, title: note.title, capturedAt: note.capturedAt }, revision) === entry.text) || entry.value.nlink !== 1) fail();
+    targets.set(relative(intake, entry.file), { ...entry.value.target, kind: 'source-backup' });
+  }
+  for (const { item, content, kind } of expected.values()) {
+    let value; try { value = await leaf(intake, path.join(intake.vault.vault, item.file), kind); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (value.bytes.toString('utf8') !== content) fail();
+    targets.set(item.file, value.target); recovery.push(item);
+  }
+  // Every present descriptor must point at a present, strictly classified journal.
+  const recoveryPointers = [];
+  for (const kind of ['blocks', 'pending']) {
+    const pointer = ledger[kind][sourceHash]; if (!pointer) continue;
+    const journal = relative(intake, path.join(intake.dir, pointer.journal || ''));
+    const tx = transactions.get(journal);
+    if (!tx || kind === 'blocks' && (!fields(pointer, ['reason', 'journal', 'incomingRevision']) || pointer.incomingRevision !== tx.revision.id || capture.conflict !== pointer.reason) || kind === 'pending' && (!fields(pointer, ['reason', 'journal', 'key']) || pointer.key !== tx.key) || typeof pointer.reason !== 'string' || capture.conflict !== undefined && typeof capture.conflict !== 'string') fail();
+    recoveryPointers.push({ kind, journal, sha256: hash(JSON.stringify(pointer)), captureConflictSha256: capture.conflict === undefined ? null : hash(capture.conflict) });
+  }
+  const result = [...targets.values()].sort((a, b) => a.file.localeCompare(b.file)), proof = { targets: result, recovery };
+  for (const name of await fs.readdir(path.join(intake.vault.root, 'Revisions'))) {
+    const file = path.join(intake.vault.root, 'Revisions', name), value = await leaf(intake, file, 'snapshot');
+    const text = value.bytes.toString('utf8');
+    if ((text.includes(capture.id) || text.includes(sourceHash)) && !targets.has(relative(intake, file))) fail();
+  }
+  const groups = new Map();
+  for (const item of result) { const key = `${item.dev}:${item.ino}`; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(item); }
+  for (const group of groups.values()) if (group.length > 1) {
+    const peers = group.map(item => item.file).sort();
+    if (group.length !== 2 || !knownPair(proof, peers) || group.some(item => item.sha256 !== group[0].sha256 || item.bytes !== group[0].bytes)) fail();
+    for (const item of group) item.peers = peers;
+  }
+  await inspectTargets(intake, { targets: result, recovery, sourceHash });
+  return { targets: result, recovery: recovery.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0), recoveryPointers, observations };
+}
+async function inspectTargets(intake, authority) {
+  for (const item of authority.recovery || []) layout(intake, authority, item);
+  const present = new Map();
+  for (const target of authority.targets) {
+    let value; try { value = await leaf(intake, path.join(intake.vault.vault, target.file), target.kind); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    if (['file', 'kind', 'sha256', 'dev', 'ino', 'bytes'].some(key => value.target[key] !== target[key])) fail();
+    present.set(target.file, value);
+  }
+  for (const target of authority.targets) if (present.has(target.file)) {
+    const peers = target.peers || [target.file], survivors = peers.filter(file => present.has(file));
+    if (present.get(target.file).nlink !== survivors.length) fail();
+  }
+  return authority.targets.filter(item => present.has(item.file));
+}
+async function inspectTarget(intake, authority, target) {
+  const peers = new Set(target.peers || [target.file]);
+  const remaining = await inspectTargets(intake, { ...authority, targets: authority.targets.filter(item => peers.has(item.file)) });
+  if (!remaining.some(item => item.file === target.file)) fail();
+}
+function inspectPointers(ledger, authority) {
+  const capture = ledger.captures[authority.sourceHash];
+  for (const item of authority.recoveryPointers || []) {
+    const pointer = ledger[item.kind][authority.sourceHash];
+    if ((capture.conflict === undefined ? null : hash(capture.conflict)) !== item.captureConflictSha256) fail();
+    const descriptor = authority.recovery.find(entry => entry.file === item.journal && entry.format === 'transaction');
+    if (pointer && (hash(JSON.stringify(pointer)) !== item.sha256 || !fields(pointer, item.kind === 'blocks' ? ['reason', 'journal', 'incomingRevision'] : ['reason', 'journal', 'key']) || typeof pointer.reason !== 'string' || path.posix.basename(item.journal) !== pointer.journal || (item.kind === 'blocks' ? pointer.incomingRevision !== descriptor.revisionId : typeof pointer.key !== 'string' || !uuid(pointer.key.split(':')[0])))) fail();
+  }
+  for (const kind of ['blocks', 'pending']) if (ledger[kind][authority.sourceHash] && !authority.recoveryPointers.some(item => item.kind === kind)) fail();
+}
+function retirePointers(ledger, authority) {
+  inspectPointers(ledger, authority);
+  const capture = ledger.captures[authority.sourceHash];
+  for (const item of authority.recoveryPointers || []) delete ledger[item.kind][authority.sourceHash];
+  if (authority.recoveryPointers?.some(item => item.captureConflictSha256 !== null)) delete capture.conflict;
+}
+function purgedAttempt(ledger, draft) {
+  const matches = Object.values(ledger.sourceAuthority || {}).flatMap(authority => authority.purgedProducerAttempts || []).filter(item => item.identity === draft.identity);
+  for (const item of matches) if (item.fingerprint !== draft.fingerprint || item.sourceHash !== draft.sourceHash || ledger.captures[draft.sourceHash]?.id !== item.captureId) throw Error('Purged producer identity changed. Preserve its original fingerprint and source binding.');
+  return matches[0];
+}
+module.exports = { validateInventory, inventory, inspectTargets, inspectTarget, inspectPointers, retirePointers, purgedAttempt };

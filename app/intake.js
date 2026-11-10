@@ -107,6 +107,7 @@ class Intake {
     });
   }
   async admit(ledger, draft, key, now) {
+    const purged = require('./source-inventory').purgedAttempt(ledger, draft);
     if (ledger.suppressed.includes(draft.sourceHash)) throw Error('Automatic re-import is suppressed. Restore this source explicitly before intake.');
     if (ledger.captures[draft.sourceHash]?.identityIssue) throw Error(ledger.captures[draft.sourceHash].identityIssue);
     if (ledger.blocks[draft.sourceHash]) throw Error(ledger.blocks[draft.sourceHash].reason);
@@ -114,7 +115,7 @@ class Intake {
     const accepted = ledger.attempts[draft.identity];
     if (accepted && accepted.fingerprint !== draft.fingerprint) throw Error('Attempt identity changed after import. Original acceptance is immutable. Restore the original export or produce a distinct attempt.');
     const prior = accepted && activeAdmission(ledger, draft.identity, accepted.captureId);
-    if (accepted && !prior) {
+    if (accepted && !prior || purged && !activeAdmission(ledger, draft.identity, purged.captureId)) {
       ledger.outcomes[key] = { status: 'suppressed', sourceHash: draft.sourceHash, locator: draft.locator, checkedAt: now, reason: 'This earlier producer attempt was deleted. Only an explicitly selected restoration may admit it again.' };
       await this.save(ledger); return;
     }
@@ -324,7 +325,7 @@ class Intake {
     await fs.unlink(intentFile);
   }
   async publicationAuthority(tx, ledger) {
-    await this.storage.guardParents();
+    if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed before publication. Refresh before retrying; changed authority was preserved.');
     assertPublication(ledger, tx.capture.id, tx);
     if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
   }
@@ -378,7 +379,7 @@ class Intake {
           catch (error) { if (['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw deferred('Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.'); throw error; }
           await this.vault.checkpoint('intake-moved'); old = await read(backup); current = await read(destination);
         }
-        if (old === null || hash(old) !== tx.previousHash) { if (current === null && old !== null) await fs.link(backup, destination).catch(() => {}); throw conflict('External edit conflict. Previous and current files were preserved.'); }
+        if (old === null || hash(old) !== tx.previousHash) { if (current === null && old !== null) { await this.publicationAuthority(tx, ledger); await fs.link(backup, destination).catch(() => {}); } throw conflict('External edit conflict. Previous and current files were preserved.'); }
       }
       if (current !== null) throw conflict('Destination changed outside Companion. The new destination was preserved.');
       await staged(stage, tx.content, destination);
@@ -500,6 +501,7 @@ class Intake {
     if (tx.previousHash !== null && !present) {
       try {
         if (await this.ownedFile(backup, destination, 'Previous capture backup')) {
+          await this.publicationAuthority(tx, ledger);
           await fs.link(backup, destination).catch(error => { if (error.code !== 'EEXIST') throw error; });
           await this.ownedFile(destination, backup, 'Restored capture destination');
         }
