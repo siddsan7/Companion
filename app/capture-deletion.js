@@ -416,7 +416,7 @@ async function finishDeletion(intake, ledger, id) {
   const extendedInventory = authority.inventoryVersion === 2 || manualTitle.explicit(authority);
   for (const target of remaining) {
     const file = path.join(vault.vault, target.file);
-    if (extendedInventory) await inspectDeletion(intake, ledger, id);
+    await inspectDeletion(intake, ledger, id);
     await intake.storage.guard();
     if (extendedInventory) {
       await sourceParents(intake, authority);
@@ -427,7 +427,7 @@ async function finishDeletion(intake, ledger, id) {
     if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
     await fs.unlink(file); await vault.checkpoint('capture-deletion-unlinked');
   }
-  if (extendedInventory && (await inspectDeletion(intake, ledger, id)).length) throw changed();
+  if ((await inspectDeletion(intake, ledger, id)).length) throw changed();
   await intake.storage.guard();
   if (extendedInventory) {
     if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
