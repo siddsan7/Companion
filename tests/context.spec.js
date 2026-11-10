@@ -22,7 +22,13 @@ async function launch(configure = true) {
   else await settledStartup(page);
 }
 async function capture(text) { await page.getByLabel('Thought or link', { exact: true }).fill(text); await page.getByRole('button', { name: 'Save capture', exact: true }).click(); await expect(page.getByLabel('Thought or link', { exact: true })).toHaveValue(''); await expect(page.getByRole('status')).toContainText('Capture saved.'); }
-async function search(question) { await page.getByLabel('Context question', { exact: true }).fill(question); await page.getByRole('button', { name: 'Find context', exact: true }).click(); }
+async function search(question) {
+  const completed = page.getByRole('region', { name: 'Context discovery', exact: true }).getByText('Context search complete.', { exact: true });
+  await page.getByLabel('Context question', { exact: true }).fill(question);
+  await expect(completed).toHaveCount(0);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(completed).toBeVisible();
+}
 test('a pending Find retires earlier context choices until current capture text is ready for explicit selection', async () => {
   await launch(); await capture('FINDCOMPLETION earlier capture text.');
   await search('FINDCOMPLETION');
