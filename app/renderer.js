@@ -1,6 +1,10 @@
 const $ = id => document.getElementById(id);
 let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0, checkingIntake = false;
 const status = message => { document.querySelector('[role=status]').textContent = message; };
+function scopeError(error, owned) {
+  const earlier = error.canReport;
+  return Object.assign(error, { canReport: () => owned() && (typeof earlier !== 'function' || earlier()) });
+}
 async function action(work) { try { await work(); } catch (error) { if (typeof error.canReport === 'function' && !error.canReport()) return; status(error.message.replace(/^Error invoking remote method '[^']+': Error: /, '')); } }
 function day(instant, timezone) { return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(instant)); }
 async function refresh() {
@@ -41,7 +45,7 @@ async function refresh() {
       if (note.type === 'reel_import') { const inspect = document.createElement('button'); inspect.textContent = 'Inspect source'; inspect.onclick = () => action(() => window.intakeView.inspect(note.id)); article.append(inspect); }
     }
     window.dispatchEvent(new CustomEvent('companion-base-refreshed', { detail: { configurationEpoch: owner, location: state.location } }));
-  } catch (error) { if (owned()) throw Object.assign(error, { canReport: owned }); }
+  } catch (error) { if (owned()) throw scopeError(error, owned); }
   finally { if (owned()) window.intakeView.settleRepairs(); }
 }
 const scheduleControls = ['enable', 'pause', 'resume', 'disable', 'repair'].map(operation => $('schedule-' + operation));
@@ -78,7 +82,7 @@ $('check-intake').onclick = () => {
       if (!owned()) return;
       await refresh();
       if (owned()) status('Intake check complete. Inspect held imports and source errors.');
-    } catch (error) { if (owned()) throw Object.assign(error, { canReport: owned }); }
+    } catch (error) { if (owned()) throw scopeError(error, owned); }
     finally { checkingIntake = false; $('check-intake').disabled = configurationBusy; }
   });
 };

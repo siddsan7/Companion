@@ -34,3 +34,10 @@ Independent review REQUESTED CHANGES for ONE P2: Check catch overwrites a Refres
 ## Reporting ownership regression RED
 
 Root added a focused desktop/file case that completes a genuine manual check, then causes its real frontend state read to fail through an owned malformed schedule file. The genuine rejected work is held at the existing outer action-report boundary; the settings file is restored and a newer capture is visibly saved. Releasing the same error lets the normal reporter run. No error/result is invented and no backend is replayed. At initialfeature934ef1f/stagedtree4838ad8eb3594aa819e7d8adc47dbf9fbdccab93 it FAILED1/0skip/exit1/9834ms: old Daily intake settings unreadable replaced current Capture saved at tests/context.spec.js:272. Raw Temp/companion-ticket13-check-reporting-red-20261110; runner60873 completed/copied. Later no-retry/byte assertions were unreached. Finally restored settings and original main/renderer handlers. Preserve the regression before composing read/action reporting predicates in a separate fix.
+
+
+## Reporting correction independently approved
+
+A small shared scopeError now COMBINES current ownership with any earlier canReport predicate. Refresh and Check preserve the same actual error while reporting only if every enclosing read/action still owns it. The Check wrapper cannot replace a stronger refreshEpoch guard. Sourcefix is separate from initialfeature934ef1f and regressionada1d24.
+
+UNCHANGED nested Check reporting regression, older Refresh success/error controls and real native Checkpending control ALLPASSED4/0skip/exit0/12075ms at stagedtree1b687b7356bf3c1b2d41f4c6cbeeaef28df14bfe. Raw Temp/companion-ticket13-check-reporting-green-four-20261110; runner2255 completed/copied. Independent review APPROVED bounded correction and closed the P2: Temp/companion-ticket13-check-reporting-fix-review-20261110.md. No source/native/model/timer/retry bypass. Temporary observers are removed separately next; observerfree originals and complete ticket gate remain required, and historical mixedfailedowner staysunproved.
