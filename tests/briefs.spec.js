@@ -60,6 +60,100 @@ test('an unfinished brief refresh cannot approve the previously displayed propos
   }
 });
 
+test('same-vault configuration keeps a persisted failed proposal unavailable for approval', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  const folder = path.join(root, 'vault', 'Companion', 'Briefs');
+  const first = path.join(folder, (await fs.readdir(folder)).find(name => name.startsWith('approved-1-')));
+  const approvedBytes = await fs.readFile(first);
+  await fs.unlink(readme);
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await expect(page.locator('#brief-error')).toContainText('ENOENT');
+  const failure = (await fs.readdir(folder)).find(name => name.startsWith('failure-'));
+  expect(await fs.readFile(path.join(folder, failure), 'utf8')).toContain('ENOENT');
+  await page.getByRole('button', { name: 'Check brief inputs', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Refresh failed:');
+  await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeDisabled();
+  const previousProposal = await page.locator('#brief-proposal').elementHandle();
+  await page.evaluate(() => {
+    const view = document.getElementById('brief-view');
+    const observation = window.__failedBriefApprovalObservation = { exposed: false, samples: 0 };
+    observation.observer = new MutationObserver(() => {
+      // Sample the settled DOM, not temporary default-enabled nodes constructed before controls().
+      const approve = view.querySelector('#brief-proposal button');
+      observation.samples++;
+      if (approve?.isConnected && !approve.disabled && view.textContent.includes('Refresh failed:')) observation.exposed = true;
+    });
+    observation.observer.observe(view, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled'] });
+  });
+  try {
+    await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+    // The old ready status is unchanged; only a replacement article proves this state was rendered.
+    await expect.poll(() => previousProposal.evaluate(node => node.isConnected)).toBe(false);
+    await expect(page.locator('#brief-view')).toContainText('Refresh failed:');
+    const observation = await page.evaluate(() => ({ exposed: window.__failedBriefApprovalObservation.exposed, samples: window.__failedBriefApprovalObservation.samples }));
+    expect(observation.samples).toBeGreaterThan(0);
+    expect(observation.exposed).toBe(false);
+    await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeDisabled();
+    expect(await fs.readFile(first)).toEqual(approvedBytes);
+    expect((await fs.readdir(folder)).filter(name => name.startsWith('approved-'))).toHaveLength(1);
+  } finally {
+    await page.evaluate(() => {
+      window.__failedBriefApprovalObservation.observer.disconnect();
+      delete window.__failedBriefApprovalObservation;
+    });
+    await previousProposal.dispose();
+  }
+});
+
+test('same-vault configuration read failure leaves explicit brief recovery available', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  await expect(page.locator('#brief-error')).toHaveText('');
+  const folder = path.join(root, 'vault', 'Companion', 'Briefs'), preserved = path.join(root, 'preserved-briefs');
+  const file = (await fs.readdir(folder)).find(name => name.startsWith('approved-1-'));
+  const approvedBytes = await fs.readFile(path.join(folder, file));
+  await fs.rename(folder, preserved);
+  let restored = false;
+  try {
+    await fs.writeFile(folder, 'Owned fixture obstruction: preserve the approved directory.');
+    await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+    // The real configured event reads the ordinary file as a directory; no error is fabricated.
+    await expect(page.locator('#brief-error')).toContainText(/ENOTDIR|not a directory/i);
+    await expect(page.getByRole('button', { name: 'Check brief inputs', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Propose brief', exact: true })).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeDisabled();
+    expect(await fs.readFile(path.join(preserved, file))).toEqual(approvedBytes);
+    await fs.unlink(folder); await fs.rename(preserved, folder); restored = true;
+    const previousProposal = await page.locator('#brief-proposal').elementHandle();
+    try {
+      await page.getByRole('button', { name: 'Check brief inputs', exact: true }).click();
+      await expect.poll(() => previousProposal.evaluate(node => node.isConnected)).toBe(false);
+    } finally { await previousProposal.dispose(); }
+    await fs.writeFile(readme, '# MyTune\n\nA recovered rhythm practice coach.\n');
+    await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+    await expect(page.getByLabel('Project purpose', { exact: true })).toHaveValue('A recovered rhythm practice coach.');
+    await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeEnabled();
+    await expect(page.locator('#brief-error')).toHaveText('');
+    expect(await fs.readFile(path.join(folder, file))).toEqual(approvedBytes);
+    expect((await fs.readdir(folder)).filter(name => name.startsWith('approved-'))).toHaveLength(1);
+  } finally {
+    if (!restored) { await fs.rm(folder, { force: true }); await fs.rename(preserved, folder); }
+  }
+});
+
 test('selected README produces a locally inspectable proposal and explicit immutable approval across restart', async () => {
   await launch();
   await page.getByRole('button', { name: 'Choose vault' }).click();
