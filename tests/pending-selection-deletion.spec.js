@@ -267,3 +267,159 @@ test('pending reviewed selection deletion holds a contradictory prospective hist
   expect(held.pending).toEqual(pendingLedger.pending); expect(held.captures).toEqual(pendingLedger.captures);
   expect(held.attempts).toEqual(retained.attempts); expect(held.admissions).toEqual(retained.admissions); expect(await files(producer)).toEqual(producerBytes);
 });
+
+test('restored-generation pending selection deletion resumes after the first native unlink without committing selection', async ({}, testInfo) => {
+  test.skip(process.platform !== 'win32', 'Requires a real Windows FileShare.Read handle that denies native rename/delete.');
+  test.setTimeout(180000);
+  const producer = path.join(root, 'producer');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(producer);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  let checks = 0;
+  const check = async (status = 'complete') => {
+    const instant = new Date(Date.parse('2026-11-08T06:59:00Z') + ++checks * 1000).toISOString();
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · ${status}`);
+    return instant;
+  };
+  await check();
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const seed = JSON.parse(await fs.readFile(ledgerFile)), id = seed.captures[sourceHash].id;
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const seedDeleted = JSON.parse(await fs.readFile(ledgerFile));
+  for (const target of seedDeleted.sourceAuthority[id].targets) expect(await exists(path.join(root, 'vault', target.file))).toBe(false);
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(producer, 'accept'));
+  await restoration.getByRole('combobox', { name: /^Selected producer artifact kind/ }).selectOption('review');
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source restored');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const restored = JSON.parse(await fs.readFile(ledgerFile)), generation = restored.sourceAuthority[id].generation;
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(producer, 'edit'), { recursive: true });
+  const producerBytes = await files(producer); await check();
+  const retained = JSON.parse(await fs.readFile(ledgerFile)), capture = retained.captures[sourceHash], current = path.join(base, 'Captures', capture.file), currentA = await fs.readFile(current);
+  const revisionB = capture.revisions.find(revision => revision !== capture.currentRevision), snapshotB = path.join(base, 'Revisions', revisionB + '.json'), stageB = path.join(intake, revisionB + '.snapshot.stage');
+  const renameFile = path.join(root, 'generation-native-rename.json');
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalRename = io.rename;
+    io.rename = async function (from, to, ...args) {
+      try { return await originalRename.call(this, from, to, ...args); }
+      catch (error) {
+        if (typeof from === 'string' && paths.resolve(from).toLowerCase() === paths.resolve(options.current).toLowerCase()) {
+          io.rename = originalRename;
+          await io.writeFile(options.renameFile, JSON.stringify({ mainPid: process.pid, from, to, code: error.code, syscall: error.syscall, message: error.message, delegatedOriginal: true }));
+        }
+        throw error;
+      }
+    };
+  }, { current, renameFile });
+  const native = await holdCurrent(current);
+  try {
+    await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+    await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Capture destination is locked or inaccessible');
+  } finally { await native.release(); handle = null; }
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  const pendingBytes = await fs.readFile(ledgerFile), pending = JSON.parse(pendingBytes), journalBytes = await fs.readFile(path.join(intake, pending.pending[sourceHash].journal)), tx = JSON.parse(journalBytes);
+  const all = await files(base), names = Object.keys(all).filter(name => /^(Captures\/|Revisions\/|\.intake\/)/.test(name) && name !== '.intake/ledger.json').sort();
+  const observe = async selected => Promise.all(selected.map(async name => {
+    const file = path.join(base, name), bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    return { file: name, bytesBase64: bytes.toString('base64'), sha256: sha(bytes), ordinary: stat.isFile() && !stat.isSymbolicLink(), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) };
+  }));
+  const observations = await observe(names), nativeRename = JSON.parse(await fs.readFile(renameFile));
+  await fs.writeFile(testInfo.outputPath('pending-selection-generation-writer.json'), JSON.stringify({ seed, seedDeleted, restored, generation, retained, pending, pendingLedgerBase64: pendingBytes.toString('base64'), journalBase64: journalBytes.toString('base64'), nativeHandle: native.proof, nativeRename, producerBytes, observations }, null, 2));
+  expect(names).toHaveLength(5); expect(nativeRename.delegatedOriginal).toBe(true); expect(['EACCES', 'EPERM', 'EBUSY']).toContain(nativeRename.code); expect(native.proof.exit).toEqual({ code: 0, signal: null });
+  expect(native.proof.stdout).toContain(`RELEASED:${native.proof.pid}`);
+  expect(restored.sourceAuthority[id].phase).toBe('active'); expect(generation).not.toBe(seedDeleted.sourceAuthority[id].generation);
+  expect(restored.attempts).toEqual(seed.attempts); expect(capture.currentRevision).not.toBe(seed.captures[sourceHash].currentRevision);
+  expect(retained.sourceAuthority[id].history).toEqual(restored.sourceAuthority[id].history); expect(restored.sourceAuthority[id].history).toEqual([seedDeleted.sourceAuthority[id]]);
+  expect(Object.values(retained.admissions)).toHaveLength(2);
+  for (const admission of Object.values(retained.admissions)) expect(admission.sourceGeneration).toBe(generation);
+  for (const [identity, accepted] of Object.entries(seed.attempts)) expect(retained.attempts[identity]).toEqual(accepted);
+  expect(pending.attempts).toEqual(retained.attempts); expect(pending.admissions).toEqual(retained.admissions); expect(pending.captures[sourceHash]).toEqual(capture);
+  expect(tx.sourceGeneration).toBe(generation); expect(tx.capture.currentRevision).toBe(revisionB); expect(tx.capture.selectionHistory.at(-1).revision).toBe(revisionB); expect(await fs.readFile(current)).toEqual(currentA);
+  expect(await fs.readFile(stageB)).toEqual(await fs.readFile(snapshotB));
+  const targets = names.map(name => 'Companion/' + name), before = await files(base);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const preview = page.getByLabel('Capture deletion preview'); await expect(preview).toBeVisible();
+  expect((await preview.locator('p').filter({ hasText: /^Remove: / }).allTextContents()).sort()).toEqual(targets.map(file => 'Remove: ' + file).sort());
+  const raw = await page.evaluate(async captureId => { const value = await window.captureDeletion.preview({ id: captureId }); await window.captureDeletion.cancel({ token: value.token }); return value; }, id);
+  expect(raw.targets.sort()).toEqual(targets.sort());
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click(); await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const freshPreview = page.getByLabel('Capture deletion preview'); await expect(freshPreview).toBeVisible();
+  const first = path.join(base, names[0]), unlinkFile = path.join(root, 'generation-native-first-unlink.json'), mainPid = await app.evaluate(() => process.pid);
+  // Observe the original unlink. The existing checkpoint pauses immediately after it.
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalUnlink = io.unlink;
+    io.unlink = async function (file, ...args) {
+      const result = await originalUnlink.call(this, file, ...args);
+      if (typeof file === 'string' && paths.resolve(file).toLowerCase() === paths.resolve(options.first).toLowerCase()) {
+        io.unlink = originalUnlink;
+        await io.writeFile(options.unlinkFile, JSON.stringify({ mainPid: process.pid, file, delegatedOriginal: true, nativeUnlinkReturned: true, controlledSourceOmissions: [] }));
+      }
+      return result;
+    };
+  }, { first, unlinkFile });
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+  await freshPreview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('capture-deletion-unlinked');
+  const committedBytes = await fs.readFile(ledgerFile), committed = JSON.parse(committedBytes), authority = committed.sourceAuthority[id], unlink = JSON.parse(await fs.readFile(unlinkFile));
+  const survivors = names.slice(1), survivorObservations = await observe(survivors), lockFile = current + '.lock', lockBytes = await fs.readFile(lockFile), lockOwner = JSON.parse(lockBytes);
+  await fs.writeFile(testInfo.outputPath('pending-selection-generation-first-unlink.json'), JSON.stringify({ mainPid, unlink, originalGeneration: generation, deletingGeneration: authority.generation, committedLedgerBase64: committedBytes.toString('base64'), authority, removed: names[0], survivorObservations, ownedCaptureLock: { file: lockFile, bytesBase64: lockBytes.toString('base64'), owner: lockOwner } }, null, 2));
+  expect(first).toBe(stageB); expect(unlink).toEqual({ mainPid, file: first, delegatedOriginal: true, nativeUnlinkReturned: true, controlledSourceOmissions: [] });
+  expect(await exists(first)).toBe(false); expect(survivorObservations).toEqual(observations.slice(1)); expect(survivors).toHaveLength(4);
+  expect(await fs.readFile(snapshotB)).toEqual(Buffer.from(observations.find(item => path.join(base, item.file) === snapshotB).bytesBase64, 'base64'));
+  expect(authority.phase).toBe('deleting'); expect(authority.generation).not.toBe(generation); expect(authority.originGenerations).toEqual([{ captureId: id, generation }]);
+  expect(authority.history).toEqual(restored.sourceAuthority[id].history); expect(authority.targets.map(item => item.file).sort()).toEqual(targets.sort());
+  for (const descriptor of authority.recovery) expect(descriptor.sourceGeneration).toBe(generation);
+  const stageDescriptor = authority.recovery.find(item => item.file === 'Companion/' + names[0]), snapshotDescriptor = authority.recovery.find(item => item.file === 'Companion/Revisions/' + revisionB + '.json');
+  expect(stageDescriptor.format).toBe('snapshot-stage'); expect(snapshotDescriptor.format).toBe('incoming-snapshot'); expect(stageDescriptor.transaction).toBe(snapshotDescriptor.transaction);
+  expect(committed.attempts).toEqual(retained.attempts); expect(committed.admissions).toEqual(retained.admissions); expect(committed.captures[sourceHash].selectionHistory).toEqual(capture.selectionHistory);
+  expect(committed.captures[sourceHash].currentRevision).toBe(capture.currentRevision); expect(committed.pending).toEqual(pending.pending); expect(committed.suppressed).toContain(sourceHash);
+  for (const source of [currentA.toString(), tx.content, journalBytes.toString()]) expect(JSON.stringify(authority)).not.toContain(JSON.stringify(source).slice(1, -1));
+  expect(lockOwner).toEqual({ pid: mainPid });
+  const child = app.process(), processEvidence = { boundary: 'capture-deletion-unlinked', wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  processEvidence.wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  app = null;
+  await fs.writeFile(testInfo.outputPath('pending-selection-generation-process-exit.json'), JSON.stringify(processEvidence, null, 2));
+  expect(processEvidence.wrapperExit).toEqual({ code: 77, signal: null });
+  expect(await observe(survivors)).toEqual(survivorObservations); expect(await exists(first)).toBe(false); expect(await fs.readFile(ledgerFile)).toEqual(committedBytes); expect(await fs.readFile(lockFile)).toEqual(lockBytes);
+  await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.'); await expect(page.locator('#captures article')).toHaveCount(0);
+  const recovered = JSON.parse(await fs.readFile(ledgerFile)), expectedAuthority = { ...authority, phase: 'deleted' };
+  expect(recovered.sourceAuthority[id]).toEqual(expectedAuthority); expect(recovered.attempts).toEqual(retained.attempts); expect(recovered.admissions).toEqual(retained.admissions);
+  expect(recovered.captures[sourceHash].selectionHistory).toEqual(capture.selectionHistory); expect(recovered.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect(recovered.pending[sourceHash]).toBeUndefined(); expect(recovered.blocks[sourceHash]).toBeUndefined(); expect(recovered.suppressed).toContain(sourceHash);
+  for (const name of names) expect(await exists(path.join(base, name))).toBe(false);
+  // The dead main's exact ownership lock is removed by normal vault recovery.
+  expect(await exists(lockFile)).toBe(false); expect(await files(producer)).toEqual(producerBytes);
+  const checkedAt = await check('held'), checked = JSON.parse(await fs.readFile(ledgerFile));
+  expect(checked.lastCheck).toEqual({ at: checkedAt, trigger: 'manual', status: 'held' });
+  const scannedKeys = ['accept', 'edit'].map(name => retained.sources[0].id + ':' + name);
+  expect(Object.keys(checked.outcomes).sort()).toEqual(Object.keys(recovered.outcomes).sort());
+  for (const [index, key] of scannedKeys.entries()) expect(checked.outcomes[key]).toEqual({ status: 'held', reason: 'Automatic re-import is suppressed. Restore this source explicitly before intake.', locator: path.join(producer, ['accept', 'edit'][index]), checkedAt });
+  // The explicit restoration has its own historical outcome; intake does not rescan it.
+  for (const [key, outcome] of Object.entries(recovered.outcomes)) if (!scannedKeys.includes(key)) expect(checked.outcomes[key]).toEqual(outcome);
+  await app.close(); app = null; await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.'); await expect(page.locator('#captures article')).toHaveCount(0);
+  const final = JSON.parse(await fs.readFile(ledgerFile));
+  expect(final.sourceAuthority[id]).toEqual(expectedAuthority); expect(final.attempts).toEqual(retained.attempts); expect(final.admissions).toEqual(retained.admissions); expect(final.captures[sourceHash].selectionHistory).toEqual(capture.selectionHistory); expect(final.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  for (const name of names) expect(await exists(path.join(base, name))).toBe(false);
+  expect(await exists(lockFile)).toBe(false); expect(await files(producer)).toEqual(producerBytes);
+});
