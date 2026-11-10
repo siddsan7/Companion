@@ -212,7 +212,11 @@ function install(Intake, { hash, read, noteText }) {
     return notes;
   };
   const inspect = Intake.prototype.inspect;
-  Intake.prototype.inspect = async function (id) { const info = await inspect.call(this, id); return { ...info, annotations: await this.annotations(id) }; };
+  Intake.prototype.inspect = async function (id, options) {
+    const info = await inspect.call(this, id);
+    if (options?.annotations === false) return info;
+    return { ...info, annotations: await this.annotations(id) };
+  };
   Intake.prototype.addAnnotation = async function ({ id, captureId, text }, now) {
     return this.locked(async () => {
       if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id) || typeof text !== 'string' || !text.trim()) throw Error('Enter annotation text before saving.');

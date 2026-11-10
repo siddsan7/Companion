@@ -46,9 +46,11 @@ class IntakeLedger {
   }
   async read() { const view = await this.view(); this.expected = view; return view.text; }
   matches(view, expected = this.expected) { return !!expected && JSON.stringify(view.parents) === JSON.stringify(expected.parents) && JSON.stringify(view.identity) === JSON.stringify(expected.identity); }
+  async guard() { if (!this.matches(await this.view())) throw changed(); }
   async guardParents() { if (!this.expected || JSON.stringify(await this.parents()) !== JSON.stringify(this.expected.parents)) throw changed(); }
   async replace(text) {
     if (!this.matches(await this.view()) || this.expected.parents.missing) throw changed();
+    if (hash(Buffer.from(text, 'utf8')) === this.expected.identity?.digest) return;
     const stage = path.join(this.directory, `ledger-${randomUUID()}.tmp`), bytes = Buffer.from(text, 'utf8');
     let own;
     try {

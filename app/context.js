@@ -3,6 +3,7 @@ const local = require('node:fs');
 const path = require('node:path');
 const YAML = require('yaml');
 const { Intake } = require('./intake');
+const { sourceInspection } = require('./source-mutation');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
 const { createHash, randomUUID } = require('node:crypto');
@@ -89,8 +90,13 @@ class Context {
   }
   async exclude(key) { await this.changeScope(current => current.filter(file => `note:${digest(file)}` !== key)); }
   async corpus() {
+    const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned());
+    return this.corpusFromSources(sources);
+  }
+  async sourceCorpusOwned() {
     const intake = new Intake(this.vault), ledger = await intake.info();
-    const notes = await this.vault.list(), issues = [], included = [], all = [], eligible = new Map(), histories = new Map();
+    const observed = intake.storage.expected;
+    const notes = await this.vault.list(), issues = [], all = [], eligible = new Map(), histories = new Map();
     for (const note of notes) {
       const authority = ledger.sourceAuthority?.[note.id];
       if (authority && authority.phase !== 'active') { issues.push(`Evidence unavailable: ${note.title}; deliberately deleted source.`); continue; }
@@ -116,7 +122,7 @@ class Context {
           await this.vault.contained(file); const stat = await fs.lstat(file);
           if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('revision is not an ordinary unlinked file');
         }
-        const inspected = await intake.inspect(note.id), revision = inspected.revisions.find(item => item.id === capture.currentRevision);
+        const inspected = await intake.inspect(note.id, { annotations: false }), revision = inspected.revisions.find(item => item.id === capture.currentRevision);
         if (!revision || revision.captureId !== capture.id || revision.sourceHash !== sourceHash || revision.supportEligible === false || revision.humanReview === 'reject' || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') throw Error('current revision is unavailable or rejected');
         const uncertainty = revision.uncertainty || {};
         const provenance = `Imported capture ${note.id}; exact imported revision ${revision.id}; snapshot sha256 ${revisionAdmission(ledger, revision.id)?.snapshotHash}; Processing: ${revision.processing || revision.run?.state || 'unknown'}; Extraction: ${revision.extraction || 'unknown'}; Human review: ${revision.humanReview}; Uncertainty: ${Array.isArray(uncertainty.uncertainEvidence) ? uncertainty.uncertainEvidence.length : 'unknown'} flagged extracts; sampling capped: ${uncertainty.truncated === true ? 'yes' : uncertainty.truncated === false ? 'no' : 'unknown'}. Claims are not independently verified.${revision.synthetic === true || revision.run?.input_kind === 'synthetic_fixture' ? ' Authored synthetic fixture; not real source evidence.' : ''}`;
@@ -125,6 +131,11 @@ class Context {
         all.push(source); eligible.set(note.id, source); histories.set(note.id, inspected.revisions);
       } catch (error) { issues.push(`Evidence unavailable: ${note.title}; ${error.message}`); }
     }
+    if (!intake.storage.matches(await intake.storage.view(), observed)) throw Error('Intake ledger changed during context discovery. Retry against the current authority.');
+    return { intake, ledger, observed, issues, all, eligible, histories };
+  }
+  async corpusFromSources({ intake, ledger, observed, issues, all, eligible, histories }) {
+    const included = [];
     const annotationGroups = new Map();
     for (const annotation of await intake.annotations()) {
       if (!annotationGroups.has(annotation.id)) annotationGroups.set(annotation.id, []);
@@ -211,6 +222,7 @@ class Context {
       const key = `note:${digest(file)}`; included.push({ key, file });
       try { all.push(await this.note(file)); } catch (error) { issues.push(`Unavailable explicit note ${path.basename(file)}: ${error.message}`); }
     }
+    if (!intake.storage.matches(await intake.storage.view(), observed)) throw Error('Intake ledger changed during context discovery. Retry against the current authority.');
     this.ideaEligibility(this.vault);
     const available = all.filter(source => {
       if (!source.key.startsWith('idea:')) return true;

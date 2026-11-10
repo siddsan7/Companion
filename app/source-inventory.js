@@ -23,6 +23,12 @@ function text(bytes) {
 // Pure shape checks for the content-free proof committed before any unlink.
 // Recovery verifies its surviving exact leaves; it does not need a removed journal.
 function validateInventory(value, id) {
+  if (value.mixedRecovery !== undefined || value.preservedWriting !== undefined || value.targets.some(item => item.kind === 'mixed-recovery')) {
+    if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
+    require('./mixed-deletion').validate(value, id);
+    if (value.mixedRecovery?.format === 'restored-backup-editor-hold-v1') validateRecovery(value, id);
+    validateObservations(value, id); return;
+  }
   if (value.inventoryVersion === 1) return require('./manual-title').validate(value, id);
   if (value.inventoryVersion === undefined) {
     if (['originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs', 'titleRecovery'].some(key => value[key] !== undefined) || value.targets.some(item => item.peers !== undefined || ['source-recovery', 'source-title-backup'].includes(item.kind)) || value.history?.some(item => item.inventoryVersion === 2)) fail();
@@ -31,6 +37,10 @@ function validateInventory(value, id) {
   if (value.inventoryVersion !== 2 || value.manual || !Array.isArray(value.originGenerations) || value.originGenerations.length > 1 || value.originGenerations.some(item => !fields(item, ['captureId', 'generation']) || item.captureId !== id || !uuid(item.generation)) || !Array.isArray(value.recovery) || !Array.isArray(value.recoveryPointers) || !Array.isArray(value.purgedProducerAttempts)) fail();
   sourceTitle.validateProofs(value, id);
   const titleRecovery = pendingTitle.validate(value, id);
+  validateRecovery(value, id, titleRecovery);
+  validateObservations(value, id);
+}
+function validateRecovery(value, id, titleRecovery) {
   const targets = new Map(value.targets.map(item => [item.file, item])); let previous = '';
   for (const item of value.recovery) {
     if (!fields(item, ['file', 'format', 'transaction', 'captureId', 'sourceHash', 'revisionId', 'sourceGeneration']) || !safe(item.file) || !safe(item.transaction) || item.file <= previous || !formats.includes(item.format) || item.captureId !== id || item.sourceHash !== value.sourceHash || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !targets.has(item.file)) fail();
@@ -55,7 +65,9 @@ function validateInventory(value, id) {
     if (!fields(item, ['kind', 'journal', 'sha256', 'captureConflictSha256']) || !['blocks', 'pending'].includes(item.kind) || pointerKinds.has(item.kind) || item.kind <= previousKind || !sha(item.sha256) || !(item.captureConflictSha256 === null || sha(item.captureConflictSha256)) || !value.recovery.some(entry => entry.file === item.journal && entry.format === 'transaction')) fail();
     pointerKinds.add(item.kind); previousKind = item.kind;
   }
-  previous = '';
+}
+function validateObservations(value, id) {
+  let previous = '';
   for (const item of value.purgedProducerAttempts) {
     if (!fields(item, ['identity', 'fingerprint', 'sourceHash', 'captureId', 'revisionId', 'sourceGeneration', 'operationId']) || typeof item.identity !== 'string' || !/^(?:[a-f0-9]{64}:[a-f0-9]{32}|finalization:[a-f0-9]{32})$/.test(item.identity) || item.identity <= previous || !sha(item.fingerprint) || item.sourceHash !== value.sourceHash || item.captureId !== id || !uuid(item.revisionId) || !(item.sourceGeneration === null || uuid(item.sourceGeneration)) || !uuid(item.operationId)) fail();
     previous = item.identity;
@@ -163,7 +175,73 @@ function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
   if (admission && (admission.snapshotHash !== hash(JSON.stringify(tx.revision, null, 2)) || admission.captureId !== capture.id || admission.sourceHash !== sourceHash || admission.identity !== tx.revision.identity || admission.fingerprint !== tx.revision.fingerprint)) fail();
   return admission;
 }
+const exact = (value, names) => fields(value, names) && names.every(key => Object.hasOwn(value, key));
+function compact(bytes) {
+  const content = text(bytes); let value;
+  try { value = JSON.parse(content); } catch { fail(); }
+  if (JSON.stringify(value) !== content || !Buffer.from(content, 'utf8').equals(bytes)) fail();
+  return value;
+}
+async function absent(file) {
+  try { await fs.lstat(file); fail(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+function accountDetachedLeaf(proof, value) {
+  const known = proof.special.find(item => item.target.file === value.target.file);
+  if (!known) return false;
+  if (value.nlink !== 1 || ['file', 'sha256', 'dev', 'ino', 'bytes'].some(key => known.target[key] !== value.target[key])) fail();
+  return true;
+}
+async function readDetachedEditor(intake, ledger, capture, sourceHash, note) {
+  const block = ledger.blocks[sourceHash], { noteText } = require('./intake');
+  const reason = 'Restored capture backup changed. Independent editor writing was preserved; this source remains paused for explicit conflict repair.';
+  if (!exact(block, ['reason', 'journal', 'incomingRevision', 'detachHold']) || !exact(block.detachHold, ['journal', 'reason', 'evidence']) || block.reason !== reason || block.detachHold.reason !== reason || capture.conflict !== reason || ledger.pending[sourceHash]) fail();
+  if (!uuid(capture.id) || !uuid(capture.currentRevision) || capture.file !== capture.id + '.md' || note.file !== intake.destination(capture) || note.id !== capture.id || note.type !== 'reel_import' || note.title !== capture.title || note.capturedAt !== capture.capturedAt || capture.reviewed !== false || capture.rejected !== false || capture.supportEligible !== true || !equal(capture.revisions, [capture.currentRevision]) || !fields(capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'conflict']) || !date(capture.capturedAt) || !date(capture.updatedAt)) fail();
+  const current = await leaf(intake, note.file, 'capture'), snapshot = await leaf(intake, path.join(intake.vault.root, 'Revisions', capture.currentRevision + '.json'), 'snapshot');
+  const admitted = JSON.parse(text(snapshot.bytes)); normalizedDraft(admitted, capture, sourceHash);
+  const known = require('./source-authority').revisionAdmission(ledger, admitted.id), accepted = ledger.attempts[admitted.identity];
+  const generation = ledger.sourceAuthority?.[capture.id]?.phase === 'active' ? ledger.sourceAuthority[capture.id].generation : undefined;
+  if (admitted.id !== capture.currentRevision || !snapshot.bytes.equals(Buffer.from(JSON.stringify(admitted, null, 2))) || !known || known.status !== 'imported' || known.revision !== admitted.id || known.captureId !== capture.id || known.sourceHash !== sourceHash || known.identity !== admitted.identity || known.fingerprint !== admitted.fingerprint || known.snapshotHash !== snapshot.target.sha256 || known.sourceGeneration !== generation || !accepted || accepted.status !== 'imported' || accepted.captureId !== capture.id || accepted.sourceHash !== sourceHash || accepted.identity !== admitted.identity || accepted.fingerprint !== admitted.fingerprint) fail();
+  const canonical = noteText(capture, admitted);
+  if (current.nlink !== 1 || snapshot.nlink !== 1 || current.target.sha256 !== capture.currentHash || !current.bytes.equals(Buffer.from(canonical)) || note.content !== canonical) fail();
+  if (!uuid(block.incomingRevision) || block.incomingRevision === admitted.id || block.journal !== `conflict-${block.incomingRevision}.json`) fail();
+  const journal = await leaf(intake, path.join(intake.dir, block.journal), 'source-recovery'), tx = compact(journal.bytes);
+  const revisions = new Map([[admitted.id, admitted]]);
+  transaction(intake, tx, ledger, capture, sourceHash, revisions);
+  if (journal.nlink !== 1 || tx.revision.id !== block.incomingRevision || tx.revision.review !== undefined || tx.resolution !== undefined || tx.externalConflict !== false || tx.retainOnly !== false || tx.previous !== canonical || tx.previousHash !== capture.currentHash || tx.content !== noteText(tx.capture, tx.revision) || tx.capture.currentHash !== hash(tx.content) || tx.capture.updatedAt !== tx.revision.importedAt || ledger.attempts[tx.revision.identity] || ledger.admissions?.[tx.revision.id]) fail();
+  const producer = ledger.sources.find(item => item.id === tx.key.split(':')[0]);
+  if (!producer || (producer.kind || 'draft') !== 'draft' || !path.isAbsolute(tx.revision.locator) || tx.key !== `${producer.id}:${path.relative(producer.folder, tx.revision.locator) || '.'}`) fail();
+  const outcome = ledger.outcomes[tx.key];
+  if (!exact(outcome, ['status', 'reason', 'locator', 'checkedAt']) || outcome.status !== 'held' || outcome.reason !== reason || outcome.locator !== tx.revision.locator || !date(outcome.checkedAt)) fail();
+  const prefix = `${capture.id}-${tx.revision.id}.before.md`, heldPrefix = prefix + '.detach.json.held-';
+  if (tx.backup !== prefix || typeof block.detachHold.journal !== 'string' || !block.detachHold.journal.startsWith(heldPrefix) || !uuid(block.detachHold.journal.slice(heldPrefix.length))) fail();
+  const hold = await leaf(intake, path.join(intake.dir, block.detachHold.journal), 'mixed-recovery'), wrapper = compact(hold.bytes);
+  if (!exact(wrapper, ['schema', 'intentBytes', 'evidence']) || wrapper.schema !== 1 || typeof wrapper.intentBytes !== 'string') fail();
+  const intent = compact(Buffer.from(wrapper.intentBytes));
+  if (!exact(intent, ['schema', 'id', 'sourceHash', 'captureId', 'file', 'journal', 'journalHash', 'backup', 'previousHash', 'dev', 'ino', 'stageDev', 'stageIno']) || intent.schema !== 1 || !uuid(intent.id) || intent.id !== block.detachHold.journal.slice(heldPrefix.length) || intent.sourceHash !== sourceHash || intent.captureId !== capture.id || intent.file !== capture.relative || intent.journal !== block.journal || intent.journalHash !== journal.target.sha256 || intent.backup !== tx.backup || intent.previousHash !== capture.currentHash || [intent.dev, intent.ino, intent.stageDev, intent.stageIno].some(value => typeof value !== 'string' || !/^[0-9]+$/.test(value)) || intent.dev !== current.target.dev || intent.ino !== current.target.ino) fail();
+  const source = await leaf(intake, path.join(intake.dir, prefix + '.independent'), 'mixed-recovery');
+  const retained = await leaf(intake, path.join(intake.dir, prefix + '.detached-' + intent.id), 'mixed-recovery');
+  const whole = text(retained.bytes);
+  if (![hold, source, retained].every(value => value.nlink === 1) || source.target.dev !== intent.stageDev || source.target.ino !== intent.stageIno || !source.bytes.equals(current.bytes) || !Buffer.from(whole, 'utf8').equals(retained.bytes) || retained.bytes.equals(current.bytes) || new Set([current, snapshot, journal, hold, source, retained].map(value => value.target.dev + ':' + value.target.ino)).size !== 6) fail();
+  const evidence = [{ role: 'independent-editor-writing', file: path.basename(retained.target.file), hash: retained.target.sha256 }, { role: 'original-source-copy', file: path.basename(source.target.file), hash: capture.currentHash }];
+  if (!isDeepStrictEqual(wrapper.evidence, evidence) || !isDeepStrictEqual(block.detachHold.evidence, evidence)) fail();
+  await absent(path.join(intake.dir, prefix)); await absent(path.join(intake.dir, prefix + '.detach.json'));
+  return { block, current, snapshot, journal, source, retained, hold, intent, known, outcome, tx, generation, revisions, whole, special: [source, retained, hold] };
+}
+async function inventoryDetachedEditor(intake, ledger, capture, sourceHash, note) {
+  const proof = await readDetachedEditor(intake, ledger, capture, sourceHash, note);
+  const result = await inventorySources(intake, ledger, capture, sourceHash, proof.revisions, [proof.current.target, proof.snapshot.target], proof);
+  if (result.targets.length !== 9 || result.titleProofs.length || result.recovery.length !== 4 || result.recoveryPointers.length !== 1 || result.observations.length !== 1) fail();
+  for (const value of [proof.current, proof.snapshot, proof.journal]) if (!result.targets.some(item => isDeepStrictEqual(item, value.target))) fail();
+  for (const value of proof.special) {
+    const fresh = await leaf(intake, path.join(intake.vault.vault, value.target.file), 'mixed-recovery');
+    if (!accountDetachedLeaf(proof, fresh) || !result.targets.some(item => isDeepStrictEqual(item, fresh.target))) fail();
+  }
+  return { ...result, detachedEditor: proof };
+}
 async function inventory(intake, ledger, capture, sourceHash, revisions, initial) {
+  return inventorySources(intake, ledger, capture, sourceHash, revisions, initial);
+}
+async function inventorySources(intake, ledger, capture, sourceHash, revisions, initial, detachedEditor = null) {
   const pending = await pendingTitle.inventory(intake, ledger, capture, sourceHash, revisions, initial);
   if (pending) initial = pending.targets;
   const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;
@@ -175,6 +253,9 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     if (name === 'ledger.json') continue;
     if (pending?.titleRecovery.intent === relative(intake, path.join(intake.dir, name))) continue;
     const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
+    if (detachedEditor && accountDetachedLeaf(detachedEditor, value)) {
+      targets.set(value.target.file, { ...value.target, kind: 'mixed-recovery' }); continue;
+    }
     if (!mentions(value.bytes, capture.id, sourceHash)) continue;
     entries.push({ name, file, value, text: text(value.bytes) });
   }
@@ -231,7 +312,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     const pointer = ledger[kind][sourceHash]; if (!pointer) continue;
     const journal = relative(intake, path.join(intake.dir, pointer.journal || ''));
     const tx = transactions.get(journal);
-    if (!tx || kind === 'blocks' && (!fields(pointer, ['reason', 'journal', 'incomingRevision']) || pointer.incomingRevision !== tx.revision.id || capture.conflict !== pointer.reason) || kind === 'pending' && (!fields(pointer, ['reason', 'journal', 'key']) || pointer.key !== tx.key) || typeof pointer.reason !== 'string' || capture.conflict !== undefined && typeof capture.conflict !== 'string') fail();
+    if (!tx || kind === 'blocks' && (!(detachedEditor ? isDeepStrictEqual(pointer, detachedEditor.block) : fields(pointer, ['reason', 'journal', 'incomingRevision'])) || pointer.incomingRevision !== tx.revision.id || capture.conflict !== pointer.reason) || kind === 'pending' && (!fields(pointer, ['reason', 'journal', 'key']) || pointer.key !== tx.key) || typeof pointer.reason !== 'string' || capture.conflict !== undefined && typeof capture.conflict !== 'string') fail();
     recoveryPointers.push({ kind, journal, sha256: hash(JSON.stringify(pointer)), captureConflictSha256: capture.conflict === undefined ? null : hash(capture.conflict) });
   }
   const result = [...targets.values()].sort((a, b) => a.file.localeCompare(b.file)), proof = { targets: result, recovery };
@@ -270,6 +351,7 @@ async function inspectTarget(intake, authority, target) {
   if (!remaining.some(item => item.file === target.file)) fail();
 }
 function inspectPointers(ledger, authority) {
+  if (authority.mixedRecovery) return require('./mixed-deletion').inspectPointers(ledger, authority);
   const capture = ledger.captures[authority.sourceHash];
   for (const item of authority.recoveryPointers || []) {
     const pointer = ledger[item.kind][authority.sourceHash];
@@ -280,6 +362,7 @@ function inspectPointers(ledger, authority) {
   for (const kind of ['blocks', 'pending']) if (ledger[kind][authority.sourceHash] && !authority.recoveryPointers.some(item => item.kind === kind)) fail();
 }
 function retirePointers(ledger, authority) {
+  if (authority.mixedRecovery) return require('./mixed-deletion').retirePointers(ledger, authority);
   inspectPointers(ledger, authority);
   const capture = ledger.captures[authority.sourceHash];
   for (const item of authority.recoveryPointers || []) delete ledger[item.kind][authority.sourceHash];
@@ -290,4 +373,4 @@ function purgedAttempt(ledger, draft) {
   for (const item of matches) if (item.fingerprint !== draft.fingerprint || item.sourceHash !== draft.sourceHash || ledger.captures[draft.sourceHash]?.id !== item.captureId) throw Error('Purged producer identity changed. Preserve its original fingerprint and source binding.');
   return matches[0];
 }
-module.exports = { validateInventory, inventory, inspectTargets, inspectTarget, inspectPointers, retirePointers, purgedAttempt };
+module.exports = { validateInventory, inventory, inventoryDetachedEditor, inspectTargets, inspectTarget, inspectPointers, retirePointers, purgedAttempt };

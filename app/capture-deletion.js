@@ -14,6 +14,7 @@ const sourceTitle = require('./source-title');
 const manualTitle = require('./manual-title');
 const pendingTitle = require('./pending-title');
 const deletionDependents = require('./deletion-dependents');
+const mixedDeletion = require('./mixed-deletion');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 const changed = () => Object.assign(Error('Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.'), { code: 'SOURCE_FILE_CHANGED' });
 
@@ -32,7 +33,7 @@ class CaptureDeletion {
     if (after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size || after.mtimeNs !== stat.mtimeNs) throw changed();
     return { file: relative(vault, file), sha256: hash(bytes), dev: String(stat.dev), ino: String(stat.ino), bytes: String(bytes.length), kind };
   }
-  async inventory(id) {
+  async inventory(id, retained) {
     if (!uuid(id)) throw Error('Choose a capture to delete.');
     const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
     const intake = new Intake(vault), ledger = await intake.load(); validateAuthority(ledger);
@@ -45,8 +46,9 @@ class CaptureDeletion {
     const manual = !entry ? { captureId: id, type: notes[0].type, capturedAt: notes[0].capturedAt, currentHash: hash(notes[0].content), file: path.basename(notes[0].file), relative: relative(vault, notes[0].file) } : undefined;
     const [sourceHash, capture] = entry || [null, { id, title: notes[0].title, currentHash: manual.currentHash, revisions: [] }];
     if (notes.length !== 1 || manual && hash(notes[0].content) !== capture.currentHash) throw changed();
-    let targets = [await this.target(vault, notes[0].file, 'capture', !manual)]; const revisions = new Map();
-    for (const revisionId of capture.revisions) {
+    const mixed = !manual ? await mixedDeletion.inventory(intake, ledger, capture, sourceHash, notes[0], retained, this.clock?.().now || new Date().toISOString()) : null;
+    let targets = mixed ? mixed.targets : [await this.target(vault, notes[0].file, 'capture', !manual)]; const revisions = new Map();
+    for (const revisionId of mixed ? [] : capture.revisions) {
       if (!uuid(revisionId)) throw changed();
       const file = path.join(vault.root, 'Revisions', revisionId + '.json'), target = await this.target(vault, file, 'snapshot', true);
       const admission = revisionAdmission(ledger, revisionId);
@@ -57,8 +59,8 @@ class CaptureDeletion {
     }
     let imported, manualTitles;
     if (!manual) {
-      imported = await sourceInventory.inventory(intake, ledger, capture, sourceHash, revisions, targets);
-      if (hash(notes[0].content) !== capture.currentHash && !imported.titleRecovery) throw changed();
+      imported = mixed || await sourceInventory.inventory(intake, ledger, capture, sourceHash, revisions, targets);
+      if (!mixed && hash(notes[0].content) !== capture.currentHash && !imported.titleRecovery) throw changed();
       targets = imported.targets;
     } else {
       manualTitles = await manualTitle.inventory(intake, ledger, manual, targets); targets = manualTitles.targets;
@@ -76,17 +78,17 @@ class CaptureDeletion {
       targets.push(await this.target(vault, file, 'source-backup'));
     }
     const directories = new Map();
-    for (const name of requiredDirectories(intake, targets)) { const value = await this.directory(vault, path.join(vault.vault, name)); directories.set(name, value); }
+    for (const name of requiredDirectories(intake, targets, mixed?.preservedWriting)) { const value = await this.directory(vault, path.join(vault.vault, name)); directories.set(name, value); }
     await inspectAdjacentTitlePrefix(vault, targets);
     const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
     await inspectManualPeers(vault, { captureId: id }, new Set([...(imported?.titleProofs || manualTitles?.titleProofs || []).map(proof => proof.before), ...pendingTitle.sidecars(imported?.titleRecovery)]));
     const dependents = await deletionDependents.inventory(vault, this.conversations, id);
     if (!intake.storage.matches(await intake.storage.view())) throw changed();
-    return { id, root: await fs.realpath(vault.vault), ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
+    return { id, root: await fs.realpath(vault.vault), ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
   }
   async preview(id) {
     const inventory = await this.inventory(id), token = randomUUID(); this.previews.set(token, inventory);
-    return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations, dependents: inventory.dependents.rows };
+    return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations, dependents: inventory.dependents.rows, ...(inventory.retainedWriting ? { retainedWriting: inventory.retainedWriting } : {}) };
   }
   cancel(token) { this.previews.delete(token); }
   async suppressed() {
@@ -182,6 +184,7 @@ class CaptureDeletion {
         } catch (error) { if (!isManualHold(error, id, authority)) throw error; reason = error.message; }
       } else reason = 'Only this exact selected producer restoration can be resumed.';
       const targets = authority.phase === 'restoring' && authority.manual ? Object.values(manualFiles(intake, authority)).map(file => relative(vault, file)) : authority.targets.map(target => target.file);
+      if (authority.phase === 'deleting' && authority.mixedRecovery) targets.push(...authority.preservedWriting.flatMap(plan => [plan.file, plan.stage]));
       if (authority.restoration?.retirement) targets.push(...authority.restoration.retirement.slots.map(slot => slot.file));
       for (const receipt of authority.phase === 'restoring' ? authority.retiredRestorations || [] : []) for (const name of retirementFiles(intake, receipt)) {
         if (await fs.lstat(path.join(vault.vault, name)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) targets.push(name);
@@ -274,22 +277,22 @@ class CaptureDeletion {
     const selected = this.previews.get(token); if (!selected) throw Error('Preview capture deletion again.');
     const vault = this.getVault();
     return this.conversations.lock(() => sourceMutation(vault.root, async () => {
-      const fresh = await this.inventory(selected.id);
+      const fresh = await this.inventory(selected.id, selected);
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw changed();
       const acquired = [];
       try {
         for (const target of fresh.targets.filter(target => target.kind === 'capture')) { const file = path.join(vault.vault, target.file); await vault.acquire(file); acquired.push(file); }
-        if (JSON.stringify(await this.inventory(selected.id)) !== JSON.stringify(selected)) throw changed();
+        if (JSON.stringify(await this.inventory(selected.id, selected)) !== JSON.stringify(selected)) throw changed();
         const intake = new Intake(vault), ledger = await intake.load();
         if (JSON.stringify(intake.storage.expected.identity) !== JSON.stringify(fresh.ledgerIdentity)) throw changed();
         ledger.sourceAuthority ||= {};
-        const operationId = randomUUID(), purged = new Map((fresh.purgedProducerAttempts || []).map(item => [item.identity, item]));
+        const operationId = fresh.preservedWriting?.[0]?.publicationOperationId || randomUUID(), purged = new Map((fresh.purgedProducerAttempts || []).map(item => [item.identity, item]));
         for (const item of fresh.observations || []) {
           const prior = purged.get(item.identity);
           if (prior && (prior.fingerprint !== item.fingerprint || prior.sourceHash !== item.sourceHash || prior.captureId !== item.captureId)) throw changed();
           if (!prior) purged.set(item.identity, { ...item, operationId });
         }
-        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId, sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual, ...(fresh.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: fresh.originGenerations, titleProofs: fresh.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: fresh.originGenerations, recovery: fresh.recovery, recoveryPointers: fresh.recoveryPointers, purgedProducerAttempts: [...purged.values()].sort((a, b) => a.identity.localeCompare(b.identity)), ...(fresh.titleProofs ? { titleProofs: fresh.titleProofs } : {}), ...(fresh.titleRecovery ? { titleRecovery: fresh.titleRecovery } : {}) }), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}), ...(ledger.sourceAuthority[selected.id]?.retiredRestorations ? { retiredRestorations: ledger.sourceAuthority[selected.id].retiredRestorations } : {}) };
+        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId, sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual, ...(fresh.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: fresh.originGenerations, titleProofs: fresh.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: fresh.originGenerations, recovery: fresh.recovery, recoveryPointers: fresh.recoveryPointers, purgedProducerAttempts: [...purged.values()].sort((a, b) => a.identity.localeCompare(b.identity)), ...(fresh.titleProofs ? { titleProofs: fresh.titleProofs } : {}), ...(fresh.titleRecovery ? { titleRecovery: fresh.titleRecovery } : {}), ...(fresh.mixedRecovery ? { mixedRecovery: fresh.mixedRecovery, preservedWriting: fresh.preservedWriting } : {}) }), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}), ...(ledger.sourceAuthority[selected.id]?.retiredRestorations ? { retiredRestorations: ledger.sourceAuthority[selected.id].retiredRestorations } : {}) };
         if (!fresh.manual) { ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])]; ledger.captures[fresh.sourceHash].removed = true; }
         await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
         await vault.checkpoint('capture-deletion-authorized');
@@ -362,6 +365,7 @@ async function inspectDeletion(intake, ledger, id) {
   await inspectAdjacentTitlePrefix(vault, authority.targets);
   const capture = ledger.captures[authority.sourceHash];
   if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
+  if (authority.mixedRecovery) return mixedDeletion.inspect(intake, ledger, id);
   if (manualTitle.explicit(authority)) manualTitle.validate(authority, id);
   else sourceTitle.inspectProofs(intake, ledger, authority);
   await pendingTitle.inspect(intake, ledger, authority);
@@ -406,23 +410,27 @@ async function inspectDeletion(intake, ledger, id) {
 }
 async function finishDeletion(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], vault = intake.vault;
+  if (authority.mixedRecovery) await mixedDeletion.publish(intake, ledger, id);
   const remaining = await inspectDeletion(intake, ledger, id);
   const deletion = new CaptureDeletion({ getVault: () => vault });
+  const extendedInventory = authority.inventoryVersion === 2 || manualTitle.explicit(authority);
   for (const target of remaining) {
     const file = path.join(vault.vault, target.file);
-    if (authority.inventoryVersion === 2 || manualTitle.explicit(authority)) {
-      await inspectDeletion(intake, ledger, id);
-      if (!intake.storage.matches(await intake.storage.view())) throw changed();
+    await inspectDeletion(intake, ledger, id);
+    await intake.storage.guard();
+    if (extendedInventory) {
       await sourceParents(intake, authority);
       if (manualTitle.explicit(authority)) {
         if (!(await manualTitle.inspect(intake, authority)).some(item => item.file === target.file)) throw changed();
       } else await sourceInventory.inspectTarget(intake, authority, target);
     } else if (JSON.stringify(await deletion.target(vault, file, target.kind)) !== JSON.stringify(target)) throw changed();
+    if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
     await fs.unlink(file); await vault.checkpoint('capture-deletion-unlinked');
   }
-  if (authority.inventoryVersion === 2 || manualTitle.explicit(authority)) {
-    if ((await inspectDeletion(intake, ledger, id)).length) throw changed();
-    if (!intake.storage.matches(await intake.storage.view())) throw changed();
+  if ((await inspectDeletion(intake, ledger, id)).length) throw changed();
+  await intake.storage.guard();
+  if (extendedInventory) {
+    if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
     if (authority.inventoryVersion === 2) sourceInventory.retirePointers(ledger, authority);
   }
   authority.phase = 'deleted'; await intake.save(ledger);
@@ -696,4 +704,4 @@ async function verifyRestorationPublication(intake, ledger, id) {
   if (hash(snapshotBytes) !== admission.snapshotHash || capture.currentRevision !== revision.id || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || hash(content) !== capture.currentHash || content !== noteText(capture, revision)) throw Error('Restoration publication changed. Suppression remains.');
   await guardRestorationParents(intake, authority);
 }
-module.exports = { CaptureDeletion, finishDeletion, finishRestoration, guardRestorationParents, installCaptureDeletion };
+module.exports = { CaptureDeletion, finishDeletion, finishRestoration, guardRestorationParents, installCaptureDeletion, inspectManualPeers };

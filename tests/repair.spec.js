@@ -33,6 +33,144 @@ async function connect(scan = false) {
   await expect(page.getByRole('status')).toContainText(scan ? 'Intake check complete' : 'Source connected');
 }
 
+test('Check now stays unavailable until its own repair refresh completes', async () => {
+  const producer = await artifact();
+  const producerNames = (await fs.readdir(producer)).sort();
+  const producerBytes = await Promise.all(producerNames.map(name => fs.readFile(path.join(producer, name))));
+  await launch(); await setup(); await connect(false);
+  await app.evaluate(({ app: mainApp, ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Held intake refresh requires the disposable fixture.');
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Intake } = load('./intake');
+    const originalRepairs = Intake.prototype.repairs, originalCheck = ipcMain._invokeHandlers.get('check-intake');
+    const gate = globalThis.__checkNowRepairOwner = { held: false, claimed: false, checkCompleted: false, checkCalls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    gate.finished = new Promise(resolve => { gate.finish = resolve; });
+    ipcMain._invokeHandlers.set('check-intake', async function (...args) {
+      gate.checkCalls++;
+      const result = await Reflect.apply(originalCheck, this, args);
+      gate.checkCompleted = true;
+      return result;
+    });
+    Intake.prototype.repairs = async function (...args) {
+      if (!gate.checkCompleted || gate.claimed) return Reflect.apply(originalRepairs, this, args);
+      gate.claimed = true;
+      const ownLocked = Object.getOwnPropertyDescriptor(this, 'locked'), nativeLocked = this.locked;
+      this.locked = function (work, ...lockedArgs) {
+        return Reflect.apply(nativeLocked, this, [async function (...workArgs) {
+          // The original locked method has already acquired its real owner and recovered.
+          gate.held = true;
+          await delivery;
+          return Reflect.apply(work, this, workArgs);
+        }, ...lockedArgs]);
+      };
+      try { return await Reflect.apply(originalRepairs, this, args); }
+      finally {
+        if (ownLocked) Object.defineProperty(this, 'locked', ownLocked); else delete this.locked;
+        gate.finish();
+      }
+    };
+    gate.restore = () => {
+      Intake.prototype.repairs = originalRepairs;
+      ipcMain._invokeHandlers.set('check-intake', originalCheck);
+    };
+  });
+  await page.evaluate(() => {
+    const button = document.getElementById('check-intake'), original = button.onclick;
+    const observation = window.__checkNowSettlement = { settled: 0, original };
+    button.onclick = async function (...args) {
+      try { return await Reflect.apply(original, this, args); }
+      finally { observation.settled++; }
+    };
+  });
+  try {
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__checkNowRepairOwner.held)).toBe(true);
+    await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeDisabled();
+    expect(await app.evaluate(() => globalThis.__checkNowRepairOwner.checkCalls)).toBe(1);
+    expect(await page.evaluate(() => window.__checkNowSettlement.settled)).toBe(0);
+    await app.evaluate(() => globalThis.__checkNowRepairOwner.release());
+    await expect.poll(() => page.evaluate(() => window.__checkNowSettlement.settled)).toBe(1);
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeEnabled();
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => window.__checkNowSettlement.settled)).toBe(2);
+    expect(await app.evaluate(() => globalThis.__checkNowRepairOwner.checkCalls)).toBe(2);
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeEnabled();
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    const base = path.join(root, 'vault', 'Companion');
+    expect((await fs.readdir(path.join(base, 'Captures'))).filter(name => name.endsWith('.md'))).toHaveLength(1);
+    expect((await fs.readdir(path.join(base, 'Revisions'))).filter(name => name.endsWith('.json'))).toHaveLength(1);
+    const ledger = JSON.parse(await fs.readFile(path.join(base, '.intake', 'ledger.json'), 'utf8'));
+    expect(ledger.lastCheck).toMatchObject({ trigger: 'manual', status: 'complete' });
+    expect(Object.values(ledger.captures)).toHaveLength(1);
+    expect(Object.values(ledger.captures)[0].revisions).toHaveLength(1);
+    expect((await fs.readdir(producer)).sort()).toEqual(producerNames);
+    for (const [index, name] of producerNames.entries()) expect(await fs.readFile(path.join(producer, name))).toEqual(producerBytes[index]);
+  } finally {
+    await app.evaluate(async () => {
+      const gate = globalThis.__checkNowRepairOwner;
+      gate.release();
+      try { if (gate.claimed) await gate.finished; }
+      finally { gate.restore(); delete globalThis.__checkNowRepairOwner; }
+    });
+    await page.evaluate(() => {
+      document.getElementById('check-intake').onclick = window.__checkNowSettlement.original;
+      delete window.__checkNowSettlement;
+    });
+  }
+});
+
+for (const channel of ['state', 'vault-repairs']) test(`repair choices wait for current ${channel} inspection before accepting a changed-copy selection`, async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
+  const name = (await fs.readdir(captures)).find(file => file.endsWith('.md'));
+  const original = path.join(captures, name), before = await fs.readFile(original, 'utf8');
+  const copy = path.join(root, 'vault', 'Projects', 'Preserved duplicate.md');
+  await fs.mkdir(path.dirname(copy), { recursive: true });
+  await fs.writeFile(copy, before + '\nKeep independent copied writing.\n');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  const choice = page.getByRole('button', { name: `Use this file: Companion/Captures/${name}`, exact: true });
+  await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
+  await expect(choice).toBeEnabled();
+  const previousChoice = await choice.elementHandle();
+  await fs.appendFile(copy, '\nLater independent copy writing changes the reviewed inventory.\n');
+  const copied = await fs.readFile(copy, 'utf8');
+  await app.evaluate(({ ipcMain }, channel) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed repair inspection requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get(channel);
+    const gate = globalThis.__repairInspectionDelivery = { original, channel, held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set(channel, async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true; await delivery; return result;
+    });
+  }, channel);
+  try {
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__repairInspectionDelivery.held)).toBe(true);
+    await expect(choice).toBeDisabled();
+    expect(await fs.readFile(original, 'utf8')).toBe(before);
+    expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+    await app.evaluate(() => globalThis.__repairInspectionDelivery.release());
+    await expect.poll(() => previousChoice.evaluate(node => node.isConnected)).toBe(false);
+    await expect(choice).toBeEnabled();
+    await choice.click();
+    await expect(page.getByRole('status')).toContainText('Identity selection saved');
+    expect(await fs.readFile(original, 'utf8')).toBe(before);
+    expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__repairInspectionDelivery;
+      ipcMain._invokeHandlers.set(gate.channel, gate.original); gate.release();
+      delete globalThis.__repairInspectionDelivery;
+    });
+    await previousChoice.dispose();
+  }
+});
+
 test('external writing survives restart and transfers to an annotation before incoming source applies', async () => {
   await artifact(); await launch(); await setup(); await connect(true);
   const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
@@ -241,6 +379,104 @@ test('verified moves keep stable capture identity and repair annotation links be
   expect((await fs.readdir(path.join(base, 'Revisions'))).filter(x => x.endsWith('.json'))).toHaveLength(2);
   await app.close(); app = null; await launch();
   await expect(page.locator('#captures article')).toHaveCount(1);
+});
+
+test('Open in Obsidian waits for Browse Refresh before opening a moved capture', async () => {
+  const producer = await artifact();
+  const producerNames = (await fs.readdir(producer)).sort();
+  const producerBytes = await Promise.all(producerNames.map(name => fs.readFile(path.join(producer, name))));
+  await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('Keep this relationship.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures'), annotations = path.join(base, 'Annotations');
+  const name = (await fs.readdir(captures)).find(file => file.endsWith('.md'));
+  const original = path.join(captures, name), before = await fs.readFile(original, 'utf8');
+  const id = before.match(/companion_id: "([^"]+)"/)[1];
+  const annotation = path.join(annotations, (await fs.readdir(annotations)).find(file => file.endsWith('.md')));
+  const annotationBefore = await fs.readFile(annotation, 'utf8');
+  const originalLink = `Source: [Capture](../Captures/${encodeURIComponent(name)})`;
+  expect(annotationBefore).toContain(originalLink);
+  const moved = path.join(root, 'vault', 'Projects', 'Moved source.md');
+  const opened = path.join(root, 'opened-uri.txt');
+  const open = page.locator('#captures').getByRole('button', { name: 'Open in Obsidian', exact: true });
+  await expect(open).toBeEnabled();
+  const previousOpen = await open.elementHandle();
+
+  try {
+    await fs.mkdir(path.dirname(moved), { recursive: true });
+    await fs.rename(original, moved);
+    await app.evaluate(({ app: mainApp, ipcMain }, { root, base }) => {
+      if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Held Browse refresh requires the disposable fixture.');
+      const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+      const { Intake } = load('./intake');
+      const originalRepairs = Intake.prototype.repairs, originalOpen = ipcMain._invokeHandlers.get('open-note');
+      const gate = globalThis.__browseRepairOwner = { held: false, claimed: false, openRequests: [] };
+      const delivery = new Promise(resolve => { gate.release = resolve; });
+      gate.finished = new Promise(resolve => { gate.finish = resolve; });
+      Intake.prototype.repairs = async function (...args) {
+        if (gate.claimed || this.vault.root !== base) return Reflect.apply(originalRepairs, this, args);
+        gate.claimed = true;
+        const ownLocked = Object.getOwnPropertyDescriptor(this, 'locked'), nativeLocked = this.locked;
+        this.locked = function (work, ...lockedArgs) {
+          return Reflect.apply(nativeLocked, this, [async function (...workArgs) {
+            // The original locked method has acquired the real owner and recovered.
+            gate.held = true;
+            await delivery;
+            return Reflect.apply(work, this, workArgs);
+          }, ...lockedArgs]);
+        };
+        try { return await Reflect.apply(originalRepairs, this, args); }
+        finally {
+          if (ownLocked) Object.defineProperty(this, 'locked', ownLocked); else delete this.locked;
+          gate.finish();
+        }
+      };
+      ipcMain._invokeHandlers.set('open-note', function (...args) {
+        gate.openRequests.push(args[1]);
+        return Reflect.apply(originalOpen, this, args);
+      });
+      gate.restore = () => {
+        Intake.prototype.repairs = originalRepairs;
+        ipcMain._invokeHandlers.set('open-note', originalOpen);
+      };
+    }, { root, base });
+
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__browseRepairOwner.held)).toBe(true);
+    expect(await previousOpen.isDisabled(), 'Previous Open in Obsidian is disabled while Refresh owns the vault').toBe(true);
+    expect(await app.evaluate(() => globalThis.__browseRepairOwner.openRequests)).toEqual([]);
+
+    await app.evaluate(() => globalThis.__browseRepairOwner.release());
+    await expect.poll(() => previousOpen.evaluate(node => node.isConnected)).toBe(false);
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    await expect(open).toBeEnabled();
+    expect(await app.evaluate(() => globalThis.__browseRepairOwner.openRequests)).toEqual([]);
+    await expect(fs.access(opened)).rejects.toMatchObject({ code: 'ENOENT' });
+    await open.click();
+    await expect(page.getByRole('status')).toContainText('Requested Obsidian to open the note.');
+    expect(await app.evaluate(() => globalThis.__browseRepairOwner.openRequests)).toEqual([id]);
+    expect(await fs.readFile(opened, 'utf8')).toBe(`obsidian://open?path=${encodeURIComponent(moved)}`);
+    expect(await fs.readFile(moved, 'utf8')).toBe(before);
+    await expect(fs.access(original)).rejects.toMatchObject({ code: 'ENOENT' });
+    const linked = await fs.readFile(annotation, 'utf8');
+    expect(linked).toContain(`capture_id: "${id}"`);
+    expect(linked).toBe(annotationBefore.replace(originalLink, 'Source: [Capture](../../Projects/Moved%20source.md)'));
+    expect((await fs.readdir(producer)).sort()).toEqual(producerNames);
+    for (const [index, name] of producerNames.entries()) expect(await fs.readFile(path.join(producer, name))).toEqual(producerBytes[index]);
+  } finally {
+    try {
+      await app.evaluate(async () => {
+        const gate = globalThis.__browseRepairOwner;
+        if (!gate) return;
+        gate.release();
+        try { if (gate.claimed) await gate.finished; }
+        finally { gate.restore(); delete globalThis.__browseRepairOwner; }
+      });
+    } finally { await previousOpen.dispose(); }
+  }
 });
 
 test('duplicate identities preserve both files until explicit selection while independent intake continues', async () => {

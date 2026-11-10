@@ -2508,6 +2508,72 @@ async function importedCapture() {
   return { base, ledgerFile, ledger, capture: ledger.captures['a'.repeat(64)] };
 }
 
+test('read-only source inspection preserves preview ledger identity while an external same-byte replacement still holds deletion', async ({}, testInfo) => {
+  const { base, ledgerFile, capture } = await importedCapture();
+  const preview = page.getByLabel('Capture deletion preview'), inspection = page.getByLabel('Source inspection');
+  await expect(inspection).toBeHidden();
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview.getByRole('button', { name: 'Confirm capture deletion', exact: true })).toBeVisible();
+  const selectedScope = await preview.innerText(), before = await files(base), producerBefore = await files(path.join(root, 'producer'));
+  const ledgerBytes = await fs.readFile(ledgerFile), selectedIdentity = await fs.stat(ledgerFile, { bigint: true }), original = JSON.parse(ledgerBytes.toString('utf8'));
+  const sourceFiles = ['Captures/' + capture.file, ...capture.revisions.map(id => 'Revisions/' + id + '.json')];
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(inspection).toBeVisible();
+  await expect(inspection).toContainText(capture.currentRevision);
+  await expect(inspection.getByRole('button', { name: 'Save annotation', exact: true })).toBeVisible();
+  const inspectedBytes = await fs.readFile(ledgerFile), inspectedIdentity = await fs.stat(ledgerFile, { bigint: true });
+  const afterInspection = await files(base), producerAfterInspection = await files(path.join(root, 'producer'));
+  // Preserve the actual family and both observations before the first feature assertion.
+  await fs.writeFile(testInfo.outputPath('inspection-ledger-family.json'), JSON.stringify({
+    fixtureRoot: root, sourceFiles, selectedScope, before, afterInspection, producerBefore, producerAfterInspection,
+    selectedIdentity: { dev: String(selectedIdentity.dev), ino: String(selectedIdentity.ino) },
+    inspectedIdentity: { dev: String(inspectedIdentity.dev), ino: String(inspectedIdentity.ino) },
+    ledgerBytes: ledgerBytes.toString('base64'), inspectedBytes: inspectedBytes.toString('base64')
+  }, null, 2));
+  expect(inspectedBytes).toEqual(ledgerBytes);
+  expect({ dev: inspectedIdentity.dev, ino: inspectedIdentity.ino }).toEqual({ dev: selectedIdentity.dev, ino: selectedIdentity.ino });
+  expect(afterInspection).toEqual(before);
+  expect(producerAfterInspection).toEqual(producerBefore);
+  expect(await preview.innerText()).toBe(selectedScope);
+  expect(JSON.parse(inspectedBytes.toString('utf8'))).toEqual(original);
+
+  const replacement = path.join(root, 'same-byte-external-ledger.json');
+  await fs.writeFile(replacement, ledgerBytes); await fs.rename(replacement, ledgerFile);
+  const foreignIdentity = await fs.stat(ledgerFile, { bigint: true });
+  expect(foreignIdentity.isFile()).toBe(true); expect(foreignIdentity.nlink).toBe(1n);
+  expect(foreignIdentity.dev).toBe(selectedIdentity.dev); expect(foreignIdentity.ino).not.toBe(selectedIdentity.ino);
+  expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes);
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deletion files changed');
+  await expect(preview).toBeVisible();
+  expect(await files(base)).toEqual(before);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBefore);
+  const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(held).toEqual(original); expect(held.sourceAuthority?.[capture.id]).toEqual(original.sourceAuthority?.[capture.id]);
+  expect((await fs.stat(ledgerFile, { bigint: true })).ino).toBe(foreignIdentity.ino);
+
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden();
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible(); expect(await preview.innerText()).toBe(selectedScope);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  expect((await fs.stat(ledgerFile, { bigint: true })).ino).toBe(foreignIdentity.ino);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible(); expect(await preview.innerText()).toBe(selectedScope);
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const after = await files(base), deleted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  for (const file of sourceFiles) expect(after[file]).toBeUndefined();
+  const preservedFiles = Object.keys(before).filter(file => !sourceFiles.includes(file) && file !== '.intake/ledger.json').sort();
+  expect(Object.keys(after).filter(file => file !== '.intake/ledger.json').sort()).toEqual(preservedFiles);
+  for (const file of preservedFiles) expect(after[file]).toBe(before[file]);
+  expect(deleted.attempts).toEqual(original.attempts); expect(deleted.admissions).toEqual(original.admissions);
+  expect(deleted.sourceAuthority[capture.id].phase).toBe('deleted'); expect(deleted.suppressed).toContain('a'.repeat(64));
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBefore);
+});
+
 test('intake authority rejects an unknown hardlinked ledger before deletion preview', async () => {
   const { ledgerFile } = await importedCapture();
   const remove = page.getByRole('button', { name: 'Delete capture', exact: true }); await expect(remove).toBeVisible();

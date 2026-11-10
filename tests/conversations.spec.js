@@ -113,6 +113,151 @@ async function selectCapture() {
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
   await page.locator('#context-results article').filter({ hasText: 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
 }
+
+// Controlled scheduling only: retain a real Refresh owner and observe native events.
+// Public UI, retained requests and exact files below decide the outcomes.
+async function holdRefreshSourceOwner() {
+  await app.evaluate(({ app: mainApp }) => {
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Intake } = load('./intake'), { Conversations } = load('./conversations');
+    const { AsyncLocalStorage } = process.getBuiltinModule('async_hooks'), net = process.getBuiltinModule('net');
+    const scope = new AsyncLocalStorage(), servers = new WeakMap();
+    const state = { entered: false, released: false, deadlineExpired: false, busy: 0, dispatchSourceReadEntries: 0, events: [] };
+    const now = () => Number(process.hrtime.bigint() / 1000000n);
+    let resolve, deadline;
+    const held = new Promise(done => { resolve = done; });
+    const release = () => { if (!state.released) { state.released = true; state.releasedAt = now(); clearTimeout(deadline); resolve(); } };
+    globalThis.__sourceInspectionControl = { state, release, markDispatch: () => { state.dispatchedAt = now(); } };
+    const locked = Intake.prototype.locked, recover = Intake.prototype.recover, info = Intake.prototype.info, build = Conversations.prototype.build;
+    Conversations.prototype.build = function (...args) { return scope.run({ dispatch: !!args[1] }, () => build.apply(this, args)); };
+    Intake.prototype.info = function (...args) {
+      if (scope.getStore()?.dispatch) state.dispatchSourceReadEntries++;
+      return info.apply(this, args);
+    };
+    Intake.prototype.locked = function (...args) {
+      return scope.run({ dispatch: scope.getStore()?.dispatch, stateCaller: /Intake\.info/.test(new Error().stack) && /[\\/]app[\\/]main\.js:\d+:\d+/.test(new Error().stack) }, () => locked.apply(this, args));
+    };
+    Intake.prototype.recover = async function (...args) {
+      const caller = scope.getStore();
+      if (!state.entered && caller?.stateCaller && caller.server?.listening && !caller.server.closed) {
+        state.entered = true; state.address = caller.server.address; state.enteredAt = now();
+        deadline = setTimeout(() => { state.deadlineExpired = true; release(); }, 10000);
+        await held;
+      }
+      return recover.apply(this, args);
+    };
+    const listen = net.Server.prototype.listen, emit = net.Server.prototype.emit;
+    net.Server.prototype.listen = function (...args) {
+      const address = typeof args[0] === 'string' ? args[0] : args[0]?.path;
+      if (typeof address === 'string' && (address.startsWith('\\\\.\\pipe\\companion-intake-') || address.startsWith('\0companion-intake-'))) {
+        const server = { address, caller: scope.getStore() }; servers.set(this, server);
+        if (server.caller) server.caller.server = server;
+      }
+      return listen.apply(this, args);
+    };
+    net.Server.prototype.emit = function (event, ...args) {
+      const server = servers.get(this);
+      if (server && ['listening', 'error', 'close'].includes(event)) {
+        if (event === 'listening') server.listening = true;
+        if (event === 'close') server.closed = true;
+        if (state.events.length < 128) state.events.push({ at: now(), event, address: server.address, code: args[0]?.code, dispatch: !!server.caller?.dispatch });
+        if (event === 'error' && args[0]?.code === 'EADDRINUSE' && server.address === state.address && server.caller?.dispatch && !state.released) state.busy++;
+      }
+      return emit.call(this, event, ...args);
+    };
+  });
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-before-dispatch' }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('conversation-before-dispatch');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect.poll(() => app.evaluate(() => globalThis.__sourceInspectionControl.state.entered)).toBe(true);
+  await app.evaluate(() => globalThis.__sourceInspectionControl.markDispatch());
+  await fs.writeFile(path.join(root, 'release.txt'), 'release dispatch into real source contention');
+}
+async function finishSourceInspectionControl(testInfo) {
+  try { await fs.writeFile(path.join(root, 'release.txt'), 'release dispatch in finally'); }
+  finally { await app.evaluate(() => globalThis.__sourceInspectionControl?.release()); }
+  const evidence = await app.evaluate(() => globalThis.__sourceInspectionControl?.state);
+  await fs.writeFile(testInfo.outputPath('source-inspection-native-events.json'), JSON.stringify(evidence, null, 2), 'utf8');
+  await testInfo.attach('source-inspection-native-events.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
+  expect(evidence?.deadlineExpired).toBe(false);
+}
+async function captureFile() {
+  const directory = path.join(root, 'vault', 'Companion', 'Captures');
+  return path.join(directory, (await fs.readdir(directory)).find(name => name.endsWith('.md')));
+}
+async function sourceInspectionNotes() {
+  const directory = path.join(root, 'vault', 'Companion'), result = {};
+  async function visit(folder) {
+    for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
+      const file = path.join(folder, entry.name);
+      if (entry.isDirectory()) await visit(file);
+      else if (entry.name.endsWith('.md')) result[path.relative(directory, file)] = await fs.readFile(file, 'utf8');
+    }
+  }
+  await visit(directory); return result;
+}
+
+test('source inspection waits for a brief Refresh owner and sends the reviewed package exactly once', async ({}, testInfo) => {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic SOURCE_INSPECTION_ONCE reply.' }));
+  await prepareConversation();
+  const reviewed = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue(), notes = await sourceInspectionNotes();
+  try {
+    await holdRefreshSourceOwner();
+    await expect.poll(() => app.evaluate(() => globalThis.__sourceInspectionControl.state.busy)).toBeGreaterThanOrEqual(2);
+    await app.evaluate(() => globalThis.__sourceInspectionControl.release());
+    await expect(page.locator('#conversation-history')).toContainText('SOURCE_INSPECTION_ONCE');
+    await expect(page.locator('#conversation-history')).toContainText('completed');
+    const record = await onlyConversation(); expect(record.requests).toHaveLength(1);
+    expect(record.requests[0].status).toBe('completed'); expect(record.requests[0].package.text).toBe(reviewed);
+    const submissions = (await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    expect(submissions).toHaveLength(1); expect(submissions[0].text).toBe(reviewed);
+    expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toHaveLength(1);
+    expect(await sourceInspectionNotes()).toEqual(notes);
+  } finally { await finishSourceInspectionControl(testInfo); }
+});
+
+test('source inspection reads changed capture bytes after a Refresh wait and requires fresh review without a turn', async ({}, testInfo) => {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic forbidden stale SOURCE_INSPECTION reply.' }));
+  await prepareConversation();
+  const reviewed = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue(), file = await captureFile();
+  const changed = `${await fs.readFile(file, 'utf8')}\nSOURCE_INSPECTION_CHANGED_WHILE_WAITING\n`;
+  const notes = await sourceInspectionNotes(); notes[path.relative(path.join(root, 'vault', 'Companion'), file)] = changed;
+  try {
+    await holdRefreshSourceOwner();
+    await expect.poll(() => app.evaluate(() => globalThis.__sourceInspectionControl.state.busy)).toBeGreaterThanOrEqual(2);
+    await fs.writeFile(file, changed);
+    await app.evaluate(() => globalThis.__sourceInspectionControl.release());
+    await expect(page.locator('#conversation-history')).toContainText('failed');
+    await expect(page.locator('#conversation-history')).toContainText(/Context changed|Selected evidence changed/);
+    await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+    const record = await onlyConversation(); expect(record.requests).toHaveLength(1);
+    expect(record.requests[0].package.text).toBe(reviewed); expect(record.requests[0].reply).toBe('');
+    await noSubmission(); expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toEqual([]);
+    expect(await sourceInspectionNotes()).toEqual(notes);
+    await selectCapture(); await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+    await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/SOURCE_INSPECTION_CHANGED_WHILE_WAITING/);
+    await noSubmission(); expect((await onlyConversation()).requests).toHaveLength(1);
+  } finally { await finishSourceInspectionControl(testInfo); }
+});
+
+test('source inspection fails closed when a native Refresh owner outlasts admission and starts no body or turn', async ({}, testInfo) => {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic forbidden busy SOURCE_INSPECTION reply.' }));
+  await prepareConversation();
+  const reviewed = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue(), notes = await sourceInspectionNotes();
+  try {
+    await holdRefreshSourceOwner();
+    await expect(page.locator('#conversation-history')).toContainText('failed');
+    await expect(page.locator('#conversation-history')).toContainText('already running');
+    const evidence = await app.evaluate(() => ({ ...globalThis.__sourceInspectionControl.state, observedAt: Number(process.hrtime.bigint() / 1000000n) }));
+    expect(evidence.released).toBe(false); expect(evidence.observedAt - evidence.dispatchedAt).toBeGreaterThanOrEqual(2000);
+    expect(evidence.dispatchSourceReadEntries).toBe(0);
+    const record = await onlyConversation(); expect(record.requests).toHaveLength(1);
+    expect(record.requests[0].status).toBe('failed'); expect(record.requests[0].package.text).toBe(reviewed); expect(record.requests[0].reply).toBe('');
+    await noSubmission(); expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toEqual([]);
+    expect(await sourceInspectionNotes()).toEqual(notes);
+  } finally { await finishSourceInspectionControl(testInfo); }
+});
 test('a history-directory junction cannot expose or change outside history and capture stays usable', async ({}, testInfo) => {
   test.setTimeout(90000);
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-outside-history-'));
