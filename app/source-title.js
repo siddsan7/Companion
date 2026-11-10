@@ -171,4 +171,4 @@ async function inventory(intake, ledger, capture, revisions, initial) {
   validateProofs({ inventoryVersion: 2, targets, titleProofs, originGenerations: generation ? [{ captureId: capture.id, generation }] : [], recovery: [] }, capture.id);
   return { targets, titleProofs, sourceBackups, proofFiles, verifiedCurrent };
 }
-module.exports = { validateProofs, inspectProofs, inventory };
+module.exports = { validateProofs, inspectProofs, inventory, leaf };
