@@ -2,6 +2,15 @@
 
 Goal: finish siddsan7/Companion#1 and tickets2–16 on integration/1-local-second-brain. Main baseline:04ed4fb6a0451714ee0d64549ad86ec3eb4108d9. Work is ACTIVE after the user's explicit resume. Initial planning commits e030e51/5a7f0c7 preceded worktrees; ticket13 plan2a7c36a and both removal plans were committed/pushed before their worktrees.
 
+## Latest verified checkpoint — November 10
+
+This paragraph supersedes older helper statuses below. Primary ticket/13-source-deletion is clean and pushed e819d85, tree399117bc. Native selection helper preserving sync0b00767 and primary mergee819d85 received independent final Standards/Spec/merger approval. Native composed6 passed all6/no skips in133444ms; final tree differs from testeddbdc only by the result paragraph. Older title helper is integrated636978f after40/40 passed834624ms; pure normal detach regression is integrated8228093 after23914ms synchronized pass.
+
+Mixed main codex/13-mixed-retention is pushed b83700c. Malformed titleProofs actualRED16373ms preceded one-line explicit own-property rejection; unchanged regression passed14655ms and all6 passed117459ms. Independent bounded schema approval is in Temp/companion-mixed13-schema-final-review.md. Lifecycle public R removal→source restoration/history owner guard is being authored, not yet measured. Old/new family composition and final review remain.
+
+Editor codex/13-detached-editor is pushed d175d78. Original9/oneE complete journey passed19211ms; outsideRalias guard passed16186ms/no skips at97bcba2d, then test/docs committedd175. Independent source audit found P2: immutable original attempt revision/snapshot incorrectly required equal fresh restored admission. Actual restored-A regression is being authored before a source fix. Restore snapshots have plain draft envelope; no normalizedDraft relaxation is indicated. The independent audit found no other actionable new-editor source finding; it is not final approval. Preserve b837 schema fix during upcoming merge.
+
+PR17 body/checklist updated after e819d85;13/16 remain open and draft. Root integration remains28d8538 before this memory checkpoint. No GUI run remains active after the outside-alias pass. Test runner evidence uses exit.json and run.stdout.log, not stdout.log. No live sign-in or hosted CI pass claimed. Next: root measures lifecycle/restored-A tests, fixes reproduced P2, preserving helper composition with current primary, relevant/full13 gates and fresh independent final reviews; then16/fullPR release gates and authorized merge→pause.
 ## Authority and publication
 
 Read publishing.md. Draft PR17 targets main: https://github.com/siddsan7/Companion/pull/17. Finish every slice before final whole-PR review, ready status or merge. Preserve every commit and ticket/helper ancestry: no squash, amend, rebase, force push, date overrides or manufactured history. Check actual author/committer siddsan7 <siddsan7@gmail.com> and absence of GIT_AUTHOR_DATE/GIT_COMMITTER_DATE before each commit/merge. Push meaningful verified milestones and update the PR/checklist.
