@@ -2,13 +2,14 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const actionOrder = require('./helpers/visible-action-order').visibleActionOrder();
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
 const { randomUUID, createHash } = require('node:crypto');
 let root, app, page;
 
-test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-deletion-')); });
-test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.beforeEach(async () => { actionOrder.reset(); root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-deletion-')); });
+test.afterEach(async ({}, testInfo) => { await actionOrder.save(testInfo); if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function artifact(name, attempt) {
   const folder = path.join(root, 'producer', name); await fs.mkdir(folder, { recursive: true });
   await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify({ job_id: 'b'.repeat(64), attempt_id: attempt.repeat(32), started_utc: '2026-11-01T10:00:00Z', input_sha256: 'a'.repeat(64), input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed' }));
@@ -20,6 +21,7 @@ async function launch() {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   page = await app.firstWindow();
+  await actionOrder.install(app, page, test.info());
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
 }
 async function files(folder, prefix = '') {

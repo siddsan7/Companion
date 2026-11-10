@@ -2,14 +2,17 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const actionOrder = require('./helpers/visible-action-order').visibleActionOrder();
 let root, app, page;
 let diagnostic, diagnosticWatcher, diagnosticReads = Promise.resolve(), diagnosticFiles = [], diagnosticPriorTimelines = [];
 test.beforeEach(async () => {
+  actionOrder.reset();
   diagnostic = false; diagnosticWatcher = null; diagnosticReads = Promise.resolve(); diagnosticFiles = []; diagnosticPriorTimelines = [];
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-conversation-'));
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T12:00:00Z', timezone: 'America/Phoenix' }));
 });
 test.afterEach(async ({}, testInfo) => {
+  await actionOrder.save(testInfo);
   diagnosticWatcher?.close(); await diagnosticReads;
   if (diagnostic) {
     const destination = testInfo.outputPath('conversation-state'); await fs.mkdir(destination, { recursive: true });
@@ -50,6 +53,7 @@ async function observeConversation(watchFiles = true) {
 }
 async function launch(configure = true, extraEnv = {}) {
   app = await electron.launch({ args: ['.'], env: { ...process.env, ...extraEnv, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+  await actionOrder.install(app, page, test.info());
   if (configure) {
     await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
     await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
