@@ -1,5 +1,7 @@
 # Runtime map
 
+Disposable `COMPANION_TEST_ROOT` desktop fixtures use a visible, unfocused window and `backgroundThrottling: false` to avoid measured hidden-window frame delays. Production window options and the windowless worker entry stay separate; sandbox, context isolation, navigation controls and test budgets remain fixed.
+
 - `app/main.js`: Electron lifecycle; folder-selection/settings, IPC, clock and Obsidian OS boundary. `COMPANION_TEST_ROOT` substitutes those boundaries for disposable acceptance runs.
 - `app/preload.js`: narrow renderer-to-main bridge. Renderer Node access is disabled; sandbox, context isolation, CSP and blocked network/navigation apply.
 - `app/vault.js`: authoritative Markdown capture store. Exclusive staged publication, stable UUID frontmatter, first capture instant, derived/editable title, user excerpt provenance. No index or database owns note content.

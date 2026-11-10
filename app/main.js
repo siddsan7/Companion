@@ -118,11 +118,14 @@ app.whenReady().then(async () => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
   installComparisons({ ipcMain, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, getEvidence });
-  const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
+  const fixtureRendering = testRoot ? { backgroundThrottling: false } : {};
+  const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { ...fixtureRendering, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
   await window.loadFile(path.join(__dirname, 'index.html'));
+  // Give disposable desktop fixtures normal frame cadence without taking focus.
+  if (testRoot) window.showInactive();
 });
 app.on('before-quit', () => { codex?.close(); conversationProvider?.close(); });
 app.on('window-all-closed', () => app.quit());
