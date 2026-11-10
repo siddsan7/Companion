@@ -152,8 +152,7 @@ async function heldSourceInventory(testInfo, replacementCharacter = false, prepa
   return { sourceHash, base, intake, ledgerFile, original, capture, destination, producerBytes, transaction, stage, snapshot, snapshotStage, archive };
 }
 
-test('source-only deletion inventories an unadmitted bound-excerpt draft with authored known run metadata and all seven copies', async ({}, testInfo) => {
-  test.setTimeout(150000);
+async function heldBoundDraftInventory(testInfo) {
   const target = {
     schema_version: '1.0', title: 'Selected source excerpts (unreviewed)', status: 'partial',
     claims: [{ id: 'excerpt-a1-0', text: 'Set the maximum number of retries to three.', attribution: 'narration', evidence_ids: ['a1'] }],
@@ -219,6 +218,12 @@ test('source-only deletion inventories an unadmitted bound-excerpt draft with au
   expect(held.captures[selected.sourceHash].revisions).toEqual(selected.capture.revisions);
   expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
   await fs.writeFile(testInfo.outputPath('bound-draft-fixture-observation.json'), JSON.stringify({ description: 'Authored bound-excerpt and known Job-shaped metadata fixture, not a live model run. Actual UI intake accepted B before deletion review; the separate process proof records actual main exit.', draftMode: revision.run.draft_mode, originalFourBufferFingerprint: fingerprint, unadmittedIdentity: revision.identity, files: targets.map(file => path.relative(selected.base, file).split(path.sep).join('/')) }, null, 2));
+  return { selected, revision, fingerprint, targets };
+}
+
+test('source-only deletion inventories an unadmitted bound-excerpt draft with authored known run metadata and all seven copies', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const { selected, revision, fingerprint, targets } = await heldBoundDraftInventory(testInfo);
   await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
   await expect(page.locator('#captures article')).toHaveCount(1);
   const before = await files(selected.base), preview = page.getByLabel('Capture deletion preview');
@@ -247,6 +252,58 @@ test('source-only deletion inventories an unadmitted bound-excerpt draft with au
   expect(restarted.sourceAuthority[selected.capture.id]).toEqual(authority); expect(restarted.suppressed).toContain(selected.sourceHash);
   expect(restarted.attempts).toEqual(selected.original.attempts); expect(restarted.admissions).toEqual(selected.original.admissions);
   for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+});
+
+test('source-only deletion holds a consistently cached bound-excerpt paraphrase that passes generic format checks', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const { selected, revision, fingerprint, targets } = await heldBoundDraftInventory(testInfo);
+  const { validate, render, bound } = require('../app/intake-producer');
+  const originalClaim = 'Set the maximum number of retries to three.', paraphrase = 'Limit retries to three.';
+  const identity = async file => { const stat = await fs.lstat(file); expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); return [stat.dev, stat.ino, stat.nlink]; };
+  const identities = await Promise.all(targets.map(identity)), beforeEdit = await files(selected.base);
+  const tx = JSON.parse(await fs.readFile(selected.archive, 'utf8'));
+  expect(tx.revision).toEqual(revision); expect(tx.revision.target.claims[0].text).toBe(originalClaim);
+  expect(() => bound(tx.revision.evidence, tx.revision.target)).not.toThrow();
+  // Controlled persisted edit after actual admission stopped: all writer-format caches agree,
+  // but this sentence is not a literal source excerpt. Producer originals stay untouched.
+  tx.revision.target.claims[0].text = paraphrase;
+  tx.revision.text = tx.revision.text.replace(originalClaim, paraphrase);
+  tx.content = tx.content.replace(originalClaim, paraphrase);
+  tx.capture.currentHash = createHash('sha256').update(tx.content).digest('hex');
+  expect(() => validate(tx.revision.evidence, tx.revision.target)).not.toThrow();
+  expect(render(tx.revision.evidence, tx.revision.target)).toBe(tx.revision.text);
+  expect(tx.content).toBe(require('../app/intake').noteText(tx.capture, tx.revision));
+  expect(() => bound(tx.revision.evidence, tx.revision.target)).toThrow('Bound excerpt generation validation failed.');
+  expect(tx.revision.evidence).toEqual(revision.evidence); expect(tx.revision.uncertainty).toEqual(revision.uncertainty);
+  expect(tx.revision.fingerprint).toBe(fingerprint); expect(tx.revision.identity).toBe(revision.identity);
+  expect(tx.previous).toBe(selected.transaction.previous); expect(tx.previousHash).toBe(selected.transaction.previousHash);
+  const journalBytes = Buffer.from(JSON.stringify(tx)), snapshotBytes = Buffer.from(JSON.stringify(tx.revision, null, 2)), stageBytes = Buffer.from(tx.content);
+  await fs.writeFile(selected.archive, journalBytes);
+  // Writing the existing snapshot inode updates exactly its known stage peer too.
+  await fs.writeFile(selected.snapshot, snapshotBytes); await fs.writeFile(selected.stage, stageBytes);
+  expect(await Promise.all(targets.map(identity))).toEqual(identities);
+  expect(await fs.readFile(selected.archive)).toEqual(journalBytes);
+  expect(await fs.readFile(selected.snapshot)).toEqual(snapshotBytes); expect(await fs.readFile(selected.snapshotStage)).toEqual(snapshotBytes);
+  expect(await fs.readFile(selected.stage)).toEqual(stageBytes);
+  const edited = await files(selected.base), changed = targets.filter(file => [selected.archive, selected.snapshot, selected.snapshotStage, selected.stage].includes(file)).map(file => path.relative(selected.base, file).split(path.sep).join('/'));
+  for (const [name, bytes] of Object.entries(beforeEdit)) if (!changed.includes(name)) expect(edited[name]).toBe(bytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
+  const raw = [];
+  for (const name of ['run.json', 'evidence.json', 'first-pass-target.json', 'notes.md']) raw.push(await fs.readFile(path.join(root, 'producer', 'second', name)));
+  expect(createHash('sha256').update(Buffer.concat(raw)).digest('hex')).toBe(fingerprint);
+  await fs.writeFile(testInfo.outputPath('bound-paraphrase-fixture-observation.json'), JSON.stringify({ description: 'Controlled post-exit persisted paraphrase, not producer output. Generic validation and exact Markdown/cache agreement pass; the existing literal bound validator rejects it. Original raw producer fingerprint and A stay unchanged.', originalClaim, paraphrase, fingerprint, changed, literalFileSha256: Object.fromEntries([[selected.archive, journalBytes], [selected.snapshot, snapshotBytes], [selected.snapshotStage, snapshotBytes], [selected.stage, stageBytes]].map(([file, bytes]) => [path.relative(selected.base, file).split(path.sep).join('/'), createHash('sha256').update(bytes).digest('hex')])) }, null, 2));
+  await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect(await files(selected.base)).toEqual(edited);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Bound excerpt generation validation failed.');
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(selected.base)).toEqual(edited); expect(await Promise.all(targets.map(identity))).toEqual(identities);
+  const held = JSON.parse(await fs.readFile(selected.ledgerFile, 'utf8'));
+  expect(held.sourceAuthority).toBeUndefined(); expect(held.suppressed || []).not.toContain(selected.sourceHash);
+  expect(held.attempts).toEqual(selected.original.attempts); expect(held.admissions).toEqual(selected.original.admissions);
+  expect(held.attempts[revision.identity]).toBeUndefined();
   expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
 });
 
