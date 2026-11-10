@@ -288,6 +288,113 @@ test('mixed retention destination collision holds unique third writing without a
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
 });
 
+test('completed mixed retention permits explicit annotation removal and fresh source restoration with immutable historical owner', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const fixture = await heldMixedRepair(testInfo, { restoredG: true });
+  const { base, ledgerFile, capture, sourceHash, intent, origins, producer, generation } = fixture;
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const deletionPreview = page.getByLabel('Capture deletion preview'); await expect(deletionPreview).toBeVisible();
+  const reviewed = await deletionPreview.textContent();
+  expect(reviewed).toContain(intent.annotation); expect(reviewed).toContain(fixture.wholeY.toString('utf8'));
+  const reviewedPaths = [...new Set(reviewed.match(/Companion\/Annotations\/[a-f0-9-]{36}\.md/g) || [])]; expect(reviewedPaths).toHaveLength(2);
+  await deletionPreview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), authority = deleted.sourceAuthority[capture.id], deletedFiles = await observe(base);
+  await save(testInfo, 'mixed-lifecycle-deleted.json', { observed: deletedFiles, deleted, reviewed, origins, originalGeneration: generation });
+  expect(authority.phase).toBe('deleted'); expect(authority.generation).not.toBe(generation);
+  expect(authority.originGenerations).toEqual([{ captureId: capture.id, generation }]); expect(authority.mixedRecovery.sourceGeneration).toBe(generation);
+  expect(authority.preservedWriting.every(plan => plan.publication && plan.publicationOperationId === authority.operationId && plan.sourceGeneration === generation)).toBe(true);
+  expect(authority.preservedWriting.map(plan => plan.file).sort()).toEqual([...reviewedPaths].sort());
+  const originalOutput = path.join(base, 'Annotations', intent.annotationId + '.md'), originalRelative = portable(path.relative(base, originalOutput));
+  const wholePlan = authority.preservedWriting.find(plan => plan.payloadKind === 'previous-whole-variant'), wholeOutput = path.join(root, 'vault', wholePlan.file), wholeRelative = portable(path.relative(base, wholeOutput));
+  expect(await fs.readFile(originalOutput)).toEqual(Buffer.from(intent.annotation)); expect((await fs.readFile(wholeOutput)).includes(fixture.wholeY)).toBe(true);
+  for (const file of origins) expect(await exists(file)).toBe(false);
+  expect(deleted.attempts).toEqual(fixture.originalAcceptedLedger.attempts); expect(deleted.admissions).toEqual(fixture.acceptedLedger.admissions);
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  const annotationReview = page.getByLabel('Annotation removal review', { exact: true });
+  const selectedRow = annotationReview.getByRole('article').filter({ hasText: intent.annotationId });
+  await expect(selectedRow).toContainText('GUARDANNOTATIONX');
+  await selectedRow.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const removalPreview = page.getByLabel('Annotation removal preview', { exact: true }); await expect(removalPreview).toBeVisible();
+  await expect(removalPreview).toContainText(intent.annotationId); await expect(removalPreview).toContainText(portable(path.relative(path.join(root, 'vault'), originalOutput)));
+  await expect(removalPreview).not.toContainText(wholePlan.annotationId);
+  await removalPreview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation removed');
+  const removed = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), removedFiles = await observe(base);
+  await save(testInfo, 'mixed-lifecycle-annotation-removed.json', { observed: removedFiles, removed, originalOutput, wholeOutput });
+  expect(await exists(originalOutput)).toBe(false); expect(removedFiles[wholeRelative]).toEqual(deletedFiles[wholeRelative]);
+  expect(removed.sourceAuthority[capture.id]).toEqual(authority);
+  expect(removed.annotationRemovals[intent.annotationId].phase).toBe('removed');
+  for (const key of ['captures', 'attempts', 'admissions', 'suppressed']) expect(removed[key]).toEqual(deleted[key]);
+  await app.close(); app = null; await launch();
+  await save(testInfo, 'mixed-lifecycle-restart-after-removal.json', { observed: await observe(base), status: await page.getByRole('status').textContent() });
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  expect(await exists(originalOutput)).toBe(false); expect((await observe(base))[wholeRelative]).toEqual(deletedFiles[wholeRelative]);
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration'); await expect(restoration).toBeVisible(); await expect(restoration).toContainText(capture.id);
+  await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(root, 'producer', 'accept'));
+  await restoration.getByRole('combobox', { name: /^Selected producer artifact kind/ }).selectOption('review');
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await expect(restoration.getByRole('button', { name: 'Confirm source restoration', exact: true })).toBeVisible();
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source restored'); await expect(page.locator('#captures article')).toHaveCount(1);
+  const restored = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), active = restored.sourceAuthority[capture.id], current = restored.captures[sourceHash], restoredFiles = await observe(base);
+  await save(testInfo, 'mixed-lifecycle-source-restored.json', { observed: restoredFiles, restored, historicalAuthority: authority, originalGeneration: generation });
+  expect(active.phase).toBe('active'); expect(active.operationId).not.toBe(authority.operationId);
+  expect(active.generation).not.toBe(generation); expect(active.generation).not.toBe(authority.generation);
+  for (const key of ['mixedRecovery', 'preservedWriting', 'originGenerations']) expect(active[key]).toEqual(authority[key]);
+  const { history: priorHistory, ...deletedHistory } = authority;
+  expect(active.history).toEqual([...(priorHistory || []), deletedHistory]);
+  expect(active.history.filter(item => item.operationId === authority.operationId)).toHaveLength(1);
+  expect(active.preservedWriting.every(plan => plan.publicationOperationId === authority.operationId && plan.publicationOperationId !== active.operationId && plan.sourceGeneration === generation)).toBe(true);
+  expect(restored.attempts).toEqual(fixture.originalAcceptedLedger.attempts);
+  for (const [id, admission] of Object.entries(deleted.admissions)) expect(restored.admissions[id]).toEqual(admission);
+  expect(Object.keys(restored.admissions).filter(id => !Object.hasOwn(deleted.admissions, id))).toEqual([current.currentRevision]);
+  expect(restored.admissions[current.currentRevision].sourceGeneration).toBe(active.generation);
+  expect(restored.admissions[current.currentRevision].identity).toBe(fixture.acceptedLedger.admissions[capture.currentRevision].identity);
+  expect(current.currentRevision).not.toBe(capture.currentRevision); expect(current.currentRevision).not.toBe(intent.tx.revision.id);
+  expect(restored.admissions[intent.tx.revision.id]).toBeUndefined(); expect(restored.attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect(restored.suppressed).not.toContain(sourceHash); expect(restored.annotationRemovals[intent.annotationId]).toEqual(removed.annotationRemovals[intent.annotationId]);
+  expect(await exists(originalOutput)).toBe(false); expect(restoredFiles[originalRelative]).toBeUndefined(); expect(restoredFiles[wholeRelative]).toEqual(deletedFiles[wholeRelative]);
+  expect((await fs.readdir(path.join(base, 'Annotations'))).sort()).toEqual([path.basename(wholeOutput)]);
+  for (const plan of active.preservedWriting) expect(await exists(path.join(root, 'vault', plan.stage))).toBe(false);
+  for (const file of origins.filter(file => file !== path.join(base, 'Captures', capture.file))) expect(await exists(file)).toBe(false);
+  expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+  // A pure public ledger-load rejection must reach the inherited-history binding.
+  const { randomUUID } = require('node:crypto'), forgedOwner = randomUUID(), corrupted = JSON.parse(JSON.stringify(restored));
+  const corruptAuthority = corrupted.sourceAuthority[capture.id];
+  expect([active.operationId, authority.operationId]).not.toContain(forgedOwner);
+  for (const plan of corruptAuthority.preservedWriting) {
+    plan.publicationOperationId = forgedOwner;
+    plan.stage = path.posix.join(path.posix.dirname(plan.stage), `deletion-writing-${forgedOwner}-${plan.annotationId}.stage`);
+  }
+  // Keep the current owner-reference graph well shaped so an earlier purge-owner check cannot mask history validation.
+  const purge = corruptAuthority.purgedProducerAttempts.find(item => item.identity === corruptAuthority.mixedRecovery.incomingIdentity);
+  expect(purge.operationId).toBe(authority.operationId); purge.operationId = forgedOwner;
+  expect(corruptAuthority.history).toEqual(active.history); expect(corruptAuthority.operationId).toBe(active.operationId);
+  const reversed = JSON.parse(JSON.stringify(corrupted)), reversedAuthority = reversed.sourceAuthority[capture.id];
+  for (const [index, plan] of reversedAuthority.preservedWriting.entries()) {
+    plan.publicationOperationId = active.preservedWriting[index].publicationOperationId; plan.stage = active.preservedWriting[index].stage;
+  }
+  reversedAuthority.purgedProducerAttempts.find(item => item.identity === corruptAuthority.mixedRecovery.incomingIdentity).operationId = authority.operationId;
+  expect(reversed).toEqual(restored);
+  await fs.writeFile(ledgerFile, JSON.stringify(corrupted, null, 2), { flush: true });
+  const beforePureLoad = await observe(base);
+  await save(testInfo, 'mixed-lifecycle-corrupt-inherited-owner.json', { observed: beforePureLoad, corrupted, forgedOwner, unchangedHistory: active.history,
+    controlledFields: ['preservedWriting[*].publicationOperationId', 'preservedWriting[*].stage', 'matching incoming purgedProducerAttempts.operationId'] });
+  const rejection = await page.evaluate(async () => {
+    try { await window.captureDeletion.suppressed(); return null; }
+    catch (error) { return error.message; }
+  });
+  const afterPureLoad = await observe(base);
+  await save(testInfo, 'mixed-lifecycle-inherited-owner-rejected.json', { rejection, observed: afterPureLoad, corrupted });
+  expect(rejection).toContain('inherited retention owner'); expect(rejection).not.toContain('incoming purge observation');
+  expect(afterPureLoad).toEqual(beforePureLoad);
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8'))).toEqual(corrupted);
+  expect(await exists(originalOutput)).toBe(false); expect(afterPureLoad[wholeRelative]).toEqual(deletedFiles[wholeRelative]);
+  expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+});
+
 test('mixed retention resumes an actual annotation link before receipt with original restored generation', async ({}, testInfo) => {
   test.setTimeout(150000);
   const fixture = await heldMixedRepair(testInfo, { restoredG: true });

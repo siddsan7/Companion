@@ -137,3 +137,21 @@ Root schema regression unchangedGREEN14655ms, exit0/no skips, immutable staged08
 
 
 The complete six-case schema-fix gate passed: 6/6, exit 0, no skips, 117,459 ms. Tested tree: 83e0f0168ea20eb8b2ab968b91630c941a929c03. This includes the original two-output journey, destination collision, late adjacent-copy HOLD, restored-G link-before-receipt crash, missing receipted-output HOLD, and malformed proof-object rejection. Product change remains exactly one explicit-absence condition. Evidence: Temp/companion-ticket13-mixed-schema-coupled-six-20261110. The separate schema fix is ready for independent confirmation and integration into the editor format; full mixed lifecycle and primary composition remain open.
+
+## Completed deletion, independent annotation removal, and source restoration
+
+New test-only lifecycle slice: `completed mixed retention permits explicit annotation removal and fresh source restoration with immutable historical owner`. Root confirmed the preceding six-case gate and independent schema review before this authorship. All existing test bodies and product source remain unchanged.
+
+The test uses the real restored-A/G held-repair fixture, reviews both outputs publicly and completes mixed deletion. It saves actual deleted authority, exact X/whole-Y outputs, original G and all-origin purge evidence. Through Review annotations it previews and separately confirms removal of exact original R, while V and all source authority metadata remain unchanged. It normally restarts and uses Review suppressed captures to load the deleted source successfully, then explicitly previews and restores only original finalized producer A with the existing tested artifact-kind combobox locator.
+
+The active authority must have a fresh source generation and restoration operation, while mixed descriptors, both plans and receipts, immutable publication owner and original origin G stay byte-for-byte equivalent as metadata. Exactly one matching deleted entry is appended to history. R must remain absent, its independent removal marker must remain unchanged, V's complete file and physical identity must remain exact, and historical stages must stay absent. Only the new source revision/admission is added; old admissions and literal producer acceptance stay unchanged, B stays unadmitted, unselected old source origins stay absent, and producers stay exact.
+
+The final pure public-load control corrupts both inherited publication owners to one well-shaped UUID and updates both derived stage paths. It also changes only the current matching B purge observation's operation owner to that UUID: otherwise the earlier incoming-purge-owner check would mask the historical binding. The current restoration operation and all deleted history stay unchanged. Reversing these explicitly recorded fields must recover the exact valid ledger. The public `captureDeletion.suppressed` bridge must reject specifically at `inherited retention owner`, and must not report the earlier `incoming purge observation` mismatch. Complete filesystem/ledger evidence must show no mutation, no R republication and unchanged V. No private validator is imported.
+
+Syntax check passed. No runtime/Git/network action or product edit was performed; root must measure this new lifecycle before claiming completion.
+
+```powershell
+npx playwright test tests/mixed-retention-deletion.spec.js --grep "completed mixed retention permits" --workers=1 --reporter=list
+```
+
+Root actual completed-retention lifecycle passed in 38,127 ms, exit 0, one test/no skips, at staged tree f336d0f7074447c36e1ab13d7d1bc4e75c16a2f6. Evidence: Temp/companion-ticket13-mixed-lifecycle-20261110/exit.json and run.stdout.log. It measured public annotation removal, restart and fresh source restoration without republishing removed writing, immutable original plans/receipts/owner/G and producer admissions, plus the specifically reached inherited-retention-owner rejection after controlled current-owner graph corruption. Product was unchanged from b83700c. Full primary/editor composition and independent final review remain open.
