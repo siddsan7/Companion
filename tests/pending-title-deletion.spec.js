@@ -6,21 +6,11 @@ const { createHash, randomUUID } = require('node:crypto');
 const YAML = require('yaml');
 const fixture = require('./fixtures/reel-draft/example.json');
 const { withTitle, parse } = require('../app/vault');
-const { createDiagnostics } = require('./helpers/ui-phase-diagnostics');
-let root, app, page, diagnostics;
+let root, app, page;
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const exists = file => fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-test.beforeEach(async () => { diagnostics = null; root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-pending-title-')); });
-test.afterEach(async ({}, testInfo) => {
-  try {
-    if (diagnostics) {
-      await diagnostics.save(app, page, root);
-    }
-  } finally {
-    if (app) await app.close(); app = null;
-    await fs.rm(root, { recursive: true, force: true });
-  }
-});
+test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-pending-title-')); });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function files(folder, prefix = '') {
   const result = {};
   for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
@@ -35,7 +25,6 @@ async function launch() {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   page = await app.firstWindow();
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
-  if (diagnostics) await diagnostics.install(app, page);
 }
 async function observe(file) {
   const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
@@ -999,24 +988,8 @@ for (const variant of ['unowned-sidecars', 'double-owned-transaction']) test(`fr
   const restoration = page.getByLabel('Source restoration');
   await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(folder);
   await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
-  if (variant === 'unowned-sidecars') {
-    diagnostics = createDiagnostics(testInfo, 'restoration');
-    if (diagnostics) await diagnostics.install(app, page);
-    if (diagnostics) await diagnostics.actionState(page, 'before original restoration confirm');
-  }
-  diagnostics?.mark('original restoration confirm click: before');
   await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
-  try {
-    await expect(page.getByRole('status')).toContainText('Source restored');
-  } catch (originalError) {
-    if (diagnostics) {
-      diagnostics.mark('original 5s Source restored assertion failed');
-      try { await diagnostics.tail(app, page, 'original restoration assertion'); }
-      catch (collectionError) { diagnostics.mark('tail collection error: ' + collectionError.message); }
-    }
-    throw originalError;
-  }
-  if (diagnostics) await diagnostics.capture(app, page, 'original Source restored assertion returned');
+  await expect(page.getByRole('status')).toContainText('Source restored');
   const ledgerBytes = await fs.readFile(ledgerFile), original = JSON.parse(ledgerBytes), sourceHash = 'a'.repeat(64), capture = original.captures[sourceHash];
   expect(capture.id).toBe(initialCapture.id); expect(capture.currentRevision).not.toBe(initialCapture.currentRevision);
   expect(original.attempts).toEqual(initialLedger.attempts);

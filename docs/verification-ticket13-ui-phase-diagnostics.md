@@ -54,3 +54,7 @@ The pending-title assertion catch retains and rethrows the same original error a
 Acceptance is diagnostic evidence that distinguishes pre-dispatch budget consumption, backend progress, and post-backend refresh progress. A passing instrumented case establishes no historical cause or correction. The full gate remains failed (160 passed, 2 failed, 0 skipped); issue 13 is open and issue 16 remains blocked.
 
 Static checks: `node --check` passed for both edited specs and the shared helper. Root owns runtime discovery, serial execution, independent review, Git, and final disposition. Remove this temporary instrumentation separately after diagnosis.
+
+## Observer cleanup and selected fixture follow-up
+
+After independent design review and the committed plan, root removed the temporary observer helper and restored both original specs byte-identical to5d9a94e. All diagnostics, source/control commits and raw artifacts remain. This cleanup changes no product code or original assertions/budgets. The selected follow-up is the existing testRoot-only fixture rendering policy: conditional unthrottled preferences and showInactive after normal load; production options and worker branch remain unchanged. Native-state/security checks, clean original pending variant group plus repair journey, and a fresh complete gate are still pending. This is not a retrospective explanation of the old postclick5s failure.
