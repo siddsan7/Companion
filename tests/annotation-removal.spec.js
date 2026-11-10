@@ -4,13 +4,13 @@ const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
-let root, app, page;
+let root, app, page, readerEntry;
 
-test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-annotation-removal-')); });
+test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-annotation-removal-')); readerEntry = null; });
 test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function launch() {
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
-  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  app = await electron.launch({ args: [readerEntry || '.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   page = await app.firstWindow();
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
 }
@@ -194,4 +194,97 @@ test('selected annotation removal accepts an actual native Windows relationship 
   await app.close(); app = null; await launch();
   for (const file of [selected, journal]) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   expect(await fs.readFile(retained)).toEqual(retainedBytes); expect(await fs.readFile(moved)).toEqual(movedBytes);
+});
+
+test('an in-flight supporting annotation read never admits writing removed before its scan returns', async () => {
+  test.setTimeout(90000);
+  readerEntry = path.join(root, 'annotation-reader-main.cjs');
+  const appDirectory = path.resolve(__dirname, '..', 'app');
+  // This disposable wrapper pauses real IO results. It does not replace any
+  // store/context output or generate authority. Async scope identifies the
+  // final supporting scan after actual source inspection, without call counts.
+  await fs.writeFile(readerEntry, `
+const fs = require('node:fs');
+const io = require('node:fs/promises');
+const path = require('node:path');
+const { AsyncLocalStorage } = require('node:async_hooks');
+const { Context } = require(${JSON.stringify(path.join(appDirectory, 'context'))});
+const { Intake } = require(${JSON.stringify(path.join(appDirectory, 'intake'))});
+const { Vault } = require(${JSON.stringify(path.join(appDirectory, 'vault'))});
+const scope = new AsyncLocalStorage(), root = process.env.COMPANION_TEST_ROOT;
+const actualCorpus = Context.prototype.corpus, actualInspect = Intake.prototype.inspect, actualScan = Vault.prototype.scan;
+Context.prototype.corpus = async function (...args) {
+  const arm = path.join(root, 'reader-arm.txt');
+  if (!fs.existsSync(arm)) return actualCorpus.apply(this, args);
+  await io.unlink(arm);
+  return scope.run({ armed: false }, () => actualCorpus.apply(this, args));
+};
+Intake.prototype.inspect = async function (...args) {
+  const result = await actualInspect.apply(this, args), current = scope.getStore();
+  if (current) current.armed = true;
+  return result;
+};
+Vault.prototype.scan = async function (...args) {
+  const result = await actualScan.apply(this, args), current = scope.getStore();
+  if (current?.armed && args[0]?.annotations) {
+    current.armed = false;
+    await io.writeFile(path.join(root, 'reader-checkpoint.txt'), 'supporting-scan-held');
+    while (!fs.existsSync(path.join(root, 'reader-release.txt'))) await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  return result;
+};
+require(${JSON.stringify(path.join(appDirectory, 'main'))});
+`, 'utf8');
+  const base = await importedCapture(), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  for (const text of ['REMOVEREADERCANARY selected independent writing.', 'RETAINREADERCANARY unrelated independent writing.']) {
+    await page.getByLabel('New annotation', { exact: true }).fill(text);
+    await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Annotation saved.');
+    await expect(page.getByLabel('New annotation', { exact: true })).toHaveValue('');
+  }
+  const notes = await Promise.all((await fs.readdir(annotationFolder)).filter(name => name.endsWith('.md')).map(async name => {
+    const file = path.join(annotationFolder, name), bytes = await fs.readFile(file), text = bytes.toString('utf8');
+    return { file, bytes, text, id: YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]).companion_id };
+  }));
+  const selected = notes.find(note => note.text.includes('REMOVEREADERCANARY')), retained = notes.find(note => note.text.includes('RETAINREADERCANARY'));
+  await page.getByLabel('Context question', { exact: true }).fill('REMOVEREADERCANARY RETAINREADERCANARY');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  for (const note of [selected, retained]) await expect(page.locator('#context-manual option').filter({ hasText: note.id })).toHaveCount(1);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await expect(page.locator('#context-manual option')).toHaveCount(0);
+  const source = await files(path.join(base, 'Captures')), revisions = await files(path.join(base, 'Revisions'));
+  await fs.writeFile(path.join(root, 'reader-arm.txt'), 'arm one supporting read');
+  await page.getByLabel('Context question', { exact: true }).fill('REMOVEREADERCANARY RETAINREADERCANARY');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'reader-checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('supporting-scan-held');
+  // Context's preceding normal intake reconciliation can republish the ledger.
+  // Bind removal consent only after that real reconciliation has completed.
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  await page.getByLabel('Annotation removal review', { exact: true }).getByRole('article').filter({ hasText: selected.id }).getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const preview = page.getByLabel('Annotation removal preview', { exact: true }); await expect(preview).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'annotation-removal-authorized' }));
+  await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('annotation-removal-authorized');
+  const committed = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(committed.annotationRemovals[selected.id].phase).toBe('removing');
+  expect(await fs.readFile(selected.file)).toEqual(selected.bytes); expect(await fs.readFile(retained.file)).toEqual(retained.bytes);
+  await fs.writeFile(path.join(root, 'reader-release.txt'), 'return actual scan result');
+  await expect.poll(async () => {
+    const stale = (await page.locator('#context-error').textContent()).includes('ledger changed');
+    const completed = await page.locator('#context-manual option').filter({ hasText: retained.id }).count();
+    return stale || completed > 0;
+  }).toBe(true);
+  await expect(page.locator('#context-manual option').filter({ hasText: selected.id })).toHaveCount(0);
+  await expect(page.locator('#context-results')).not.toContainText('REMOVEREADERCANARY');
+  expect(await fs.readFile(selected.file)).toEqual(selected.bytes);
+  await fs.writeFile(path.join(root, 'release.txt'), 'finish reviewed removal');
+  await expect(page.getByRole('status')).toContainText('Annotation removed');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-manual option').filter({ hasText: retained.id })).toHaveCount(1);
+  await expect(page.locator('#context-manual option').filter({ hasText: selected.id })).toHaveCount(0);
+  await expect(page.locator('#context-results')).toContainText('RETAINREADERCANARY');
+  await expect(page.locator('#context-results')).not.toContainText('REMOVEREADERCANARY');
+  expect(await fs.readFile(retained.file)).toEqual(retained.bytes);
+  expect(await files(path.join(base, 'Captures'))).toEqual(source); expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
 });
