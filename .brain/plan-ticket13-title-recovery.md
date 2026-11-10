@@ -1,0 +1,48 @@
+# Ticket 13 T1 completed imported title — concrete protocol proposal
+
+Read-only proposal on source9aa0893; root reports all seven source-inventory cases now passed2.3m and report committedbe00c6f. No repository edits, tests/runtime, Git/network/install/native/model calls. This narrows next-source-families.md and adopts every next-source-design-audit title/origin/partial-unlink condition. Root review is required before the first T1 test or production edit. Manual titles, interrupted title journals, older-revision/multiple-title chains and mixed writing remain separate follow-ons; they must HOLD while unsupported, never hide behind complete purge.
+
+## Actual T1 writer and first boundary
+
+Use one normal imported source admitted through UI, then public Display title / Save title to a visibly different one-line title. Intake writes title-intent.json; Vault writes adjacent title-transaction/pending, renames the old note to <actual note basename>.before-title-<UUID>.bak, links pending -> current, and removes pending/journal. Successful imported acknowledgement updates capture.title/currentHash and removes title-intent. The completed old backup remains, as does the unchanged admitted snapshot. Current and old backup are distinct ordinary single-link inodes. Do not invent a peer pair for this completed state.
+
+Exactly THREE physical source files in the first fixture: current titled note, immutable admitted snapshot, adjacent old title backup. The raw old backup must equal the note saved before public Save title; the current note must be the actual writer result. Do NOT assert that noteText(capture,newTitle) equals the YAML writer result. The pure transformation is withTitle(actualBeforeBytes,newTitle), with literal UTF-8 buffer equality against actual after bytes. Bind stable UUID/type/original capturedAt/sourceHash/source_revision and the full exact generated source body. A display-title value is part of this explicit capture deletion scope; it does not license deleting unrelated body/frontmatter edits.
+
+## Exact minimal schema under existing authority
+
+Keep inventoryVersion2 imported semantics and every existing strict transaction recovery descriptor unchanged. Add optional sourceAuthority[id].titleProofs array (absence valid for all earlier v2 records). Introduce target kind source-title-backup, legal ONLY under imported v2 with exactly one corresponding title proof. Manual v2 remains forbidden in this T1 edit.
+
+Each proof is content-free:
+
+{ before, after, snapshot, revisionId, sourceGeneration }
+
+before/after/snapshot are normalized vault-relative references to EXACT entries already in authority.targets. No body, title, source JSON, mutable user selection or arbitrary path expression is stored in proof. Each referenced target already stores its literal SHA/dev/ino/size/kind. Require the array canonical by before then after, no duplicate before target, all fields strict, UUID revisionId, sourceGeneration UUID or null for actual legacy absence.
+
+- before target is source-title-backup; after target is the one capture target; snapshot target is kind snapshot for this exact revision. For T1 all proof members concern the current admitted source revision.
+- Execution binds snapshot to THIS vault.root/Revisions/<revisionId>.json. Before is in the SAME actual parent as after and its basename is exactly <after basename>.before-title-<canonical UUID>.bak. No ledger/provenance filename may invent another unlink path. RequiredDirectories pins all actual parents before consent; only ordinary contained files, nlink1 in T1. Unknown aliases remain refused.
+- Snapshot target SHA equals the existing immutable revisionAdmission SHA for owner capture/source/revision. sourceGeneration is taken from THAT admission, UUID or explicit null; it is not allocated at deletion or borrowed from whichever generation is now current. Its original source binding must agree with the pre-deletion active generation (or both actual legacy absence). Incoming/deleting generation never replaces it.
+
+This is an additive proof family under the same sourceAuthority, not a new state owner/format parser. The existing recovery array stays transaction-specific; do not masquerade title data as an Intake transaction to bypass its validator. No new mutex or title replay path.
+
+## Raw classification before consent
+
+1. Keep the existing generic noteHash==capture.currentHash guard for this completed T1 state. Successful title acknowledgement guarantees it. The change is only the later canonical noteText check: permit an exact verified title proof instead of assuming YAML rewritten current bytes are canonical noteText bytes.
+2. Read the actual adjacent candidate backups with guarded ordinary-file/buffer reads. Match UUID/type/first instant/sourceHash/current source_revision to the admitted snapshot and owning managed capture. The first T1 before leaf must equal the canonical generated noteText for that admitted revision and its observed original display title, using the immutable capture identity/instant. Every metadata/body byte must match; arbitrary frontmatter, footer or body additions fail.
+3. Establish the explicit proof edge admitted snapshot -> exact generated before target -> withTitle(before, actual current title) -> exact current after target. Parse title only as input to the existing exact writer transformation; no fuzzy matching, inferred diff, producer locator read, or acceptance rewrite. After need NOT equal noteText(newTitle). The snapshot/body/identity plus exact before render and withTitle transformation are the proof, not the presence of a title field.
+4. Include all three exact targets/proof references in the existing preview token, alongside loaded-ledger identity/digest and directory pins. Raw preview/cancel creates no source authority/journal and runs no recover/list/info/finishTitle. Existing unknown .intake/title-intent or title-conflict, adjacent pending/title-transaction, multiple/older-revision unsupported backups, unknown new peers and changed local writing HOLD explicitly.
+
+The current broad adjacent-recovery scanner rejects every matching title backup. It must skip ONLY the exact paths just proven in the new title inventory; all other matching copies remain blockers. This needs a small coordinated CaptureDeletion inventory/inspect hook plus source-family helper/schema edits. Affected-preview helper owns a separate small hook on its own branch; root coordinates preserving integration. No capture-view/main/repairs changes are needed for T1.
+
+## Confirmation, partial unlink and history
+
+Reuse Conversation -> existing sourceMutation/Intake -> capture file ownership, exact preview rebuild, fresh loaded-ledger CAS, suppression/deleting save before unlink, full unknown-copy rescan and target/group revalidation. Persist titleProofs with targets BEFORE the first unlink; copy it with the operation's existing history representation. Future deletions build new current proofs while old deleted history remains exact. No source payload or title string enters receipts/history.
+
+On resume, validate the proof's manifest reference roles, fixed layouts, original admission identity/SHA/generation and every surviving target SHA/inode/count. Earlier before/snapshot/journal leaves may already be absent through consented removal. DO NOT read a removed baseline to re-run withTitle, demand an already-purged snapshot body, infer current note presence from ledger.currentHash, or reconstruct source text. The committed proof edge attests that the exact transformation was established before consent. Current immutable admission facts still validate the snapshot target hash even when its file is gone. A new/replaced leaf at a previously removed manifested path fails exact identity; an unknown adjacent copy blocks completion. This is the same consented-survivor principle already demonstrated by v2 partial recovery.
+
+## First T1 RED and narrow writing guard
+
+FIRST TEST ONLY after root approves this plan: real imported source -> public successful Save title -> verify one exact old backup plus current and admitted snapshot, immutable attempts/admissions unchanged. Require raw deletion preview to list exactly these THREE source files, byte-exact cancel, confirmation purges all three and records the generation-bound title proof, no title recovery residue, unchanged producer originals, and Check now/restart suppression without replay. Current code should fail at missing preview because the adjacent backup is unsupported; record the actual point reached, not an assumed production cause. No staged-journal or manual cases bundled in this first test.
+
+After its actual RED, implement only this reviewed imported/completed path. One separate realistic negative guard then edits the real backup with unique authored BODY writing (single link, ordinary parent); raw preview must HOLD and preserve exact changed writing, current/snapshot/ledger/producers, with no new deletion authority. The same source admission/render proof must fail on independent body/frontmatter changes; never loosen it to make T1 pass. Existing hash/alias/whole-scope/CAS checks remain. The body-writing HOLD is part of this protocol's acceptance before considering this title slice complete, not consent to extract or purge that writing.
+
+Then separate partial-proof and pending-journal/multiple-title/older-revision cases based on actual writer residuals, plus manual title variant under its own schema review. The first T1 gate alone is not complete title/source/mixed/ticket acceptance. No new external-frontmatter ownership policy, path sweep or automatic restoration is proposed.
