@@ -381,6 +381,104 @@ test('verified moves keep stable capture identity and repair annotation links be
   await expect(page.locator('#captures article')).toHaveCount(1);
 });
 
+test('Open in Obsidian waits for Browse Refresh before opening a moved capture', async () => {
+  const producer = await artifact();
+  const producerNames = (await fs.readdir(producer)).sort();
+  const producerBytes = await Promise.all(producerNames.map(name => fs.readFile(path.join(producer, name))));
+  await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('Keep this relationship.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures'), annotations = path.join(base, 'Annotations');
+  const name = (await fs.readdir(captures)).find(file => file.endsWith('.md'));
+  const original = path.join(captures, name), before = await fs.readFile(original, 'utf8');
+  const id = before.match(/companion_id: "([^"]+)"/)[1];
+  const annotation = path.join(annotations, (await fs.readdir(annotations)).find(file => file.endsWith('.md')));
+  const annotationBefore = await fs.readFile(annotation, 'utf8');
+  const originalLink = `Source: [Capture](../Captures/${encodeURIComponent(name)})`;
+  expect(annotationBefore).toContain(originalLink);
+  const moved = path.join(root, 'vault', 'Projects', 'Moved source.md');
+  const opened = path.join(root, 'opened-uri.txt');
+  const open = page.locator('#captures').getByRole('button', { name: 'Open in Obsidian', exact: true });
+  await expect(open).toBeEnabled();
+  const previousOpen = await open.elementHandle();
+
+  try {
+    await fs.mkdir(path.dirname(moved), { recursive: true });
+    await fs.rename(original, moved);
+    await app.evaluate(({ app: mainApp, ipcMain }, { root, base }) => {
+      if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Held Browse refresh requires the disposable fixture.');
+      const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+      const { Intake } = load('./intake');
+      const originalRepairs = Intake.prototype.repairs, originalOpen = ipcMain._invokeHandlers.get('open-note');
+      const gate = globalThis.__browseRepairOwner = { held: false, claimed: false, openRequests: [] };
+      const delivery = new Promise(resolve => { gate.release = resolve; });
+      gate.finished = new Promise(resolve => { gate.finish = resolve; });
+      Intake.prototype.repairs = async function (...args) {
+        if (gate.claimed || this.vault.root !== base) return Reflect.apply(originalRepairs, this, args);
+        gate.claimed = true;
+        const ownLocked = Object.getOwnPropertyDescriptor(this, 'locked'), nativeLocked = this.locked;
+        this.locked = function (work, ...lockedArgs) {
+          return Reflect.apply(nativeLocked, this, [async function (...workArgs) {
+            // The original locked method has acquired the real owner and recovered.
+            gate.held = true;
+            await delivery;
+            return Reflect.apply(work, this, workArgs);
+          }, ...lockedArgs]);
+        };
+        try { return await Reflect.apply(originalRepairs, this, args); }
+        finally {
+          if (ownLocked) Object.defineProperty(this, 'locked', ownLocked); else delete this.locked;
+          gate.finish();
+        }
+      };
+      ipcMain._invokeHandlers.set('open-note', function (...args) {
+        gate.openRequests.push(args[1]);
+        return Reflect.apply(originalOpen, this, args);
+      });
+      gate.restore = () => {
+        Intake.prototype.repairs = originalRepairs;
+        ipcMain._invokeHandlers.set('open-note', originalOpen);
+      };
+    }, { root, base });
+
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__browseRepairOwner.held)).toBe(true);
+    expect(await previousOpen.isDisabled(), 'Previous Open in Obsidian is disabled while Refresh owns the vault').toBe(true);
+    expect(await app.evaluate(() => globalThis.__browseRepairOwner.openRequests)).toEqual([]);
+
+    await app.evaluate(() => globalThis.__browseRepairOwner.release());
+    await expect.poll(() => previousOpen.evaluate(node => node.isConnected)).toBe(false);
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    await expect(open).toBeEnabled();
+    expect(await app.evaluate(() => globalThis.__browseRepairOwner.openRequests)).toEqual([]);
+    await expect(fs.access(opened)).rejects.toMatchObject({ code: 'ENOENT' });
+    await open.click();
+    await expect(page.getByRole('status')).toContainText('Requested Obsidian to open the note.');
+    expect(await app.evaluate(() => globalThis.__browseRepairOwner.openRequests)).toEqual([id]);
+    expect(await fs.readFile(opened, 'utf8')).toBe(`obsidian://open?path=${encodeURIComponent(moved)}`);
+    expect(await fs.readFile(moved, 'utf8')).toBe(before);
+    await expect(fs.access(original)).rejects.toMatchObject({ code: 'ENOENT' });
+    const linked = await fs.readFile(annotation, 'utf8');
+    expect(linked).toContain(`capture_id: "${id}"`);
+    expect(linked).toBe(annotationBefore.replace(originalLink, 'Source: [Capture](../../Projects/Moved%20source.md)'));
+    expect((await fs.readdir(producer)).sort()).toEqual(producerNames);
+    for (const [index, name] of producerNames.entries()) expect(await fs.readFile(path.join(producer, name))).toEqual(producerBytes[index]);
+  } finally {
+    try {
+      await app.evaluate(async () => {
+        const gate = globalThis.__browseRepairOwner;
+        if (!gate) return;
+        gate.release();
+        try { if (gate.claimed) await gate.finished; }
+        finally { gate.restore(); delete globalThis.__browseRepairOwner; }
+      });
+    } finally { await previousOpen.dispose(); }
+  }
+});
+
 test('duplicate identities preserve both files until explicit selection while independent intake continues', async () => {
   await artifact(); await launch(); await setup(); await connect(true);
   const base = path.join(root, 'vault', 'Companion'), dir = path.join(base, 'Captures'), name = (await fs.readdir(dir)).find(x => x.endsWith('.md'));
