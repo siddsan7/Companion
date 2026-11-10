@@ -108,9 +108,16 @@ function normalizedDraft(revision, capture, sourceHash) {
 }
 function selectionTransaction(tx, ledger, capture, sourceHash, revisions) {
   if (!fields(tx, ['schema', 'resolution', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || !uuid(tx.resolution) || tx.retainOnly !== false || tx.sourceHash !== sourceHash || tx.revision.id === capture.currentRevision || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'reviewChoices', 'selectionHistory']) || !date(tx.capture.updatedAt)) fail();
-  const block = ledger.blocks[sourceHash], outcome = ledger.outcomes[tx.key];
-  const journal = `conflict-${tx.revision.id}-${tx.resolution}.json`;
-  if (!fields(block, ['reason', 'journal', 'incomingRevision']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  const block = ledger.blocks[sourceHash], pending = ledger.pending[sourceHash], outcome = ledger.outcomes[tx.key];
+  if (block === undefined) {
+    // The native destination-to-backup rename failed before capture staging.
+    // Bind only that deferred selection; deleting it does not complete it.
+    const reason = 'Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.';
+    if (!fields(pending, ['reason', 'journal', 'key']) || pending.reason !== reason || pending.journal !== `pending-${tx.revision.id}-${tx.resolution}.json` || pending.key !== tx.key || capture.conflict !== undefined || !isDeepStrictEqual(outcome, { status: 'held', reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  } else {
+    const journal = `conflict-${tx.revision.id}-${tx.resolution}.json`;
+    if (!fields(block, ['reason', 'journal', 'incomingRevision']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+  }
   const authority = ledger.sourceAuthority?.[capture.id];
   if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
   const { revisionAdmission } = require('./source-authority'), { noteText } = require('./intake');
@@ -177,6 +184,8 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
     // those exact bytes. Do not discard duplicate-key or formatting payloads.
     if (!entry.value.bytes.equals(Buffer.from(JSON.stringify(tx), 'utf8'))) fail();
     const admission = transaction(intake, tx, ledger, capture, sourceHash, revisions), journal = relative(intake, entry.file);
+    const deferredSelection = tx.resolution !== undefined && ledger.blocks[sourceHash] === undefined;
+    if (deferredSelection && (entry.name !== ledger.pending[sourceHash].journal || !entries.some(item => item.name === tx.revision.id + '.snapshot.stage') || entries.some(item => [tx.revision.id + '.stage', tx.backup].includes(item.name)))) fail();
     const descriptor = { transaction: journal, captureId: capture.id, sourceHash, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null };
     const add = (file, format, content, kind = 'source-recovery') => {
       const item = { file: relative(intake, file), format, ...descriptor }; layout(intake, { sourceHash }, item);
