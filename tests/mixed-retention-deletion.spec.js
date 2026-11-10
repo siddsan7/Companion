@@ -133,6 +133,7 @@ test('deleting a held kept-current repair retains distinct annotation and whole 
   await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
   await expect(preview).toBeHidden(); expect(contents(await observe(base))).toEqual(before);
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByLabel('Capture deletion preview')).toBeVisible();
   const confirmedText = await page.getByLabel('Capture deletion preview').textContent();
   expect(confirmedText).toContain(repair.annotation); expect(confirmedText).toContain(wholeY.toString('utf8'));
   // Cancel may discard its memory-only destination. Read the freshly reviewed destinations again.
