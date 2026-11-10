@@ -1,6 +1,6 @@
 # Ticket 13 composed-gate corrections
 
-Status: the three observed failures have bounded corrections and targeted evidence. All four normal cases passed without diagnostic observers at tree `9ad5394b74d9be9e4af1fa9663ef8185094f4cb6`: exit 0, no skips, 113,336 ms. The fresh complete 142-case gate remains pending. The original full gate failed; targeted passes are not a composite full pass.
+Status: the original three failures and the later plain-manual P1/P2 blockers have bounded corrections and targeted evidence. Four normal cases passed without observers in 113,336 ms; both manual regressions and six relevant controls also passed. Independent Standards and Spec reviewers approve the bounded manual fixes at tree `330dab30e00728b8adceceeedcb017364125290d`, committed as `2ae4333`. The fresh complete gate remains pending: expected 144 cases, subject to actual discovery. The original 141-case full gate failed and the later 142-case run was stopped incomplete. Targeted passes are not a composite full pass.
 
 ## Run record
 
@@ -16,7 +16,9 @@ Times are actual elapsed milliseconds. Trees identify the tested state, which ma
 | Original external-ledger case, specific diagnostic fix | `bf11a93794d13e9bbb8559dba48054f46b392c78` | 1 passed, 0 skipped; exit 0 | 11,918 | `companion-ticket13-ledger-message-green-20261110` |
 | Original backup-recovery case, final-startup readiness wait | `aff161f1c07b7ffdfc77098c927763cda9d34162` | 1 passed, 0 skipped; exit 0 | 11,289 | `companion-ticket13-backup-startup-green-20261110` |
 | Four normal coupled cases, observers removed | `9ad5394b74d9be9e4af1fa9663ef8185094f4cb6` | 4 passed, 0 skipped; exit 0 | 113,336 | `companion-ticket13-corrected-normal-four-20261110` |
-| Fresh complete ticket gate | Pending final reviewed composition | Not run; expected 142 cases, actual discovery required | Pending | Pending |
+| Stopped 142-case gate | Corrected candidate before manual fixes | 13 completed passes, 0 completed failures; stopped, exit 1; incomplete | 299,371 | `companion-ticket13-corrected-final-142-20261110` |
+| Six manual/extended-family controls | `fce9cf95bfdb996beed40185e5e04d50b77451d5` | 6 passed, 0 skipped; exit 0 | 88,807 | `companion-ticket13-manual-authority-coupled-six-20261110` |
+| Fresh complete ticket gate | Pending final reviewed composition | Not run; expected 144 cases, actual discovery required | Pending | Pending |
 
 ## Restored imported citations: physical ledger drift
 
@@ -48,10 +50,14 @@ The original workflow passed all later preservation, unrelated-import, link-coun
 
 The normal coupled run subsequently passed all four complete workflows with no observers: the original restored-imported-citation case, the new inspection/foreign-same-byte regression, the original specific-ledger-diagnostic case and the backup-recovery case. This verifies the restored citation workflow on the corrected composition; it does not replace the required fresh full ticket gate.
 
+## Later plain-manual authority blockers
+
+The stopped 142-case run is not a full pass. Independent review found plain manual deletion could remove its source before checking changed live ledger ownership. Actual RED proved source disappearance; the unchanged GREEN passed after the unconditional ledger guard. A second actual RED proved false completion when an unknown reserved-prefix whole-source copy arrived after the authorized first unlink. Existing inventory inspections now run for every family before each unlink and completion. The unchanged GREEN held without adopting or deleting the unknown copy; explicit Refresh completed the same scope only after the test removed its own verified arrival. Both manual tests and representative extended controls passed together. Exact RED/GREEN trees, durations, separate commits, review approvals and limits are in [the manual authority report](verification-ticket13-manual-ledger-guard.md).
+
 ## Review, cleanup and remaining gates
 
 The deterministic regression was committed separately in `6a2e981`, before the product fix. The no-op design and exact bounded fix received independent reviews in `Temp/companion-ticket13-ledger-noop-design-audit.md` and `Temp/companion-ticket13-ledger-noop-fix-review.md`. The specific diagnostic correction received independent review in `Temp/companion-ticket13-ledger-message-fix-review.md`. These approvals cover their stated bounded changes, not ticket integration, the full PR or live readiness.
 
-Temporary prototype observers, light-probe switching, trace wrappers and opt-in failed-fixture retention have been removed. Original case 49 and 75 bodies and the original cleanup hook are restored. Removing only the unchanged new 66-line regression reconstructs the original deletion test file exactly by normalized-text comparison; the checkout line endings differ. Static literal declarations increased from 37 to 38; actual loop-expanded discovery must confirm 54 to 55 deletion cases and 142 total. Diagnostic traces remain outside the repository. The retained evidence roots are `Temp/companion-deletion-IcAQ2f` and `Temp/companion-deletion-UC6bGb`; root must verify ownership and remaining evidence needs before any cleanup.
+Temporary prototype observers, light-probe switching, trace wrappers and opt-in failed-fixture retention have been removed. Original case 49 and 75 bodies and the original cleanup hook are restored. Removing only the unchanged new 66-line regression reconstructs the original deletion test file exactly by normalized-text comparison; the checkout line endings differ. Static literal declarations increased from 37 to 38; the earlier loop-expanded expectation was 54 to 55 deletion cases and 142 total. The two later manual cases raise the full expectation to 144 across 18 files; actual final discovery remains required. Diagnostic traces remain outside the repository. The retained evidence roots are `Temp/companion-deletion-IcAQ2f` and `Temp/companion-deletion-UC6bGb`; automatic approval review rejected both recursive cleanup requests with only "blocked by policy" before execution. Leave these folders as evidence; do not bypass the rejection or ask for workflow permission.
 
-Syntax checks passed for the edited source and tests. Next: synchronize the required verification documents; run the required source checks; obtain fresh final reviews; discover and run the full immutable corrected composition. Preserve the failed full-gate record. Exact-tip approval must precede ticket 13 integration and closure. Ticket 16 and the final complete-PR/main-merge review remain separate. Live sign-in remains deferred and readiness restricted.
+Syntax checks passed for the edited source and tests. Next: discover and run the full immutable 144-case corrected composition, then obtain required final-tip reviews and assigned merger approval. No GUI run is active at this checkpoint. Preserve the failed full-gate record. Exact-tip approval must precede ticket 13 integration and closure. Ticket 16 and the final complete-PR/main-merge review remain separate. Live sign-in remains deferred and readiness restricted.
