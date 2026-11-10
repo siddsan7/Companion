@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
+const { randomUUID } = require('node:crypto');
 let root, app, page, readerEntry, diagnosticFile;
 function diagnostic(event, details = {}) { local.appendFileSync(diagnosticFile, JSON.stringify({ timestamp: Date.now(), source: 'test', event, ...details }) + '\n'); }
 
@@ -476,4 +477,75 @@ require(${JSON.stringify(path.resolve(__dirname, '..', 'app', 'main'))});
   const published = (await fs.readdir(annotationFolder)).filter(name => name.endsWith('.md'));
   expect(published).toHaveLength(2); expect(published).not.toContain(intent.id + '.md');
   expect(await fs.readFile(retained)).toEqual(retainedBytes);
+});
+
+test('standalone annotation removal after source deletion excludes private fixtures and preserves suppression and other writing', async () => {
+  test.setTimeout(90000);
+  const base = await importedCapture(), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  for (const text of ['SELECTSOURCEGONE independent writing.', 'RETAINSOURCEGONE other independent writing.']) {
+    await page.getByLabel('New annotation', { exact: true }).fill(text);
+    await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Annotation saved.');
+    await expect(page.getByLabel('New annotation', { exact: true })).toHaveValue('');
+  }
+  const notes = await Promise.all((await fs.readdir(annotationFolder)).filter(name => name.endsWith('.md')).map(async name => {
+    const file = path.join(annotationFolder, name), bytes = await fs.readFile(file), text = bytes.toString('utf8');
+    return { file, bytes, text, metadata: YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]) };
+  }));
+  const selected = notes.find(note => note.text.includes('SELECTSOURCEGONE')), retained = notes.find(note => note.text.includes('RETAINSOURCEGONE'));
+  // These paths belong only to this disposable test vault. They are synthetic
+  // annotation-looking fixtures, never a real account or managed home.
+  const privateNotes = [];
+  for (const [folder, sentinel] of [['.codex', 'PRIVATECODEXANNOTATIONCANARY'], ['managed-home', 'PRIVATEMANAGEDANNOTATIONCANARY']]) {
+    const file = path.join(root, 'vault', folder, 'synthetic', 'private-annotation.md'), id = randomUUID();
+    const bytes = Buffer.from(`---\ncompanion_id: ${JSON.stringify(id)}\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ${JSON.stringify(selected.metadata.capture_id)}\n---\n\n# Synthetic private fixture\n\n${sentinel} retained private writing.\n`, 'utf8');
+    await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, bytes); privateNotes.push({ file, bytes, id, sentinel });
+  }
+  const producer = await files(path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const deleted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(deleted.sourceAuthority[selected.metadata.capture_id].phase).toBe('deleted');
+  expect(deleted.suppressed).toContain('a'.repeat(64));
+  expect((await fs.readdir(path.join(base, 'Captures'))).filter(name => name.endsWith('.md'))).toHaveLength(0);
+  expect((await fs.readdir(path.join(base, 'Revisions'))).filter(name => name.endsWith('.json'))).toHaveLength(0);
+  for (const note of [selected, retained, ...privateNotes]) expect(await fs.readFile(note.file)).toEqual(note.bytes);
+  const before = await files(base);
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  const review = page.getByLabel('Annotation removal review', { exact: true });
+  await expect(review).toContainText(selected.metadata.companion_id); await expect(review).toContainText(retained.metadata.companion_id);
+  for (const note of privateNotes) {
+    await expect(review).not.toContainText(note.sentinel);
+    await expect(review).not.toContainText(note.id);
+    await expect(review).not.toContainText(note.file);
+  }
+  const row = review.getByRole('article').filter({ hasText: selected.metadata.companion_id });
+  await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const preview = page.getByLabel('Annotation removal preview', { exact: true });
+  await expect(preview).toContainText(path.relative(path.join(root, 'vault'), selected.file).split(path.sep).join('/'));
+  await expect(preview).not.toContainText(retained.metadata.companion_id);
+  for (const note of privateNotes) { await expect(preview).not.toContainText(note.id); await expect(preview).not.toContainText(note.sentinel); }
+  expect(await files(base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel annotation removal', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  for (const note of privateNotes) expect(await fs.readFile(note.file)).toEqual(note.bytes);
+  await row.getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation removed');
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  const after = await files(base), expected = { ...before }; delete expected['.intake/ledger.json']; delete after['.intake/ledger.json'];
+  delete expected[path.relative(base, selected.file).split(path.sep).join('/')]; expect(after).toEqual(expected);
+  const removed = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  for (const key of ['captures', 'attempts', 'admissions', 'sourceAuthority', 'suppressed']) expect(removed[key]).toEqual(deleted[key]);
+  for (const note of [retained, ...privateNotes]) expect(await fs.readFile(note.file)).toEqual(note.bytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(producer);
+  await closeApp('source-gone-restart'); app = null; await launch();
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  expect(await fs.access(selected.file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  for (const note of [retained, ...privateNotes]) expect(await fs.readFile(note.file)).toEqual(note.bytes);
+  const restarted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority).toEqual(deleted.sourceAuthority); expect(restarted.suppressed).toEqual(deleted.suppressed);
 });
