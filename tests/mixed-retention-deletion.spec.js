@@ -396,3 +396,116 @@ test('mixed retention resumes an actual annotation link before receipt with orig
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
   await expect(page.locator('#captures article')).toHaveCount(0);
 });
+
+test('mixed retention holds a missing receipted output before first native source unlink without republication', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const fixture = await heldMixedRepair(testInfo);
+  const { base, ledgerFile, capture, sourceHash, intent, origins, producer } = fixture;
+  const originalOrigins = await observe(base), beforeReview = contents(originalOrigins);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const preview = page.getByLabel('Capture deletion preview'); await expect(preview).toBeVisible();
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(contents(await observe(base))).toEqual(beforeReview);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByLabel('Capture deletion preview')).toBeVisible();
+  const reviewed = await page.getByLabel('Capture deletion preview').textContent();
+  expect(reviewed).toContain(intent.annotation); expect(reviewed).toContain(fixture.wholeY.toString('utf8'));
+  for (const file of origins) expect(reviewed).toContain(portable(path.relative(path.join(root, 'vault'), file)));
+  const reviewedPaths = [...new Set(reviewed.match(/Companion\/Annotations\/[a-f0-9-]{36}\.md/g) || [])]; expect(reviewedPaths).toHaveLength(2);
+  const outputs = reviewedPaths.map(file => path.join(root, 'vault', file)), observerFile = testInfo.outputPath('mixed-before-native-source-unlink.json');
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), crypto = process.getBuiltinModule('crypto');
+    const nativeUnlink = io.unlink, selected = new Set(options.origins.map(file => paths.resolve(file).toLowerCase()));
+    const snapshot = async file => {
+      try {
+        const bytes = await io.readFile(file), stat = await io.lstat(file, { bigint: true });
+        return { path: file, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), dev: String(stat.dev), ino: String(stat.ino), bytes: String(stat.size), nlink: String(stat.nlink), ordinary: stat.isFile() && !stat.isSymbolicLink() };
+      } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+    };
+    io.unlink = async function (file, ...args) {
+      if (typeof file !== 'string' || !selected.has(paths.resolve(file).toLowerCase())) return nativeUnlink.call(this, file, ...args);
+      io.unlink = nativeUnlink;
+      const ledger = JSON.parse(await io.readFile(options.ledgerFile, 'utf8')), authority = ledger.sourceAuthority[options.captureId];
+      const observation = { boundary: 'before-native-unlink', requestedSource: file, mainPid: process.pid, nativeUnlinkDelegated: false, nativeUnlinkReturned: false, ledger,
+        origins: await Promise.all(options.origins.map(snapshot)), outputs: await Promise.all(options.outputs.map(snapshot)),
+        stages: await Promise.all(authority.preservedWriting.map(plan => snapshot(paths.join(options.vault, plan.stage)))) };
+      await io.writeFile(options.observerFile, JSON.stringify(observation, null, 2), { flush: true });
+      // No source unlink is delegated. Actual main exit ends this observation boundary.
+      await new Promise(() => {});
+    };
+  }, { origins, outputs, ledgerFile, captureId: capture.id, vault: path.join(root, 'vault'), observerFile });
+  await page.getByLabel('Capture deletion preview').getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(async () => {
+    try { return JSON.parse(await fs.readFile(observerFile, 'utf8')).boundary; }
+    catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return ''; throw error; }
+  }).toBe('before-native-unlink');
+  const observation = JSON.parse(await fs.readFile(observerFile, 'utf8')), authority = observation.ledger.sourceAuthority[capture.id], paused = await observe(base);
+  await save(testInfo, 'mixed-before-native-unlink-vault.json', { observation, observed: paused, originalOrigins });
+  expect(observation.mainPid).toBe(await app.evaluate(() => process.pid)); expect(origins).toContain(observation.requestedSource);
+  expect(observation.nativeUnlinkDelegated).toBe(false); expect(observation.nativeUnlinkReturned).toBe(false);
+  expect(authority.phase).toBe('deleting'); expect(authority.preservedWriting).toHaveLength(2);
+  expect(observation.stages).toEqual([null, null]);
+  expect(authority.preservedWriting.map(plan => plan.file).sort()).toEqual([...reviewedPaths].sort());
+  for (const plan of authority.preservedWriting) {
+    const output = observation.outputs.find(value => value.path === path.join(root, 'vault', plan.file));
+    expect(plan.publication).toEqual(plan.stageIdentity); expect(plan.publication).toBeDefined();
+    expect(plan.publicationOperationId).toBe(authority.operationId);
+    expect(output.ordinary).toBe(true); expect(output.nlink).toBe('1');
+    for (const field of ['sha256', 'dev', 'ino', 'bytes']) expect(output[field]).toBe(plan.publication[field]);
+  }
+  expect(observation.origins).toHaveLength(5);
+  for (const [index, value] of observation.origins.entries()) {
+    const before = originalOrigins[portable(path.relative(base, origins[index]))];
+    expect(value.ordinary).toBe(true); expect(value.nlink).toBe('1');
+    for (const field of ['sha256', 'dev', 'ino', 'bytes']) expect(value[field]).toBe(before[field]);
+  }
+  const removedOutput = path.join(base, 'Annotations', intent.annotationId + '.md'), removedRelative = portable(path.relative(base, removedOutput));
+  const otherOutput = outputs.find(file => file !== removedOutput), otherRelative = portable(path.relative(base, otherOutput));
+  expect(outputs).toContain(removedOutput); expect(await fs.readFile(removedOutput)).toEqual(Buffer.from(intent.annotation));
+  const lockPath = origins.find(file => portable(path.relative(base, file)).startsWith('Captures/')) + '.lock', lockRelative = portable(path.relative(base, lockPath));
+  const ownedLock = paused[lockRelative]; expect(ownedLock.ordinary).toBe(true); expect(ownedLock.nlink).toBe('1');
+  expect(JSON.parse(text(ownedLock))).toEqual({ pid: observation.mainPid });
+  const child = app.process(), mainPid = observation.mainPid;
+  const proof = { boundary: 'before-native-unlink', requestedSource: observation.requestedSource, mainPid, wrapperPid: child.pid, nativeUnlinkDelegated: false, nativeUnlinkReturned: false, action: 'Electron app.exit(77)', ownedLock: { file: lockPath, observation: ownedLock } };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  proof.wrapperExit = await exited; await abrupt; await save(testInfo, 'mixed-before-native-unlink-main-exit.json', proof);
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  proof.mainObservedExited = true; await save(testInfo, 'mixed-before-native-unlink-main-exit.json', proof); app = null;
+  const exitedVault = await observe(base);
+  await save(testInfo, 'mixed-before-output-removal.json', { observed: exitedVault, authority, controlledRemoval: removedOutput });
+  expect(exitedVault).toEqual(paused);
+  // The only controlled offline change is removal of the already receipted X output.
+  await fs.unlink(removedOutput);
+  const offline = await observe(base), expectedOffline = { ...exitedVault }; delete expectedOffline[removedRelative];
+  await save(testInfo, 'mixed-offline-output-removal.json', { observed: offline, removedOutput, removedIdentity: exitedVault[removedRelative], survivingOutput: otherOutput, controlledSourceOmissions: [] });
+  expect(offline).toEqual(expectedOffline);
+  await launch();
+  await save(testInfo, 'mixed-missing-output-startup-observations.json', { observed: await observe(base), status: await page.getByRole('status').textContent(), authority });
+  await expect(page.getByRole('status')).toContainText('publication is verify only');
+  const restarted = await observe(base), restartedLedger = JSON.parse(text(restarted['.intake/ledger.json']));
+  await save(testInfo, 'mixed-missing-output-held.json', { observed: restarted, restartedLedger, status: await page.getByRole('status').textContent() });
+  // Only this exact lock may be cleaned after its recorded owner exited; all other paths stay exact.
+  const compareHeld = value => {
+    const expected = { ...offline }, actual = { ...value };
+    if (actual[lockRelative]) expect(actual[lockRelative]).toEqual(ownedLock);
+    else delete expected[lockRelative];
+    expect(actual).toEqual(expected);
+  };
+  compareHeld(restarted);
+  expect(restartedLedger.sourceAuthority[capture.id]).toEqual(authority);
+  expect(await exists(removedOutput)).toBe(false); expect(restarted[otherRelative]).toEqual(paused[otherRelative]);
+  for (const file of origins) expect(restarted[portable(path.relative(base, file))]).toEqual(originalOrigins[portable(path.relative(base, file))]);
+  expect(restartedLedger.attempts).toEqual(fixture.acceptedLedger.attempts); expect(restartedLedger.admissions).toEqual(fixture.acceptedLedger.admissions);
+  expect(restartedLedger.suppressed).toContain(sourceHash); expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+  await page.getByRole('button', { name: 'Review capture deletion recovery', exact: true }).click();
+  const recovery = page.getByLabel('Capture deletion recovery'); await expect(recovery).toBeVisible();
+  await expect(recovery).toContainText(intent.annotationId); await expect(recovery).toContainText(portable(path.relative(path.join(root, 'vault'), removedOutput)));
+  await expect(recovery).toContainText('publication is verify only');
+  const resume = recovery.getByRole('button', { name: 'Resume confirmed capture deletion', exact: true }); await expect(resume).toBeEnabled();
+  await resume.click(); await expect(page.getByRole('status')).toContainText('publication is verify only');
+  const retried = await observe(base), retriedLedger = JSON.parse(text(retried['.intake/ledger.json']));
+  await save(testInfo, 'mixed-missing-output-resume-held.json', { observed: retried, retriedLedger, status: await page.getByRole('status').textContent(), recovery: await recovery.textContent() });
+  compareHeld(retried); expect(retriedLedger.sourceAuthority[capture.id]).toEqual(authority); expect(await exists(removedOutput)).toBe(false);
+  expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+});

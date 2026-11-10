@@ -84,8 +84,27 @@ npx playwright test tests/mixed-retention-deletion.spec.js --grep "actual annota
 
 The pre-first-source-unlink missing-receipted-output and completed annotation-removal/restoration lifecycle guards are not authored yet. Their read-only plan remains in Temp `companion-mixed13-remaining-guards-plan.md`.
 
+## Missing receipted output before first source unlink
+
+Root measured the corrected stage-2 guard passing 31637ms with no skips, committed as `4a218271ca794a4a22c279a4a9036ab109029df7`. Its first attempt stopped at an unsupported exact restoration-field label. Root changed only that fixture locator to the existing tested combobox role/prefix. Product source, assertions and timeouts stayed unchanged. The passing run measures actual restored G, durable stage identity before real linking, the actual two-link pair with all five origins intact, main exit, normal restart recovery of the same inode, original G distinct from deleting H, complete purge and immutable acceptance/admission/producer facts.
+
+New test-only guard: `mixed retention holds a missing receipted output before first native source unlink without republication`. It uses the existing legacy real-writer fixture, byte-exact preview Cancel, and fresh visible public review. The native main-process `fs.promises.unlink` wrapper matches only the five actual source paths disclosed in that review. At its first matching invocation it records the requested path, actual main PID, all five ordinary single-link origins, both actual outputs and both durable stage/publication receipts, and absent stages. It pauses without delegating the native source unlink. The boundary is explicitly `before-native-unlink`; it is not evidence of an actual source unlink.
+
+The test saves the native and full-vault observations before feature assertions, records actual main/wrapper exit and main PID disappearance, then removes only the already receipted original X annotation offline. All five source origins, including repair X, remain. The offline inventory must equal the exited inventory minus that one exact path. On normal restart, startup and public recovery must name X/path with the verify-only reason. Explicit Resume must hold again. The same operation, receipts, source identities, other output, ledger and producer bytes must remain; X must stay absent and no origin may be removed or reconstructed.
+
+Full-tree comparisons allow only cleanup of the exact current-note lock captured with the exited main PID. If that lock survives, its bytes and physical identity must match. No broad lock or directory exclusion is used. No product source or preceding test body changed. Syntax check passed; root runtime verification remains pending.
+
+```powershell
+npx playwright test tests/mixed-retention-deletion.spec.js --grep "missing receipted output" --workers=1 --reporter=list
+```
+
+The completed annotation-removal/restoration lifecycle and inherited-owner corruption guards remain planned and unauthored.
+
 
 Root first stage2/restored-G attempt failed43338ms/exit1 before restoration/held mixed setup: exact getByLabel for artifact kind did not match the actual wrapping select label, whose accessible name includes option text. Existing successful reviewed-restoration test uses role combobox with Selected producer artifact kind prefix. Root uses that same observed locator; no source/assertion/timeout/retry change. No restoredG/native link/crash proof was reached or claimed. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-20261110 retained separately as fixture failure; correctedstage2 runtime pending.
 
 
 Root corrected stage2 actualrestoredG/link-before-receipt crash GREEN31637ms, exit0/no skips, stagedtree1d11bdc3bff446911dd4438df91155f479ceae95/product4d5f296 unchanged. Actualseeddelete/explicitreviewrestore producedfreshG, nativeBEFORElink recordprovedstageIdentitydurable andreceiptabsent; ORIGINALfirstannotationlink createdactualstage/outputtwo-linkpair whileall5originsintact, thenactualmain/wrapperexit occurred before receipt. Normalrestartcompletedbothreceipts/purgedall5, boundrecoveredreceipt toSAME observedlinked inode andoriginalG!=deletingH, preservedhistory/admissions/producerfacts and suppression/no replay. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-v2-20261110. First43.3s dropdownlocatorfailure remainsfixtureonly/noGorcrashclaim. This newtest/helperoptionalrestoredGbranch leaves originalhappy/collision bodies unchanged. Missingreceiptedoutput verify-only HOLD, completedannotationremoval/restore/lifecycleowner, sourcecomposition/finalreviews remain.
+
+
+Root missing-receipted-output guard PASS23429ms, exit0/no skips, stagedtreefa4b9fe7eb34a4fc8d80ba92a0b6f74a71ea741b/product4a21827 unchanged. BEFOREfirstnativeSOURCEunlink observer recorded BOTHdurablereceipts/exactoutputs/no stages/all5origins; it did NOTdelegate sourceunlink. Actualmain/wrapperexit thencontrolledoffline removalONLYX whileall5origins(inclrepairX) remained. Startup/publicrecovery/explicitResume heldSAMEoperation/receipts/fullsource5/producers/otherYoutput withXabsent,norepub/noreconstruction/nooriginunlink. Exactownedcurrentlockwasboundtoexitedmain andonlylegitimatecleanupaccounted, no broadsnapshotfilter. Evidence Temp/companion-ticket13-mixed-retention-missing-output-20261110. This measuresverify-onlyevenwhenpayloadoriginsremain; notanactualsourceunlinkcrashcase (stage2measuresactualannotationlink). Completedannotationremoval/restoration/inheritedowner andstrictproof-schema/formatcomposition/finalreviews remain.
