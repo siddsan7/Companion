@@ -23,6 +23,60 @@ async function launch(configure = true) {
 }
 async function capture(text) { await page.getByLabel('Thought or link', { exact: true }).fill(text); await page.getByRole('button', { name: 'Save capture', exact: true }).click(); await expect(page.getByLabel('Thought or link', { exact: true })).toHaveValue(''); await expect(page.getByRole('status')).toContainText('Capture saved.'); }
 async function search(question) { await page.getByLabel('Context question', { exact: true }).fill(question); await page.getByRole('button', { name: 'Find context', exact: true }).click(); }
+test('a pending Find retires earlier context choices until current capture text is ready for explicit selection', async () => {
+  await launch(); await capture('FINDCOMPLETION earlier capture text.');
+  await search('FINDCOMPLETION');
+  const results = page.locator('#context-results');
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await expect(results.getByRole('button', { name: 'Add to context', exact: true })).toBeEnabled();
+  await expect(manual.locator('option')).toHaveText(['FINDCOMPLETION earlier capture text.']);
+  await expect(page.getByRole('button', { name: 'Add manual source', exact: true })).toBeEnabled();
+  const captures = path.join(root, 'vault', 'Companion', 'Captures');
+  const file = path.join(captures, (await fs.readdir(captures)).find(name => name.endsWith('.md')));
+  await fs.appendFile(file, '\nFINDCOMPLETION newly inspected capture text.\n');
+
+  // Hold delivery only after actual discovery has read the changed file.
+  // Preserve the real handler's result/error and call it once per invocation.
+  await app.evaluate(({ ipcMain }) => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Delayed Find requires the disposable fixture.');
+    const original = ipcMain._invokeHandlers.get('context-find');
+    if (!original) throw Error('Context Find handler is unavailable.');
+    const gate = globalThis.__contextFindDelivery = { original, held: false, calls: 0 };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('context-find', async function (...args) {
+      gate.calls++;
+      const result = await Reflect.apply(original, this, args);
+      gate.held = true;
+      await delivery;
+      return result;
+    });
+  });
+  try {
+    await page.getByRole('button', { name: 'Find context', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__contextFindDelivery.held)).toBe(true);
+    await expect(page.locator('#context-results button:enabled, #context-add-manual:enabled')).toHaveCount(0);
+    await expect(manual).toBeDisabled();
+    const discovery = page.getByRole('region', { name: 'Context discovery', exact: true });
+    await expect(discovery.getByText('Finding context…', { exact: true })).toBeVisible();
+    await expect(page.locator('#context-selected article')).toHaveCount(0);
+    await app.evaluate(() => globalThis.__contextFindDelivery.release());
+    await expect(discovery.getByText('Context search complete.', { exact: true })).toBeVisible();
+    await expect(results).toContainText('FINDCOMPLETION newly inspected capture text.');
+    await expect(manual).toBeEnabled();
+    await results.getByRole('button', { name: 'Add to context', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(/FINDCOMPLETION newly inspected capture text\./);
+    await expect(page.locator('#context-error')).toHaveText('');
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__contextFindDelivery;
+      ipcMain._invokeHandlers.set('context-find', gate.original);
+      gate.release();
+      delete globalThis.__contextFindDelivery;
+    });
+  }
+});
+
 test('local exact matches show reasons and manual selection previews the literal question and source provenance', async () => {
   await launch(); await capture('Spaced retrieval can revisit a learned chord.');
   await search('How can retrieval help MyTune?');
