@@ -665,11 +665,12 @@ test('completed reviewed Make current deletion inventories actual selection copi
   await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Source connected');
   let checks = 0;
-  const check = async () => {
+  const check = async (expectedStatus = 'complete') => {
     const instant = new Date(Date.parse('2026-11-08T06:59:00Z') + ++checks * 1000).toISOString();
     await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
     await page.getByRole('button', { name: 'Check now', exact: true }).click();
-    await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · complete`);
+    await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · ${expectedStatus}`);
+    return instant;
   };
   await check();
   const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
@@ -725,7 +726,16 @@ test('completed reviewed Make current deletion inventories actual selection copi
   expect(deleted.attempts).toEqual(retained.attempts); expect(deleted.admissions).toEqual(retained.admissions);
   expect(deleted.captures[sourceHash].selectionHistory).toEqual(selectedCapture.selectionHistory);
   for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
-  expect(await files(producer)).toEqual(producerBytes); await check();
+  expect(await files(producer)).toEqual(producerBytes);
+  const suppressedAt = await check('held'), checked = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(checked.lastCheck).toEqual({ at: suppressedAt, trigger: 'manual', status: 'held' });
+  const outcomes = Object.values(checked.outcomes);
+  expect(outcomes).toHaveLength(2);
+  expect(outcomes.map(item => item.locator).sort()).toEqual([path.join(producer, 'accept'), path.join(producer, 'edit')].sort());
+  for (const outcome of outcomes) {
+    expect(outcome.status).toBe('held'); expect(outcome.checkedAt).toBe(suppressedAt);
+    expect(outcome.reason).toBe('Automatic re-import is suppressed. Restore this source explicitly before intake.');
+  }
   await app.close(); app = null; await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
   await expect(page.locator('#captures article')).toHaveCount(0);
   const restarted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
