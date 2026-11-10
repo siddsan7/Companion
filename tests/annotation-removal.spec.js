@@ -240,6 +240,10 @@ test('selected annotation removal accepts an actual native Windows relationship 
   expect(hold.journal).toBe(`link-${intent.id}.json`);
   expect(await fs.readFile(journal, 'utf8')).toBe(intentBytes);
   expect(await fs.readFile(selected)).toEqual(selectedBytes);
+  const retryControl = page.getByLabel('Vault repairs').getByRole('button', { name: 'Retry annotation relationship', exact: true });
+  await expect(retryControl).toHaveCount(1);
+  const staleRetry = await retryControl.elementHandle();
+  expect(await staleRetry.evaluate(button => button.isConnected)).toBe(true);
   const retainedName = (await fs.readdir(annotationFolder)).find(name => name.endsWith('.md') && path.join(annotationFolder, name) !== selected);
   const retained = path.join(annotationFolder, retainedName), retainedBytes = await fs.readFile(retained);
   const movedBytes = await fs.readFile(moved), revisions = await files(path.join(base, 'Revisions')), producer = await files(path.join(root, 'producer'));
@@ -267,6 +271,19 @@ test('selected annotation removal accepts an actual native Windows relationship 
   expect(await files(path.join(base, 'Revisions'))).toEqual(revisions);
   expect(await files(path.join(root, 'producer'))).toEqual(producer);
   expect(await files(path.join(root, 'conversations')).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toEqual(history);
+  // Removal refreshes only its own review, so the original real repair control
+  // and its captured UUID/token remain available as a stale UI operation.
+  expect(await staleRetry.evaluate(button => button.isConnected)).toBe(true);
+  const postRemovalLedger = await fs.readFile(ledgerFile), postRemovalFiles = await files(path.join(root, 'vault'));
+  expect(removed.annotationRemovals[selectedId].phase).toBe('removed');
+  await staleRetry.click();
+  await expect(page.getByRole('status')).toContainText('annotation identity was removed');
+  expect(await fs.readFile(ledgerFile)).toEqual(postRemovalLedger);
+  expect(await files(path.join(root, 'vault'))).toEqual(postRemovalFiles);
+  for (const file of [selected, journal, activeIntent, path.join(intake, 'annotation-' + selectedId + '.stage')]) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).annotationRemovals[selectedId]).toEqual(removed.annotationRemovals[selectedId]);
+  expect(await fs.readFile(retained)).toEqual(retainedBytes); expect(await fs.readFile(moved)).toEqual(movedBytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(producer);
   await closeApp('native-hold-restart'); app = null; await launch();
   for (const file of [selected, journal]) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   expect(await fs.readFile(retained)).toEqual(retainedBytes); expect(await fs.readFile(moved)).toEqual(movedBytes);
