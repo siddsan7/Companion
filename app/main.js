@@ -97,7 +97,12 @@ app.whenReady().then(async () => {
   installBriefs({ ipcMain, dialog, fs, path, testRoot, getVault: () => vault, clock });
   const evidence = new ConversationEvidence({ setup: codex, getVault: () => vault, settingsPath, testRoot });
   const getEvidence = () => evidence.read();
-  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData'), getEvidence });
+  let ideas;
+  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData'), getEvidence, ideaEligibility: (selected, id) => {
+    if (!ideas || ideas.getVault()?.root !== selected.root) throw Error('Selected vault changed. Inspect saved idea context again.');
+    ideas.guard(selected);
+    if (id) ideas.removal.allow(selected, id);
+  } });
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
   const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
@@ -107,7 +112,7 @@ app.whenReady().then(async () => {
     return selection.canceled ? null : selection.filePath;
   } });
   installArchives({ ipcMain, history: conversations, settingsPath, dialog, testRoot, clock, checkpoint, appVersion: app.getVersion(), invalidateContextApprovals: context.clearApprovals, getSchedule: () => new Schedule(path.join(conversations.dataRoot, 'schedule.json'), vault, scheduleOptions()) });
-  installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
+  ideas = installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
   installComparisons({ ipcMain, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, getEvidence });

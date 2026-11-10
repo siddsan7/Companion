@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const YAML = require('yaml');
 const { Intake } = require('./intake');
@@ -9,6 +10,21 @@ const { revisionAdmission } = require('./source-authority');
 const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance } = require('./source-generations');
 const digest = text => createHash('sha256').update(text).digest('hex');
 const body = content => content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '').trim();
+// Direct Context callers still honor durable removal. The desktop supplies the
+// Ideas store's stronger guard, including its observed directory identity.
+function rawIdeaEligibility(vault, id) {
+  const directory = path.join(vault.root, '.ideas');
+  try {
+    const stat = local.lstatSync(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || local.realpathSync(directory) !== directory) throw Error('Saved idea authority requires an ordinary contained .ideas folder.');
+  } catch (error) { if (error.code === 'ENOENT') return; throw error; }
+  if (!id) return;
+  for (const suffix of ['removed.json', 'removed.json.pending']) {
+    try { local.lstatSync(path.join(directory, `${id}.${suffix}`)); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    throw Error('Saved idea selected for removal is unavailable as context.');
+  }
+}
 // Provisional #11 adapter: unsupported attribution is excluded, never guessed.
 async function validateDependencies(dependencies, resolve) {
   if (!Array.isArray(dependencies)) throw Error('source dependency attribution is unavailable');
@@ -33,7 +49,7 @@ function passages(text, terms) {
   return found.sort((a, b) => b.matched.length - a.matched.length || a.start - b.start);
 }
 class Context {
-  constructor(vault, { scopeFile, dependencyValidator = validateDependencies, verifiedInputBound = null, capacityBinding = null, approvals = new Map() } = {}) { this.vault = vault; this.scopeFile = scopeFile; this.dependencyValidator = dependencyValidator; this.verifiedInputBound = verifiedInputBound; this.capacityBinding = capacityBinding; this.approvals = approvals; }
+  constructor(vault, { scopeFile, dependencyValidator = validateDependencies, verifiedInputBound = null, capacityBinding = null, approvals = new Map(), ideaEligibility = rawIdeaEligibility } = {}) { this.vault = vault; this.scopeFile = scopeFile; this.dependencyValidator = dependencyValidator; this.verifiedInputBound = verifiedInputBound; this.capacityBinding = capacityBinding; this.approvals = approvals; this.ideaEligibility = ideaEligibility; }
   async scope() {
     try { const scope = JSON.parse(await fs.readFile(this.scopeFile, 'utf8')); if (scope.schema !== 1 || !Array.isArray(scope.files) || scope.files.some(file => typeof file !== 'string')) throw Error('Invalid explicit note scope. Preserve settings for repair.'); return scope.files; }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
@@ -158,6 +174,7 @@ class Context {
         approvedVersions.add(version);
       } catch (error) { issues.push(`Approved brief version ${version} unavailable: ${error.message}`); }
     }
+    this.ideaEligibility(this.vault);
     const ideaDir = path.join(this.vault.root, 'Ideas'); await this.vault.contained(ideaDir);
     for (const entry of await fs.readdir(ideaDir, { withFileTypes: true })) if (entry.isFile() && entry.name.endsWith('.md')) {
       try {
@@ -165,6 +182,7 @@ class Context {
         if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('unsupported saved-idea file');
         const content = await fs.readFile(file, 'utf8'), match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/), metadata = match && YAML.parse(match[1]);
         if (metadata?.artifact_type !== 'saved_idea' || metadata.schema_version !== 1 || !/^[a-f0-9-]{36}$/.test(metadata.companion_id)) throw Error('unsupported saved-idea record');
+        this.ideaEligibility(this.vault, metadata.companion_id);
         if (metadata.support_attribution_unavailable === true) throw Error('additional source dependency attribution is unavailable');
         const associatedIds = await this.dependencyValidator(metadata.source_dependencies, async dependency => {
           const source = eligible.get(dependency.capture_id); if (!source) return false;
@@ -193,9 +211,15 @@ class Context {
       const key = `note:${digest(file)}`; included.push({ key, file });
       try { all.push(await this.note(file)); } catch (error) { issues.push(`Unavailable explicit note ${path.basename(file)}: ${error.message}`); }
     }
-    const keys = all.map(source => source.key), duplicates = new Set(keys.filter((key, i) => keys.indexOf(key) !== i));
+    this.ideaEligibility(this.vault);
+    const available = all.filter(source => {
+      if (!source.key.startsWith('idea:')) return true;
+      try { this.ideaEligibility(this.vault, source.key.slice(5)); return true; }
+      catch (error) { issues.push(`Saved idea unavailable: ${source.title}; ${error.message}`); return false; }
+    });
+    const keys = available.map(source => source.key), duplicates = new Set(keys.filter((key, i) => keys.indexOf(key) !== i));
     for (const key of duplicates) issues.push(`Evidence unavailable: duplicate source identity ${key}.`);
-    return { all: all.filter(source => !duplicates.has(source.key)).map(source => ({ ...source, text: source.text.replace(/\r\n?/g, '\n') })), issues, included };
+    return { all: available.filter(source => !duplicates.has(source.key)).map(source => ({ ...source, text: source.text.replace(/\r\n?/g, '\n') })), issues, included };
   }
   async discover({ question }) {
     const state = await this.corpus(), terms = [...new Set(question.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [])];
@@ -255,7 +279,7 @@ class Context {
     return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), sources: chosen, capacityBinding: this.capacityBinding, boundEvidence: bound ? `${bound.model}: ${bound.evidence}${bound.harnessAndOutputEvidence ? `; ${bound.harnessAndOutputEvidence}` : ''}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
   }
 }
-function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvidence, getVerifiedInputBound = async () => null }) {
+function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvidence, getVerifiedInputBound = async () => null, ideaEligibility = rawIdeaEligibility }) {
   let chain = Promise.resolve(); const approvals = new Map();
   const serial = work => { const next = chain.then(work); chain = next.catch(() => {}); return next; };
   const store = async () => {
@@ -264,7 +288,7 @@ function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvid
     let verifiedInputBound = evidence ? evidence.capacity : await getVerifiedInputBound();
     // Controlled OS/provider-boundary evidence only; never accepted from renderer input.
     if (testRoot && !getEvidence) try { verifiedInputBound = JSON.parse(await fs.readFile(path.join(testRoot, 'context-bound.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    return new Context(vault, { scopeFile: path.join(dataRoot, `context-settings-${digest(vault.root)}`, 'notes.json'), verifiedInputBound, capacityBinding: evidence?.binding || null, approvals });
+    return new Context(vault, { scopeFile: path.join(dataRoot, `context-settings-${digest(vault.root)}`, 'notes.json'), verifiedInputBound, capacityBinding: evidence?.binding || null, approvals, ideaEligibility });
   };
   ipcMain.handle('context-find', async (_, input) => (await store()).discover(input));
   ipcMain.handle('context-passage', async (_, input) => (await store()).approvePassage(input));

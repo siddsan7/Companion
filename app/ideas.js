@@ -6,6 +6,7 @@ const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
+const { IdeasRemoval } = require('./ideas-removal');
 const { generations, sameEvidence, sameGenerations } = require('./source-generations');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -18,7 +19,8 @@ function metadata(text) {
 class Ideas {
   constructor({ getVault, conversations, clock, open, checkpoint }) {
     Object.assign(this, { getVault, conversations, clock, open, checkpoint });
-    this.previews = new Map(); this.roots = new Map(); this.references = new Map();
+    this.previews = new Map(); this.roots = new Map(); this.references = new Map(); this.stores = new Map();
+    this.removal = new IdeasRemoval(this);
   }
   guard(vault, expected, create = false) {
     const root = path.resolve(vault.vault);
@@ -37,9 +39,14 @@ class Ideas {
     }
     for (const area of ['Ideas', '.ideas']) {
       const directory = path.join(vault.root, area);
+      const observed = area === '.ideas' && this.stores.get(directory);
+      if (observed && !local.existsSync(directory)) reject();
       if (create && area === '.ideas') { try { local.mkdirSync(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } }
       if (area === '.ideas' && !create && !local.existsSync(directory)) continue;
-      identities.set(directory, check(directory, expected?.get(directory)));
+      const stat = check(directory, expected?.get(directory));
+      if (observed && !same(observed, stat)) reject();
+      if (area === '.ideas') this.stores.set(directory, stat);
+      identities.set(directory, stat);
     }
     for (const [file, identity] of expected || []) check(file, identity);
     return identities;
@@ -84,7 +91,7 @@ class Ideas {
         const file = path.join(vault.root, 'Ideas', name); if (held.has(file)) continue;
         const { text } = await this.readFile(vault, file, parents);
         const data = metadata(text);
-        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0, supportMetadata: data });
+        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id) && !this.removal.fenced(vault, data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0, supportMetadata: data });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
@@ -236,6 +243,7 @@ class Ideas {
   }
   async preview(input, identity) {
     const { vault, record, request } = await this.origin(input);
+    if (identity) this.removal.allow(vault, identity.id);
     const citations = await this.selectedReferences(input, { vault, record, request });
     for (const field of ['title', 'explanation', 'limitations']) if (typeof input[field] !== 'string' || !input[field].trim()) throw Error(`Enter the idea ${field} before previewing.`);
     if (/[\r\n]/.test(input.title)) throw Error('Use a title on one line.');
@@ -252,9 +260,9 @@ class Ideas {
     // An unchanged proposal keeps the same immutable identity and creation instant
     // when the user cancels and reviews it again. Confirmation never regenerates it.
     const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, scope: record.scope, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment, citations, supportState: support.state }));
-    const retained = !identity && [...this.previews.values()].find(preview => preview.proposalKey === proposalKey);
+    const retained = !identity && [...this.previews.values()].find(preview => preview.proposalKey === proposalKey && !this.removal.fenced(vault, preview.id));
     if (retained) {
-      this.guard(vault);
+      this.removal.allow(vault, retained.id);
       return { operation: retained.operation, text: retained.text, destination: retained.destination, warnings: [...retained.warnings] };
     }
     const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => {
@@ -263,6 +271,7 @@ class Ideas {
     });
     const unsupported = support.unavailable || request.status !== 'completed' || request.package.dependencies.some(dep => !dep.key.startsWith('capture:') && !dep.key.startsWith('brief:'));
     const id = identity?.id || randomUUID(), operation = identity?.operation || randomUUID();
+    this.removal.allow(vault, id);
     const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: identity?.createdAt || this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations, origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
     const disclosure = citations.length ? 'Supporting references were explicitly selected and checked against exact admitted revisions and the original full source in the retained package. The original package had no structured passage offsets. These references do not establish sentence-level support for the explanation. Claims are not independently verified.' : 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
     const experimentText = kind === 'experiment_proposal' ? `\n# Experiment Proposal\n\n${Object.entries(experimentLabels).map(([key, label]) => `## ${label}\n\n${experiment[key]}`).join('\n\n')}\n` : '';
@@ -278,12 +287,13 @@ class Ideas {
     this.previews.set(operation, preview);
     return { operation, text, destination, warnings: [...preview.warnings] };
   }
-  async intent(operation) {
+  async intent(operation, inspectRemoved = false) {
     if (!uuid(operation)) throw Error('Proposed idea identity is invalid.');
     const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
     const parents = this.guard(vault), file = path.join(vault.root, '.ideas', `${operation}.intent.json`);
     const value = JSON.parse((await this.readFile(vault, file, parents)).text), fields = typeof value.text === 'string' && metadata(value.text);
     if (value.schema !== 1 || value.operation !== operation || !uuid(value.id) || value.vault !== vault.root || typeof value.destination !== 'string' || path.dirname(value.destination) !== path.join(vault.root, 'Ideas') || !path.basename(value.destination).endsWith(`--${value.id}.md`) || hash(value.text) !== value.digest || fields?.artifact_type !== 'saved_idea' || fields.schema_version !== 1 || fields.companion_id !== value.id || !value.input || value.input.conversationId !== fields.origin?.conversation_id || value.input.requestId !== fields.origin?.request_id || typeof fields.created_at !== 'string' || !Number.isFinite(Date.parse(fields.created_at))) throw Error('Retained idea journal is invalid. Preserve it for repair; nothing was published.');
+    if (!inspectRemoved) this.removal.allow(vault, value.id);
     return { value, fields, vault, parents };
   }
   async pending() {
@@ -293,14 +303,15 @@ class Ideas {
     const proposals = [];
     for (const name of await fs.readdir(directory)) {
       const match = name.match(/^([a-f0-9-]{36})\.intent\.json$/); if (!match) continue;
-      const { value, fields } = await this.intent(match[1]);
+      const { value, fields } = await this.intent(match[1], true);
+      if (this.removal.fenced(vault, value.id)) continue;
       let receipt;
       try { receipt = JSON.parse((await this.readFile(vault, path.join(directory, `${value.operation}.published.json`), parents)).text); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (receipt) this.checkReceipt(receipt, value);
       const hasPublication = await this.knownPublication(value, vault, parents, receipt);
       if (receipt && !hasPublication) continue;
-      proposals.push({ operation: value.operation, title: fields.title, destination: value.destination, hasPublication, cleanup: !!receipt });
+      proposals.push({ id: value.id, operation: value.operation, title: fields.title, destination: value.destination, hasPublication, cleanup: !!receipt });
     }
     return proposals;
   }
@@ -344,6 +355,7 @@ class Ideas {
     return true;
   }
   async acknowledgePublication(value, vault, parents, exclusive) {
+    this.removal.allow(vault, value.id);
     const directory = path.join(vault.root, '.ideas'), stage = path.join(directory, `${value.operation}.md.pending`);
     const intent = path.join(directory, `${value.operation}.intent.json`), receipt = path.join(directory, `${value.operation}.published.json`);
     // This operation acknowledges bytes already published. It neither links a new
@@ -353,11 +365,12 @@ class Ideas {
     const record = { schema: 1, operation: value.operation, id: value.id, digest: value.digest, dev: published.stat.dev.toString(), ino: published.stat.ino.toString() };
     await exclusive(receipt, JSON.stringify(record));
     await this.checkpoint('idea-after-receipt');
+    this.removal.allow(vault, value.id);
     if ((await this.readFile(vault, intent, parents)).text !== JSON.stringify(value, null, 2) || !await this.knownPublication(value, vault, parents, record)) throw Error('Published idea ownership changed before cleanup. Existing writing was preserved.');
     this.guard(vault, parents);
     const staged = local.lstatSync(stage, { bigint: true }), destination = local.lstatSync(value.destination, { bigint: true });
     if (!staged.isFile() || staged.isSymbolicLink() || !destination.isFile() || destination.isSymbolicLink() || staged.nlink !== 2n || destination.nlink !== 2n || !same(staged, destination) || !same(destination, published.stat)) throw Error('Published idea peer identity changed. No stage was removed.');
-    local.unlinkSync(stage);
+    this.removal.allow(vault, value.id); local.unlinkSync(stage);
   }
   async confirm({ operation }) {
     const preview = this.previews.get(operation), vault = this.getVault();
@@ -365,8 +378,9 @@ class Ideas {
     const parents = this.guard(vault, undefined, true), directory = path.join(vault.root, '.ideas');
     return withBriefMutation(directory, async () => {
       this.guard(vault, parents);
+      this.removal.allow(vault, preview.id);
       const intent = path.join(directory, `${operation}.intent.json`), stage = path.join(directory, `${operation}.md.pending`), receipt = path.join(directory, `${operation}.published.json`);
-      const exclusive = async (file, text) => { this.guard(vault, parents); await fs.writeFile(file, text, { flag: 'wx', flush: true, encoding: 'utf8' }); this.guard(vault, parents); };
+      const exclusive = async (file, text) => { this.guard(vault, parents); this.removal.allow(vault, preview.id); await fs.writeFile(file, text, { flag: 'wx', flush: true, encoding: 'utf8' }); this.guard(vault, parents); this.removal.allow(vault, preview.id); };
       try { await exclusive(intent, JSON.stringify(preview, null, 2)); }
       catch (error) { if (error.code !== 'EEXIST') throw error; if ((await this.readFile(vault, intent, parents)).text !== JSON.stringify(preview, null, 2)) throw Error('Saved idea intent conflict. The proposal was preserved.'); }
       let prior;
@@ -382,7 +396,7 @@ class Ideas {
           current = await this.readFile(vault, preview.destination, parents, retainedStage ? 2 : 1);
           if (retainedStage) {
             if (!same(retainedStage.stat, current.stat) || current.text !== preview.text || current.stat.ino.toString() !== prior.ino || current.stat.dev.toString() !== prior.dev) throw Error('Completed publication peer changed.');
-            this.guard(vault, parents); await fs.unlink(stage);
+            this.guard(vault, parents); this.removal.allow(vault, preview.id); await fs.unlink(stage);
           }
         }
         catch { throw Error('The saved idea is unavailable or changed. The completed operation will not create another note.'); }
@@ -400,6 +414,7 @@ class Ideas {
       const staged = await this.readFile(vault, stage, parents, links);
       if (staged.text !== preview.text) throw Error('Saved idea stage conflict. The proposal was preserved.');
       await this.checkpoint('idea-before-publication');
+      this.removal.allow(vault, preview.id);
       const currentPreview = await this.preview(preview.input, { ...preview, createdAt: metadata(preview.text).created_at });
       if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
       const freshLinks = local.lstatSync(stage).nlink;
@@ -414,10 +429,12 @@ class Ideas {
       try { finalDestination = local.lstatSync(preview.destination, { bigint: true }); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (!finalStage.isFile() || finalStage.isSymbolicLink() || !same(freshStage.stat, finalStage)) throw Error('Saved idea stage identity changed. No destination was created.');
+      this.removal.allow(vault, preview.id);
       if (finalStage.nlink === 1n && !finalDestination) local.linkSync(stage, preview.destination);
       else if (finalStage.nlink !== 2n || !finalDestination?.isFile() || finalDestination.isSymbolicLink() || finalDestination.nlink !== 2n || !same(finalStage, finalDestination)) throw Error('Saved idea stage has an unknown peer or the destination exists. Existing files were preserved; no destination peer was created.');
       this.guard(vault, parents);
       await this.checkpoint('idea-after-publication');
+      this.removal.allow(vault, preview.id);
       const published = await this.readFile(vault, preview.destination, parents, 2);
       if (!same(staged.stat, published.stat) || published.text !== preview.text) throw Error('Saved idea changed during publication. Preserve the proposal and inspect the note.');
       await this.acknowledgePublication(preview, vault, parents, exclusive);
@@ -455,6 +472,11 @@ function installIdeas({ ipcMain, ...options }) {
   ipcMain.handle('idea-evidence', (_, input) => store.inspectEvidence(input));
   ipcMain.handle('idea-pending', () => store.pending());
   ipcMain.handle('idea-resume', (_, input) => store.resume(input));
+  ipcMain.handle('idea-removal-preview', (_, input) => store.removal.preview(input));
+  ipcMain.handle('idea-removal-cancel', (_, input) => store.removal.cancel(input));
+  ipcMain.handle('idea-removal-confirm', (_, input) => store.removal.confirm(input));
+  ipcMain.handle('idea-removal-pending', () => store.removal.pending());
+  ipcMain.handle('idea-removal-resume', (_, input) => store.removal.resume(input));
   return store;
 }
 module.exports = { installIdeas };

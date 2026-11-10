@@ -22,11 +22,78 @@
   byId('idea-preview-button').before(references);
   const evidenceView = document.createElement('div'); evidenceView.id = 'idea-evidence'; section.append(evidenceView);
   const pendingView = document.createElement('div'); pendingView.id = 'pending-ideas'; section.append(pendingView);
+  const removalPreview = document.createElement('section'), removalFiles = document.createElement('div'), removalWarnings = document.createElement('p');
+  const removalHeading = document.createElement('h3'), removalConfirm = document.createElement('button'), removalCancel = document.createElement('button');
+  removalPreview.setAttribute('aria-label', 'Saved idea removal preview'); removalPreview.hidden = true;
+  removalConfirm.textContent = 'Confirm saved idea removal'; removalCancel.textContent = 'Cancel saved idea removal';
+  removalPreview.append(removalHeading, removalFiles, removalWarnings, removalConfirm, removalCancel); section.append(removalPreview);
+  const removalRecovery = document.createElement('div'); removalRecovery.id = 'idea-removal-recovery'; section.append(removalRecovery);
   const editorControls = document.createElement('fieldset');
   Object.assign(editorControls.style, { border: '0', padding: '0', margin: '0', minWidth: '0' });
   editorControls.append(...byId('idea-editor').childNodes); byId('idea-editor').append(editorControls);
   let origin = null, operation = null, epoch = 0, listEpoch = 0, vaultEpoch = 0, initialSupportPending = true;
   let editorLoad = null;
+  let removalOperation = null, removalEpoch = 0;
+  function closeRemoval() { removalEpoch++; removalOperation = null; removalPreview.hidden = true; }
+  function showRemoval(preview) {
+    removalOperation = preview.operation; removalHeading.textContent = `Remove saved idea ${preview.id}`;
+    removalFiles.replaceChildren();
+    for (const file of preview.files) {
+      const line = document.createElement('p'); line.textContent = `${file.kind}: ${file.path}`; removalFiles.append(line);
+      const writing = preview.writing.find(item => item.path === file.path && item.kind === file.kind);
+      if (writing) {
+        const body = document.createElement('pre'); body.textContent = writing.text;
+        Object.assign(body.style, { whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }); removalFiles.append(body);
+      }
+    }
+    removalWarnings.textContent = preview.warnings.join(' '); removalPreview.hidden = false;
+  }
+  async function previewRemoval(id) {
+    closeRemoval(); const attempt = removalEpoch, selectedVault = vaultEpoch;
+    try {
+      const preview = await window.companion['idea-removal-preview']({ id });
+      if (attempt === removalEpoch && selectedVault === vaultEpoch) showRemoval(preview);
+    } catch (error) { if (attempt === removalEpoch && selectedVault === vaultEpoch) byId('idea-status').textContent = error.message; }
+  }
+  removalCancel.onclick = async () => {
+    const approved = removalOperation; closeRemoval();
+    if (approved) try { await window.companion['idea-removal-cancel']({ operation: approved }); } catch (error) { byId('idea-status').textContent = error.message; }
+  };
+  removalConfirm.onclick = async () => {
+    const approved = removalOperation, current = removalEpoch, owner = vaultEpoch; if (!approved) return;
+    removalConfirm.disabled = true;
+    try {
+      await window.companion['idea-removal-confirm']({ operation: approved });
+      if (current !== removalEpoch || owner !== vaultEpoch) return;
+      closeRemoval(); byId('idea-status').textContent = 'Saved idea removal complete. The displayed managed copies were removed; originating conversations and other writing were retained.';
+      await list();
+    } catch (error) {
+      if (current === removalEpoch && owner === vaultEpoch) {
+        closeRemoval(); byId('idea-status').textContent = `Saved idea removal held. ${error.message}`; await list();
+      }
+    } finally { removalConfirm.disabled = false; }
+  };
+  async function listRemovals(current) {
+    const pending = await window.companion['idea-removal-pending'](); if (!current()) return;
+    removalRecovery.replaceChildren();
+    for (const removal of pending) {
+      const article = document.createElement('article'), heading = document.createElement('h3'), warning = document.createElement('p');
+      heading.textContent = `Confirmed saved idea removal ${removal.id}`; warning.textContent = removal.warnings.join(' '); article.append(heading, warning);
+      for (const file of removal.files) { const line = document.createElement('p'); line.textContent = `${file.kind}: ${file.path}`; article.append(line); }
+      if (!removal.held) {
+        const recover = document.createElement('button'); recover.textContent = 'Recover confirmed saved idea removal';
+        recover.onclick = async () => {
+          recover.disabled = true;
+          try {
+            await window.companion['idea-removal-resume']({ id: removal.id }); if (!current()) return;
+            byId('idea-status').textContent = 'Saved idea removal complete. Only the confirmed managed scope was removed.'; await list();
+          } catch (error) { if (current()) { byId('idea-status').textContent = `Saved idea removal held. ${error.message}`; await list(); } }
+          finally { recover.disabled = false; }
+        }; article.append(recover);
+      }
+      removalRecovery.append(article);
+    }
+  }
   const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
   function beginEditorLoad() {
     invalidate(); editorLoad = { epoch, vaultEpoch }; editorControls.disabled = true; editorControls.setAttribute('aria-busy', 'true'); return editorLoad;
@@ -60,6 +127,7 @@
     const current = () => request === listEpoch && owner === vaultEpoch && view === epoch;
     supportStatus.textContent = 'Checking current saved idea support…';
     try {
+      await listRemovals(current); if (!current()) return;
       const notes = await window.companion['idea-list'](); if (!current()) return;
       byId('saved-ideas').replaceChildren();
       for (const note of notes) {
@@ -67,6 +135,8 @@
         title.textContent = note.title; open.textContent = 'Open saved idea in Obsidian'; open.disabled = note.unavailable;
         open.onclick = async () => { try { await window.companion['idea-open'](note.id); } catch (error) { if (current()) byId('idea-status').textContent = error.message; } };
         article.append(title, open); byId('saved-ideas').append(article);
+        const remove = document.createElement('button'); remove.textContent = 'Preview saved idea removal'; remove.disabled = note.unavailable;
+        remove.onclick = () => previewRemoval(note.id); article.append(remove);
         if (note.reviewSupport) {
           const warning = document.createElement('p'); warning.textContent = `Review support. ${note.supportWarnings.join(' ')} Independent writing remains available; this inspection does not rewrite it.`; article.append(warning);
         }
@@ -105,7 +175,9 @@
           } catch (error) { if (ownsEditorLoad(owner)) byId('idea-status').textContent = error.message; }
           finally { finishEditorLoad(owner); }
         };
-        article.append(title, resume); pendingView.append(article);
+        const remove = document.createElement('button'); remove.textContent = 'Preview proposed idea removal';
+        remove.onclick = () => previewRemoval(proposal.id);
+        article.append(title, resume, remove); pendingView.append(article);
       }
       supportStatus.textContent = 'Current support inspected. Warnings do not change note ownership or independently verify claims.';
     } catch (error) {
@@ -146,7 +218,7 @@
     finally { byId('idea-confirm').disabled = false; }
   };
   refreshSupport.onclick = () => list();
-  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; invalidate(); editorLoad = null; editorControls.disabled = false; editorControls.removeAttribute('aria-busy'); initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
+  document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; invalidate(); closeRemoval(); removalRecovery.replaceChildren(); editorLoad = null; editorControls.disabled = false; editorControls.removeAttribute('aria-busy'); initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });
   function inspectInitialSupport(event) {
     if (configurationBusy || event?.detail && event.detail.configurationEpoch !== configurationEpoch) return;
     refreshSupport.disabled = false;
