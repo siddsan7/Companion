@@ -218,6 +218,7 @@ test('deleting persistent detached editor writing retains one whole local annota
   await expect(page.getByRole('status')).toContainText('Capture deleted');
   await expect(page.getByRole('status')).toContainText('supporting evidence is unavailable');
   async function verifyDeleted(name) {
+    await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
     const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
     const observed = await observe(testInfo, name, base, { ledger });
     expect(sourceLeaves(observed)).toEqual([]);
@@ -239,6 +240,7 @@ test('deleting persistent detached editor writing retains one whole local annota
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: checkedAt, timezone: 'America/Phoenix' }));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.locator('#intake-state')).toContainText(`Last check: ${checkedAt} · manual · held`);
+  await expect(page.getByRole('status')).toContainText('Intake check complete. Inspect held imports and source errors.');
   const checked = await verifyDeleted('suppressed-check');
   const outcomes = Object.values(checked.outcomes); expect(outcomes).toHaveLength(2);
   expect(outcomes.map(value => value.locator).sort()).toEqual(Object.values(held.outcomes).map(value => value.locator).sort());
