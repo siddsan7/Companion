@@ -42,3 +42,10 @@ This is one regression for the observed approval-before-preview workflow. It doe
 
 
 Actual passage baseline at stagedtreea5e45b278e64bda1aa7a402061ab168ee12a2ea0 FAILED1/0skip/exit1/7069ms. Real approval-delivery gate was reached; original5s Context Preview disabled assertion saw ENABLED atline393. Later Conversation Preview/selected package checks were not reached. Finally released/restored handler and cleanup completed. Raw Temp/companion-ticket13-context-passage-red-20261110; durable runner completed/copied. This is product RED with Find fix present; no passage implementation yet.
+
+
+## Passage implementation and bounded verification
+
+Module-local selectionAction disables both previews and guards their handler entry while actual passage/shortening approval is unresolved. Starting work invalidates existing package/send authority. Only the current context generation/view action may commit/error/finish; ordinary edit/remove/full-source/question/reset/Find/scope actions cancel that ownership. Shortening additionally retains the same selected source object and submitted editor text. Older completions do not resurrect sources or release newer pending work; backend validation, clocks/timers and original tests remain unchanged.
+
+At stagedtreeb2a5456dcd43cd61ced03390d18f89cf85931237, the UNCHANGED delayed-passage regression and original ranked-passage/oversized-shortening workflows ALLPASSED3/0skip/exit0/5170ms. New regression1.3s (baselineRED7069ms), originaloversized1.7s/ranked1.2s. Raw Temp/companion-ticket13-context-passage-green-three-20261110; durable runner completed/copied. Independent bounded source review APPROVED preserving this implementation, no blockers: Temp/companion-ticket13-context-passage-bounded-review-20261110.md. Additional late-response ownership regressions, separate repair/brief corrections, observer cleanup and complete gates remain pending; no complete runtime acceptance is implied.

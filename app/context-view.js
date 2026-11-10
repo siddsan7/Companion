@@ -125,8 +125,26 @@
     findFeedback.textContent = '';
   }
   retireFind();
-  const clearPreview = () => { generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
+  let selectionAction = null;
+  const selectionControls = () => {
+    byId('context-preview').disabled = selectionAction !== null;
+    byId('conversation-preview').disabled = selectionAction !== null;
+  };
+  const clearPreview = () => { selectionAction = null; selectionControls(); generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
   const run = async work => { try { byId('context-error').textContent = ''; await work(); } catch (error) { clearPreview(); byId('context-error').textContent = error.message; } };
+  async function selectPassage(work) {
+    clearPreview(); byId('context-error').textContent = '';
+    const action = selectionAction = { generation, epoch: viewEpoch };
+    const current = () => selectionAction === action && generation === action.generation && viewEpoch === action.epoch;
+    selectionControls(); byId('context-summary').textContent = 'Passage approval pending. Wait before previewing the package.';
+    try { await work(current); }
+    catch (error) {
+      if (!current()) return;
+      clearPreview(); byId('context-error').textContent = error.message;
+    } finally {
+      if (selectionAction === action) { selectionAction = null; selectionControls(); }
+    }
+  }
   const dependentOn = (item, key) => [item.associated, ...(item.associatedIds || [])].some(id => `capture:${id}` === key) || item.projectVersion !== undefined && `brief:${item.projectVersion}` === key;
   function revoke(item) { delete item.approval; delete item.approvedText; delete item.approvalLabel; }
   function add(source) {
@@ -144,8 +162,10 @@
       const proposal = () => { proposed.textContent = `${source.provenance}; ${source.approvalLabel || 'Explicitly shortened passage'}\n${editor.value}`; };
       proposal(); state.textContent = source.approval ? 'Shortening approved. Preview the complete package.' : 'Inspect the exact proposed outgoing selection, then approve it to use it in the package.';
       editor.oninput = () => { delete source.approval; delete source.approvedText; delete source.approvalLabel; state.textContent = 'Shortening needs explicit approval.'; proposal(); clearPreview(); };
-      approve.textContent = 'Approve shorter passage'; approve.onclick = () => run(async () => {
-        const approved = await window.companion['context-shorten']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, text: editor.value });
+      approve.textContent = 'Approve shorter passage'; approve.onclick = () => selectPassage(async current => {
+        const text = editor.value;
+        const approved = await window.companion['context-shorten']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, text });
+        if (!current() || !selections.includes(source) || editor.value !== text) return;
         source.approval = approved.approval; source.approvedText = approved.text; source.approvalLabel = 'Explicitly shortened passage'; state.textContent = 'Shortening approved. Preview the complete package.'; clearPreview();
       });
       const full = document.createElement('button'); full.textContent = 'Use full source'; full.onclick = () => { delete source.approval; delete source.approvedText; delete source.approvalLabel; selected(); clearPreview(); };
@@ -165,7 +185,7 @@
       byId('context-error').textContent = result.issues.join('\n');
       for (const note of result.included) {
         const row = document.createElement('p'), remove = document.createElement('button'); row.textContent = note.file; remove.textContent = 'Exclude note';
-        remove.onclick = () => run(async () => { await window.companion['context-exclude'](note.key); selections = selections.filter(source => source.key !== note.key); selected(); await find(); }); row.append(remove); byId('context-notes').append(row);
+        remove.onclick = () => run(async () => { clearPreview(); await window.companion['context-exclude'](note.key); selections = selections.filter(source => source.key !== note.key); selected(); await find(); }); row.append(remove); byId('context-notes').append(row);
       }
       for (const source of all) { const option = document.createElement('option'); option.value = source.key; option.textContent = source.title; byId('context-manual').append(option); }
       for (const source of result.matches) {
@@ -175,7 +195,13 @@
         for (const match of source.passages || []) {
           const row = document.createElement('div'), anchor = document.createElement('p'), excerpt = document.createElement('pre'), choose = document.createElement('button'); row.className = 'context-passage';
           anchor.textContent = `Matching passage lines ${match.start}-${match.end}; Text match: ${match.matched.join(', ')}; source sha256 ${source.digest}`; excerpt.textContent = match.text; choose.textContent = 'Add passage';
-          choose.onclick = () => run(async () => { if (!current()) return; const approved = await window.companion['context-passage']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, start: match.start, end: match.end }); add({ ...source, approval: approved.approval, approvedText: approved.text, approvalLabel: approved.label }); });
+          choose.onclick = () => {
+            if (!current()) return;
+            return selectPassage(async owned => {
+              const approved = await window.companion['context-passage']({ key: source.key, digest: source.digest, sourceGenerations: source.sourceGenerations, start: match.start, end: match.end });
+              if (owned()) add({ ...source, approval: approved.approval, approvedText: approved.text, approvalLabel: approved.label });
+            });
+          };
           row.append(anchor, excerpt, choose); article.append(row);
         }
         const full = document.createElement('details'), summary = document.createElement('summary'); summary.textContent = 'Inspect full eligible source'; full.append(summary, passage); article.append(full, button); byId('context-results').append(article);
@@ -194,10 +220,11 @@
     }
   }
   byId('context-find').onclick = find;
-  byId('context-include').onclick = () => run(async () => { await window.companion['context-include'](); await find(); });
+  byId('context-include').onclick = () => run(async () => { clearPreview(); await window.companion['context-include'](); await find(); });
   byId('context-add-manual').onclick = () => { if (!byId('context-add-manual').disabled) add(all.find(source => source.key === byId('context-manual').value)); };
   byId('context-question').oninput = () => { retireFind(); clearPreview(); };
   byId('context-preview').onclick = async () => {
+    if (selectionAction) return;
     clearPreview(); const request = generation; byId('context-error').textContent = '';
     const outdated = () => {
       if (request === generation) return false;
@@ -246,6 +273,7 @@
     } catch (error) { if (version === conversationGeneration) byId('history-search-status').textContent = error.message; }
   };
   byId('conversation-preview').onclick = async () => {
+    if (selectionAction) return;
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
       const preview = await window.companion['conversation-preview'](conversationInput());
