@@ -127,14 +127,18 @@ test('source deletion names actual retained writing and requests, cancels byte-e
   expect(await files(path.join(root, 'vault'))).toEqual(before);
   expect(await files(path.join(root, 'conversations'))).toEqual(historyBefore);
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
   await expect(preview).toContainText('AFFECTED_SAVED_IDEA');
+  await expect(preview).not.toContainText('DEPENDENT_CHANGED_AFTER_REVIEW');
   const changedIdea = idea.text + '\nDEPENDENT_CHANGED_AFTER_REVIEW\n'; await fs.writeFile(idea.file, changedIdea);
   await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
   await expect(page.getByRole('status')).toContainText(/changed|preview.*again/i);
   expect(await fs.readFile(idea.file, 'utf8')).toBe(changedIdea);
   expect((await fs.readdir(path.join(fixture.base, 'Captures'))).filter(name => name.endsWith('.md'))).toHaveLength(1);
   await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden();
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
   await expect(preview).toContainText('DEPENDENT_CHANGED_AFTER_REVIEW');
   await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Capture deleted');
