@@ -804,6 +804,76 @@ test('repeated completed imported titles review every physical backup including 
   await expectAbsent([...targets, ...residue]); expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
 });
 
+test('repeated imported title deletion holds unique body writing in an actual intermediate backup', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  await artifact('first', '1'); const producerBytes = await files(path.join(root, 'producer'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures[sourceHash], current = path.join(base, 'Captures', capture.file);
+  const snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json');
+  const backupNames = async () => (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(path.basename(current) + '.before-title-') && name.endsWith('.bak')).sort();
+  const saveTitle = async title => {
+    const before = await fs.readFile(current), namesBefore = new Set(await backupNames());
+    await page.getByLabel('Display title', { exact: true }).fill(title);
+    const oldSave = await page.getByRole('button', { name: 'Save title', exact: true }).elementHandle();
+    expect(oldSave).not.toBeNull();
+    await page.getByRole('button', { name: 'Save title', exact: true }).click();
+    await oldSave.waitForElementState('hidden');
+    await expect(page.getByRole('button', { name: 'Save title', exact: true })).toBeVisible();
+    await expect(page.getByRole('status')).toContainText('Title saved.');
+    const after = await fs.readFile(current), added = (await backupNames()).filter(name => !namesBefore.has(name));
+    for (const name of added) expect(await fs.readFile(path.join(path.dirname(current), name))).toEqual(before);
+    return { before, after, added };
+  };
+  const first = await saveTitle('Intermediate "quoted" title: [alpha]?');
+  const finalTitle = 'Terminal (title) — [beta] "quote": stable?';
+  const second = await saveTitle(finalTitle), same = await saveTitle(finalTitle);
+  expect(first.added).toHaveLength(1); expect(second.added).toHaveLength(1); expect(same.added).toHaveLength(2); expect(same.after).toEqual(same.before);
+  const names = await backupNames(); expect(names).toHaveLength(4);
+  const baseline = path.join(path.dirname(current), first.added[0]), intermediate = path.join(path.dirname(current), second.added[0]);
+  expect(intermediate).not.toBe(baseline); expect(await fs.readFile(baseline)).toEqual(first.before); expect(await fs.readFile(intermediate)).toEqual(first.after);
+  expect(first.after.equals(first.before)).toBe(false);
+  const targets = [...names.map(name => path.join(path.dirname(current), name)), current, snapshot], buffers = new Map(), identities = new Map();
+  for (const file of targets) {
+    const stat = await fs.lstat(file, { bigint: true });
+    expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1n);
+    buffers.set(file, await fs.readFile(file)); identities.set(file, `${stat.dev}:${stat.ino}`);
+  }
+  expect(new Set(identities.values()).size).toBe(6);
+  const ledgerBytes = await fs.readFile(ledgerFile, 'utf8'), titled = JSON.parse(ledgerBytes);
+  const admission = Object.values(original.attempts).find(item => item.revision === capture.currentRevision);
+  expect(createHash('sha256').update(buffers.get(snapshot)).digest('hex')).toBe(admission.snapshotHash);
+  expect(createHash('sha256').update(buffers.get(current)).digest('hex')).toBe(titled.captures[sourceHash].currentHash);
+  expect(titled.attempts).toEqual(original.attempts); expect(titled.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  await fs.appendFile(intermediate, '\nREPEATEDTITLEINTERMEDIATEBODY My unique authored explanation is only in this intermediate backup and retains a source quotation.\n');
+  const edited = await fs.readFile(intermediate), editedStat = await fs.lstat(intermediate, { bigint: true });
+  expect(edited.toString('utf8')).toContain('REPEATEDTITLEINTERMEDIATEBODY');
+  expect(`${editedStat.dev}:${editedStat.ino}`).toBe(identities.get(intermediate)); expect(editedStat.nlink).toBe(1n);
+  buffers.set(intermediate, edited);
+  await fs.writeFile(testInfo.outputPath('repeated-title-intermediate-body-fixture.json'), JSON.stringify({ actualInitialBackup: path.basename(baseline), actualIntermediateBackupFromSecondSave: path.basename(intermediate), backupCount: names.length, physicalSourceCount: targets.length, editedInode: identities.get(intermediate), editedSha256: createHash('sha256').update(edited).digest('hex') }, null, 2), 'utf8');
+  const beforePreview = await files(base);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title recovery contains changed or unsupported writing');
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(base)).toEqual(beforePreview); expect(await fs.readFile(ledgerFile, 'utf8')).toBe(ledgerBytes);
+  for (const file of targets) {
+    expect(await fs.readFile(file)).toEqual(buffers.get(file));
+    const stat = await fs.lstat(file, { bigint: true }); expect(`${stat.dev}:${stat.ino}`).toBe(identities.get(file)); expect(stat.nlink).toBe(1n);
+  }
+  const refused = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(refused.sourceAuthority).toBeUndefined(); expect(refused.suppressed).not.toContain(sourceHash);
+  expect(refused.attempts).toEqual(original.attempts); expect(refused.admissions).toEqual(original.admissions); expect(refused.captures).toEqual(titled.captures);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
