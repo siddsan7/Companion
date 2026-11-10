@@ -53,7 +53,7 @@ function validate(value, id) {
   if (descriptor === undefined && plans === undefined) {
     if (value.targets.some(item => item.kind === 'mixed-recovery')) fail('mixed targets have no proof'); return;
   }
-  if (value.inventoryVersion !== 2 || value.manual || !shape(descriptor, descriptorFields) || descriptor.format !== 'kept-current-repair-v1' || !Array.isArray(plans) || plans.length !== 2 || value.targets.length !== 5 || value.recovery.length || value.recoveryPointers.length || value.titleProofs?.length) fail('unsupported mixed scope');
+  if (value.inventoryVersion !== 2 || value.manual || !shape(descriptor, descriptorFields) || descriptor.format !== 'kept-current-repair-v1' || !Array.isArray(plans) || plans.length !== 2 || value.targets.length !== 5 || value.recovery.length || value.recoveryPointers.length || Object.hasOwn(value, 'titleProofs') || Object.hasOwn(value, 'titleRecovery')) fail('unsupported mixed scope');
   if (![descriptor.admittedRevision, descriptor.incomingRevision, descriptor.annotationId].every(uuid) || descriptor.admittedRevision === descriptor.incomingRevision || !(descriptor.sourceGeneration === null || uuid(descriptor.sourceGeneration)) || ![descriptor.incomingFingerprint, descriptor.admissionSha256, descriptor.pointerSha256, descriptor.conflictSha256, descriptor.outcomeSha256].every(sha) || !/^finalization:[a-f0-9]{32}$/.test(descriptor.incomingIdentity) || typeof descriptor.outcomeKey !== 'string' || !uuid(descriptor.outcomeKey.split(':')[0])) fail('mixed identities');
   if (!['current', 'snapshot', 'originalConflict', 'resolutionConflict', 'repair'].every(key => safe(descriptor[key]))) fail('mixed paths');
   const targets = new Map(value.targets.map(item => [item.file, item]));

@@ -116,6 +116,10 @@ npx playwright test tests/mixed-retention-deletion.spec.js --grep "malformed tit
 
 The lifecycle and inherited-owner tests remain unauthored pending this guard's measured RED, separate product fix and measured GREEN.
 
+Root measured true schema RED in 16373ms with no skips, committed as `fdf6c85640ed1017fe3b19f70df54509fa3b0bd7`. All five-origin, no-output authorization, actual main exit and offline-only-field facts passed. Saved actual terminal was phase deleted, all five origins gone and two outputs published while `titleProofs.unreviewedSourceCopy` remained in authority. The phase-deleting feature assertion then failed. Evidence: Temp `companion-ticket13-mixed-proof-schema-red-20261110`.
+
+The minimum source candidate changes only the old kept-current format's optional-length condition to reject own `titleProofs` or `titleRecovery` properties explicitly. Canonical mixed authority omits both fields. It neither strips the field nor reconstructs source/writing, and it changes no other family or test. `node --check app/mixed-deletion.js` passed. The unchanged schema guard still requires root runtime verification before a separate product fix commit. Lifecycle tests remain unauthored.
+
 
 Root first stage2/restored-G attempt failed43338ms/exit1 before restoration/held mixed setup: exact getByLabel for artifact kind did not match the actual wrapping select label, whose accessible name includes option text. Existing successful reviewed-restoration test uses role combobox with Selected producer artifact kind prefix. Root uses that same observed locator; no source/assertion/timeout/retry change. No restoredG/native link/crash proof was reached or claimed. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-20261110 retained separately as fixture failure; correctedstage2 runtime pending.
 
@@ -127,3 +131,9 @@ Root missing-receipted-output guard PASS23429ms, exit0/no skips, stagedtreefa4b9
 
 
 Root proof-schema actualRED16373ms, exit1/no skips, stagedtree62b6230df18cf12a3b05d2056994e378750ff671/product63e64d6 unchanged. Real5origin/publicauthorized/nooutputs/main+wrapperexit facts passed; ONLYofflineauthority.titleProofs={unreviewedSourceCopy:ACTUALwholeY} wasadded. NormalrestartwronglyfinishedphaseDeleted/all5originsgone/twowritingoutputs whilemalformedproofobject remained. Savedterminalprecededexpecteddeleting/schemaHOLD558failure. Independentoptional-lengthfinding thereforeverified, notfixturefailure; laterpreservation assertionsNOTreached. Evidence Temp/companion-ticket13-mixed-proof-schema-red-20261110. RootGO separateoldformatvalidatorfix explicitcanonicalabsence oftitleProofs/titleRecovery; no payloadstrip/scoperepair/autoadoption. New9formatalreadyrejectsfields. RegressiontestMUSTunchanged; sourcefixseparatecommit fromfeature.
+
+
+Root schema regression unchangedGREEN14655ms, exit0/no skips, immutable staged0893f930e6178e09d8a4a09a3d2e75fda6f12f9a. ONEoldformatconditionnowexplicitlyrejectstitleProofs/titleRecovery propertypresence; baseline16373ms wrongcompletedpurge wasreal. CorrectednormalrestartHOLDunsupportedmixedscopekeptactual5sources/exactalteredledger/producers/nooutputs/stages unchanged, no stripping/reconstruction/sourceunlink. Evidence Temp/companion-ticket13-mixed-proof-schema-green-20261110. FullvalidMixedcoupled6 andindependentreview/mergeintonewEditorformat remainbeforeclosedfinalapproval; thisfixseparatefromEditorfeature.
+
+
+The complete six-case schema-fix gate passed: 6/6, exit 0, no skips, 117,459 ms. Tested tree: 83e0f0168ea20eb8b2ab968b91630c941a929c03. This includes the original two-output journey, destination collision, late adjacent-copy HOLD, restored-G link-before-receipt crash, missing receipted-output HOLD, and malformed proof-object rejection. Product change remains exactly one explicit-absence condition. Evidence: Temp/companion-ticket13-mixed-schema-coupled-six-20261110. The separate schema fix is ready for independent confirmation and integration into the editor format; full mixed lifecycle and primary composition remain open.
