@@ -38,6 +38,71 @@ async function absent(paths) {
   for (const file of paths) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
 }
 
+async function normalOlderTitleWriter(testInfo, evidenceName) {
+  await artifact('first', '1');
+  const firstProducer = await files(path.join(root, 'producer', 'first'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const first = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), captureA = first.captures[sourceHash], revisionA = captureA.currentRevision;
+  const current = path.join(base, 'Captures', captureA.file), snapshotA = path.join(base, 'Revisions', revisionA + '.json');
+  const originalA = await fs.readFile(current), snapshotABytes = await fs.readFile(snapshotA);
+  const title = 'Guarded older A: [literal] "title" & complete?';
+  await page.getByLabel('Display title', { exact: true }).fill(title);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const titledA = await fs.readFile(current);
+  const backupNames = (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(captureA.file + '.before-title-'));
+  expect(backupNames).toHaveLength(1);
+  const adjacentA = path.join(path.dirname(current), backupNames[0]);
+  expect(await fs.readFile(adjacentA)).toEqual(originalA);
+  await artifact('second', '2');
+  const producerBytes = await files(path.join(root, 'producer'));
+  expect(await files(path.join(root, 'producer', 'first'))).toEqual(firstProducer);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const ledgerBytes = await fs.readFile(ledgerFile), ledger = JSON.parse(ledgerBytes), captureB = ledger.captures[sourceHash], revisionB = captureB.currentRevision;
+  expect(revisionB).not.toBe(revisionA);
+  expect(captureB).toMatchObject({ id: captureA.id, file: captureA.file, capturedAt: captureA.capturedAt, title });
+  expect(captureB.revisions.slice().sort()).toEqual([revisionA, revisionB].sort());
+  expect(Object.keys(ledger.attempts)).toHaveLength(2);
+  for (const [identity, admission] of Object.entries(first.attempts)) expect(ledger.attempts[identity]).toEqual(admission);
+  expect(ledger.admissions).toEqual(first.admissions);
+  const snapshotB = path.join(base, 'Revisions', revisionB + '.json'), terminalA = path.join(intake, captureA.id + '-' + revisionB + '.before.md');
+  const currentBytes = await fs.readFile(current), targets = [current, snapshotA, snapshotB, adjacentA, terminalA], observations = [];
+  for (const file of targets) {
+    const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    observations.push({ file, sha256: sha256(bytes), length: bytes.length, dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink), isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() });
+  }
+  await fs.writeFile(testInfo.outputPath(evidenceName + '-writer.json'), JSON.stringify({ origin: 'Normal draft A, public title Save, normal same-hash distinct-attempt B. No journal, admission, source-copy or cache edits.', revisionA, revisionB, attempts: ledger.attempts, admissions: ledger.admissions || {}, observations }, null, 2));
+  expect(new Set(observations.map(item => item.dev + ':' + item.ino)).size).toBe(5);
+  for (const item of observations) expect({ isFile: item.isFile, isSymbolicLink: item.isSymbolicLink, nlink: item.nlink }).toEqual({ isFile: true, isSymbolicLink: false, nlink: '1' });
+  expect(await fs.readFile(terminalA)).toEqual(titledA);
+  expect(fields(titledA)).toMatchObject({ companion_id: captureA.id, capture_type: 'reel_import', captured_at: captureA.capturedAt, source_hash: sourceHash, source_revision: revisionA, title });
+  expect(fields(currentBytes)).toMatchObject({ companion_id: captureA.id, capture_type: 'reel_import', captured_at: captureA.capturedAt, source_hash: sourceHash, source_revision: revisionB, title });
+  expect(captureB.currentHash).toBe(sha256(currentBytes));
+  expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  for (const revision of [revisionA, revisionB]) {
+    const admission = Object.values(ledger.attempts).filter(item => item.revision === revision);
+    expect(admission).toHaveLength(1);
+    expect(admission[0]).toMatchObject({ captureId: captureA.id, sourceHash, snapshotHash: sha256(await fs.readFile(path.join(base, 'Revisions', revision + '.json'))) });
+  }
+  expect((await fs.readdir(intake)).sort()).toEqual([path.basename(terminalA), 'ledger.json'].sort());
+  expect((await fs.readdir(path.dirname(current))).sort()).toEqual([captureA.file, path.basename(adjacentA)].sort());
+  expect((await fs.readdir(path.join(base, 'Revisions'))).sort()).toEqual([revisionA + '.json', revisionB + '.json'].sort());
+  await absent([current + '.pending', current + '.title-transaction.json', path.join(intake, 'title-intent.json'), path.join(intake, 'transaction.json')]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  return { base, intake, ledgerFile, ledgerBytes, ledger, captureA, revisionA, revisionB, current, terminalA, targets, observations, producerBytes };
+}
+
 test('older imported title deletion reviews five actual source files from two normal admissions without replay', async ({}, testInfo) => {
   test.setTimeout(150000);
   await artifact('first', '1');
@@ -163,4 +228,75 @@ test('older imported title deletion reviews five actual source files from two no
   await absent([...targets, ...residue]);
   expect(await fs.readdir(captures)).toEqual([]); expect(await fs.readdir(path.join(base, 'Revisions'))).toEqual([]);
   expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
+test('older imported title deletion holds BODY writing in its actual incoming-B before-file containing titled A', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const state = await normalOlderTitleWriter(testInfo, 'older-title-terminal-body');
+  const beforeEdit = await files(state.base), originalBytes = await fs.readFile(state.terminalA), originalStat = await fs.lstat(state.terminalA, { bigint: true });
+  const body = Buffer.from('\nOLDERTERMINALINDEPENDENTBODY My authored interpretation exists only in this actual retained titled-A file.\n', 'utf8');
+  await fs.appendFile(state.terminalA, body);
+  const editedBytes = await fs.readFile(state.terminalA), editedStat = await fs.lstat(state.terminalA, { bigint: true });
+  expect(editedBytes).toEqual(Buffer.concat([originalBytes, body]));
+  expect(editedStat.dev).toBe(originalStat.dev); expect(editedStat.ino).toBe(originalStat.ino); expect(editedStat.nlink).toBe(1n);
+  const before = await files(state.base), relative = path.relative(state.base, state.terminalA).split(path.sep).join('/');
+  expect(before).toEqual({ ...beforeEdit, [relative]: editedBytes.toString('base64') });
+  expect(await fs.readFile(state.ledgerFile)).toEqual(state.ledgerBytes);
+  const raw = await page.evaluate(async id => { try { return { preview: await window.captureDeletion.preview({ id }) }; } catch (error) { return { error: error.message }; } }, state.captureA.id);
+  await fs.writeFile(testInfo.outputPath('older-title-terminal-body-result.json'), JSON.stringify({ control: 'Only append independent BODY writing to the actual ordinary incoming-B before-file containing titled A; ledger/admissions/snapshots/current untouched.', file: state.terminalA, payloadRevision: state.revisionA, incomingNameRevision: state.revisionB, originalSha256: sha256(originalBytes), editedSha256: sha256(editedBytes), originalIdentity: { dev: String(originalStat.dev), ino: String(originalStat.ino) }, raw }, null, 2));
+  expect(raw.error).toContain('Title recovery contains changed or unsupported writing');
+  expect(raw.preview).toBeUndefined();
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(state.base)).toEqual(before);
+  expect(await fs.readFile(state.ledgerFile)).toEqual(state.ledgerBytes);
+  const retained = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8'));
+  expect(retained).toEqual(state.ledger);
+  expect(retained.attempts).toEqual(state.ledger.attempts); expect(retained.admissions).toEqual(state.ledger.admissions);
+  expect(retained.sourceAuthority).toEqual(state.ledger.sourceAuthority); expect(retained.suppressed).toEqual(state.ledger.suppressed);
+  for (const observation of state.observations) {
+    const stat = await fs.lstat(observation.file, { bigint: true });
+    expect({ dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) }).toEqual({ dev: observation.dev, ino: observation.ino, nlink: '1' });
+  }
+  expect(await fs.readFile(state.terminalA)).toEqual(editedBytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(state.producerBytes);
+});
+
+test('older imported title proof cannot waive canonical current-B BODY checks after a controlled currentHash cache edit', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const state = await normalOlderTitleWriter(testInfo, 'older-title-current-body');
+  const beforeEdit = await files(state.base), originalBytes = await fs.readFile(state.current), originalStat = await fs.lstat(state.current, { bigint: true });
+  const body = Buffer.from('\nCURRENTBINDEPENDENTBODY My authored interpretation was appended to current B after both normal admissions.\n', 'utf8');
+  await fs.appendFile(state.current, body);
+  const editedBytes = await fs.readFile(state.current), editedStat = await fs.lstat(state.current, { bigint: true });
+  expect(editedBytes).toEqual(Buffer.concat([originalBytes, body]));
+  expect(editedStat.dev).toBe(originalStat.dev); expect(editedStat.ino).toBe(originalStat.ino); expect(editedStat.nlink).toBe(1n);
+  // Explicit corruption control: pass the earlier cached-hash check so this
+  // test reaches the current canonical renderer despite the valid older A proof.
+  // Immutable producer facts and revision snapshots are never rewritten.
+  const controlled = JSON.parse(state.ledgerBytes);
+  controlled.captures[sourceHash].currentHash = sha256(editedBytes);
+  expect(controlled).toEqual({ ...state.ledger, captures: { ...state.ledger.captures, [sourceHash]: { ...state.ledger.captures[sourceHash], currentHash: sha256(editedBytes) } } });
+  const controlledLedgerBytes = Buffer.from(JSON.stringify(controlled, null, 2), 'utf8');
+  await fs.writeFile(state.ledgerFile, controlledLedgerBytes);
+  const before = await files(state.base), currentRelative = path.relative(state.base, state.current).split(path.sep).join('/'), ledgerRelative = path.relative(state.base, state.ledgerFile).split(path.sep).join('/');
+  expect(before).toEqual({ ...beforeEdit, [currentRelative]: editedBytes.toString('base64'), [ledgerRelative]: controlledLedgerBytes.toString('base64') });
+  const raw = await page.evaluate(async id => { try { return { preview: await window.captureDeletion.preview({ id }) }; } catch (error) { return { error: error.message }; } }, state.captureA.id);
+  await fs.writeFile(testInfo.outputPath('older-title-current-body-result.json'), JSON.stringify({ control: 'Normal writer state first; append BODY to actual current B, then change ONLY cached captures[sourceHash].currentHash to that edited SHA. This cache edit is controlled corruption, not real producer or title writer output. Immutable attempts/admissions and both literal snapshots remain unchanged.', current: state.current, currentRevision: state.revisionB, olderProofRevision: state.revisionA, originalSha256: sha256(originalBytes), editedSha256: sha256(editedBytes), originalCachedCurrentHash: state.ledger.captures[sourceHash].currentHash, controlledCachedCurrentHash: controlled.captures[sourceHash].currentHash, originalIdentity: { dev: String(originalStat.dev), ino: String(originalStat.ino) }, raw }, null, 2));
+  // This exact later inventory refusal distinguishes the canonical guard from
+  // CaptureDeletion's initial currentHash refusal and source-title edge failures.
+  expect(raw.error).toContain('Source recovery inventory contains changed or unsupported writing');
+  expect(raw.preview).toBeUndefined();
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(state.base)).toEqual(before);
+  expect(await fs.readFile(state.ledgerFile)).toEqual(controlledLedgerBytes);
+  const retained = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8'));
+  expect(retained).toEqual(controlled);
+  expect(retained.attempts).toEqual(state.ledger.attempts); expect(retained.admissions).toEqual(state.ledger.admissions);
+  expect(retained.sourceAuthority).toEqual(state.ledger.sourceAuthority); expect(retained.suppressed).toEqual(state.ledger.suppressed);
+  for (const observation of state.observations) {
+    const stat = await fs.lstat(observation.file, { bigint: true });
+    expect({ dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) }).toEqual({ dev: observation.dev, ino: observation.ino, nlink: '1' });
+  }
+  expect(await fs.readFile(state.current)).toEqual(editedBytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(state.producerBytes);
 });
