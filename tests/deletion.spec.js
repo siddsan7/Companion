@@ -570,6 +570,46 @@ test('completed imported title deletion reviews its three source files and binds
   await expectAbsent([...targets, ...residue]); expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
 });
 
+test('completed imported title deletion holds independent body writing added to its actual ordinary backup', async () => {
+  test.setTimeout(90000);
+  await artifact('first', '1'); const producerBytes = await files(path.join(root, 'producer'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures[sourceHash], current = path.join(base, 'Captures', capture.file);
+  await page.getByLabel('Display title', { exact: true }).fill('Body guard completed imported title');
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  const names = (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(capture.file + '.before-title-') && name.endsWith('.bak'));
+  expect(names).toHaveLength(1);
+  const backup = path.join(path.dirname(current), names[0]), initialStat = await fs.lstat(backup, { bigint: true });
+  expect(initialStat.isFile()).toBe(true); expect(initialStat.isSymbolicLink()).toBe(false); expect(initialStat.nlink).toBe(1n);
+  const currentBytes = await fs.readFile(current), snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json'), snapshotBytes = await fs.readFile(snapshot);
+  const ledgerBytes = await fs.readFile(ledgerFile, 'utf8'), written = JSON.parse(ledgerBytes);
+  await fs.appendFile(backup, '\nTITLEBACKUPINDEPENDENTBODY My authored interpretation remains only in this backup, including its source quotation.\n');
+  const editedBytes = await fs.readFile(backup), editedStat = await fs.lstat(backup, { bigint: true });
+  expect(editedBytes.toString('utf8')).toContain('TITLEBACKUPINDEPENDENTBODY');
+  expect(editedStat.dev).toBe(initialStat.dev); expect(editedStat.ino).toBe(initialStat.ino); expect(editedStat.nlink).toBe(1n);
+  const before = await files(base);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title recovery contains changed or unsupported writing');
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(base)).toEqual(before); expect(await fs.readFile(ledgerFile, 'utf8')).toBe(ledgerBytes);
+  expect(await fs.readFile(backup)).toEqual(editedBytes); expect(await fs.readFile(current)).toEqual(currentBytes); expect(await fs.readFile(snapshot)).toEqual(snapshotBytes);
+  expect((await fs.lstat(backup, { bigint: true })).ino).toBe(initialStat.ino);
+  const refused = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(refused.sourceAuthority).toBeUndefined(); expect(refused.suppressed).not.toContain(sourceHash);
+  expect(refused.attempts).toEqual(original.attempts); expect(refused.admissions).toEqual(original.admissions); expect(refused.captures).toEqual(written.captures);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
