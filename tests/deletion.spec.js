@@ -1756,6 +1756,147 @@ test('history archives roundtrip exact source generations without rolling back t
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
 
+test('restoring an older history archive preserves imported capture suppression and current source exclusions', async () => {
+  test.setTimeout(120000);
+  const reply = 'OLDERIMPORTREPLY authored synthetic interpretation of the imported source.';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply }));
+  const { base, ledgerFile, ledger, capture } = await importedCapture();
+  const sourceHash = Object.keys(ledger.captures)[0], captureKey = 'capture:' + capture.id;
+  const producer = path.join(root, 'producer'), producerBefore = await files(producer);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('ARCHIVEANNOTATION independent writing linked to the imported source.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByLabel('Source inspection')).toContainText('ARCHIVEANNOTATION');
+  const annotations = path.join(base, 'Annotations'), annotationBefore = await files(annotations);
+  expect(Object.keys(annotationBefore)).toHaveLength(1);
+
+  const readme = path.join(root, 'README.md');
+  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n', 'utf8');
+  await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]));
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-view')).toContainText('Approved version 1');
+  const oldQuestion = 'Interpret the selected imported source for MyTune.';
+  await page.getByLabel('Context question', { exact: true }).fill(oldQuestion);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.getByLabel('Manual context source', { exact: true }).selectOption(captureKey);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  const reviewed = page.getByLabel('Reviewed conversation package', { exact: true });
+  await expect(reviewed).toHaveValue(new RegExp(capture.currentRevision));
+  const submittedPackage = await reviewed.inputValue();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(reply);
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const submissionsFile = path.join(root, 'conversation-submissions.jsonl');
+  const submissions = await fs.readFile(submissionsFile, 'utf8');
+  expect(submissions.trim().split('\n').map(line => JSON.parse(line).text)).toEqual([submittedPackage]);
+  const historyDirectory = path.join(root, 'conversations');
+  const historyName = (await fs.readdir(historyDirectory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const historyFile = path.join(historyDirectory, historyName);
+  const readHistory = async () => JSON.parse(await fs.readFile(historyFile, 'utf8'));
+  const original = await readHistory();
+  expect(original.requests[0].package.dependencies.map(source => source.key)).toContain(captureKey);
+
+  const archivePath = path.join(root, 'older-import-history.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archivePath, open: archivePath }));
+  const archive = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await archive.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await archive.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(archive).toContainText('Archive exported');
+  const archiveBytes = await fs.readFile(archivePath);
+  expect(JSON.parse(archiveBytes.toString('utf8')).payload.conversations).toEqual([original]);
+  expect(original.scope.excludedSources).toEqual([]);
+
+  // Exclude a separate source so the purged import alone makes the old turn ineligible.
+  const excludedText = 'ARCHIVEEXCLUSION independent capture for the current source scope.';
+  await page.getByLabel('Thought or link', { exact: true }).fill(excludedText);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture saved.');
+  await page.getByLabel('Context question', { exact: true }).fill('ARCHIVEEXCLUSION');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const result = page.locator('#context-results article').filter({ hasText: excludedText });
+  await result.getByRole('button', { name: 'Add to context', exact: true }).click();
+  const selection = page.locator('#context-selected article').filter({ hasText: 'ARCHIVEEXCLUSION' });
+  await selection.getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.locator('#conversation-summary')).toContainText('Reviewed exclusion scope saved locally.');
+  const currentScope = (await readHistory()).scope;
+  expect(currentScope.excludedSources).toHaveLength(1);
+  expect(currentScope.excludedSources).not.toContain(captureKey);
+  expect(currentScope.excludedHistory).toEqual([]);
+
+  const imported = page.locator('#captures article').filter({ has: page.getByRole('heading', { name: capture.title, exact: true }) });
+  await imported.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const purge = page.getByLabel('Capture deletion preview');
+  await expect(purge.getByRole('checkbox', { name: 'Current capture and all snapshots', exact: true })).toBeChecked();
+  await expect(purge).toContainText('1 revision snapshot');
+  await purge.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const readLedger = async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  const deletedAuthority = (await readLedger()).sourceAuthority[capture.id];
+  expect(deletedAuthority.phase).toBe('deleted');
+  const assertPurged = async () => {
+    const current = await readLedger();
+    expect(current.sourceAuthority[capture.id]).toEqual(deletedAuthority);
+    expect(current.suppressed).toContain(sourceHash);
+    expect(current.attempts).toEqual(ledger.attempts);
+    expect(await files(annotations)).toEqual(annotationBefore);
+    expect(await files(producer)).toEqual(producerBefore);
+    const vaultFiles = Object.keys(await files(base));
+    expect(vaultFiles.filter(file => file.startsWith('Revisions/'))).toEqual([]);
+    expect(vaultFiles.filter(file => file.startsWith('Captures/'))).toHaveLength(1);
+    await expect(page.locator('#captures article')).toHaveCount(1);
+    await expect(page.locator('#captures article')).toContainText(excludedText);
+  };
+  await assertPurged();
+
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+  await expect(fs.stat(historyFile)).rejects.toMatchObject({ code: 'ENOENT' });
+  await archive.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(archive).toContainText('Integrity and version validated');
+  await expect(archive).toContainText('1 missing conversation');
+  await archive.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await archive.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await archive.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect(archive).toContainText('Restored 1 conversation');
+  const assertRestoredScope = async () => {
+    const restored = await readHistory();
+    expect(restored.requests).toEqual(original.requests);
+    expect(restored.scope.excludedSources).toEqual(currentScope.excludedSources);
+    expect(restored.scope.excludedHistory).toEqual(currentScope.excludedHistory);
+  };
+  await assertRestoredScope();
+  await assertPurged();
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await assertPurged();
+  await app.close(); app = null; await launch();
+  await assertPurged();
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+  await expect(page.locator('#conversation-history')).toContainText(reply);
+  const nextQuestion = 'Review the current approved project context.';
+  await page.getByLabel('Context question', { exact: true }).fill(nextQuestion);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-error')).toContainText('Annotation unavailable');
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
+  const nextPackage = await page.getByLabel('Reviewed conversation package', { exact: true }).inputValue();
+  expect(nextPackage).toContain(nextQuestion);
+  expect(nextPackage).toContain('A guitar practice tutor.');
+  for (const excluded of [oldQuestion, reply, capture.currentRevision, 'ARCHIVEANNOTATION', excludedText]) {
+    expect(nextPackage).not.toContain(excluded);
+  }
+  await expect(page.locator('#conversation-history .history-exclusion')).toContainText('source dependency');
+  await assertRestoredScope();
+  expect(await fs.readFile(archivePath)).toEqual(archiveBytes);
+  expect(await fs.readFile(submissionsFile, 'utf8')).toBe(submissions);
+});
+
 test('same-byte restoration revokes a two-hop foreign history closure and its stale reviewed dispatch without changing retained dialogue', async () => {
   test.setTimeout(180000);
   const fixture = await manualConversationForRestoration(), generation = await restoreManualConversation(fixture);
