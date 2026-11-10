@@ -3,6 +3,7 @@ const local = require('node:fs');
 const path = require('node:path');
 const YAML = require('yaml');
 const { Intake } = require('./intake');
+const { sourceInspection } = require('./source-mutation');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
 const { createHash, randomUUID } = require('node:crypto');
@@ -89,6 +90,9 @@ class Context {
   }
   async exclude(key) { await this.changeScope(current => current.filter(file => `note:${digest(file)}` !== key)); }
   async corpus() {
+    return sourceInspection(this.vault.root, () => this.corpusOwned());
+  }
+  async corpusOwned() {
     const intake = new Intake(this.vault), ledger = await intake.info();
     const notes = await this.vault.list(), issues = [], included = [], all = [], eligible = new Map(), histories = new Map();
     for (const note of notes) {
