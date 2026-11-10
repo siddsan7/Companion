@@ -11,6 +11,7 @@ const { parse } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf } = require('./source-recovery');
 const sourceInventory = require('./source-inventory');
 const sourceTitle = require('./source-title');
+const pendingTitle = require('./pending-title');
 const deletionDependents = require('./deletion-dependents');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 const changed = () => Object.assign(Error('Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.'), { code: 'SOURCE_FILE_CHANGED' });
@@ -42,7 +43,7 @@ class CaptureDeletion {
     if (!entry && (notes.length !== 1 || !['thought', 'link'].includes(notes[0].type))) throw changed();
     const manual = !entry ? { captureId: id, type: notes[0].type, capturedAt: notes[0].capturedAt, currentHash: hash(notes[0].content), file: path.basename(notes[0].file), relative: relative(vault, notes[0].file) } : undefined;
     const [sourceHash, capture] = entry || [null, { id, title: notes[0].title, currentHash: manual.currentHash, revisions: [] }];
-    if (notes.length !== 1 || hash(notes[0].content) !== capture.currentHash) throw changed();
+    if (notes.length !== 1 || manual && hash(notes[0].content) !== capture.currentHash) throw changed();
     let targets = [await this.target(vault, notes[0].file, 'capture', !manual)]; const revisions = new Map();
     for (const revisionId of capture.revisions) {
       if (!uuid(revisionId)) throw changed();
@@ -55,7 +56,9 @@ class CaptureDeletion {
     }
     let imported;
     if (!manual) {
-      imported = await sourceInventory.inventory(intake, ledger, capture, sourceHash, revisions, targets); targets = imported.targets;
+      imported = await sourceInventory.inventory(intake, ledger, capture, sourceHash, revisions, targets);
+      if (hash(notes[0].content) !== capture.currentHash && !imported.titleRecovery) throw changed();
+      targets = imported.targets;
     }
     for (const name of manual ? (await fs.readdir(intake.dir)).sort() : []) {
       if (name === 'ledger.json') continue;
@@ -72,10 +75,10 @@ class CaptureDeletion {
     const directories = new Map();
     for (const name of requiredDirectories(intake, targets)) { const value = await this.directory(vault, path.join(vault.vault, name)); directories.set(name, value); }
     const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
-    await inspectManualPeers(vault, { captureId: id }, new Set((imported?.titleProofs || []).map(proof => proof.before)));
+    await inspectManualPeers(vault, { captureId: id }, new Set([...(imported?.titleProofs || []).map(proof => proof.before), ...pendingTitle.sidecars(imported?.titleRecovery)]));
     const dependents = await deletionDependents.inventory(vault, this.conversations, id);
     if (!intake.storage.matches(await intake.storage.view())) throw changed();
-    return { id, root: await fs.realpath(vault.vault), ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
+    return { id, root: await fs.realpath(vault.vault), ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
   }
   async preview(id) {
     const inventory = await this.inventory(id), token = randomUUID(); this.previews.set(token, inventory);
@@ -282,7 +285,7 @@ class CaptureDeletion {
           if (prior && (prior.fingerprint !== item.fingerprint || prior.sourceHash !== item.sourceHash || prior.captureId !== item.captureId)) throw changed();
           if (!prior) purged.set(item.identity, { ...item, operationId });
         }
-        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId, sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual } : { inventoryVersion: 2, originGenerations: fresh.originGenerations, recovery: fresh.recovery, recoveryPointers: fresh.recoveryPointers, purgedProducerAttempts: [...purged.values()].sort((a, b) => a.identity.localeCompare(b.identity)), ...(fresh.titleProofs ? { titleProofs: fresh.titleProofs } : {}) }), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}), ...(ledger.sourceAuthority[selected.id]?.retiredRestorations ? { retiredRestorations: ledger.sourceAuthority[selected.id].retiredRestorations } : {}) };
+        ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId, sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual } : { inventoryVersion: 2, originGenerations: fresh.originGenerations, recovery: fresh.recovery, recoveryPointers: fresh.recoveryPointers, purgedProducerAttempts: [...purged.values()].sort((a, b) => a.identity.localeCompare(b.identity)), ...(fresh.titleProofs ? { titleProofs: fresh.titleProofs } : {}), ...(fresh.titleRecovery ? { titleRecovery: fresh.titleRecovery } : {}) }), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}), ...(ledger.sourceAuthority[selected.id]?.retiredRestorations ? { retiredRestorations: ledger.sourceAuthority[selected.id].retiredRestorations } : {}) };
         if (!fresh.manual) { ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])]; ledger.captures[fresh.sourceHash].removed = true; }
         await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
         await vault.checkpoint('capture-deletion-authorized');
@@ -340,7 +343,8 @@ async function inspectDeletion(intake, ledger, id) {
   const capture = ledger.captures[authority.sourceHash];
   if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
   sourceTitle.inspectProofs(intake, ledger, authority);
-  await inspectManualPeers(vault, { captureId: id }, new Set((authority.titleProofs || []).map(proof => proof.before)));
+  await pendingTitle.inspect(intake, ledger, authority);
+  await inspectManualPeers(vault, { captureId: id }, new Set([...(authority.titleProofs || []).map(proof => proof.before), ...pendingTitle.sidecars(authority.titleRecovery)]));
   const knownPaths = new Set(authority.targets.map(target => target.file));
   for (const note of (await vault.scan()).filter(note => note.id === id)) if (!knownPaths.has(relative(vault, note.file))) throw changed();
   for (const folder of [intake.dir, path.join(vault.root, 'Revisions')]) for (const name of await fs.readdir(folder)) {

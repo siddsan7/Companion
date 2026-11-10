@@ -94,4 +94,4 @@ async function inventory(intake, ledger, capture, revisions, initial) {
   titleProofs.sort((left, right) => left.before < right.before ? -1 : left.before > right.before ? 1 : 0);
   return { targets: [...initial, ...backups.map(value => value.target)], titleProofs };
 }
-module.exports = { validateProofs, inspectProofs, inventory };
+module.exports = { validateProofs, inspectProofs, inventory, leaf };
