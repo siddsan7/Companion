@@ -610,6 +610,91 @@ test('completed imported title deletion holds independent body writing added to 
   expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
 });
 
+test('completed title proof recovers after actual snapshot unlink with its original restored generation and no source bodies', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  await artifact('first', '1'); const producerBytes = await files(path.join(root, 'producer'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), id = original.captures[sourceHash].id;
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(root, 'producer', 'first'));
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source restored');
+  const restored = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), generation = restored.sourceAuthority[id].generation, capture = restored.captures[sourceHash];
+  expect(generation).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+  expect(restored.admissions[capture.currentRevision].sourceGeneration).toBe(generation);
+  expect(restored.attempts).toEqual(original.attempts);
+  await page.getByLabel('Display title', { exact: true }).fill('Title survivor proof after explicit restoration');
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  const current = path.join(base, 'Captures', capture.file), snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json');
+  const names = (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(path.basename(current) + '.before-title-') && name.endsWith('.bak'));
+  expect(names).toHaveLength(1);
+  const backup = path.join(path.dirname(current), names[0]), targets = [current, backup, snapshot], relative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+  const titled = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(titled.admissions).toEqual(restored.admissions); expect(titled.attempts).toEqual(original.attempts);
+  const observer = path.join(root, 'title-snapshot-native-observer.json'), faults = path.join(root, 'faults.json');
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), nativeUnlink = io.unlink;
+    const exact = paths.resolve(options.snapshot).toLowerCase();
+    io.unlink = async function (file, ...args) {
+      const result = await nativeUnlink.call(this, file, ...args);
+      if (typeof file === 'string' && paths.resolve(file).toLowerCase() === exact) {
+        io.unlink = nativeUnlink;
+        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, matchedSnapshot: options.snapshot, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2), 'utf8');
+        await io.writeFile(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }), 'utf8');
+      }
+      return result;
+    };
+  }, { snapshot, observer, faults });
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('capture-deletion-unlinked');
+  const nativeObservation = JSON.parse(await fs.readFile(observer, 'utf8'));
+  expect(nativeObservation.mainPid).toBe(await app.evaluate(() => process.pid));
+  expect(nativeObservation.nativeUnlinkReturned).toBe(true); expect(nativeObservation.matchedSnapshot).toBe(snapshot); expect(nativeObservation.controlledSourceOmissions).toEqual([]);
+  const expectAbsent = async () => { for (const file of targets) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false); };
+  await expectAbsent();
+  const authorized = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), authority = authorized.sourceAuthority[id];
+  expect(authority.phase).toBe('deleting'); expect(authority.generation).not.toBe(generation);
+  expect(authority.titleProofs).toEqual([{ before: relative(backup), after: relative(current), snapshot: relative(snapshot), revisionId: capture.currentRevision, sourceGeneration: generation }]);
+  expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(relative).sort());
+  expect(authority.history).toEqual(restored.sourceAuthority[id].history);
+  expect(authorized.attempts).toEqual(original.attempts); expect(authorized.admissions).toEqual(restored.admissions); expect(authorized.suppressed).toContain(sourceHash);
+  await fs.copyFile(observer, testInfo.outputPath('title-snapshot-native-observer.json'));
+  await exitMain('capture-deletion-unlinked', testInfo, 'title-survivor-main-processes.json');
+  await expectAbsent();
+  await fs.writeFile(faults, '{}'); await launch();
+  await expect.poll(async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8')).sourceAuthority[id].phase).toBe('deleted');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0); await expectAbsent();
+  const recovered = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(recovered.sourceAuthority[id]).toEqual({ ...authority, phase: 'deleted' });
+  expect(recovered.attempts).toEqual(original.attempts); expect(recovered.admissions).toEqual(restored.admissions); expect(recovered.suppressed).toEqual(authorized.suppressed);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0); await expectAbsent();
+  const restarted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[id]).toEqual(recovered.sourceAuthority[id]); expect(restarted.attempts).toEqual(original.attempts); expect(restarted.admissions).toEqual(restored.admissions);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
