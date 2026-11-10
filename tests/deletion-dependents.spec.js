@@ -152,3 +152,71 @@ test('source deletion names actual retained writing and requests, cancels byte-e
   await expect(page.locator('#saved-ideas article').filter({ hasText: 'AFFECTED_SAVED_IDEA' })).toContainText('Review support');
 });
 
+
+// Exercise the existing provider/save-failure boundary, without fabricating history.
+test('source deletion preview preserves foreign historical dialogue and the only unsaved derived reply without replay', async () => {
+  test.setTimeout(150000);
+  await importedConversationForPreview();
+  const directory = path.join(root, 'conversations');
+  const originalName = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
+  const original = JSON.parse(await fs.readFile(path.join(directory, originalName), 'utf8'));
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await expect(page.locator('#conversation-history article')).toHaveCount(0);
+  await page.getByLabel('Context question', { exact: true }).fill('Inspect OLDIDEAGENERATION from the prior discussion.');
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  const result = page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: 'OLDIDEAGENERATION' });
+  await expect(result).toHaveCount(1);
+  await result.getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await expect(page.locator('#history-selected')).toContainText(original.requests[0].id);
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/OLDIDEAGENERATION/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(original.id));
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ holdCompletion: true, messages: [
+    { delta: 'FOREIGN_DERIVED_DURABLE_PREFIX', text: 'FOREIGN_DERIVED_ONLY_UNSAVED_WRITING a retained independent interpretation.', phase: 'final_answer' }
+  ] }));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  let derivedName;
+  await expect.poll(async () => {
+    derivedName = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name) && name !== originalName);
+    if (!derivedName) return '';
+    return JSON.parse(await fs.readFile(path.join(directory, derivedName), 'utf8')).requests[0].reply;
+  }).toContain('FOREIGN_DERIVED_DURABLE_PREFIX');
+  const derivedFile = path.join(directory, derivedName);
+  const derived = JSON.parse(await fs.readFile(derivedFile, 'utf8'));
+  // New conversation stays in draft mode until explicitly selected or the turn returns.
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(derived.id);
+  await expect(page.locator('#conversation-history')).toContainText('FOREIGN_DERIVED_DURABLE_PREFIX');
+  expect(derived.requests[0].package.historyRefs).toContainEqual(expect.objectContaining({ conversationId: original.id, requestId: original.requests[0].id }));
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'conversation-before-store', code: 'EACCES' }));
+  await fs.writeFile(path.join(root, 'conversation-release.json'), '{}');
+  await expect(page.locator('#conversation-error')).toContainText('may not survive restart');
+  await expect(page.locator('#conversation-history')).toContainText('FOREIGN_DERIVED_ONLY_UNSAVED_WRITING');
+  await expect(page.getByRole('button', { name: 'Save retained reply locally', exact: true })).toBeVisible();
+  await fs.writeFile(path.join(root, 'faults.json'), '{}');
+  const durableBytes = await fs.readFile(derivedFile);
+  expect(durableBytes.toString('utf8')).toContain('FOREIGN_DERIVED_DURABLE_PREFIX');
+  expect(durableBytes.toString('utf8')).not.toContain('FOREIGN_DERIVED_ONLY_UNSAVED_WRITING');
+  const vaultBefore = await files(path.join(root, 'vault')), historyBefore = await files(directory);
+  const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'));
+  expect(calls.toString('utf8').trim().split('\n')).toHaveLength(2);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const preview = page.getByLabel('Capture deletion preview');
+  await expect(preview).toBeVisible();
+  await expect(preview).toContainText(original.id);
+  await expect(preview).toContainText(original.requests[0].id);
+  await expect(preview).toContainText(derived.id);
+  await expect(preview).toContainText(derived.requests[0].id);
+  await expect(preview).toContainText('Includes derived historical dialogue.');
+  await expect(preview).toContainText('FOREIGN_DERIVED_ONLY_UNSAVED_WRITING');
+  await expect(preview).toContainText('unsaved; may not survive restart');
+  expect(await files(path.join(root, 'vault'))).toEqual(vaultBefore);
+  expect(await files(directory)).toEqual(historyBefore);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden();
+  await expect(page.locator('#conversation-history')).toContainText('FOREIGN_DERIVED_ONLY_UNSAVED_WRITING');
+  await expect(page.locator('#conversation-error')).toContainText('may not survive restart');
+  expect(await files(path.join(root, 'vault'))).toEqual(vaultBefore);
+  expect(await files(directory)).toEqual(historyBefore);
+  expect(await fs.readFile(derivedFile)).toEqual(durableBytes);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'))).toEqual(calls);
+});
