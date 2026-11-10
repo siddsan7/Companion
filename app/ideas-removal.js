@@ -51,13 +51,28 @@ function checkEnvelopes(value) {
 // This store owns only explicit saved-idea removal. It never reads Conversation
 // or Context, and never reconstructs writing from an intent during recovery.
 class IdeasRemoval {
-  constructor(ideas) { this.ideas = ideas; this.previews = new Map(); }
+  constructor(ideas) { this.ideas = ideas; this.previews = new Map(); this.refused = new Map(); }
+  refusals(vault) {
+    const key = JSON.stringify([vault.vault, vault.root]);
+    if (!this.refused.has(key)) this.refused.set(key, new Set());
+    return this.refused.get(key);
+  }
+  remember(vault, id) {
+    if (!uuid(id)) held();
+    // Refusal only: observed removal cannot supply unlink authority or recreate
+    // missing controls. Cold loss of all durable authority is not inferred.
+    this.refusals(vault).add(id);
+  }
   files(vault, id) {
     const final = path.join(vault.root, '.ideas', `${id}.removed.json`);
     return { final, stage: `${final}.pending` };
   }
   exists(file) { try { fs.lstatSync(file); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; } }
-  fenced(vault, id) { const files = this.files(vault, id); return this.exists(files.final) || this.exists(files.stage); }
+  fenced(vault, id) {
+    const files = this.files(vault, id);
+    if (this.refusals(vault).has(id) || this.exists(files.final) || this.exists(files.stage)) { this.remember(vault, id); return true; }
+    return false;
+  }
   allow(vault, id) {
     this.ideas.guard(vault);
     if (this.fenced(vault, id)) throw Error('This saved idea was selected for removal. Old proposals cannot publish or acknowledge it again. Inspect saved idea removal recovery.');
@@ -180,7 +195,9 @@ class IdeasRemoval {
   }
   load(vault, id) {
     const locations = this.files(vault, id), parents = this.ideas.guard(vault), copies = [];
-    for (const file of [locations.final, locations.stage]) if (this.exists(file)) copies.push({ file, ...this.read(vault, file, parents) });
+    for (const file of [locations.final, locations.stage]) if (this.exists(file)) {
+      this.remember(vault, id); copies.push({ file, ...this.read(vault, file, parents) });
+    }
     if (!copies.length) held();
     const value = JSON.parse(copies[0].text); this.validate(vault, value, id);
     if (copies.some(copy => copy.text !== copies[0].text || !same(copy.stat, copies[0].stat) || copy.stat.nlink !== BigInt(copies.length))) held();
@@ -225,7 +242,7 @@ class IdeasRemoval {
     const text = JSON.stringify(value), handle = fs.openSync(locations.stage, 'wx');
     let created;
     try {
-      created = fs.fstatSync(handle, { bigint: true }); fs.writeFileSync(handle, text); fs.fsyncSync(handle);
+      created = fs.fstatSync(handle, { bigint: true }); this.remember(vault, value.ideaId); fs.writeFileSync(handle, text); fs.fsyncSync(handle);
       const current = this.read(vault, locations.stage, parents);
       if (!same(created, current.stat) || current.text !== text || current.stat.nlink !== 1n) held();
       this.ideas.guard(vault, parents); fs.linkSync(locations.stage, locations.final);

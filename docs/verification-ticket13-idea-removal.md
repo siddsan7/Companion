@@ -22,6 +22,16 @@ The root agent ran the normal Electron UI with isolated persisted files and cont
 - Nested-envelope RED: the next case failed in 36.0 seconds at its first input subcase. An unknown nested writing field still allowed removal preview. No erase was attempted; the later authority and legacy-support subcases were not reached. Root preserved the test in `3af53cc` and retained its actual 92-byte diagnostic and error context under `Temp/companion-ticket13-idea-nested-red-20261109`.
 - Nested-envelope GREEN: root session `25964` passed the unchanged case in 39.2 seconds (39.6 seconds total), exit 0 with no skips. All input, authority and legacy-support subcases were reached. Removal-only known-field checks cover input, experiment fields, reference bindings and evidence anchors, support states, identity choices/issues and capture authority. Legacy six-field support states may omit both generation fields; inspection neither fills them nor rewrites the journal. Present generation arrays use the existing strict validator. JavaScript syntax and whitespace checks passed.
 
+## Stale normal-save confirmation
+
+The finite two-state behavior retains the real normal-save UI token after a controlled failure immediately before publication. The pending-row removal then commits its removal marker and stops at the controlled marker-before-unlink boundary. A subsequent stale normal confirmation must refuse both while those observed controls remain and after external loss of both controls with an unchanged `.ideas` directory identity. Fresh explicit writing remains allowed under a new UUID.
+
+Root session `77040` produced a genuine RED: the intact-control case passed in 44.9 seconds; the externally missing-control case failed in 43.8 seconds, total 1.5 minutes, exit 1. The lost-control case reported `Saved idea` and recreated its destination while changing three managed paths: pending stage, publication receipt and output. The directory device/inode identity was unchanged. Root retained the actual 852-byte and 556-byte diagnostics plus error context under `Temp/companion-ticket13-idea-stale-red-20261109` and preserved the test in `5580ae6` before the fix. Fresh-writing assertions in that failed case were not reached.
+
+The minimum fix remembers refused idea UUIDs in the existing removal instance, keyed by vault and application-root paths. It records its own newly created removal control and observed final/staged controls before reading or parsing them. Same-vault reconfiguration keeps that instance and its refusals. This memory only refuses old publication/acknowledgement: removal and recovery still require strict loaded controls, exact committed scope and per-attempt file identities. It cannot authorize unlink or reconstruct missing controls. Cold loss of all durable authority across process restart cannot be inferred from memory. Syntax and whitespace checks passed.
+
+Root session `62737` passed both unchanged stale-save states in 1.4 minutes, exit 0 with no skips: intact controls in 43.0 seconds and externally lost controls in 42.9 seconds. Both diagnostics showed `destinationExists: false`, no changed files and unchanged parent identities. Fresh explicit save assertions completed under new UUIDs. Source captures, originating conversation/history, the other saved idea and provider submissions remained exact. Root retained the distinct 570-byte and 560-byte diagnostics plus `.last-run` under `Temp/companion-ticket13-idea-stale-green-20261109`.
+
 ## Approved authority protocol
 
 The existing `.ideas` mutation lock serializes preview, confirmation and recovery. Raw removal preview does not call context or recovery-mutating list helpers, and does not create a missing store.
@@ -35,5 +45,4 @@ Ideas guards retain each observed `.ideas` directory identity for the process li
 ## Remaining checks
 
 - Additional changed-file and unknown-hardlink cases, stale operation publication and same-session store replacement still need focused regression evidence. The demonstrated changed-scope case covers a new orphan stage after preview.
-- A same-session observed-marker loss needs a bounded public stale-save check and refusal cache. Such a cache must never authorize unlink or reconstruct missing authority; fresh UUIDs remain allowed.
 - Full ticket review, integration, release checks and live provider/isolation checks remain with the root agent. No live provider, authentication, merge or deployment was performed by this worker.
