@@ -2,14 +2,12 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const actionOrder = require('./helpers/visible-action-order').visibleActionOrder();
 let root, app, page;
 test.beforeEach(async () => {
-  actionOrder.reset();
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-context-'));
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
 });
-test.afterEach(async ({}, testInfo) => { await actionOrder.save(testInfo); if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function settledStartup(window) {
   // A new window starts with an empty status. This current-epoch completion
   // follows its accepted base refresh and all initial saved-idea support reads.
@@ -17,7 +15,6 @@ async function settledStartup(window) {
 }
 async function launch(configure = true) {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
-  await actionOrder.install(app, page, test.info());
   if (configure) { await page.getByRole('button', { name: 'Choose vault' }).click(); await page.getByRole('button', { name: 'Use this folder' }).click(); await expect(page.getByRole('status')).toContainText('Vault ready.'); }
   else await settledStartup(page);
 }

@@ -4,14 +4,13 @@ const path = require('node:path');
 const os = require('node:os');
 const { createHash } = require('node:crypto');
 const YAML = require('yaml');
-const actionOrder = require('./helpers/mixed-check-phase').mixedCheckPhase();
 let root, app, page, checks;
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const exists = file => fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
 const portable = file => file.split(path.sep).join('/');
 
-test.beforeEach(async () => { actionOrder.reset(); root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-mixed-retention-')); checks = 0; });
-test.afterEach(async ({}, testInfo) => { await actionOrder.save(testInfo); if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-mixed-retention-')); checks = 0; });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
 async function bundle(name) {
   await fs.cp(path.join(__dirname, 'fixtures/reel-review', name), path.join(root, 'producer', name), { recursive: true });
 }
@@ -20,14 +19,12 @@ async function launch() {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   page = await app.firstWindow();
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
-  await actionOrder.install(app, page, test.info());
 }
 async function check(status = 'complete') {
   const instant = new Date(Date.parse('2026-11-08T06:59:00Z') + ++checks * 1000).toISOString();
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: instant, timezone: 'America/Phoenix' }));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.locator('#intake-state')).toContainText(`Last check: ${instant} · manual · ${status}`);
-  if (checks === 2) await actionOrder.saveSetup(test.info());
 }
 async function observe(folder, prefix = '') {
   const result = {};
