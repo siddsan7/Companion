@@ -61,6 +61,8 @@ Codex's separate `codex/managed-home` belongs to App Server and may contain mana
 
 `app/context.js` owns eligibility, deterministic exact-word paragraph matching, source/project association reasons, exact excerpt approvals and package serialization. `context-view.js` owns inspection/manual selection. The narrow `context-*` IPC never dispatches, authenticates or reads history. See ../docs/verification-ticket9.md for evidence and final gates.
 
+Context sourceInspection admits the entire fresh corpus through the existing native source owner, with a monotonic two-second admission bound and retries only before its callback begins; mutations retain immediate refusal, body errors never retry, and Conversation→required writing stores→Intake lock order is unchanged.
+
 Intake identity wins over writable capture type. Imported support uses validated immutable snapshots plus current eligibility. Annotations carry their own content hash and an explicitly unversioned capture association; their creation revision is unknown. Explicit note scope is stored in application-data `context-settings-<vault-path hash>/notes.json`, published atomically under the existing kernel-owned helper keyed to that dedicated directory.
 
 Saved-idea reader: schema-1 `saved_idea` with stable `companion_id` and explicit `source_dependencies`. Imported dependencies use capture/revision IDs; quick captures use capture/content digests. New writer records carry the exact full project-brief pin; legacy numeric versions remain checked separately. Unknown/incomplete attribution is unavailable support; explicit independent dependencies do not imply validated sentence citations. `validateDependencies` supplies conservative closure; authoring is owned by Ideas below.
