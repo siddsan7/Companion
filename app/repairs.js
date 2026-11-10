@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const { assertAnnotationPublication, annotationRemoved } = require('./annotation-authority');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { parseAnnotation } = require('./vault');
@@ -107,6 +108,8 @@ function install(Intake, { hash, read, noteText }) {
     const journal = path.join(this.dir, 'link-intent.json'), bytes = await read(journal); if (bytes === null) return;
     const intent = JSON.parse(bytes), uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
     if (intent.schema !== 1 || !uuid.test(intent.id) || typeof intent.before !== 'string' || typeof intent.content !== 'string' || typeof intent.relative !== 'string' || intent.content !== sourceLink(intent.before, intent.relative) || !parseAnnotation(intent.before)) throw Error('Invalid relationship repair journal. Files were preserved.');
+    const annotationId = parseAnnotation(intent.before).id;
+    if (annotationRemoved(await this.load(), annotationId)) return { held: true, removed: true };
     const file = this.destination({ relative: intent.file }), backup = path.join(this.dir, 'link-' + intent.id + '.before.md'), stage = path.join(this.dir, 'link-' + intent.id + '.stage');
     await this.vault.contained(path.dirname(file)); await this.ownedFile(file, [backup, stage], 'Annotation relationship'); await this.ownedFile(backup, file, 'Annotation relationship backup');
     const changed = message => Object.assign(Error(message), { annotationLinkConflict: true });
@@ -115,6 +118,7 @@ function install(Intake, { hash, read, noteText }) {
       if (current !== intent.content) {
         if (before === null) {
           if (current !== intent.before) throw changed('Annotation changed during move repair. Its writing was preserved.');
+          assertAnnotationPublication(await this.load(), annotationId);
           await fs.rename(file, backup); before = await read(backup); current = await read(file);
         }
         if (before !== intent.before) {
@@ -123,11 +127,13 @@ function install(Intake, { hash, read, noteText }) {
         }
         if (current !== null) throw changed('Annotation destination was recreated during relationship repair. Both files were preserved.');
         await this.ownedFile(stage, file, 'Annotation relationship stage');
+        assertAnnotationPublication(await this.load(), annotationId);
         try { await fs.writeFile(stage, intent.content, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST') throw error; if (await read(stage) !== intent.content) throw changed('Relationship staging conflict. Files were preserved.'); }
-        await this.ownedFile(stage, file, 'Annotation relationship stage'); await fs.link(stage, file).catch(error => { if (error.code !== 'EEXIST') throw error; throw changed('Annotation destination was recreated during relationship publication. Both files were preserved.'); });
+        await this.ownedFile(stage, file, 'Annotation relationship stage'); assertAnnotationPublication(await this.load(), annotationId); await fs.link(stage, file).catch(error => { if (error.code !== 'EEXIST') throw error; throw changed('Annotation destination was recreated during relationship publication. Both files were preserved.'); });
       }
       await this.ownedFile(file, stage, 'Annotation relationship');
       if (await read(file) !== intent.content || await read(backup) !== intent.before) throw changed('Annotation relationship changed during publication. Files were preserved.');
+      assertAnnotationPublication(await this.load(), annotationId);
       await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); await fs.unlink(journal);
     } catch (error) {
       if (!error.annotationLinkConflict) throw error;
@@ -166,6 +172,7 @@ function install(Intake, { hash, read, noteText }) {
   };
   Intake.prototype.retryLink = async function ({ id, token }) {
     return this.locked(async () => {
+      assertAnnotationPublication(await this.load(), id);
       await this.syncMoves(); const ledger = await this.load(), hold = ledger.linkHolds?.[id];
       if (!hold || hold.token !== token || !/^link-[a-f0-9-]{36}\.json$/.test(hold.journal)) throw Error('Annotation relationship hold changed. Refresh before retrying.');
       const archive = path.join(this.dir, hold.journal); await this.ownedFile(archive, [], 'Relationship hold archive');
@@ -187,7 +194,8 @@ function install(Intake, { hash, read, noteText }) {
     });
   };
   Intake.prototype.annotations = async function (captureId) {
-    const notes = (await this.vault.scan({ annotations: true })).filter(note => !captureId || note.captureId === captureId);
+    const ledger = await this.load();
+    const notes = (await this.vault.scan({ annotations: true })).filter(note => (!captureId || note.captureId === captureId) && !annotationRemoved(ledger, note.id));
     for (const note of notes) await this.ownedFile(note.file, [], 'Annotation');
     return notes;
   };
@@ -197,6 +205,7 @@ function install(Intake, { hash, read, noteText }) {
     return this.locked(async () => {
       if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(id) || typeof text !== 'string' || !text.trim()) throw Error('Enter annotation text before saving.');
       const ledger = await this.load(), capture = Object.values(ledger.captures).find(x => x.id === captureId);
+      assertAnnotationPublication(ledger, id);
       if (!capture) throw Error('Choose an imported capture before adding an annotation.');
       const annotation = '---\ncompanion_id: ' + JSON.stringify(id) + '\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ' + JSON.stringify(captureId) + (ledger.sourceAuthority?.[captureId]?.phase === 'active' ? '\nsource_generation: ' + JSON.stringify(ledger.sourceAuthority[captureId].generation) : '') + '\ncreated_at: ' + JSON.stringify(now) + '\n---\n\n# Annotation\n\nSource: [Capture](' + urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture))) + ')\n\n' + text + '\n';
       await this.publishJournal(path.join(this.dir, 'annotation-intent.json'), { schema: 1, id, captureId, annotation });
@@ -207,14 +216,18 @@ function install(Intake, { hash, read, noteText }) {
     const journal = path.join(this.dir, 'annotation-intent.json'), bytes = await read(journal); if (bytes === null) return;
     const intent = JSON.parse(bytes), uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
     if (intent.schema !== 1 || !uuid.test(intent.id) || !uuid.test(intent.captureId) || typeof intent.annotation !== 'string' || !intent.annotation.includes('capture_id: ' + JSON.stringify(intent.captureId) + '\n')) throw Error('Invalid annotation save intent. Preserve .intake for repair.');
+    if (annotationRemoved(await this.load(), intent.id)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', intent.id + '.md'), stage = path.join(this.dir, 'annotation-' + intent.id + '.stage');
     await this.vault.contained(path.dirname(file)); await this.ownedFile(stage, file, 'Annotation staging file');
+    assertAnnotationPublication(await this.load(), intent.id);
     try { await fs.writeFile(stage, intent.annotation, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(stage) !== intent.annotation) throw Error('Annotation staging conflict. Both files were preserved.'); }
     await this.ownedFile(stage, file, 'Annotation staging file'); await this.ownedFile(file, stage, 'Annotation destination');
+    assertAnnotationPublication(await this.load(), intent.id);
     try { await fs.link(stage, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     await this.ownedFile(file, stage, 'Annotation destination');
     if (await read(file) !== intent.annotation) throw Error('Annotation destination changed. Both files were preserved.');
     await this.vault.checkpoint('annotation-published');
+    assertAnnotationPublication(await this.load(), intent.id);
     await fs.unlink(stage); await fs.unlink(journal);
   };
   Intake.prototype.repairs = async function () {
@@ -267,6 +280,7 @@ function install(Intake, { hash, read, noteText }) {
     const intent = JSON.parse(bytes), tx = intent.tx;
     this.validateTransaction(tx);
     if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
+    if (annotationRemoved(await this.load(), intent.annotationId)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
     const hold = async error => {
       // Retain the complete annotation intent before moving the active source
@@ -298,13 +312,16 @@ function install(Intake, { hash, read, noteText }) {
     const existing = await this.ownedFile(file, stage, 'Annotation destination');
     if (!existing) {
       await this.ownedFile(stage, file, 'Annotation staging file');
+      assertAnnotationPublication(await this.load(), intent.annotationId);
       try { await fs.writeFile(stage, intent.annotation, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(stage) !== intent.annotation) throw Error('Annotation staging conflict. Both files were preserved.'); }
       await this.ownedFile(stage, file, 'Annotation staging file');
+      assertAnnotationPublication(await this.load(), intent.annotationId);
       try { await fs.link(stage, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     }
     await this.ownedFile(file, stage, 'Annotation destination');
     if (await read(file) !== intent.annotation) throw Error('Annotation changed. Incoming source remains paused; preserve both versions.');
     await this.vault.checkpoint('repair-annotation-published');
+    assertAnnotationPublication(await this.load(), intent.annotationId);
     const ledger = await this.load();
     if (activeAdmission(ledger, tx.revision.identity, tx.capture.id)?.revision !== tx.revision.id || ledger.captures[tx.sourceHash]?.currentRevision !== tx.capture.currentRevision || ledger.captures[tx.sourceHash]?.currentHash !== tx.capture.currentHash) {
       const journal = path.join(this.dir, 'transaction.json');
@@ -326,4 +343,4 @@ function install(Intake, { hash, read, noteText }) {
     await fs.unlink(intentFile);
   };
 }
-module.exports = { install };
+module.exports = { install, sourceLink };
