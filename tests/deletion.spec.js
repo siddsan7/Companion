@@ -406,6 +406,97 @@ test('source-only deletion inventories an unadmitted finalized acceptance with e
   expect(await files(reviewRoot)).toEqual(producerReview); expect(await files(path.join(root, 'producer'))).toEqual(selected.producerBytes);
 });
 
+test('source-only deletion preserves accepted reviewed A while purging an unadmitted retained-current edit B and its five actual copies', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const producer = path.join(root, 'producer');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(producer);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures[sourceHash], destination = path.join(base, 'Captures', capture.file);
+  const currentBytes = await fs.readFile(destination), snapshotA = path.join(base, 'Revisions', capture.currentRevision + '.json'), snapshotABytes = await fs.readFile(snapshotA);
+  expect(capture.reviewed).toBe(true); expect(Object.keys(original.attempts)).toHaveLength(1);
+  expect(JSON.parse(snapshotABytes.toString('utf8')).review.decision).toBe('accept');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(producer, 'edit'), { recursive: true });
+  const producerBytes = await files(producer);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-snapshot' }));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('intake-snapshot');
+  const tx = JSON.parse(await fs.readFile(path.join(intake, 'transaction.json'), 'utf8'));
+  expect(tx.retainOnly).toBe(true); expect(tx.revision.review.decision).toBe('edit');
+  expect(tx.capture.currentRevision).toBe(capture.currentRevision);
+  expect(tx.content).toBe(currentBytes.toString('utf8')); expect(tx.previous).toBe(tx.content); expect(tx.previousHash).toBe(capture.currentHash);
+  expect(tx.capture.revisions).toEqual([capture.currentRevision, tx.revision.id]);
+  expect(tx.capture.reviewChoices).toEqual([capture.currentRevision, tx.revision.id]); expect(tx.capture.supportEligible).toBe(false);
+  const snapshotB = path.join(base, 'Revisions', tx.revision.id + '.json'), stageB = path.join(intake, tx.revision.id + '.snapshot.stage');
+  const absent = [path.join(intake, tx.revision.id + '.stage'), path.join(intake, tx.backup)];
+  const expectAbsent = async paths => { for (const file of paths) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false); };
+  await expectAbsent(absent);
+  expect((await fs.stat(snapshotB)).nlink).toBe(2); expect((await fs.stat(stageB)).ino).toBe((await fs.stat(snapshotB)).ino);
+  const paused = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(paused.attempts).toEqual(original.attempts); expect(paused.attempts[tx.revision.identity]).toBeUndefined();
+  expect(paused.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  await exitMain('intake-snapshot', testInfo, 'source-inventory-retain-only-processes.json');
+  const outside = path.join(root, 'controlled-outside-B-snapshot');
+  await fs.link(snapshotB, outside); expect((await fs.stat(snapshotB)).nlink).toBe(3);
+  await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
+  await expect.poll(async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8')).blocks[sourceHash]?.incomingRevision).toBe(tx.revision.id);
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  const held = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), archive = path.join(intake, held.blocks[sourceHash].journal);
+  expect(held.blocks[sourceHash].reason).toContain('unexpected hardlink alias');
+  expect(held.attempts).toEqual(original.attempts); expect(held.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect(await fs.readFile(destination)).toEqual(currentBytes); expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  expect(JSON.parse(await fs.readFile(archive, 'utf8'))).toEqual(tx);
+  await expectAbsent(absent);
+  await app.close(); app = null; await fs.unlink(outside);
+  await fs.writeFile(testInfo.outputPath('source-inventory-retain-only-fixture.json'), JSON.stringify({
+    actualExitBoundary: 'intake-snapshot',
+    controlledOutsideAlias: { name: path.basename(outside), createdWhileMainAbsent: true, removedWhileMainAbsentAfterConflict: true },
+    description: 'The test created a third outside hardlink after actual exit to retain the real transaction through the existing ownership refusal. Only that test-created alias was then removed; source bytes were unchanged.'
+  }, null, 2), 'utf8');
+  await launch(); await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(1);
+  expect((await fs.stat(snapshotB)).nlink).toBe(2); expect((await fs.stat(stageB)).ino).toBe((await fs.stat(snapshotB)).ino);
+  expect(await fs.readFile(snapshotB, 'utf8')).toBe(JSON.stringify(tx.revision, null, 2));
+  expect(await fs.readFile(destination)).toEqual(currentBytes); expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  const before = await files(base), targets = [destination, snapshotA, snapshotB, stageB, archive], preview = page.getByLabel('Capture deletion preview');
+  for (const file of targets) expect((await fs.stat(file)).isFile()).toBe(true);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
+  for (const file of targets) await expect(preview).toContainText(path.relative(path.join(root, 'vault'), file).split(path.sep).join('/'));
+  expect(await files(base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), authority = deleted.sourceAuthority[capture.id];
+  expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/')).sort());
+  expect(authority.purgedProducerAttempts).toEqual([{ identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, sourceHash, captureId: capture.id, revisionId: tx.revision.id, sourceGeneration: null, operationId: authority.operationId }]);
+  expect(deleted.attempts).toEqual(original.attempts); expect(deleted.admissions).toEqual(original.admissions);
+  expect(deleted.attempts[tx.revision.identity]).toBeUndefined(); expect(deleted.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect(deleted.blocks[sourceHash]).toBeUndefined(); expect(deleted.pending[sourceHash]).toBeUndefined();
+  expect(authority.phase).toBe('deleted'); expect(deleted.suppressed).toContain(sourceHash);
+  await expectAbsent([...targets, ...absent]); expect(await files(producer)).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[capture.id]).toEqual(authority); expect(restarted.attempts).toEqual(original.attempts); expect(restarted.admissions).toEqual(original.admissions);
+  await expectAbsent([...targets, ...absent]); expect(await files(producer)).toEqual(producerBytes);
+});
+
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
