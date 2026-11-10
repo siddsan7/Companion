@@ -5,6 +5,7 @@ const path = require('node:path');
 const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
+const { TranscriptRemoval } = require('./transcript-removal');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -17,7 +18,7 @@ const literal = text => {
 class Transcripts {
   constructor({ conversations, getVault, getContext, clock, checkpoint, choose }) {
     Object.assign(this, { conversations, getVault, getContext, clock, checkpoint, choose });
-    this.previews = new Map(); this.roots = new Map();
+    this.previews = new Map(); this.roots = new Map(); this.removal = new TranscriptRemoval(this);
   }
   guard(vault, destination, expected, create = false) {
     const root = path.resolve(vault.vault), directory = path.join(vault.root, '.transcripts');
@@ -38,8 +39,9 @@ class Transcripts {
       let current = root;
       for (const part of parts) { current = path.join(current, part); check(current, expected?.get(current)); }
     }
+    if (this.roots.has(directory) && !local.existsSync(directory)) throw Error('Transcript folder identity changed. Restore the original folder before retrying.');
     if (create) { try { local.mkdirSync(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } }
-    if (local.existsSync(directory)) check(directory, expected?.get(directory));
+    if (local.existsSync(directory)) { const identity = check(directory, this.roots.get(directory) || expected?.get(directory)); this.roots.set(directory, identity); }
     for (const [file, identity] of expected || []) check(file, identity);
     return identities;
   }
@@ -50,7 +52,7 @@ class Transcripts {
     const handle = await fs.open(file, 'r');
     try {
       if (!same(before, await handle.stat({ bigint: true }))) throw Error('Transcript file identity changed. Preserve it for review.');
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(await handle.readFile());
+      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await handle.readFile());
       this.guard(vault, destination, parents);
       const after = await fs.lstat(file, { bigint: true });
       if (!same(before, after) || after.nlink !== BigInt(links)) throw Error('Transcript file identity changed. Preserve it for review.');
@@ -139,6 +141,7 @@ class Transcripts {
     const directory = path.join(vault.root, '.transcripts'), base = path.join(directory, operation);
     const journal = await this.read(vault, placeholder, `${base}.intent.json`, parents);
     const intent = this.validateIntent(JSON.parse(journal.text), operation, vault);
+    await this.removal.fence(intent, vault);
     return { intent, vault, base };
   }
   async publicationState(intent, vault, base, parents) {
@@ -169,6 +172,10 @@ class Transcripts {
     try { this.guard(vault, placeholder); names = await fs.readdir(directory); }
     catch (error) { if (error.code !== 'ENOENT') issues.push(error.message); return { records, issues }; }
     const owned = new Set();
+    for (const name of names) {
+      const control = name.match(/^([a-f0-9-]{36})\.removed\.json(?:\.pending)?$/);
+      if (control && uuid(control[1])) owned.add(name); // Inspected separately by the removal recovery view.
+    }
     for (const name of names) {
       const match = name.match(/^([a-f0-9-]{36})\.intent\.json$/); if (!match) continue;
       owned.add(name);
@@ -201,17 +208,20 @@ class Transcripts {
     const preview = this.previews.get(token); if (!preview) throw Error('Preview the transcript again before exporting.');
     const { intent } = preview, vault = this.getVault();
     if (!vault || vault.vault !== intent.vault.vault || vault.root !== intent.vault.root) throw Error('Selected vault changed. Preview the transcript again.');
+    this.guard(vault, intent.destination, preview.parents);
+    await this.removal.fence(intent, vault);
     // Lock order: conversation store, then transcript journal. Never acquire these in reverse.
     return this.conversations.lock(async () => {
       const parents = this.guard(vault, intent.destination, preview.parents, true), directory = path.join(vault.root, '.transcripts');
       return withBriefMutation(directory, async () => {
         this.guard(vault, intent.destination, parents);
+        await this.removal.fence(intent, vault);
         const base = path.join(directory, intent.operation), journal = `${base}.intent.json`, stage = `${base}.md.pending`, receipt = `${base}.published.json`;
         const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
         const exactIntent = async () => {
           if (await exists(journal)) {
             if ((await this.read(vault, intent.destination, journal, parents)).text !== JSON.stringify(intent, null, 2)) throw Error('Transcript intent changed. Preserve the proposed writing for review.');
-          } else { this.guard(vault, intent.destination, parents); await fs.writeFile(journal, JSON.stringify(intent, null, 2), { flag: 'wx', flush: true }); this.guard(vault, intent.destination, parents); }
+          } else { this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.writeFile(journal, JSON.stringify(intent, null, 2), { flag: 'wx', flush: true }); this.guard(vault, intent.destination, parents); }
         };
         const pair = async () => {
           const a = await this.read(vault, intent.destination, stage, parents, 2), b = await this.read(vault, intent.destination, intent.destination, parents, 2);
@@ -224,7 +234,7 @@ class Transcripts {
           if (await exists(stage)) {
             const stat = await pair();
             if (String(stat.dev) !== saved.dev || String(stat.ino) !== saved.ino) throw Error('Transcript publication identity changed. Preserve files for review.');
-            this.guard(vault, intent.destination, parents); await fs.unlink(stage);
+            this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.unlink(stage);
           }
           this.previews.delete(token); return { destination: intent.destination, completed: true };
         }
@@ -237,19 +247,23 @@ class Transcripts {
           await exactIntent();
           if (await exists(stage)) {
             if ((await this.read(vault, intent.destination, stage, parents)).text !== intent.text) throw Error('Transcript stage changed. Preserve it for review.');
-          } else { this.guard(vault, intent.destination, parents); await fs.writeFile(stage, intent.text, { flag: 'wx', flush: true }); }
+          } else { this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.writeFile(stage, intent.text, { flag: 'wx', flush: true }); }
           await this.checkpoint('transcript-before-publish');
+          await this.removal.fence(intent, vault);
           const current = await this.snapshot(intent.conversationId);
           if (JSON.stringify(current.state) !== JSON.stringify(intent.reviewState)) throw Error('Conversation or support warnings changed. Preview the transcript again before new publication.');
           if ((await this.read(vault, intent.destination, stage, parents)).text !== intent.text) throw Error('Transcript stage changed. Preserve it for review.');
-          this.guard(vault, intent.destination, parents); await fs.link(stage, intent.destination); published = true;
+          this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.link(stage, intent.destination); published = true;
           await this.checkpoint('transcript-after-link');
+          await this.removal.fence(intent, vault);
         }
         const stat = await pair();
         this.guard(vault, intent.destination, parents);
+        await this.removal.fence(intent, vault);
         await fs.writeFile(receipt, JSON.stringify({ schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest, dev: String(stat.dev), ino: String(stat.ino) }, null, 2), { flag: 'wx', flush: true });
         await this.checkpoint('transcript-after-receipt');
-        await pair(); this.guard(vault, intent.destination, parents); await fs.unlink(stage);
+        await this.removal.fence(intent, vault);
+        await pair(); this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.unlink(stage);
         this.previews.delete(token); return { destination: intent.destination, completed: published };
       });
     });
@@ -263,6 +277,11 @@ function installTranscripts({ ipcMain, ...options }) {
   ipcMain.handle('transcript-cancel', (_, input) => store.cancel(input?.token));
   ipcMain.handle('transcript-pending', () => store.pending());
   ipcMain.handle('transcript-resume', (_, input) => store.resume(input?.operation));
+  ipcMain.handle('transcript-remove-list', () => store.removal.list());
+  ipcMain.handle('transcript-remove-preview', (_, input) => store.removal.preview(input?.operation));
+  ipcMain.handle('transcript-remove-confirm', (_, input) => store.removal.confirm(input?.token));
+  ipcMain.handle('transcript-remove-cancel', (_, input) => store.removal.cancel(input?.token));
+  ipcMain.handle('transcript-remove-resume', (_, input) => store.removal.resume(input?.id));
   return store;
 }
 module.exports = { Transcripts, installTranscripts };
