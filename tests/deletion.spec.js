@@ -695,6 +695,115 @@ test('completed title proof recovers after actual snapshot unlink with its origi
   expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
 });
 
+test('repeated completed imported titles review every physical backup including stable same-title copies', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  await artifact('first', '1'); const producerBytes = await files(path.join(root, 'producer'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
+  const original = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), capture = original.captures[sourceHash], current = path.join(base, 'Captures', capture.file);
+  const snapshot = path.join(base, 'Revisions', capture.currentRevision + '.json'), snapshotBytes = await fs.readFile(snapshot);
+  const admitted = Object.values(original.attempts).find(item => item.revision === capture.currentRevision);
+  const backupNames = async () => (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(path.basename(current) + '.before-title-') && name.endsWith('.bak')).sort();
+  const buffers = new Map(), observations = [];
+  const saveTitle = async title => {
+    const before = await fs.readFile(current), namesBefore = new Set(await backupNames());
+    await page.getByLabel('Display title', { exact: true }).fill(title);
+    const oldSave = await page.getByRole('button', { name: 'Save title', exact: true }).elementHandle();
+    expect(oldSave).not.toBeNull();
+    await page.getByRole('button', { name: 'Save title', exact: true }).click();
+    // A same-title status/heading can be stale. Observe the completed render's
+    // replacement control before reading the writer's new physical copies.
+    await oldSave.waitForElementState('hidden');
+    await expect(page.getByRole('button', { name: 'Save title', exact: true })).toBeVisible();
+    await expect(page.getByRole('status')).toContainText('Title saved.');
+    await expect(page.getByLabel('Display title', { exact: true })).toHaveValue(title);
+    const after = await fs.readFile(current), added = (await backupNames()).filter(name => !namesBefore.has(name));
+    expect(added.length).toBeGreaterThan(0);
+    for (const name of added) {
+      const file = path.join(path.dirname(current), name), bytes = await fs.readFile(file);
+      expect(bytes).toEqual(before); buffers.set(file, bytes);
+    }
+    observations.push({ beforeSha256: createHash('sha256').update(before).digest('hex'), afterSha256: createHash('sha256').update(after).digest('hex'), addedBackupNames: added });
+    return { before, after, added };
+  };
+  const first = await saveTitle('First "quoted" title: [alpha] & question?');
+  const secondTitle = 'Second (title) — [beta] "quote": complete?';
+  const second = await saveTitle(secondTitle), same = await saveTitle(secondTitle);
+  expect(first.added).toHaveLength(1); expect(second.added).toHaveLength(1);
+  expect(same.after).toEqual(same.before); expect(same.added).toHaveLength(2);
+  const names = await backupNames(); expect(names).toHaveLength(first.added.length + second.added.length + same.added.length);
+  expect(names).toHaveLength(4);
+  const backups = names.map(name => path.join(path.dirname(current), name)), targets = [...backups, current, snapshot];
+  buffers.set(current, same.after); buffers.set(snapshot, snapshotBytes);
+  const identities = new Set();
+  for (const file of targets) {
+    const stat = await fs.lstat(file, { bigint: true });
+    expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1n);
+    identities.add(`${stat.dev}:${stat.ino}`); expect(await fs.readFile(file)).toEqual(buffers.get(file));
+  }
+  expect(identities.size).toBe(targets.length); expect(targets).toHaveLength(6);
+  for (const name of same.added) expect(buffers.get(path.join(path.dirname(current), name))).toEqual(buffers.get(current));
+  const named = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(named.attempts).toEqual(original.attempts); expect(named.admissions).toEqual(original.admissions);
+  expect(named.captures[sourceHash].id).toBe(capture.id); expect(named.captures[sourceHash].capturedAt).toBe(capture.capturedAt);
+  expect(named.captures[sourceHash].currentRevision).toBe(capture.currentRevision); expect(named.captures[sourceHash].title).toBe(secondTitle);
+  expect(named.captures[sourceHash].currentHash).toBe(createHash('sha256').update(same.after).digest('hex'));
+  const residue = [current + '.pending', current + '.title-transaction.json', path.join(base, '.intake', 'title-intent.json')];
+  const expectAbsent = async paths => { for (const file of paths) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false); };
+  await expectAbsent(residue);
+  await fs.writeFile(testInfo.outputPath('repeated-title-writer-observations.json'), JSON.stringify({ saves: observations, physicalBackupCount: backups.length, physicalSourceFileCount: targets.length, distinctSingleLinkInodes: identities.size, sameByteBackupNames: same.added }, null, 2), 'utf8');
+  const beforePreview = await files(base), preview = page.getByLabel('Capture deletion preview'), relative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible();
+  for (const file of targets) await expect(preview).toContainText(relative(file));
+  expect(await files(base)).toEqual(beforePreview);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(beforePreview);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), authority = deleted.sourceAuthority[capture.id], proofs = authority.titleProofs;
+  expect(authority.phase).toBe('deleted'); expect(authority.inventoryVersion).toBe(2);
+  expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(relative).sort());
+  for (const file of targets) {
+    const target = authority.targets.find(item => item.file === relative(file));
+    expect(target.kind).toBe(file === current ? 'capture' : file === snapshot ? 'snapshot' : 'source-title-backup');
+    expect(target.sha256).toBe(createHash('sha256').update(buffers.get(file)).digest('hex'));
+  }
+  expect(authority.targets.every(item => item.peers === undefined)).toBe(true);
+  expect(proofs).toHaveLength(backups.length); expect(proofs.map(item => item.before)).toEqual(backups.map(relative).sort());
+  const next = new Map(), incoming = new Set();
+  for (const proof of proofs) {
+    expect(Object.keys(proof).sort()).toEqual(['before', 'after', 'snapshot', 'revisionId', 'sourceGeneration'].sort());
+    expect(proof.snapshot).toBe(relative(snapshot)); expect(proof.revisionId).toBe(capture.currentRevision);
+    expect(proof.sourceGeneration).toBe(admitted.sourceGeneration || null); expect(proof.sourceGeneration).not.toBe(authority.generation);
+    expect([...backups, current].map(relative)).toContain(proof.after);
+    expect(incoming.has(proof.after)).toBe(false); incoming.add(proof.after); next.set(proof.before, proof.after);
+  }
+  const roots = backups.map(relative).filter(file => !incoming.has(file)); expect(roots).toHaveLength(1);
+  const visited = new Set(); let node = roots[0];
+  while (node !== relative(current)) { expect(visited.has(node)).toBe(false); visited.add(node); expect(next.has(node)).toBe(true); node = next.get(node); }
+  visited.add(node); expect([...visited].sort()).toEqual([...backups, current].map(relative).sort());
+  expect(deleted.attempts).toEqual(original.attempts); expect(deleted.admissions).toEqual(original.admissions); expect(deleted.suppressed).toContain(sourceHash);
+  await expectAbsent([...targets, ...residue]); expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[capture.id]).toEqual(authority); expect(restarted.attempts).toEqual(original.attempts); expect(restarted.admissions).toEqual(original.admissions);
+  await expectAbsent([...targets, ...residue]); expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
 test('capture deletion previews all snapshots, cancels unchanged and preserves independent annotations on confirmation', async () => {
   await artifact('first', '1'); await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
