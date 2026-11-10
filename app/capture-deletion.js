@@ -74,6 +74,7 @@ class CaptureDeletion {
     }
     const directories = new Map();
     for (const name of requiredDirectories(intake, targets)) { const value = await this.directory(vault, path.join(vault.vault, name)); directories.set(name, value); }
+    await inspectAdjacentTitlePrefix(vault, targets);
     const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
     await inspectManualPeers(vault, { captureId: id }, new Set((imported?.titleProofs || manualTitles?.titleProofs || []).map(proof => proof.before)));
     const dependents = await deletionDependents.inventory(vault, this.conversations, id);
@@ -295,6 +296,21 @@ class CaptureDeletion {
     }));
   }
 }
+async function inspectAdjacentTitlePrefix(vault, targets) {
+  const captures = targets.filter(target => target.kind === 'capture');
+  if (captures.length !== 1) throw changed();
+  // Discovery covers the full namespace even after the current file is gone.
+  // Only literal manifested backup paths retain their existing ownership proof.
+  const current = path.join(vault.vault, captures[0].file), parent = path.dirname(current);
+  await vault.contained(parent);
+  const stat = await fs.lstat(parent);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw changed();
+  const prefix = (path.basename(current) + '.before-title-').toLowerCase();
+  const known = new Set(targets.filter(target => target.kind === 'source-title-backup').map(target => target.file));
+  for (const name of await fs.readdir(parent)) {
+    if (name.toLowerCase().startsWith(prefix) && !known.has(relative(vault, path.join(parent, name)))) throw changed();
+  }
+}
 async function inspectManualPeers(vault, manual, provenTitles = new Set()) {
   // Adjacent recovery records are deliberately held until their separate
   // source/writing inventory is reviewed. They cannot hide behind completion.
@@ -340,6 +356,7 @@ async function inspectDeletion(intake, ledger, id) {
   if (await fs.realpath(vault.vault) !== authority.root) throw changed();
   const deletion = new CaptureDeletion({ getVault: () => vault });
   await sourceParents(intake, authority);
+  await inspectAdjacentTitlePrefix(vault, authority.targets);
   const capture = ledger.captures[authority.sourceHash];
   if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
   if (manualTitle.explicit(authority)) manualTitle.validate(authority, id);
