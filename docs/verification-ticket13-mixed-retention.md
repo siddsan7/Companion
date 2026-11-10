@@ -100,6 +100,22 @@ npx playwright test tests/mixed-retention-deletion.spec.js --grep "missing recei
 
 The completed annotation-removal/restoration lifecycle and inherited-owner corruption guards remain planned and unauthored.
 
+## Strict mixed proof field corruption
+
+Root reported the unchanged missing-receipted-output guard passing 23429ms with no skips, committed as `63e64d6b07ea283ac3fc996a7db4314fa5f0aefd`. Its actual before-native-unlink observation found both receipts, no stages and all five origins; no source unlink was delegated. Actual main exit, removal of only X, startup/public-recovery/Resume HOLD, unchanged authority/all five origins/Y, and absence of X republication all passed.
+
+The next test-only regression is `mixed retention rejects a malformed title proof object before publication or source purge`. The independent detached-editor interface audit identified that the old mixed validator's optional `.length` condition accepts malformed null/object `titleProofs`; canonical kept-current mixed authority emits neither titleProofs nor titleRecovery. This test measures the object case through a real public operation and normal restart, without importing private validators or changing product source.
+
+The real legacy five-origin fixture confirms deletion and pauses at the existing authorized checkpoint before any writing output/stage. It saves the actual authority, all origins, reviewed output paths and current lock, then records actual main/wrapper exit. Offline it adds only `authority.titleProofs = { unreviewedSourceCopy: actualWholeY }` as well-formed JSON, verifies all other authority facts and vault paths are unchanged, and restarts with no fault. It waits for either actual completed deletion or an actual startup schema error, then saves complete terminal evidence before its first feature assertion. Expected strict behavior is schema HOLD: deleting phase, exact altered ledger retained, all five origin identities and producers unchanged, no outputs/stages, and no stripping of the added field. The only permitted incidental cleanup is the exact lock belonging to the exited main.
+
+Syntax check passed. Runtime RED/GREEN is unmeasured for this new guard. Root's next exact command is:
+
+```powershell
+npx playwright test tests/mixed-retention-deletion.spec.js --grep "malformed title proof object" --workers=1 --reporter=list
+```
+
+The lifecycle and inherited-owner tests remain unauthored pending this guard's measured RED, separate product fix and measured GREEN.
+
 
 Root first stage2/restored-G attempt failed43338ms/exit1 before restoration/held mixed setup: exact getByLabel for artifact kind did not match the actual wrapping select label, whose accessible name includes option text. Existing successful reviewed-restoration test uses role combobox with Selected producer artifact kind prefix. Root uses that same observed locator; no source/assertion/timeout/retry change. No restoredG/native link/crash proof was reached or claimed. Evidence Temp/companion-ticket13-mixed-retention-link-before-receipt-20261110 retained separately as fixture failure; correctedstage2 runtime pending.
 
@@ -108,3 +124,6 @@ Root corrected stage2 actualrestoredG/link-before-receipt crash GREEN31637ms, ex
 
 
 Root missing-receipted-output guard PASS23429ms, exit0/no skips, stagedtreefa4b9fe7eb34a4fc8d80ba92a0b6f74a71ea741b/product4a21827 unchanged. BEFOREfirstnativeSOURCEunlink observer recorded BOTHdurablereceipts/exactoutputs/no stages/all5origins; it did NOTdelegate sourceunlink. Actualmain/wrapperexit thencontrolledoffline removalONLYX whileall5origins(inclrepairX) remained. Startup/publicrecovery/explicitResume heldSAMEoperation/receipts/fullsource5/producers/otherYoutput withXabsent,norepub/noreconstruction/nooriginunlink. Exactownedcurrentlockwasboundtoexitedmain andonlylegitimatecleanupaccounted, no broadsnapshotfilter. Evidence Temp/companion-ticket13-mixed-retention-missing-output-20261110. This measuresverify-onlyevenwhenpayloadoriginsremain; notanactualsourceunlinkcrashcase (stage2measuresactualannotationlink). Completedannotationremoval/restoration/inheritedowner andstrictproof-schema/formatcomposition/finalreviews remain.
+
+
+Root proof-schema actualRED16373ms, exit1/no skips, stagedtree62b6230df18cf12a3b05d2056994e378750ff671/product63e64d6 unchanged. Real5origin/publicauthorized/nooutputs/main+wrapperexit facts passed; ONLYofflineauthority.titleProofs={unreviewedSourceCopy:ACTUALwholeY} wasadded. NormalrestartwronglyfinishedphaseDeleted/all5originsgone/twowritingoutputs whilemalformedproofobject remained. Savedterminalprecededexpecteddeleting/schemaHOLD558failure. Independentoptional-lengthfinding thereforeverified, notfixturefailure; laterpreservation assertionsNOTreached. Evidence Temp/companion-ticket13-mixed-proof-schema-red-20261110. RootGO separateoldformatvalidatorfix explicitcanonicalabsence oftitleProofs/titleRecovery; no payloadstrip/scoperepair/autoadoption. New9formatalreadyrejectsfields. RegressiontestMUSTunchanged; sourcefixseparatecommit fromfeature.

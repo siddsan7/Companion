@@ -509,3 +509,61 @@ test('mixed retention holds a missing receipted output before first native sourc
   compareHeld(retried); expect(retriedLedger.sourceAuthority[capture.id]).toEqual(authority); expect(await exists(removedOutput)).toBe(false);
   expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
 });
+
+test('mixed retention rejects a malformed title proof object before publication or source purge', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const fixture = await heldMixedRepair(testInfo), { base, ledgerFile, capture, origins, producer } = fixture;
+  const originalOrigins = await observe(base);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(page.getByLabel('Capture deletion preview')).toBeVisible();
+  const reviewed = await page.getByLabel('Capture deletion preview').textContent();
+  for (const file of origins) expect(reviewed).toContain(portable(path.relative(path.join(root, 'vault'), file)));
+  const outputPaths = [...new Set(reviewed.match(/Companion\/Annotations\/[a-f0-9-]{36}\.md/g) || [])]; expect(outputPaths).toHaveLength(2);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-deletion-authorized' }));
+  await page.getByLabel('Capture deletion preview').getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8')).toBe('capture-deletion-authorized');
+  const authorizedBytes = await fs.readFile(ledgerFile), authorized = JSON.parse(authorizedBytes), authority = authorized.sourceAuthority[capture.id], paused = await observe(base);
+  await save(testInfo, 'mixed-proof-schema-authorized.json', { observed: paused, authorized, reviewed, outputPaths, origins });
+  expect(authority.phase).toBe('deleting'); expect(authority.titleProofs).toBeUndefined(); expect(authority.titleRecovery).toBeUndefined();
+  expect(authority.preservedWriting.every(plan => !plan.stageIdentity && !plan.publication)).toBe(true);
+  expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
+  for (const file of origins) expect(paused[portable(path.relative(base, file))]).toEqual(originalOrigins[portable(path.relative(base, file))]);
+  const current = origins.find(file => portable(path.relative(base, file)).startsWith('Captures/'));
+  const lockPath = current + '.lock', lockRelative = portable(path.relative(base, lockPath)), ownedLock = paused[lockRelative];
+  const mainPid = await app.evaluate(() => process.pid);
+  expect(ownedLock.ordinary).toBe(true); expect(ownedLock.nlink).toBe('1'); expect(JSON.parse(text(ownedLock))).toEqual({ pid: mainPid });
+  const processProof = await exitMain(testInfo); await save(testInfo, 'mixed-proof-schema-main-exit.json', { ...processProof, ownedLock: { file: lockPath, observation: ownedLock } });
+  const exited = await observe(base); expect(exited).toEqual(paused);
+  const altered = JSON.parse(authorizedBytes);
+  // One controlled authority-field corruption. The payload is the actual complete observed Y.
+  altered.sourceAuthority[capture.id].titleProofs = { unreviewedSourceCopy: fixture.wholeY.toString('utf8') };
+  const alteredBytes = Buffer.from(JSON.stringify(altered, null, 2)); await fs.writeFile(ledgerFile, alteredBytes, { flush: true });
+  const corrupted = await observe(base), withoutAddedField = JSON.parse(alteredBytes); delete withoutAddedField.sourceAuthority[capture.id].titleProofs;
+  await save(testInfo, 'mixed-proof-schema-corrupted.json', { observed: corrupted, altered, onlyControlledField: 'sourceAuthority.' + capture.id + '.titleProofs', origins, producer });
+  expect(withoutAddedField).toEqual(authorized);
+  const expectedCorrupted = { ...exited, '.intake/ledger.json': corrupted['.intake/ledger.json'] }; expect(corrupted).toEqual(expectedCorrupted);
+  await fs.unlink(path.join(root, 'faults.json'));
+  await launch();
+  // Observe actual writer termination first: old code may fully delete rather than reject this field.
+  let terminal;
+  await expect.poll(async () => {
+    const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), status = await page.getByRole('status').textContent();
+    const phase = ledger.sourceAuthority[capture.id].phase;
+    terminal = { phase, status, reason: phase === 'deleted' ? 'actual deletion completed' : /unsupported mixed scope|Source authority needs repair|Source recovery inventory contains changed or unsupported writing/.test(status) ? 'startup schema rejection' : 'waiting' };
+    return terminal.reason !== 'waiting';
+  }).toBe(true);
+  const actual = await observe(base), actualLedgerBytes = await fs.readFile(ledgerFile), actualLedger = JSON.parse(actualLedgerBytes);
+  await save(testInfo, 'mixed-proof-schema-terminal.json', { terminal, observed: actual, actualLedger, altered, origins, outputPaths, processProof });
+  // First feature assertion follows the saved actual terminal, not an assumed pre-writer state.
+  expect(actualLedger.sourceAuthority[capture.id].phase).toBe('deleting');
+  await expect(page.getByRole('status')).toContainText('unsupported mixed scope');
+  expect(actualLedgerBytes).toEqual(alteredBytes); expect(actualLedger.sourceAuthority[capture.id]).toEqual(altered.sourceAuthority[capture.id]);
+  const expectedHeld = { ...corrupted };
+  if (actual[lockRelative]) expect(actual[lockRelative]).toEqual(ownedLock); else delete expectedHeld[lockRelative];
+  expect(actual).toEqual(expectedHeld);
+  for (const file of origins) expect(actual[portable(path.relative(base, file))]).toEqual(originalOrigins[portable(path.relative(base, file))]);
+  expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
+  expect(Object.keys(actual).filter(file => file.startsWith('.intake/') && file.endsWith('.stage'))).toEqual([]);
+  expect(actualLedger.attempts).toEqual(fixture.acceptedLedger.attempts); expect(actualLedger.admissions).toEqual(fixture.acceptedLedger.admissions);
+  expect(contents(await observe(path.join(root, 'producer')))).toEqual(producer);
+});
