@@ -1,4 +1,4 @@
-# Bounded source inspection — focused checks passed
+# Bounded source inspection — revised span awaiting verification
 
 Goal: a reviewed Conversation waits for brief real source contention, reads fresh source bytes after admission, and fails closed when native ownership outlasts the two-second admission bound. Provider turns must never retry automatically. Source mutations keep their existing immediate refusal and sole native ownership boundary.
 
@@ -29,7 +29,10 @@ Both short cases wait for two actual same-address `EADDRINUSE` emissions in the 
 | Focused GREEN, three unchanged cases | Root-tested corrected tree `ed3f76` | 71,774 ms, exit 0; all three passed with their original outcome assertions |
 | Original-four harness discovery | Diagnostic cleanup candidate | Aborted before launch: the filter selected five cases, including the existing ledger preview identity guard. Discovery mismatch only; no product failure. |
 | Original FIVE after diagnostic cleanup | Root-tested tree `f96c261` | 183,494 ms, exit 0; all five passed: the three new cases, original two-hop history case, and existing ledger preview identity guard |
-| Complete ticket / Context gate | 162 cases across 20 files prepared by root | Pending; no result or final approval |
+| Complete ticket / Context gate, whole-corpus span | HEAD `1aabd8f`, root-tested tree `f9a773` | STOPPED after 8 completed passes / 1 completed failure; 232,908 ms, exit 1. Existing in-flight annotation read/removal regression failed. |
+| Revised narrow-span syntax | Context / repairs correction after approved plan merge `d808925` | `node --check app/context.js` and `node --check app/repairs.js` passed |
+| Revised narrow-span FOUR | Exact root-tested tree `ede0e1e1110aad437be1bb9867484c7838a83d7a` | 94,747 ms, exit 0; unchanged annotation reader plus all three admission cases passed |
+| Revised original history/ledger and full gate | Narrow-span correction; admission helper and tests unchanged | Pending root execution; no complete-gate or final approval claimed |
 
 Earlier actual full144 and controlled overlap results remain in `docs/verification-ticket13-history-contention.md`; this report does not reinterpret the original failure's unproved owner. The controlled RED in that report established a reachable contention seam, not a successful correction.
 
@@ -53,12 +56,27 @@ The independent review of the bounded correction at `ed3f76` reported no blocker
 
 The attempted original-four harness run stopped at discovery before Electron launch because its filter selected five cases. Root corrected the expected count and used a new evidence directory. No assertion or application timeout changed. The cleanup five-case pass verifies the original journey without the temporary diagnostic; it does not prove the owner of the original full144 failure.
 
-The fresh complete gate remains pending: root prepared `%TEMP%/companion-ticket13-context-162-argv.json` for 162 cases across 20 files, including the full 15-case Context suite and three new cases. Complete-ticket static checks, exact-tip review and merger approval remain pending. Live inference remains deferred; these runs use the controlled provider fixture.
+The complete 162-case / 20-file gate included the full 15-case Context suite and three new cases. Root stopped it after the existing annotation-removal regression failed: 8 completed passes / 1 completed failure, 232,908 ms, exit 1. Evidence is in `%TEMP%/companion-ticket13-context-final-162-20261110`. The earlier focused passes did not establish whole-corpus concurrency correctness. Fresh complete checks, exact-tip review and merger approval remain pending. Live inference remains deferred; these runs use the controlled provider fixture.
 
 ## Minimal correction
 
 Root committed and pushed the failing tests and RED report as `f9e9a76`, then authorized this correction. `sourceInspection` in `app/source-mutation.js` uses the existing sourceMutation/native admission. Its single monotonic deadline is two seconds, with delays capped at 25 ms and the remaining admission budget. It checks the deadline before every attempt and again inside the admitted callback before the corpus body. Only `INTAKE_BUSY` before that callback has ever begun can retry. Once the callback starts, all body and nested errors propagate without replay. The existing sourceMutation implementation, live ownership token, native endpoint, and mutation refusal behavior are unchanged.
 
-`Context.corpus` now admits through sourceInspection and calls the complete existing body as `corpusOwned`. All ledger, capture, revision, annotation, source-generation, physical identity, independent-removal and raw CAS checks remain in that body. Existing corpus callers and outer lock order remain unchanged. No registry, second mutex, stale fallback, provider retry, or late uncancellable body is introduced.
+The initial `Context.corpus` correction held the entire body under sourceInspection. That span is superseded by the revision below. The admission helper itself remains unchanged: no registry, second mutex, stale fallback, provider retry, or late uncancellable body is introduced.
 
-Worker scope: authorized source/docs edits and syntax only. This cleanup-results update changes only this report, architecture and checkpoint docs; product files and tests remain frozen. The three new tests are unchanged from root's RED commit; root separately removed only the original-case diagnostic. No staging, commit, installation, runtime test, GUI, or network action by this worker. Root performed the recorded runtime runs; complete checks remain pending.
+## Revised span after the unchanged annotation regression
+
+The existing test `an in-flight supporting annotation read never admits writing removed before its scan returns` pauses a real supporting scan after source inspection. It then requires annotation removal to commit phase `removing` before releasing the reader. Whole-corpus native ownership blocked that authorization. The reader already has an optimistic physical ledger CAS designed to reject the stale scan after removal; it must remain free to observe that change. Whole-corpus design approval is withdrawn.
+
+Root committed the revised independently approved plan as `d8da40a` and preserved it in this helper through plan-only merge `d808925`. The revised correction changes only `app/context.js` and `app/repairs.js` in addition to this report:
+
+- `sourceCorpusOwned` runs fresh Info/ledger, Vault.list and capture/revision eligibility under unchanged bounded admission. It saves the INITIAL Info physical ledger observation before nested Info calls can replace `storage.expected`, then checks that same original observation at source-core end, outside per-item catches.
+- Context passes the strict internal option `{ annotations: false }` through the existing `Intake.inspect` seam. Only strict false omits its unused appended annotation scan. Default public inspection and ordinary recovery/reconciliation scans are unchanged.
+- After source ownership releases, `corpusFromSources` performs the supporting annotation, Brief, Ideas and explicit-scope reads. Existing annotation CAS, source-generation, identity, dependency and removal guards remain.
+- After all unlocked awaits, and before the final synchronous idea eligibility filter, a raw non-acquiring ledger view must match the SAME original parent/inode/raw-digest observation. Any mismatch rejects the entire corpus. The baseline is never rebased; mismatch is never converted to a per-item issue. There is no final native reacquisition, body replay or mutation retry. Conversation → required writing stores → Intake order is unchanged.
+
+Root ran the unchanged four-case set against exact tree `ede0e1e1110aad437be1bb9867484c7838a83d7a`: all four passed in 94,747 ms, exit 0. Evidence is in `%TEMP%/companion-source-inspection13-narrow-four-20261110`. The annotation reader case passed in 26.7 seconds, including durable removal authorization while its scan was held and stale-writing exclusion after release. The three admission cases passed in 19.2 / 26.8 / 21.1 seconds and retained their native event evidence. All original outcome assertions passed; no action, assertion or timeout changed.
+
+Independent bounded review of this exact narrow-span tree reported zero blockers, conditional on the four focused checks, which root has now validated. Original two-hop history and ledger preview identity controls, fresh full162, complete-ticket checks, independent exact-tip review and assigned merger approval remain pending. The earlier failed/stopped gates remain failed/stopped; these four passes establish only the focused correction. Product files, admission helper and tests are frozen for root's separate correction commit and subsequent checks.
+
+Worker scope in this step: Context, repairs and this report only. `source-mutation.js` and all tests are unchanged. No staging, commit, installation, runtime test, GUI, or network action by this worker. Architecture/checkpoint updates are deferred to a separate step after root's actual results.
