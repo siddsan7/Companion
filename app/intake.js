@@ -781,19 +781,27 @@ class Intake {
   async recover() {
     const controlled = await this.load();
     await pendingParents(this, controlled);
-    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
-      if (authority.restorationCleanup) await require('./capture-deletion').finishRestorationCleanup(this, controlled, id);
-    }
+    const { finishDeletion, finishRestoration, finishRestorationCleanup, isImportedRestorationHold, verifyImportedRestorationHold } = require('./capture-deletion');
     this.vault.warnings = this.vault.warnings.filter(warning => !warning.startsWith('Source restoration held:'));
-    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'deleting') await require('./capture-deletion').finishDeletion(this, controlled, id);
-    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'restoring') {
-      try { await require('./capture-deletion').finishRestoration(this, controlled, id); }
+    const recoverRestoration = async (id, work) => {
+      try { await work(this, controlled, id); }
       catch (error) {
-        if (!isManualHold(error, id, authority)) throw error;
+        const authority = controlled.sourceAuthority[id], imported = isImportedRestorationHold(error, id, authority);
+        if (!imported && !isManualHold(error, id, authority)) throw error;
         await pendingParents(this, controlled);
         if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed during source recovery. Refresh before retrying.');
+        if (imported) verifyImportedRestorationHold(this, authority);
         this.vault.warnings.push(`Source restoration held: ${id}. ${error.message}`);
       }
+    };
+    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
+      if (authority.restorationCleanup) await recoverRestoration(id, finishRestorationCleanup);
+    }
+    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
+      if (authority.phase === 'deleting') await finishDeletion(this, controlled, id);
+    }
+    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
+      if (authority.phase === 'restoring') await recoverRestoration(id, finishRestoration);
     }
     await this.finishLink();
     await this.finishAnnotation();

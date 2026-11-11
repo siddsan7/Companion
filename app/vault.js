@@ -130,7 +130,7 @@ class Vault {
     }
     verifySettlement();
   }
-  async scan({ annotations = false } = {}) {
+  async scan({ annotations = false, excludedCapturePaths } = {}) {
     await this.writable();
     const notes = [];
     const visit = async dir => {
@@ -140,6 +140,7 @@ class Vault {
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
+          if (excludedCapturePaths?.has(comparableRelative(path.relative(this.vault, file)))) continue;
           await this.contained(file); const content = await fs.readFile(file, 'utf8'), note = annotations ? parseAnnotation(content) : parse(content);
           if (note) notes.push({ ...note, file });
           else if (!annotations && /^(?:companion_id|artifact_type):/m.test(content) && path.dirname(file) === path.join(this.root, 'Captures')) this.warnings.push('Invalid capture metadata in ' + entry.name + '. The file was preserved; repair its identity, type, schema, title and absolute captured_at timestamp.');
@@ -156,14 +157,27 @@ class Vault {
     return note.type !== 'reel_import' && typeof note.managedParent === 'string' &&
       comparable(note.managedParent) === comparable(parentOf(this.vault, this.root));
   }
+  restoringImportedCaptures(ledger) {
+    const held = new Map(), intake = new (require('./intake').Intake)(this);
+    for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) {
+      if (authority.phase !== 'restoring' || authority.manual || !authority.restoration.published ||
+          !authority.restoration.importedPublication || !ledger.suppressed.includes(authority.sourceHash)) continue;
+      const capture = ledger.captures[authority.sourceHash];
+      if (capture?.id === id && capture.currentRevision === authority.restoration.revision) {
+        held.set(id, comparableRelative(path.relative(this.vault, intake.destination(capture))));
+      }
+    }
+    return held;
+  }
   async captureInventory({ ledger, guardLedger, id } = {}) {
-    const all = await this.scan();
-    const notes = id ? all.filter(note => note.id === id) : all;
     if (!ledger) {
       const intake = new (require('./intake').Intake)(this);
       ledger = await intake.load();
       guardLedger = () => intake.storage.guard();
     }
+    const heldRestorations = this.restoringImportedCaptures(ledger);
+    const all = await this.scan({ excludedCapturePaths: new Set(heldRestorations.values()) });
+    const notes = all.filter(note => !heldRestorations.has(note.id) && (!id || note.id === id));
     const imported = new Set(Object.values(ledger.captures).map(capture => capture.id));
     const excluded = new Set(notes.filter(note => {
       const relative = comparableRelative(path.relative(this.vault, note.file));
@@ -174,7 +188,7 @@ class Vault {
     if (held && !this.warnings.includes(ownerWarning)) this.warnings.push(ownerWarning);
     const repairable = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
     const owned = new Set([...repairable].filter(note => !excluded.has(note)));
-    return { notes, owned, repairable, excluded };
+    return { notes, owned, repairable, excluded, heldRestorations };
   }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();

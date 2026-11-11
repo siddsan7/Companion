@@ -33,7 +33,7 @@ function sourceLink(content, relative) {
 function install(Intake, { hash, read, noteText }) {
   Intake.prototype.syncMoves = async function () {
     const annotations = await this.annotations(), ledger = await this.load();
-    const { notes, owned, repairable, excluded } = await this.vault.captureInventory({ ledger, guardLedger: () => this.storage.guard() });
+    const { notes, owned, repairable, excluded, heldRestorations } = await this.vault.captureInventory({ ledger, guardLedger: () => this.storage.guard() });
     ledger.identityIssues = {}; ledger.identityChoices ||= {}; this.vault.identityPaths = new Map();
     const groups = new Map(); for (const note of notes) { if (!groups.has(note.id)) groups.set(note.id, []); groups.get(note.id).push(note); }
     const importedIds = new Set(Object.values(ledger.captures).map(capture => capture.id));
@@ -60,7 +60,7 @@ function install(Intake, { hash, read, noteText }) {
     }
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
       // An output hold may deliberately retain a hardlinked capture stage.
-      if (capture.removed || ledger.blocks[sourceHash]?.outputHold) continue;
+      if (capture.removed || ledger.blocks[sourceHash]?.outputHold || heldRestorations.has(capture.id)) continue;
       if (ledger.identityIssues[capture.id]) { capture.identityIssue = ledger.identityIssues[capture.id].reason; continue; }
       if (capture.id === this.pendingTitleCapture) continue;
       delete capture.identityIssue;
@@ -223,7 +223,8 @@ function install(Intake, { hash, read, noteText }) {
   Intake.prototype.annotations = async function (captureId) {
     // Keep this read's authority separate from an outer writer's CAS baseline.
     const reader = new Intake(this.vault), ledger = await reader.load(), observed = reader.storage.expected;
-    const notes = (await this.vault.scan({ annotations: true })).filter(note => (!captureId || note.captureId === captureId) && !annotationRemoved(ledger, note.id));
+    const excludedCapturePaths = new Set(this.vault.restoringImportedCaptures(ledger).values());
+    const notes = (await this.vault.scan({ annotations: true, excludedCapturePaths })).filter(note => (!captureId || note.captureId === captureId) && !annotationRemoved(ledger, note.id));
     for (const note of notes) await this.ownedFile(note.file, [], 'Annotation');
     if (!reader.storage.matches(await reader.storage.view(), observed)) throw Error('Intake ledger changed during the annotation read. Retry context discovery against the current authority.');
     return notes;

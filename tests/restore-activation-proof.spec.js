@@ -148,11 +148,25 @@ test('restoration hold allows independent import after a published output change
   await fs.rename(shared, testInfo.outputPath('independent-unknown-transaction.json'));
 
   const restarted = new Intake(new Vault(vault.vault, 'Companion'));
-  const result = await restarted.reconcile({ now: later });
+  const readFile = fs.readFile;
+  let result, visible, heldReads = 0;
+  fs.readFile = async (file, ...args) => {
+    if (file === destination) heldReads++;
+    return readFile(file, ...args);
+  };
+  try {
+    result = await restarted.reconcile({ now: later });
+    visible = await restarted.vault.list();
+  } finally { fs.readFile = readFile; }
   const independent = result.captures['c'.repeat(64)];
   expect(independent).toBeDefined();
+  expect(visible.map(note => note.id)).toContain(independent.id);
+  expect(visible.map(note => note.id)).not.toContain(id);
+  expect(heldReads).toBe(0);
   expect(await readOptional(restarted.destination(independent))).not.toBeNull();
-  expect((await restarted.info()).captures['c'.repeat(64)]).toEqual(independent);
+  expect((await restarted.info()).captures['c'.repeat(64)]).toMatchObject(independent);
+  expect(restarted.vault.warnings.join('\n')).toContain('A published restoration output changed.');
+  expect(result.captures[sourceHash]).toEqual(before.captures[sourceHash]);
   expect(result.sourceAuthority[id]).toEqual(authority);
   expect(result.suppressed).toContain(sourceHash);
   expect(result.admissions).toEqual(before.admissions);
@@ -183,7 +197,8 @@ test('restoration hold allows independent import with a foreign active cleanup j
   const independent = result.captures['c'.repeat(64)];
   expect(independent).toBeDefined();
   expect(await readOptional(restarted.destination(independent))).not.toBeNull();
-  expect((await restarted.info()).captures['c'.repeat(64)]).toEqual(independent);
+  expect((await restarted.info()).captures['c'.repeat(64)]).toMatchObject(independent);
+  expect(restarted.vault.warnings.join('\n')).toContain('The selected cleanup journal changed.');
   expect(result.sourceAuthority[id]).toEqual(committed.sourceAuthority[id]);
   expect(result.suppressed).not.toContain(sourceHash);
   expect(result.admissions).toEqual(committed.admissions);
@@ -243,9 +258,12 @@ for (const { output, restart } of [{ output: 'capture', restart: false }, { outp
       };
       return handle;
     };
-    let failure;
+    let failure, restarted;
     try {
-      if (restart) await new Intake(new Vault(vault.vault, 'Companion')).info();
+      if (restart) {
+        restarted = new Intake(new Vault(vault.vault, 'Companion'));
+        await restarted.info();
+      }
       else await deletion.confirmRestoration(restoration.token);
     } catch (error) { failure = error; }
     finally { fs.open = open; }
@@ -253,7 +271,10 @@ for (const { output, restart } of [{ output: 'capture', restart: false }, { outp
     expect(replacement, 'the staged active ledger reached its last awaited write boundary').toBeDefined();
     expect(witness, 'the selected journal was present at restoration admission').toBeDefined();
     const after = await readJson(ledgerFile);
-    expect.soft(failure?.message).toMatch(/changed|preserv|remain/i);
+    if (restart) {
+      expect.soft(failure).toBeUndefined();
+      expect.soft(restarted.vault.warnings.join('\n')).toContain('A published restoration output changed.');
+    } else expect.soft(failure?.message).toMatch(/changed|preserv|remain/i);
     expect.soft(after.sourceAuthority[id]).toMatchObject({ phase: 'restoring', restoration: { published: true } });
     expect.soft(after.suppressed).toContain(sourceHash);
     expect(after.admissions).toEqual(replacement.before.admissions);
