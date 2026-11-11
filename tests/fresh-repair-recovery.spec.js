@@ -285,12 +285,15 @@ test('fresh repair does not rebase its conflict authority before the first sourc
     const annotationIdentity = await identity(annotation);
     expect(annotationIdentity.nlink).toBe(2n);
     expect(await identity(stage)).toEqual(annotationIdentity);
-    expect(intent.sourceProof).toBeUndefined();
+    const sourceStage = path.join(intake.dir, `journal-${intent.annotationId}.stage`);
+    const sourceIdentity = await identity(sourceStage), sourceBytes = await fs.readFile(sourceStage);
+    expect(sourceIdentity).toEqual({ dev: BigInt(intent.sourceProof.dev), ino: BigInt(intent.sourceProof.ino), nlink: 1n });
+    expect(sourceBytes.toString('utf8')).toBe(JSON.stringify(intent.tx));
     await expect(fs.lstat(shared)).rejects.toMatchObject({ code: 'ENOENT' });
     delete ledger.blocks[sourceHash];
     const edited = JSON.stringify(ledger, null, 2);
     await fs.writeFile(ledgerFile, edited);
-    witness = { edited, bytes, intent, intentIdentity, stage, annotation, annotationIdentity };
+    witness = { edited, bytes, intent, intentIdentity, stage, annotation, annotationIdentity, sourceStage, sourceIdentity, sourceBytes };
     return observed;
   };
 
@@ -300,8 +303,8 @@ test('fresh repair does not rebase its conflict authority before the first sourc
   expect.soft((await json(ledgerFile)).attempts[witness.intent.tx.revision.identity]).toBeUndefined();
   expect.soft(await fs.readFile(destination)).toEqual(local);
   await expect.soft(fs.lstat(shared)).rejects.toMatchObject({ code: 'ENOENT' });
-  const sourceStage = path.join(intake.dir, `journal-${witness.intent.annotationId}.stage`);
-  await expect.soft(fs.lstat(sourceStage)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await identity(witness.sourceStage)).toEqual(witness.sourceIdentity);
+  expect(await fs.readFile(witness.sourceStage)).toEqual(witness.sourceBytes);
   expect.soft(await fs.readFile(intentFile)).toEqual(witness.bytes);
   expect.soft(await identity(intentFile)).toEqual(witness.intentIdentity);
   for (const file of [witness.stage, witness.annotation]) {

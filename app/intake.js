@@ -988,9 +988,9 @@ class Intake {
     if (held) {
       if (held.journal !== heldName(tx) || held.incomingRevision !== tx.revision.id) {
         if (links > 2 || pending) return null;
-        repair = this.distinctRepairRecovery(ledger, tx, { bytes, proof }, held, guard);
-        if (!repair || links !== 1 && !repair.freshRepair) return null;
-        if (repair.freshRepair) names.push(repair.freshRepair.sourceStage);
+        repair = this.distinctRepairRecovery(ledger, tx, { bytes, proof }, guard);
+        if (!repair) return null;
+        names.push(repair.sourceStage);
       } else {
         names.push(path.join(this.dir, held.journal));
         if (held.outputHold) {
@@ -1055,7 +1055,7 @@ class Intake {
     if (!previous) throw Error('The original repair conflict has no exact journal proof. Recovery files were preserved.');
     return previous.verify;
   }
-  distinctRepairRecovery(ledger, tx, journal, held, guard) {
+  distinctRepairRecovery(ledger, tx, journal, guard) {
     if (!tx.resolution || !tx.keptCurrent) return null;
     const intentFile = path.join(this.dir, 'repair-intent.json');
     const archivedIntent = path.join(this.dir, `repair-${tx.resolution}.json`);
@@ -1067,18 +1067,18 @@ class Intake {
         !journal.bytes.equals(Buffer.from(JSON.stringify(intent.tx)))) {
       throw Error('The active source journal does not match its repair intent. Recovery files were preserved.');
     }
-    const previous = intentLinks === 2 ? this.repairConflictWitness(ledger, tx, held, guard, intent.priorConflict?.journalProof)?.verify :
-      this.boundRepairConflict(ledger, tx, intent.priorConflict, guard);
-    if (!previous) return null;
+    const previous = this.boundRepairConflict(ledger, tx, intent.priorConflict, guard);
     const verifyIntent = links => {
       previous();
       verifyStageSync(intentFile, guard, intentRecord.proof, links);
       if (links === 2) verifyStageSync(archivedIntent, guard, intentRecord.proof, 2);
       else verifyAbsentSync(archivedIntent, guard);
     };
+    if (!isDeepStrictEqual(journal.proof, intent.sourceProof)) throw Error('The active repair source journal changed. Recovery files were preserved.');
+    const sourceStage = path.join(this.dir, `journal-${tx.resolution}.stage`);
     if (intentLinks === 2) {
       verifyIntent(2);
-      return { verifyRepair: () => verifyIntent(2) };
+      return { sourceStage, verifyRepair: () => verifyIntent(2) };
     }
 
     // A fresh repair publishes its annotation before creating the source journal.
@@ -1088,7 +1088,6 @@ class Intake {
         tx.retainOnly !== false || tx.externalConflict !== false) return null;
     const proof = intent.annotationProof;
     if (!proof) throw Error('The active repair has no recorded annotation identity. Recovery files were preserved.');
-    if (!isDeepStrictEqual(journal.proof, intent.sourceProof)) throw Error('The active repair source journal changed. Recovery files were preserved.');
     const stage = path.join(this.dir, `annotation-${tx.resolution}.stage`);
     const directory = path.join(this.vault.root, 'Annotations');
     const file = path.join(directory, `${tx.resolution}.md`);
@@ -1100,7 +1099,6 @@ class Intake {
     };
     const freshRepair = {
       intentProof: intentRecord.proof,
-      sourceStage: path.join(this.dir, `journal-${tx.resolution}.stage`),
       verify: (links = 1) => { verifyIntent(links); verifyAnnotation(); },
       retireAnnotation: () => {
         verifyAnnotation();
@@ -1109,7 +1107,7 @@ class Intake {
       }
     };
     freshRepair.verify();
-    return { freshRepair };
+    return { sourceStage, freshRepair };
   }
   matchesOrdinaryHeldRepair(ledger, tx, old, held, capture) {
     if (Object.keys(held).length !== 3 || typeof held.reason !== 'string' || held.reason.startsWith(outputHold) ||
@@ -1189,7 +1187,7 @@ class Intake {
     if (tx.restoreOperation || this.hasHeldJournal(ledger, tx) || ledger.pending[tx.sourceHash]) return;
     const priorBlock = ledger.blocks[tx.sourceHash];
     if (priorBlock && priorBlock.journal !== heldName(tx) && observed.nlink <= 2n &&
-        this.distinctRepairRecovery(ledger, tx, { bytes, proof }, priorBlock, guard)) return;
+        this.distinctRepairRecovery(ledger, tx, { bytes, proof }, guard)) return;
     const current = ledger.captures[tx.sourceHash], outcome = ledger.outcomes[tx.key];
     const sameCapture = isDeepStrictEqual(current, tx.capture);
     const referencesOutcome = outcome?.status === 'imported' && outcome.sourceHash === tx.sourceHash &&
@@ -1284,6 +1282,26 @@ class Intake {
     const block = ledger.blocks?.[tx.sourceHash];
     return this.hasOutputHold(ledger, tx) || block?.outputHold?.mode === precommitConflict &&
       block.incomingRevision === tx.revision.id && block.journal === heldName(tx);
+  }
+  heldRepairSourceVerifier(ledger, tx, recorded, guard) {
+    const block = ledger.blocks[tx.sourceHash], witness = block?.outputHold;
+    const pending = pendingName(tx);
+    const changed = () => Error('The held repair source journal or its known aliases changed. Recovery files were preserved.');
+    if (!this.hasHeldJournal(ledger, tx) || !this.validOutputHold(witness, pending, tx.previousHash) ||
+        witness.journal.digest !== hash(JSON.stringify(tx)) || recorded &&
+        (!sameProofIdentity(witness.journal, recorded) || witness.journal.digest !== recorded.digest)) throw changed();
+    assertPublication(ledger, tx.capture.id, tx);
+    const active = path.join(this.dir, 'transaction.json'), archive = path.join(this.dir, block.journal);
+    const pendingFile = path.join(this.dir, pending), names = [active, archive, pendingFile];
+    return () => {
+      guard();
+      const present = names.filter(file => local.lstatSync(file, { throwIfNoEntry: false }));
+      if ((!present.includes(active) && !present.includes(archive)) || present.includes(pendingFile) && !witness.pending) throw changed();
+      for (const file of names) {
+        if (present.includes(file)) verifyStageSync(file, guard, witness.journal, present.length);
+        else verifyAbsentSync(file, guard, changed);
+      }
+    };
   }
   validOutputHold(witness, pending, previousHash) {
     if (!witness || !Object.hasOwn(witness, 'journal') || !Object.hasOwn(witness, 'pending') || !validProof(witness.journal) ||
