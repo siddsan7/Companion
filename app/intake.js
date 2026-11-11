@@ -80,10 +80,11 @@ class Intake {
     validateAnnotationRemovals(ledger);
     await this.storage.replace(JSON.stringify(ledger, null, 2), verifyRelated);
   }
-  async publishJournal(file, value) {
+  async publishJournal(file, value, verifyRelated) {
     await this.vault.contained(this.dir);
     const stage = path.join(this.dir, `journal-${randomUUID()}.stage`);
     await fs.writeFile(stage, JSON.stringify(value), { flag: 'wx', flush: true });
+    verifyRelated?.();
     await fs.link(stage, file); await fs.unlink(stage);
   }
   async locked(work, admit) {
@@ -659,6 +660,7 @@ class Intake {
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
     let committed = false;
     const verifyPublished = () => {
+      if (!committed && journalProof?.freshRepair) journalProof.verify();
       if (!committed || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
       try {
         for (const item of [...outputs, ...cleanup]) verify(item);
@@ -676,6 +678,10 @@ class Intake {
         outcomes: { ...ledger.outcomes }, attempts: { ...ledger.attempts }, pending: { ...ledger.pending },
         ...(ledger.admissions || tx.sourceGeneration ? { admissions: { ...ledger.admissions } } : {})
       };
+      if (journalProof?.freshRepair) {
+        next.blocks = { ...ledger.blocks };
+        delete next.blocks[tx.sourceHash];
+      }
       const outcome = acceptedOutcome(tx, snapshotBytes);
       const accepted = ledger.attempts[tx.revision.identity];
       if (accepted && (accepted.fingerprint !== outcome.fingerprint || accepted.captureId !== outcome.captureId || accepted.sourceHash !== outcome.sourceHash)) throw Error('Producer acceptance facts changed. All files were preserved.');
@@ -1042,13 +1048,13 @@ class Intake {
     const annotation = parseAnnotation(intent.annotation);
     if (annotation?.id !== tx.resolution || annotation.captureId !== tx.capture.id ||
         tx.retainOnly !== false || tx.externalConflict !== false) return null;
+    const proof = intent.annotationProof;
+    if (!proof) throw Error('The active repair has no recorded annotation identity. Recovery files were preserved.');
     const stage = path.join(this.dir, `annotation-${tx.resolution}.stage`);
     const directory = path.join(this.vault.root, 'Annotations');
     const file = path.join(directory, `${tx.resolution}.md`);
     const annotationGuard = this.vault.publicationFolders(directory).guard;
     const guardAnnotation = () => { guard(); annotationGuard(); };
-    const { bytes, proof } = readExactSync(stage, guardAnnotation, 2);
-    if (!bytes.equals(Buffer.from(intent.annotation))) throw Error('The published repair annotation changed. Recovery files were preserved.');
     const verifyAnnotation = () => {
       verifyStageSync(stage, guardAnnotation, proof, 2);
       verifyStageSync(file, guardAnnotation, proof, 2);
