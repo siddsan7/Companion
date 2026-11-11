@@ -32,6 +32,129 @@ async function observe(file) {
   return { sha256: sha(bytes), bytes: String(stat.size), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) };
 }
 
+const titleRefusals = {
+  substitution: 'held imported title substitution leaves an independent note and permits Check now',
+  cleanup: 'held imported title rollback settles an exact cleanup refusal after restart and permits Check now',
+  rollback: 'held imported title rollback restores the exact prior note after a pre-link refusal',
+  active: 'interrupted imported title keeps its intent through independent Check now and restart'
+};
+for (const [boundary, name] of Object.entries(titleRefusals)) test(name, async () => {
+  test.setTimeout(90000);
+  const producer = path.join(root, 'producer');
+  async function draft(folder, clip, source, attempt, title) {
+    const directory = path.join(producer, folder);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, 'run.json'), JSON.stringify({ job_id: clip, attempt_id: attempt, started_utc: '2026-11-01T10:00:00Z', input_sha256: source, input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed' }));
+    await fs.writeFile(path.join(directory, 'evidence.json'), JSON.stringify({ ...fixture.input, clip_id: clip }));
+    await fs.writeFile(path.join(directory, 'first-pass-target.json'), JSON.stringify({ ...fixture.target, title }));
+    const notes = await fs.readFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), 'utf8');
+    await fs.writeFile(path.join(directory, 'notes.md'), notes.replace(fixture.target.title, title));
+  }
+  const first = 'a'.repeat(64), second = 'd'.repeat(64), originalTitle = fixture.target.title;
+  await draft('first', 'b'.repeat(64), first, '1'.repeat(32), originalTitle);
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(producer);
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake');
+  const ledgerFile = path.join(intake, 'ledger.json'), intent = path.join(intake, 'title-intent.json');
+  const captured = JSON.parse(await fs.readFile(ledgerFile)).captures[first];
+  const current = path.join(base, 'Captures', captured.file), stage = `${current}.pending`, journal = `${current}.title-transaction.json`;
+  const original = await fs.readFile(current);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'title-moved' }));
+  const proposed = 'Held imported title proposal';
+  await page.getByLabel('Display title', { exact: true }).fill(proposed);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('title-moved');
+  const journalBytes = await fs.readFile(journal), intentBytes = await fs.readFile(intent);
+  const backup = path.join(path.dirname(current), JSON.parse(journalBytes).backup);
+  const reviewed = await fs.readFile(stage), foreign = Buffer.concat([reviewed, Buffer.from('\nIndependent staged writing.\n')]);
+  const moved = path.join(root, 'original-imported-title-stage');
+  if (boundary !== 'active') {
+    await fs.rename(stage, moved); await fs.writeFile(stage, foreign, { flag: 'wx' });
+  }
+  const observation = path.join(root, 'title-publication-refusal.json');
+  if (boundary !== 'substitution') await app.evaluate((_, { root, current, stage, boundary, observation }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Title rollback refusal requires a disposable import fixture.');
+    const io = process.getBuiltinModule('fs').promises;
+    const operation = boundary === 'cleanup' ? 'unlink' : 'link', native = io[operation];
+    io[operation] = async function (file, ...args) {
+      const expected = boundary === 'active' ? file === stage : file.startsWith(current + '.restore-title-') && file.endsWith('.pending');
+      if (!expected || operation === 'link' && args[0] !== current) return native.call(this, file, ...args);
+      const staged = await io.lstat(file, { bigint: true });
+      const output = await io.lstat(current, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      const bytes = await io.readFile(file);
+      await io.writeFile(observation, JSON.stringify({ file, same: output !== null && staged.dev === output.dev && staged.ino === output.ino, links: String(staged.nlink), bytes: bytes.toString('base64') }));
+      throw Object.assign(Error('Temporary imported title ' + boundary + ' refusal.'), { code: 'EACCES', syscall: operation });
+    };
+  }, { root, current, stage, boundary, observation });
+  await fs.writeFile(path.join(root, 'release.txt'), 'resume');
+  await expect(page.getByRole('status')).toContainText(boundary === 'active' ? /temporary imported title active/i : /staging.*preserv/i);
+  expect(await fs.readFile(backup)).toEqual(original);
+  const unrelatedTitle = 'Independent draft after held title';
+  await draft('second', 'c'.repeat(64), second, '2'.repeat(32), unrelatedTitle);
+  const producerBytes = await files(producer);
+  if (boundary === 'active') {
+    expect(JSON.parse(await fs.readFile(observation))).toEqual({ file: stage, same: false, links: '1', bytes: reviewed.toString('base64') });
+    expect(await exists(current)).toBe(false);
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    await expect(page.getByRole('heading', { name: unrelatedTitle, exact: true })).toBeVisible();
+    expect.soft(await fs.readFile(intent).catch(error => error.code)).toEqual(intentBytes);
+    expect(await fs.readFile(stage)).toEqual(reviewed);
+    expect(await fs.readFile(journal)).toEqual(journalBytes);
+    await app.close(); app = null;
+    await fs.unlink(path.join(root, 'faults.json'));
+    await launch();
+    await expect(page.getByRole('heading', { name: proposed, exact: true })).toBeVisible();
+    const ledger = JSON.parse(await fs.readFile(ledgerFile));
+    expect(ledger.captures[first]).toMatchObject({ id: captured.id, currentHash: sha(reviewed), currentRevision: captured.currentRevision, title: proposed });
+    expect(ledger.captures[first].conflict).toBeUndefined();
+    expect(ledger.captures[first].identityIssue).toBeUndefined();
+    expect(ledger.captures[second].revisions).toHaveLength(1);
+    expect(await fs.readFile(current)).toEqual(reviewed);
+    expect(await fs.readFile(backup)).toEqual(original);
+    expect(await exists(intent)).toBe(false);
+    expect(await exists(stage)).toBe(false);
+    expect(await exists(journal)).toBe(false);
+    expect(await files(producer)).toEqual(producerBytes);
+    return;
+  }
+  if (boundary !== 'substitution') {
+    const refusal = JSON.parse(await fs.readFile(observation));
+    expect(refusal).toMatchObject({ same: boundary === 'cleanup', links: boundary === 'cleanup' ? '2' : '1', bytes: original.toString('base64') });
+    if (boundary === 'rollback') expect(await exists(current)).toBe(false);
+    expect(await fs.readFile(refusal.file)).toEqual(original);
+    await app.close(); app = null;
+    await fs.unlink(path.join(root, 'faults.json'));
+    await launch();
+    await expect.poll(() => fs.stat(refusal.file).catch(error => error.code)).toBe('ENOENT');
+  }
+  expect(await fs.readFile(current)).toEqual(original);
+  expect.soft((await fs.lstat(current)).nlink).toBe(1);
+  expect.soft((await fs.lstat(backup)).nlink).toBe(1);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await expect(page.getByRole('heading', { name: unrelatedTitle, exact: true })).toBeVisible();
+  const ledger = JSON.parse(await fs.readFile(ledgerFile));
+  expect(ledger.captures[first]).toMatchObject({ id: captured.id, currentHash: captured.currentHash, currentRevision: captured.currentRevision });
+  expect(ledger.captures[second].revisions).toHaveLength(1);
+  expect(await fs.readFile(current)).toEqual(original);
+  expect(await fs.readFile(backup)).toEqual(original);
+  expect(await fs.readFile(stage)).toEqual(foreign);
+  expect(await fs.readFile(moved)).toEqual(reviewed);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  const held = (await fs.readdir(intake)).filter(name => name.startsWith(`title-conflict-${captured.id}-`));
+  expect(held).toHaveLength(1);
+  expect(await fs.readFile(path.join(intake, held[0]))).toEqual(intentBytes);
+  expect(await exists(intent)).toBe(false);
+  expect(await files(producer)).toEqual(producerBytes);
+});
+
 test('staged imported title conflict reviews exactly five actual writer files before deletion without title replay', async ({}, testInfo) => {
   test.setTimeout(120000);
   const producer = path.join(root, 'producer'), folder = path.join(producer, 'first');

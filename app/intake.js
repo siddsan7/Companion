@@ -234,6 +234,7 @@ class Intake {
       ledger.outcomes[key] = { ...prior, locator: draft.locator, checkedAt: now }; await this.save(ledger); return;
     }
     let capture = ledger.captures[draft.sourceHash];
+    if (capture && capture.id === this.pendingTitleCapture) throw Error('An interrupted title is still being recovered. Its source revision was held for the next intake check.');
     if (capture?.conflict) throw Error(capture.conflict);
     const retainOnly = !!capture?.reviewed;
     const id = capture?.id || randomUUID(), revisionId = randomUUID();
@@ -667,22 +668,41 @@ class Intake {
       const note = await this.vault.find(id); if (hash(note.content) !== capture.currentHash) throw Error('This imported note changed outside Companion. Inspect it before editing.');
       await this.publishJournal(path.join(this.dir, 'title-intent.json'), { id, before: note.content, previousHash: capture.currentHash, title: title.trim(), content: withTitle(note.content, title.trim()), ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) });
       await this.vault.title(id, title);
-      if (!await this.finishTitleIntent()) throw Error('External edit conflict. The title intent and your files were preserved.');
+      const finished = await this.finishTitleIntent();
+      if (finished === 'pending') throw Error('The exact title save still awaits recovery. Restart Companion to continue.');
+      if (!finished) throw Error('External edit conflict. The title intent and your files were preserved.');
     });
   }
   async finishTitleIntent() {
+    this.pendingTitleCapture = undefined;
     const file = path.join(this.dir, 'title-intent.json'), text = await read(file); if (text === null) return true;
     let intent; try { intent = JSON.parse(text); } catch { throw Error('Unreadable imported title intent. Preserve .intake for repair.'); }
     const ledger = await this.load(), capture = Object.values(ledger.captures).find(x => x.id === intent.id);
     assertPublication(ledger, intent.id, { sourceGeneration: intent.sourceGeneration });
     if (!capture || typeof intent.before !== 'string' || typeof intent.title !== 'string' || !intent.title.trim() || /[\r\n]/.test(intent.title) || intent.previousHash !== hash(intent.before) || intent.content !== withTitle(intent.before, intent.title) || ![intent.previousHash, hash(intent.content)].includes(capture.currentHash)) throw Error('Invalid imported title recovery intent. Files were preserved for repair.');
-    let note = (await this.vault.list()).find(x => x.id === intent.id);
-    if (!note || ![intent.before, intent.content].includes(note.content)) {
-      const reason = 'External edit conflict during title save. Local writing and title intent were preserved; this source is paused for repair.';
-      capture.conflict = reason; ledger.outcomes[`title:${intent.id}`] = { status: 'held', reason, locator: note?.file || capture.file };
+    const hold = async (reason, locator) => {
+      capture.conflict = reason; ledger.outcomes[`title:${intent.id}`] = { status: 'held', reason, locator };
       await this.save(ledger); await fs.rename(file, path.join(this.dir, `title-conflict-${intent.id}-${randomUUID()}.json`)); return false;
+    };
+    let note = (await this.vault.list()).find(x => x.id === intent.id);
+    const destination = this.destination(capture);
+    if ((!note || note.file === destination) && await this.vault.hasExactTitleIntent(destination, intent)) {
+      this.pendingTitleCapture = intent.id;
+      return 'pending';
     }
-    if (note.content === intent.before) { await this.vault.title(intent.id, intent.title); note = await this.vault.find(intent.id); }
+    if (!note || ![intent.before, intent.content].includes(note.content)) {
+      return hold('External edit conflict during title save. Local writing and title intent were preserved; this source is paused for repair.', note?.file || capture.file);
+    }
+    const holdPublication = () => hold('Title publication is held. The prior note, staging files and title intent were preserved for inspection; this source is paused for repair.', note.file);
+    if (await this.vault.titleHasStage(note.file)) return holdPublication();
+    if (note.content === intent.before) {
+      try { await this.vault.title(intent.id, intent.title); }
+      catch (error) {
+        if (error.code !== 'TITLE_PUBLICATION_HELD') throw error;
+        return holdPublication();
+      }
+      note = await this.vault.find(intent.id);
+    }
     capture.title = intent.title; capture.currentHash = hash(note.content); this.vault.expected.set(intent.id, capture.currentHash);
     await this.save(ledger); await fs.unlink(file); return true;
   }

@@ -50,6 +50,7 @@ function install(Intake, { hash, read, noteText }) {
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
       if (capture.removed) continue;
       if (ledger.identityIssues[capture.id]) { capture.identityIssue = ledger.identityIssues[capture.id].reason; continue; }
+      if (capture.id === this.pendingTitleCapture) continue;
       delete capture.identityIssue;
       const matches = notes.filter(note => note.id === capture.id && (!this.vault.identityPaths.has(capture.id) || note.file === this.vault.identityPaths.get(capture.id)));
       if (!matches.length) {

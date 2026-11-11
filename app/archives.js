@@ -6,8 +6,10 @@ const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveInte
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { withBriefMutation } = require('./briefs-lock');
+const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const noteScopeReceipt = '.archive-note-scope-publication.json';
 class Archives {
   constructor(options) { Object.assign(this, options); this.review = null; }
   guard() { this.history.safeDirectory(false, this.directory); }
@@ -36,7 +38,7 @@ class Archives {
     };
     guard(); return guard;
   }
-  async snapshot({ locked = false, savedOnly = false, recoveryId } = {}) {
+  async snapshot({ locked = false, savedOnly = false, recoveryId, assertSelection } = {}) {
     // The store lock fences sends/scope writes/resave and keeps unsaved text out of a false complete backup.
     if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
     const collect = async () => {
@@ -75,7 +77,7 @@ class Archives {
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
-        const read = await this.json(file, guard, true); if (!read) continue;
+        const read = await this.readNoteScope(directory, file, guard, assertSelection); if (!read) continue;
         if (read.value.schema !== 1 || !Array.isArray(read.value.files) || read.value.files.some(file => typeof file !== 'string' || !path.isAbsolute(file))) throw Error('Explicit note settings need repair.');
         contextScopes.push({ binding: name.slice('context-settings-'.length), schema: 1, files: read.value.files }); fingerprints[file] = read.digest;
       }
@@ -166,18 +168,27 @@ class Archives {
   async match(input) {
     const reviewed = this.restoreReview;
     if (!reviewed || reviewed.id !== input?.id || input.matched !== true) throw Error('Inspect the archive and explicitly match its vault first.');
-    await this.revalidateInspectedFile(reviewed);
     const vault = this.history.getVault(), root = vault?.root;
     const sourceRoot = input.sourceRoot || root;
     if (!root || !reviewed.archive.payload.vaultBindings.some(binding => binding.managedRoot === sourceRoot)) throw Error('Choose an archived vault and explicitly match the current vault; nothing was restored.');
+    const selectionChanged = 'The reviewed vault selection changed. Select the reviewed vault and preview again.';
+    const selected = ordinaryDirectories([vault.vault, root], selectionChanged);
+    const assertSelection = () => {
+      if (this.history.getVault() !== vault) throw Error(selectionChanged);
+      selected.guard();
+    };
+    await this.revalidateInspectedFile(reviewed);
+    assertSelection();
     await this.validatePins(reviewed.archive, sourceRoot, vault);
-    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root, reviewed.allocations);
+    assertSelection();
+    const current = await this.snapshot({ assertSelection }), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root, reviewed.allocations);
     const metadata = await this.metadataPlan(reviewed.archive, sourceRoot, root);
     const settingsMode = input.settingsMode || 'keep-current';
     if (!['keep-current', 'review-note-inclusions'].includes(settingsMode)) throw Error('Choose an explicit settings restoration policy.');
     const noteCandidates = settingsMode === 'review-note-inclusions' ? await this.noteCandidates(reviewed.archive, sourceRoot, vault) : [];
+    assertSelection();
     const token = randomUUID();
-    reviewed.matched = { token, root, sourceRoot, snapshot: current, plan, metadata, settingsMode, noteCandidates };
+    reviewed.matched = { token, vault, assertSelection, root, sourceRoot, snapshot: current, plan, metadata, settingsMode, noteCandidates };
     return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, newGenerations: plan.transitions.length, metadataAdditions: metadata.additions.length, metadataConflicts: metadata.conflicts.length, metadataTypes: metadata.types, omitted: reviewed.archive.coverage?.omitted.length || 0, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
       const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
       return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
@@ -187,11 +198,15 @@ class Archives {
     const reviewed = this.restoreReview; this.restoreReview = null;
     if (!reviewed?.matched || input?.token !== reviewed.matched.token) throw Error('Preview the matched restore again before confirming additions.');
     const matched = reviewed.matched;
+    const { vault, assertSelection } = matched;
     return this.history.lock(async () => {
+      assertSelection();
       await this.revalidateInspectedFile(reviewed);
-      const current = await this.snapshot({ locked: true });
-      if (this.history.getVault()?.root !== matched.root || canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
-      await this.validatePins(reviewed.archive, matched.sourceRoot, this.history.getVault());
+      const current = await this.snapshot({ locked: true, assertSelection });
+      assertSelection();
+      if (canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
+      await this.validatePins(reviewed.archive, matched.sourceRoot, vault);
+      assertSelection();
       const plan = this.restorePlan(reviewed.archive, current, matched.sourceRoot, matched.root, reviewed.allocations);
       if (canonical(plan) !== canonical(matched.plan)) throw Error('Local restoration generations or retained exclusions changed. Preview the matched restore again.');
       const metadata = await this.metadataPlan(reviewed.archive, matched.sourceRoot, matched.root);
@@ -201,21 +216,30 @@ class Archives {
       if (!Array.isArray(resolutions) || resolutions.length !== plan.conflicts.length || resolutions.some(choice => !choice || typeof choice !== 'object' || Array.isArray(choice) || Object.keys(choice).some(key => !['id', 'choice'].includes(key)) || !plan.conflicts.includes(choice.id) || choice.choice !== 'keep-current') || new Set(resolutions.map(choice => choice.id)).size !== plan.conflicts.length) throw Error('Every conflicting conversation requires an explicit Keep current choice. Existing history was preserved.');
       const noteFiles = input.noteFiles === undefined ? [] : input.noteFiles;
       if (!Array.isArray(noteFiles) || new Set(noteFiles).size !== noteFiles.length || noteFiles.some(file => typeof file !== 'string' || matched.settingsMode !== 'review-note-inclusions' || !matched.noteCandidates.some(candidate => !candidate.unavailable && candidate.file === file))) throw Error('Select only individually reviewed available note inclusions.');
-      for (const file of noteFiles) { const actual = await this.noteSnapshot(file, this.history.getVault()), approved = matched.noteCandidates.find(candidate => candidate.file === file); if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('A reviewed note changed. Preview its current bytes again; nothing was restored.'); }
+      for (const file of noteFiles) {
+        assertSelection();
+        const actual = await this.noteSnapshot(file, vault), approved = matched.noteCandidates.find(candidate => candidate.file === file);
+        if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('A reviewed note changed. Preview its current bytes again; nothing was restored.');
+      }
       if (!plan.additions.length && !noteFiles.length && !metadata.additions.length) throw Error('There are no new reviewed additions to restore. Existing history and settings were preserved.');
       let restored = 0, restoredNotes = 0, preservedMetadata = 0;
       try {
-        preservedMetadata += await this.retainIntents(reviewed.archive, matched.sourceRoot, matched.root);
-        preservedMetadata += await this.retainCoverage(reviewed.archive);
-        preservedMetadata += await this.retainCodexHints(reviewed.archive);
+        assertSelection();
+        await this.retainMetadata(reviewed.archive, matched, () => preservedMetadata++);
         for (const original of plan.additions) {
+          assertSelection();
           const record = structuredClone(original);
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
-          await this.publishAddition(record, plan.transitions.find(transition => transition.id === record.id)); restored++;
+          await this.publishAddition(record, plan.transitions.find(transition => transition.id === record.id), assertSelection, () => restored++);
         }
-        if (noteFiles.length) restoredNotes = await this.includeReviewedNotes(noteFiles, matched);
-      } catch (error) { throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Existing conversations were preserved. Inert metadata may already have been preserved; inspect it before retrying. ${noteFiles.length ? 'Reviewed note settings may have been published; inspect the current inclusions before retrying. ' : ''}Inspect again to review remaining additions; no automatic retry occurs.`); }
-      return { restored, restoredNotes, preservedMetadata, equal: plan.equal.length, inactiveIntents: (await this.inactiveIntents()).length };
+        assertSelection();
+        if (noteFiles.length) await this.includeReviewedNotes(noteFiles, matched, count => { restoredNotes = count; });
+        const inactiveIntents = (await this.inactiveIntents()).length;
+        assertSelection();
+        return { restored, restoredNotes, preservedMetadata, equal: plan.equal.length, inactiveIntents };
+      } catch (error) {
+        throw Error(`Restored ${restored} conversation${restored === 1 ? '' : 's'} before restore stopped. ${error.message} Preserved ${preservedMetadata} inert settings records and restored ${restoredNotes} reviewed note inclusions. Inspect again to review remaining additions or pending restoration recovery.`);
+      }
     });
   }
   async revalidateInspectedFile(reviewed) {
@@ -266,24 +290,104 @@ class Archives {
     }
     return candidates;
   }
-  async includeReviewedNotes(files, matched) {
-    const vault = this.history.getVault(), directory = path.join(this.history.dataRoot, `context-settings-${hash(vault.root)}`), file = path.join(directory, 'notes.json');
-    this.guard(); try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } this.guard();
+  async readNoteScope(directory, file, guard, assertSelection) {
+    guard();
+    const pending = await fs.lstat(path.join(directory, noteScopeReceipt)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    if (!pending) return this.json(file, guard, true);
+    return withBriefMutation(directory, async () => {
+      await this.settleNoteScope(directory, file, guard, assertSelection);
+      return this.json(file, guard, true);
+    });
+  }
+  async settleNoteScope(directory, file, guard, assertSelection = () => {}) {
+    const receipt = path.join(directory, noteScopeReceipt);
+    const stored = await readExact(receipt, guard).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    if (!stored) return;
+    const proof = JSON.parse(stored.bytes);
+    if (proof?.schema !== 1 || !stored.bytes.equals(Buffer.from(JSON.stringify(proof))) ||
+        typeof proof.stage !== 'string' || !/^notes-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/.test(proof.stage) ||
+        !validProof(proof.staged) || !Array.isArray(proof.identities)) throw Error('Archive note scope receipt is invalid. Files were preserved for inspection.');
+    const folders = ordinaryDirectories([directory], 'The reviewed note settings folder changed. Files were preserved for inspection.', proof.identities);
+    const pinned = () => { assertSelection(); guard(); folders.guard(); };
+    await verifyStage(receipt, pinned, stored.proof);
+    const stage = path.join(directory, proof.stage);
+    const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    if (await exists(file)) {
+      await settlePublishedLink(stage, file, pinned, proof.staged);
+      await removeStage(receipt, pinned, stored.proof);
+    } else {
+      const stillUnpublished = () => {
+        pinned();
+        try { local.lstatSync(file); }
+        catch (error) { if (error.code === 'ENOENT') return; throw error; }
+        throw Error('Note scope appeared while retiring an unpublished archive stage. Files were preserved for inspection.');
+      };
+      if (await exists(stage)) await removeStage(stage, stillUnpublished, proof.staged);
+      await removeStage(receipt, stillUnpublished, stored.proof);
+    }
+  }
+  async includeReviewedNotes(files, matched, committed) {
+    const { vault, root, assertSelection } = matched;
+    const directory = path.join(this.history.dataRoot, `context-settings-${hash(root)}`), file = path.join(directory, 'notes.json');
+    assertSelection(); this.guard();
+    try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    assertSelection(); this.guard();
     const guard = this.directoryGuard(directory);
     return withBriefMutation(directory, async () => {
+      assertSelection();
+      await this.settleNoteScope(directory, file, guard, assertSelection);
       guard(); const current = await this.json(file, guard, true);
       if ((current?.digest || null) !== (matched.snapshot.fingerprints[file] || null)) throw Error('Current note inclusions changed. Preview settings again.');
       const existing = current?.value.files || [];
-      for (const chosen of files) { const actual = await this.noteSnapshot(chosen, vault), approved = matched.noteCandidates.find(candidate => candidate.file === chosen); if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.'); }
-      const next = [...new Set([...existing, ...files])], stage = path.join(directory, `notes-${randomUUID()}.tmp`); let handle;
+      for (const chosen of files) {
+        assertSelection();
+        const actual = await this.noteSnapshot(chosen, vault), approved = matched.noteCandidates.find(candidate => candidate.file === chosen);
+        if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.');
+      }
+      const next = [...new Set([...existing, ...files])], stage = path.join(directory, `notes-${randomUUID()}.tmp`), receipt = path.join(directory, noteScopeReceipt);
+      const folders = ordinaryDirectories([directory], 'The reviewed note settings folder changed. Files were preserved for inspection.');
+      const pinned = () => { guard(); folders.guard(); };
+      const guardedSelection = () => { assertSelection(); pinned(); };
+      let staged, recorded, published = false, verified = false;
+      const commit = () => {
+        verified = true;
+        committed(next.length - existing.length);
+        this.history.tokens.clear(); this.invalidateContextApprovals();
+      };
       try {
-        handle = await fs.open(stage, 'wx'); guard(); await handle.writeFile(JSON.stringify({ schema: 1, files: next }, null, 2), 'utf8'); guard(); await handle.sync(); await handle.close(); handle = null;
+        staged = await writeStage(stage, JSON.stringify({ schema: 1, files: next }, null, 2), guardedSelection);
         const latest = await this.json(file, guard, true);
         if ((latest?.digest || null) !== (current?.digest || null)) throw Error('Note inclusion settings changed before publication. Existing scope was preserved.');
-        guard(); if (current) await fs.rename(stage, file); else await fs.link(stage, file); guard();
-        this.history.tokens.clear(); this.invalidateContextApprovals();
-        return next.length - existing.length;
-      } finally { await handle?.close(); guard(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+        if (!current) {
+          const proof = { schema: 1, stage: path.basename(stage), staged, identities: folders.identities };
+          recorded = await writeStage(receipt, JSON.stringify(proof), guardedSelection);
+          await verifyStage(receipt, pinned, recorded);
+        }
+        await verifyStage(stage, pinned, staged);
+        guardedSelection();
+        if (current) {
+          await fs.rename(stage, file); published = true;
+          await verifyStage(file, pinned, staged);
+          commit();
+        } else {
+          await fs.link(stage, file); published = true;
+          await verifyPeers(stage, file, pinned, staged);
+          commit();
+          await settlePublishedLink(stage, file, guardedSelection, staged);
+          await removeStage(receipt, guardedSelection, recorded);
+        }
+      } catch (error) {
+        if (!published) throw error;
+        if (!verified) throw Error(`Note inclusion publication could not be verified. Inspect the current scope and any staging file before retrying. ${error.message}`);
+        throw Error(`The reviewed note scope was published, but cleanup could not be verified. Inspect the current scope and any retained staging file before retrying. ${error.message}`);
+      } finally {
+        if (staged && !published) {
+          try {
+            if (recorded) await removeStage(receipt, guardedSelection, recorded);
+            await removeStage(stage, guardedSelection, staged);
+          } catch {}
+        }
+      }
     });
   }
   async validatePins(archive, sourceRoot, vault) {
@@ -327,8 +431,8 @@ class Archives {
     }
     return records;
   }
-  async metadataPlan(archive, sourceRoot, targetRoot) {
-    const candidates = [], additions = [], equal = [], conflicts = [], types = { cadence: 0, codexHints: 0, coverage: 0 };
+  metadataCandidates(archive, sourceRoot, targetRoot) {
+    const candidates = [];
     for (const value of this.matchedIntents(archive, sourceRoot, targetRoot)) {
       const record = inactiveIntent(value); candidates.push({ kind: 'cadence', name: `archive-intent-${record.archiveId}-${hash(record.sourceRoot + '\n' + record.targetRoot)}.json`, record });
     }
@@ -338,8 +442,12 @@ class Archives {
     for (const value of this.archiveCodexHints(archive)) {
       const record = inactiveCodexHints(value); candidates.push({ kind: 'codexHints', name: `archive-codex-hints-${record.archiveId}.json`, record });
     }
+    return candidates;
+  }
+  async metadataPlan(archive, sourceRoot, targetRoot) {
+    const additions = [], equal = [], conflicts = [], types = { cadence: 0, codexHints: 0, coverage: 0 };
     const seen = new Map();
-    for (const item of candidates) {
+    for (const item of this.metadataCandidates(archive, sourceRoot, targetRoot)) {
       if (seen.has(item.name)) { if (canonical(seen.get(item.name)) !== canonical(item.record)) throw Error('The archive contains conflicting inert settings identities. Nothing was restored.'); continue; }
       seen.set(item.name, item.record);
       const existing = await this.json(path.join(this.history.dataRoot, item.name), undefined, true);
@@ -372,35 +480,6 @@ class Archives {
     }
     return records;
   }
-  async retainCodexHints(archive) {
-    let preserved = 0;
-    for (const original of this.archiveCodexHints(archive)) {
-      const record = inactiveCodexHints(original), destination = path.join(this.history.dataRoot, `archive-codex-hints-${record.archiveId}.json`), existing = await this.json(destination, undefined, true);
-      if (existing) { if (canonical(existing.value) !== canonical(record)) throw Error('Retained Codex hints differ. Existing hints were preserved.'); continue; }
-      const directory = this.history.safeDirectory(), stage = path.join(this.history.dataRoot, `.archive-codex-hints-${randomUUID()}.pending`); let handle;
-      try {
-        this.history.safeDirectory(false, directory); handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
-        await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
-        this.history.safeDirectory(false, directory); await fs.link(stage, destination); this.history.safeDirectory(false, directory); preserved++;
-      } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
-    }
-    return preserved;
-  }
-  async retainCoverage(archive) {
-    let preserved = 0;
-    const records = [...(archive.payload.settings?.inactiveArchiveCoverage || []), ...(archive.coverage ? [{ schema: 1, archiveId: archive.id, coverage: archive.coverage }] : [])];
-    for (const original of records) {
-      const record = inactiveCoverage(original), destination = path.join(this.history.dataRoot, `archive-coverage-${record.archiveId}.json`), existing = await this.json(destination, undefined, true);
-      if (existing) { if (canonical(existing.value) !== canonical(record)) throw Error('Retained omission metadata differs. Existing metadata was preserved.'); continue; }
-      const directory = this.history.safeDirectory(), stage = path.join(this.history.dataRoot, `.archive-coverage-${randomUUID()}.pending`); let handle;
-      try {
-        this.history.safeDirectory(false, directory); handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
-        await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
-        this.history.safeDirectory(false, directory); await fs.link(stage, destination); this.history.safeDirectory(false, directory); preserved++;
-      } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
-    }
-    return preserved;
-  }
   async inactiveIntents(fingerprints) {
     const records = [], names = await fs.readdir(this.history.dataRoot); this.guard();
     for (const name of names.sort().filter(name => /^archive-intent-[a-f0-9-]{36}-[a-f0-9]{64}\.json$/.test(name))) {
@@ -411,21 +490,17 @@ class Archives {
     }
     return records;
   }
-  async retainIntents(archive, sourceRoot, targetRoot) {
-    let preserved = 0;
-    const records = this.matchedIntents(archive, sourceRoot, targetRoot);
-    for (const original of records) {
-      const record = inactiveIntent(original), destination = path.join(this.history.dataRoot, `archive-intent-${record.archiveId}-${hash(record.sourceRoot + '\n' + record.targetRoot)}.json`);
-      const existing = await this.json(destination, undefined, true);
-      if (existing) { if (canonical(existing.value) !== canonical(record)) throw Error('Imported cadence intent differs. Existing intent was preserved.'); continue; }
-      const directory = this.history.safeDirectory(), stage = path.join(this.history.dataRoot, `.archive-intent-${randomUUID()}.pending`); let handle;
-      try {
-        this.history.safeDirectory(false, directory); handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
-        await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
-        this.history.safeDirectory(false, directory); await fs.link(stage, destination); this.history.safeDirectory(false, directory); preserved++;
-      } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+  async retainMetadata(archive, matched, committed) {
+    const { sourceRoot, root, assertSelection, metadata } = matched;
+    const directory = this.history.safeDirectory(), guard = () => this.history.safeDirectory(false, directory);
+    const additions = new Set(metadata.additions);
+    for (const { name, record } of this.metadataCandidates(archive, sourceRoot, root)) {
+      if (!additions.delete(name)) continue;
+      assertSelection();
+      const destination = path.join(this.history.dataRoot, name), stage = path.join(this.history.dataRoot, `.archive-${randomUUID()}.pending`);
+      if (await this.json(destination, guard, true)) throw Error('Inert settings changed. Inspect and preview their preservation again.');
+      await this.publishFile(stage, destination, JSON.stringify(record, null, 2), guard, { assertSelection, committed });
     }
-    return preserved;
   }
   matchedIntents(archive, sourceRoot, targetRoot) {
     const inherited = (archive.payload.settings?.inactiveScheduleIntents || []).map(original => {
@@ -504,52 +579,69 @@ class Archives {
       this.history.safeDirectory(false, directory); return hash(text);
     } finally { await handle?.close(); this.history.safeDirectory(false, directory); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
   }
-  async publishGenerationAddition(record, transition) {
+  async publishGenerationAddition(record, transition, assertSelection, committed) {
     const controls = this.history.controls, directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
+    const guard = () => this.history.safeDirectory(false, directory);
     const baseline = await controls.state(record.id);
     if (canonical(baseline) !== canonical(transition.baseline)) throw Error('Local generation or exclusion authority changed. Inspect the archive again.');
-    if (baseline) await controls.settlePublication(baseline);
+    assertSelection();
+    if (baseline) await controls.settlePublication(baseline, assertSelection);
     const stage = path.join(this.history.directory, `${randomUUID()}.pending`), text = JSON.stringify(record, null, 2), digest = hash(text);
     // This source-bearing stage is preserved on failure; only its exact published peer can finish it.
-    this.history.safeDirectory(false, directory); await fs.writeFile(stage, text, { flag: 'wx', flush: true });
+    assertSelection();
+    const proof = await writeStage(stage, text, () => { assertSelection(); guard(); });
+    await verifyStage(stage, guard, proof);
     const staged = await controls.file(stage, directory), target = { ...staged.owned, name: `${record.id}.json` };
-    if (staged.text !== text) throw Error('Restoration stage changed. Preserve the retained writing.');
+    if (staged.text !== text || staged.owned.dev !== proof.dev || staged.owned.ino !== proof.ino) throw Error('Restoration stage changed. Preserve the retained writing.');
     const recheckReservation = async () => {
+      assertSelection();
       const exact = await controls.file(stage, directory, staged.owned, 1, false, true);
       const destinationExists = await fs.lstat(destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-      if (exact.rawDigest !== digest || destinationExists || record.vault.root !== this.history.getVault()?.root) throw Error('Restoration stage or destination changed. Preserve the retained writing.');
+      assertSelection();
+      if (exact.rawDigest !== digest || destinationExists) throw Error('Restoration stage or destination changed. Preserve the retained writing.');
     };
-    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation);
+    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation, assertSelection);
     this.history.tokens.clear(); this.history.durable.delete(record.id);
     await this.checkpoint('archive-restore-after-reservation');
-    await controls.file(stage, directory, staged.owned); this.history.safeDirectory(false, directory);
-    await fs.link(stage, destination); this.history.safeDirectory(false, directory);
+    await controls.file(stage, directory, staged.owned);
+    assertSelection(); guard(); await fs.link(stage, destination); guard();
     await this.checkpoint('archive-restore-after-link');
     const a = await controls.file(stage, directory, staged.owned, 2), b = await controls.file(destination, directory, target, 2);
     if (!same(a.stat, b.stat) || a.text !== text || b.text !== text || canonical(await controls.state(record.id)) !== canonical(marker)) throw Error('Restoration publication changed. Preserve both copies and local authority for explicit recovery.');
-    this.history.safeDirectory(false, directory); await fs.unlink(stage);
+    await verifyStage(stage, guard, proof, 2);
+    assertSelection(); guard(); await fs.unlink(stage);
     await this.checkpoint('archive-restore-before-active');
+    assertSelection();
     await controls.file(destination, directory, target);
-    await controls.put({ ...marker, phase: 'active', targets: [] }, marker, () => controls.verifyRestorationComplete(marker, directory));
-    await controls.check(record); this.history.durable.set(record.id, digest);
+    await controls.put({ ...marker, phase: 'active', targets: [] }, marker, () => controls.verifyRestorationComplete(marker, directory), assertSelection);
+    await controls.check(record); this.history.durable.set(record.id, digest); committed();
   }
-  async publishAddition(record, transition) {
-    if (transition) return this.publishGenerationAddition(record, transition);
+  async publishAddition(record, transition, assertSelection, committed) {
+    if (transition) return this.publishGenerationAddition(record, transition, assertSelection, committed);
     const directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
-    const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`); let handle;
+    const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`);
+    const guard = () => this.history.safeDirectory(false, directory);
     try {
-      this.history.safeDirectory(false, directory);
-      handle = await fs.open(stage, 'wx'); this.history.safeDirectory(false, directory);
-      await handle.writeFile(JSON.stringify(record, null, 2), 'utf8'); await handle.sync(); await handle.close(); handle = null;
-      this.history.safeDirectory(false, directory);
-      await fs.link(stage, destination); this.history.safeDirectory(false, directory);
-      // Imported capacity bindings and provider IDs are historical bytes, never dispatch approval.
-      for (const [token, approval] of this.history.tokens) if (approval.input.conversationId === record.id) this.history.tokens.delete(token);
+      await this.publishFile(stage, destination, JSON.stringify(record, null, 2), guard, { assertSelection, committed: () => {
+        committed();
+        // Imported capacity bindings and provider IDs cannot approve dispatch.
+        for (const [token, approval] of this.history.tokens) if (approval.input.conversationId === record.id) this.history.tokens.delete(token);
+      } });
     } catch (error) { if (error.code === 'EEXIST') throw Error('A conversation appeared during restore. It was not replaced.'); throw error; }
-    finally {
-      await handle?.close(); this.history.safeDirectory(false, directory);
-      await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    }
+  }
+  async publishFile(stage, destination, text, guard, { assertSelection = () => {}, checkpoint, committed = () => {} } = {}) {
+    let staged, linked = false;
+    try {
+      assertSelection();
+      staged = await writeStage(stage, text, () => { assertSelection(); guard(); });
+      if (checkpoint) await this.checkpoint(checkpoint);
+      await verifyStage(stage, guard, staged);
+      assertSelection(); guard(); await fs.link(stage, destination); linked = true;
+      await verifyPeers(stage, destination, guard, staged);
+      committed();
+      await removeStage(stage, guard, staged, 2);
+      await verifyStage(destination, guard, staged);
+    } finally { if (staged && !linked) await removeStage(stage, guard, staged).catch(() => {}); }
   }
   async publish(destination, text) {
     if (!path.isAbsolute(destination)) throw Error('Choose an absolute archive destination.');
@@ -557,17 +649,11 @@ class Archives {
     // Export creates a separate file. It must never add files to guarded application stores.
     const relative = path.relative(this.history.dataRoot, destination);
     if (!relative.startsWith('..') && !path.isAbsolute(relative) && (relative.includes(path.sep) || ['settings.json', 'schedule.json'].includes(relative))) throw Error('Choose an archive file outside application store folders.');
-    const parent = path.dirname(destination), identity = await fs.lstat(parent, { bigint: true });
-    const guard = async () => { const current = await fs.lstat(parent, { bigint: true }); if (!identity.isDirectory() || identity.isSymbolicLink() || current.isSymbolicLink() || !same(identity, current) || await fs.realpath(parent) !== parent) throw Error('Archive destination folder changed or is an alias. Choose an ordinary folder.'); };
-    await guard(); const stage = path.join(parent, `.companion-archive-${randomUUID()}.pending`); let handle;
-    try {
-      handle = await fs.open(stage, 'wx'); await guard(); await handle.writeFile(text, 'utf8'); await handle.sync(); await handle.close(); handle = null;
-      await this.checkpoint('archive-before-publish');
-      await guard();
-      // Atomic exclusive publication: an existing destination is never replaced.
-      await fs.link(stage, destination); await guard();
-    } catch (error) { if (error.code === 'EEXIST') throw Error('Archive destination already exists. Choose a new file; existing content was preserved.'); throw error; }
-    finally { await handle?.close(); await guard(); await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+    const parent = path.dirname(destination);
+    const { guard } = ordinaryDirectories([parent], 'Archive destination folder changed or is an alias. Choose an ordinary folder.');
+    const stage = path.join(parent, `.companion-archive-${randomUUID()}.pending`);
+    try { await this.publishFile(stage, destination, text, guard, { checkpoint: 'archive-before-publish' }); }
+    catch (error) { if (error.code === 'EEXIST') throw Error('Archive destination already exists. Choose a new file; existing content was preserved.'); throw error; }
   }
 }
 function installArchives({ ipcMain, ...options }) {

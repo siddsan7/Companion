@@ -131,7 +131,7 @@ class ConversationControls {
     if (JSON.stringify(scope) === JSON.stringify(marker.scope)) return;
     await this.settlePublication(marker); await this.put({ ...marker, scope }, marker);
   }
-  async replace(stage, file, directory, staged, current, revalidate) {
+  async replace(stage, file, directory, staged, current, revalidate, assertSelection) {
     const guard = () => {
       this.store.safeDirectory(false, directory.parent);
       this.guard(false, directory.stat);
@@ -145,6 +145,7 @@ class ConversationControls {
     while (true) {
       guard();
       if (lastRefusal && performance.now() >= deadline) throw lastRefusal;
+      assertSelection();
       try { await fs.rename(stage, file); }
       catch (error) {
         const remaining = deadline - performance.now();
@@ -165,7 +166,8 @@ class ConversationControls {
       return;
     }
   }
-  async put(marker, baseline, revalidate) {
+  async put(marker, baseline, revalidate, assertSelection = () => {}) {
+    assertSelection();
     const directory = this.guard(true), file = path.join(directory.directory, `${marker.id}.json`);
     const value = { ...marker, publication: randomUUID() }, text = JSON.stringify(value, null, 2), stage = path.join(directory.directory, `${value.publication}.pending`);
     this.validate(value, value.id);
@@ -178,9 +180,10 @@ class ConversationControls {
       if (staged && staged.rawDigest !== hash(text)) throw Error('Conversation control stage changed. Preserve it for review.');
       const current = await this.file(file, directory, null, 1, true, retry);
       if (JSON.stringify(JSON.parse(current.text)) !== JSON.stringify(baseline)) throw Error('Conversation authority changed. Preserve the control stage for review.');
-      if (retry) await this.replace(stage, file, directory, staged, current, revalidate);
-      else await fs.rename(stage, file);
+      if (retry) await this.replace(stage, file, directory, staged, current, revalidate, assertSelection);
+      else { assertSelection(); await fs.rename(stage, file); }
     } else {
+      assertSelection();
       await fs.link(stage, file);
       const a = await this.file(stage, directory, null, 2, true), b = await this.file(file, directory, null, 2, true);
       if (!same(a.stat, b.stat) || a.text !== text || b.text !== text) throw Error('Conversation control publication changed. Preserve both peers.');
@@ -273,14 +276,14 @@ class ConversationControls {
       return { token, id, generation: snapshot.marker.generation, requestCount: null, targets: snapshot.marker.targets.map(target => target.name), pending: [], recovery: true };
     });
   }
-  async settlePublication(marker) {
+  async settlePublication(marker, assertSelection = () => {}) {
     const directory = this.guard(), file = path.join(directory.directory, `${marker.id}.json`), stat = await fs.lstat(file);
     if (stat.nlink === 1) return;
     if (stat.nlink !== 2) throw Error('Conversation control has unknown linked peers. Preserve them before recovery.');
     const stage = path.join(directory.directory, `${marker.publication}.pending`);
     const a = await this.file(file, directory, null, 2, true), b = await this.file(stage, directory, null, 2, true);
     if (!same(a.stat, b.stat) || a.text !== b.text || JSON.stringify(JSON.parse(a.text)) !== JSON.stringify(marker)) throw Error('Conversation control publication changed. Unknown peers remain preserved.');
-    this.guard(false, directory.stat); await fs.unlink(stage);
+    this.guard(false, directory.stat); assertSelection(); await fs.unlink(stage);
   }
   async restorationSnapshot(id, { expectedParent, exactBytes = false } = {}) {
     const marker = await this.state(id);
