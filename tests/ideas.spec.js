@@ -637,6 +637,12 @@ test('an explicitly selected imported evidence citation opens its original revis
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
   expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(capturesBefore);
 
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const linkedIdea = page.getByLabel('Source inspection').getByRole('button', { name: 'Open linked saved idea in Obsidian: Inspect the original authored evidence', exact: true });
+  await expect(linkedIdea).toBeVisible();
+  await linkedIdea.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8').catch(error => error.code)).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
+
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(root, 'producer', 'edit'), { recursive: true });
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }), 'utf8');
   await page.getByRole('button', { name: 'Check now', exact: true }).click();

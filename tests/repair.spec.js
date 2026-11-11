@@ -187,6 +187,12 @@ test('external writing survives restart and transfers to an annotation before in
   await app.close(); app = null; await launch();
   await expect(page.getByLabel('Vault repairs')).toContainText('Incoming revision');
   expect(await fs.readFile(file, 'utf8')).toContain('My external observation.');
+  const heldCapture = page.locator('#captures article').filter({ hasText: 'My external observation.' });
+  await expect.soft(heldCapture).toContainText(/Companion manages the imported source text and metadata[\s\S]*annotation/i);
+  await heldCapture.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const inspection = page.getByLabel('Source inspection');
+  await expect.soft(inspection).toContainText(/Supporting evidence: paused[\s\S]*conflict/i);
+  await expect.soft(inspection).not.toContainText('Supporting evidence: eligible');
   await page.getByLabel('Transfer local writing').fill('My external observation.');
   await page.getByRole('button', { name: 'Save annotation and apply incoming', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Conflict resolved');
