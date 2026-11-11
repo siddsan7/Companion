@@ -251,6 +251,31 @@ for (const boundary of ['held ledger rename', 'held journal link', 'edited journ
   expect(await readOptional(pending)).toBeNull();
 });
 
+async function exitAfterOrdinaryAdmission(vault, producer) {
+  const script = `
+    const path = require('node:path');
+    const [app, directory, producer, now] = process.argv.slice(1);
+    const { Vault } = require(path.join(app, 'vault'));
+    const { Intake } = require(path.join(app, 'intake'));
+    const vault = new Vault(directory, 'Companion', { checkpoint: name => {
+      if (name === 'intake-ledger') process.exit(77);
+    } });
+    new Intake(vault).connect(producer, true, now).catch(error => {
+      console.error(error);
+      process.exitCode = 1;
+    });`;
+  const child = spawn(process.execPath, ['-e', script, path.resolve(__dirname, '../app'), vault.vault, producer, now], {
+    stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
+  });
+  let stderr = '';
+  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+  const exit = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  expect(exit, stderr).toEqual({ code: 77, signal: null });
+}
+
 const ordinaryRestartCases = [
   ...['unchanged', 'missing capture', 'missing snapshot', 'replaced capture', 'replaced snapshot'].map(change => ({ change })),
   { change: 'missing snapshot', legacy: true },
@@ -261,28 +286,7 @@ for (const { change, legacy } of ordinaryRestartCases) {
     const producer = testInfo.outputPath('producer');
     const { vault, intake, ledgerFile } = await setup(testInfo);
     await writeDraft(producer);
-    const script = `
-      const path = require('node:path');
-      const [app, directory, producer, now] = process.argv.slice(1);
-      const { Vault } = require(path.join(app, 'vault'));
-      const { Intake } = require(path.join(app, 'intake'));
-      const vault = new Vault(directory, 'Companion', { checkpoint: name => {
-        if (name === 'intake-ledger') process.exit(77);
-      } });
-      new Intake(vault).connect(producer, true, now).catch(error => {
-        console.error(error);
-        process.exitCode = 1;
-      });`;
-    const child = spawn(process.execPath, ['-e', script, path.resolve(__dirname, '../app'), vault.vault, producer, now], {
-      stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
-    });
-    let stderr = '';
-    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-    const exit = await new Promise((resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', (code, signal) => resolve({ code, signal }));
-    });
-    expect(exit, stderr).toEqual({ code: 77, signal: null });
+    await exitAfterOrdinaryAdmission(vault, producer);
 
     const journal = path.join(intake.dir, 'transaction.json');
     const raw = await fs.readFile(journal, 'utf8'), tx = JSON.parse(raw);
@@ -359,6 +363,82 @@ for (const { change, legacy } of ordinaryRestartCases) {
     }
   });
 }
+
+for (const target of ['published snapshot', 'shared journal']) test('Windows accepted intake read refusal at the ' + target, async ({}, testInfo) => {
+  test.skip(process.platform !== 'win32', 'Requires a native Windows FileShare.None refusal.');
+  const { vault, intake, ledgerFile } = await setup(testInfo);
+  const producer = testInfo.outputPath('producer');
+  await writeDraft(producer);
+  await exitAfterOrdinaryAdmission(vault, producer);
+  const journal = path.join(intake.dir, 'transaction.json'), raw = await fs.readFile(journal, 'utf8'), tx = JSON.parse(raw);
+  const before = await fs.readFile(ledgerFile, 'utf8'), committed = JSON.parse(before);
+  const originalJournal = await fs.lstat(journal, { bigint: true });
+  const snapshot = path.join(vault.root, 'Revisions', tx.revision.id + '.json');
+  const capture = intake.destination(tx.capture), captureStage = path.join(intake.dir, tx.revision.id + '.stage');
+  const snapshotStage = path.join(intake.dir, tx.revision.id + '.snapshot.stage');
+  const files = await Promise.all([capture, snapshot, captureStage, snapshotStage].map(async file => ({
+    file, bytes: await fs.readFile(file, 'utf8'), stat: await fs.lstat(file, { bigint: true })
+  })));
+  const locked = target === 'published snapshot' ? snapshot : journal;
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$stream = [IO.File]::Open($env:COMPANION_LOCKED_INTAKE_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)',
+    'try { [Console]::WriteLine("READY:" + $PID); [void][Console]::ReadLine() } finally { $stream.Dispose(); [Console]::WriteLine("RELEASED:" + $PID) }'
+  ].join('; ');
+  await writeDraft(producer, 'z-independent', '2', 'c');
+  const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true, env: { ...process.env, COMPANION_LOCKED_INTAKE_FIXTURE: locked }, stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const native = { pid: child.pid, stdout: '', stderr: '' };
+  child.stdout.on('data', chunk => { native.stdout += chunk.toString(); });
+  child.stderr.on('data', chunk => { native.stderr += chunk.toString(); });
+  child.stdin.on('error', error => { native.inputError = error.message; });
+  child.on('error', error => { native.error = error.message; });
+  const closed = new Promise(resolve => child.once('close', (code, signal) => {
+    native.exit = { code, signal };
+    resolve();
+  }));
+  const sharing = ['EPERM', 'EBUSY', 'EACCES'];
+  let outcome, refusal;
+  try {
+    await expect.poll(() => {
+      if (native.error || native.exit) throw Error(JSON.stringify(native));
+      return native.stdout;
+    }).toContain('READY:' + child.pid);
+    try { local.readFileSync(locked); }
+    catch (error) { refusal = error.code; }
+    expect(sharing).toContain(refusal);
+    const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+    outcome = await restarted.reconcile({ now: later }).catch(error => error);
+  } finally {
+    child.stdin.end('\n');
+    await closed;
+  }
+  expect(native.exit).toEqual({ code: 0, signal: null });
+  expect(native.stdout).toContain('RELEASED:' + child.pid);
+  for (const { file, bytes, stat } of files) {
+    expect(await fs.readFile(file, 'utf8')).toBe(bytes);
+    const after = await fs.lstat(file, { bigint: true });
+    expect([after.dev, after.ino, after.nlink]).toEqual([stat.dev, stat.ino, stat.nlink]);
+  }
+  if (target === 'shared journal') {
+    expect(outcome).toBeInstanceOf(Error);
+    expect(sharing).toContain(outcome.code);
+    expect(await fs.readFile(ledgerFile, 'utf8')).toBe(before);
+    expect(await fs.readFile(journal, 'utf8')).toBe(raw);
+    return;
+  }
+  expect(outcome instanceof Error ? { code: outcome.code, message: outcome.message } : null).toBeNull();
+  expect(outcome.lastCheck.status).toBe('held');
+  expect(outcome.attempts[tx.revision.identity]).toEqual(committed.attempts[tx.revision.identity]);
+  expect(Object.values(outcome.attempts)).toHaveLength(2);
+  const held = path.join(intake.dir, 'conflict-' + tx.revision.id + '.json');
+  expect(outcome.blocks[tx.sourceHash]?.journal).toBe(path.basename(held));
+  expect(await readOptional(journal)).toBeNull();
+  expect(await fs.readFile(held, 'utf8')).toBe(raw);
+  const heldJournal = await fs.lstat(held, { bigint: true });
+  expect([heldJournal.dev, heldJournal.ino, heldJournal.nlink]).toEqual([originalJournal.dev, originalJournal.ino, 1n]);
+});
 
 test('accepted deferred intake restart settles its unchanged journal pair without replay', async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer'), interruption = Error('Stopped after successful deferred admission.');
