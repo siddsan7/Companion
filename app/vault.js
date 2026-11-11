@@ -4,12 +4,16 @@ const { randomUUID, createHash } = require('node:crypto');
 const YAML = require('yaml');
 const { sourceMutation } = require('./source-mutation');
 const { assertPublication } = require('./source-authority');
-const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage } = require('./staged-publication');
+const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
 const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
+const titleRollbackSuffix = '.title-rollback.json';
+const transactionSuffix = '.title-transaction.json';
+const transactionBackup = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.bak$/;
+const rollbackStage = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.pending$/;
 async function noteLock(file, guard) {
   const lock = await readExact(`${file}.lock`, guard).catch(missing);
   if (!lock) return null;
@@ -180,7 +184,8 @@ class Vault {
     return sourceMutation(this.root, () => this.titleOwned(id, title));
   }
   async titleHasStage(file) {
-    const exists = await fs.lstat(`${file}.title-transaction.json`).catch(missing) || await fs.lstat(`${file}.pending`).catch(missing);
+    const exists = await fs.lstat(file + transactionSuffix).catch(missing) || await fs.lstat(`${file}.pending`).catch(missing) ||
+      await fs.lstat(file + titleRollbackSuffix).catch(missing);
     if (!exists) return false;
     const recoveryError = this.titleRecoveryErrors.get(file);
     if (recoveryError) throw recoveryError;
@@ -199,7 +204,7 @@ class Vault {
     const original = await readExact(note.file, guard);
     if (!original.bytes.equals(Buffer.from(note.content))) throw Error('The note changed. Your file was preserved.');
     const transaction = { expectedHash: hash(note.content), content, backup: `${path.basename(note.file)}.before-title-${randomUUID()}.bak`, ...(authority?.phase === 'active' ? { sourceGeneration: authority.generation } : {}) };
-    let lock;
+    let lock, retainLock = false;
     try {
       const create = (file, bytes) => writeStage(file, bytes, guard).catch(error => { if (error.code === 'EEXIST') throw titleHeld(); throw error; });
       const staged = await create(stage, content);
@@ -209,7 +214,10 @@ class Vault {
       await this.checkpoint('title-staged');
       await this.finishTitleOwned(note.file, transaction, publication, guard);
       this.expected.set(id, hash(content));
-    } finally { if (lock) await this.release(note.file, lock, guard); }
+    } catch (error) {
+      retainLock = temporaryFileError(error);
+      throw error;
+    } finally { if (lock && !retainLock) await this.release(note.file, lock, guard); }
   }
   async finishTitleOwned(file, transaction, publication, guard, legacyJournal) {
     const backup = path.join(path.dirname(file), transaction.backup), stage = `${file}.pending`, journal = `${file}.title-transaction.json`;
@@ -251,18 +259,11 @@ class Vault {
       } else if (!current.isFile() || current.isSymbolicLink() || String(current.ino) !== publication.staged.ino || String(current.dev) !== publication.staged.dev) {
         throw Error('External edit conflict. The current file and previous version were preserved.');
       }
-      if (!current || current.nlink === 2n) {
-        await verifyPeers(stage, file, guard, publication.staged);
-        await removeStage(stage, guard, publication.staged, 2);
-      } else {
-        guard();
-        if (await fs.lstat(stage).catch(missing)) throw stagingHeld();
-      }
-      await verifyStage(file, guard, publication.staged);
+      await settlePublishedLink(stage, file, guard, publication.staged);
       await verifyStage(backup, guard, publication.previous);
       await removeStage(journal, guard, publication.journal);
     } catch (error) {
-      if (error.code !== 'SOURCE_AUTHORITY_DENIED') {
+      if (error.code !== 'SOURCE_AUTHORITY_DENIED' && !temporaryFileError(error)) {
         try {
           const retained = await readExact(backup, guard).catch(missing);
           // An open editor can change the old inode after the move. Keep those bytes, too.
@@ -278,18 +279,39 @@ class Vault {
     guard();
     if (await fs.lstat(file).catch(missing)) return;
     await this.publication(id, transaction);
-    const stage = `${file}.restore-title-${randomUUID()}.pending`;
-    const staged = await writeStage(stage, retained.bytes, guard);
-    let linked = false;
+    const receipt = file + titleRollbackSuffix, stage = `${file}.restore-title-${randomUUID()}.pending`;
+    const folders = this.publicationFolders(path.dirname(file));
+    const pinned = () => { guard(); folders.guard(); };
+    const staged = await writeStage(stage, retained.bytes, pinned);
+    let recorded;
     try {
-      await verifyStage(`${file}.title-transaction.json`, guard, journalProof);
-      await verifyStage(backup, guard, retained.proof);
-      await verifyStage(stage, guard, staged);
-      guard(); await fs.link(stage, file); linked = true;
-      await verifyPeers(stage, file, guard, staged);
-      await removeStage(stage, guard, staged, 2);
-      await verifyStage(file, guard, staged);
-    } finally { if (!linked) await removeStage(stage, guard, staged).catch(() => {}); }
+      const proof = { schema: 1, stage: path.basename(stage), staged, backup: path.basename(backup), previous: retained.proof, journal: journalProof, identities: folders.identities };
+      recorded = await writeStage(receipt, JSON.stringify(proof), pinned);
+      await verifyStage(receipt, pinned, recorded);
+      await verifyStage(file + transactionSuffix, pinned, journalProof);
+      await verifyStage(backup, pinned, retained.proof);
+      await verifyStage(stage, pinned, staged);
+      pinned(); await fs.link(stage, file);
+      await settlePublishedLink(stage, file, pinned, staged);
+      await removeStage(receipt, pinned, recorded);
+    } finally { if (!recorded) await removeStage(stage, pinned, staged).catch(() => {}); }
+  }
+  async settleTitleRollback(file, guard) {
+    const receipt = file + titleRollbackSuffix, stored = await readExact(receipt, guard);
+    const proof = JSON.parse(stored.bytes), filename = path.basename(file);
+    const stagePrefix = filename + '.restore-title-', backupPrefix = filename + '.before-title-';
+    if (proof?.schema !== 1 || !stored.bytes.equals(Buffer.from(JSON.stringify(proof))) ||
+        typeof proof.stage !== 'string' || !proof.stage.startsWith(stagePrefix) || !rollbackStage.test(proof.stage.slice(stagePrefix.length)) ||
+        typeof proof.backup !== 'string' || !proof.backup.startsWith(backupPrefix) || !transactionBackup.test(proof.backup.slice(backupPrefix.length)) ||
+        !validProof(proof.staged) || !validProof(proof.previous) || !validProof(proof.journal) || proof.staged.digest !== proof.previous.digest || !Array.isArray(proof.identities)) {
+      throw Error('Title rollback receipt is invalid. Files were preserved for inspection.');
+    }
+    const directory = path.dirname(file), pinned = this.publicationFolders(directory, proof.identities).guard;
+    await verifyStage(receipt, pinned, stored.proof);
+    await verifyStage(file + transactionSuffix, pinned, proof.journal);
+    await verifyStage(path.join(directory, proof.backup), pinned, proof.previous);
+    await settlePublishedLink(path.join(directory, proof.stage), file, pinned, proof.staged);
+    await removeStage(receipt, pinned, stored.proof);
   }
   async recover(dir) {
     return sourceMutation(this.root, () => this.recoverOwned(dir));
@@ -299,20 +321,34 @@ class Vault {
     const entries = await fs.readdir(dir);
     const recoveryLocks = new Set();
     this.titleRecoveryErrors.clear();
-    for (const entry of entries.filter(name => name.endsWith('.md.title-transaction.json'))) {
-      const journal = path.join(dir, entry), file = journal.slice(0, -'.title-transaction.json'.length);
+    const unsettledRollbacks = new Set();
+    for (const entry of entries.filter(name => name.endsWith('.md' + titleRollbackSuffix))) {
+      const file = path.join(dir, entry.slice(0, -titleRollbackSuffix.length));
+      try { await this.settleTitleRollback(file, guard); }
+      catch (error) {
+        unsettledRollbacks.add(file);
+        this.warnings.push(`Prior title recovery held: ${error.message}`);
+        if (temporaryFileError(error)) this.titleRecoveryErrors.set(file, error);
+      }
+    }
+    for (const entry of entries.filter(name => name.endsWith('.md' + transactionSuffix))) {
+      const journal = path.join(dir, entry), file = journal.slice(0, -transactionSuffix.length);
       recoveryLocks.add(file);
+      if (unsettledRollbacks.has(file)) continue;
       let lock;
       try {
         lock = await noteLock(file, guard);
-        if (lock?.live) continue;
+        if (lock?.live) {
+          if (lock.publication?.kind === 'title') this.titleRecoveryErrors.set(file, Error('An interrupted title save awaits exact recovery. Restart Companion to continue.'));
+          continue;
+        }
         const publication = lock?.publication;
         const pinned = this.publicationFolders(dir, publication?.identities);
         const stored = await readExact(journal, pinned.guard);
         const transaction = JSON.parse(stored.bytes);
         const backupPrefix = path.basename(file) + '.before-title-';
         if (typeof transaction.content !== 'string' || typeof transaction.expectedHash !== 'string' || typeof transaction.backup !== 'string' ||
-            !transaction.backup.startsWith(backupPrefix) || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.bak$/.test(transaction.backup.slice(backupPrefix.length))) throw Error('Invalid title recovery journal; preserve it for repair.');
+            !transaction.backup.startsWith(backupPrefix) || !transactionBackup.test(transaction.backup.slice(backupPrefix.length))) throw Error('Invalid title recovery journal; preserve it for repair.');
         await this.finishTitleOwned(file, transaction, publication, pinned.guard, lock?.legacy ? stored.proof : undefined);
         this.warnings.push('Recovered an interrupted title save. The previous version remains in an adjacent backup.');
         await this.release(file, lock.proof, pinned.guard);

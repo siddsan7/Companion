@@ -7,6 +7,8 @@ const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const identity = stat => ({ dev: String(stat.dev), ino: String(stat.ino) });
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const changed = () => Error('Staging file or publication peer changed. Files were preserved for inspection.');
+const validProof = proof => proof && typeof proof.dev === 'string' && typeof proof.ino === 'string' && typeof proof.digest === 'string' &&
+  /^[0-9]+$/.test(proof.dev) && /^[0-9]+$/.test(proof.ino) && /^[a-f0-9]{64}$/.test(proof.digest);
 
 function ordinaryDirectories(directories, message, expected) {
   const comparable = file => process.platform === 'win32' ? file.toLowerCase() : file;
@@ -75,4 +77,18 @@ async function removeStage(file, guard, proof, links = 1) {
   await fs.unlink(file);
 }
 
-module.exports = { digest, ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage };
+async function settlePublishedLink(stage, destination, guard, proof) {
+  guard();
+  const links = (await fs.lstat(destination, { bigint: true })).nlink;
+  if (links === 2n) {
+    await verifyPeers(stage, destination, guard, proof);
+    await removeStage(stage, guard, proof, 2);
+  } else {
+    await verifyStage(destination, guard, proof);
+    const stagePresent = await fs.lstat(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    if (stagePresent) throw changed();
+  }
+  await verifyStage(destination, guard, proof);
+}
+
+module.exports = { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink };
