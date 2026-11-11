@@ -42,6 +42,7 @@ async function main() {
       await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
       await page.getByRole('status').filter({ hasText: 'Daily intake enabled' }).waitFor();
       const state = await load(), effective = await tasks.apply('inspect', state, scheduleFile);
+      if (state.launchBinding !== 1) throw Error('New daily intake setup did not bind its worker to the local task identity.');
       await fs.writeFile(path.join(directory, 'production-task.xml'), effective.xml);
       await fs.writeFile(path.join(directory, 'production-inspection.json'), JSON.stringify({ ...effective, policyMatches: tasks.matchesSchedule(effective, state, scheduleFile) }, null, 2));
       await fs.writeFile(path.join(directory, 'production-state.json'), JSON.stringify(state, null, 2));

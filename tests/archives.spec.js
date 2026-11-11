@@ -14,6 +14,9 @@ async function launch() {
   await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Vault ready.');
 }
+async function selectCadence(region, archiveId, sourceRoot, targetRoot) {
+  await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(JSON.stringify({ archiveId, sourceRoot, targetRoot }));
+}
 async function tree(directory) {
   const records = {};
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
@@ -444,7 +447,7 @@ test('explicit imported cadence reconnection preserves its anchor with a fresh l
     await expect(region).toContainText('Imported daily intake intent is inactive');
     const vaultBefore = await tree(path.join(root, 'vault'));
     for (const name of ['schedule.json', 'scheduler-task.json']) expect(await fs.access(path.join(root, name)).then(() => true, () => false)).toBe(false);
-    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(exported.id);
+    await selectCadence(region, exported.id, original.vault.root, path.join(root, 'vault', 'Companion'));
     await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(region).toContainText(`Original anchor: ${exported.payload.scheduleIntent.anchor}`);
     await expect(region).toContainText('A fresh local task identity will be used');
@@ -468,7 +471,7 @@ test('explicit imported cadence reconnection preserves its anchor with a fresh l
     app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
     await expect(page.locator('#timezone')).toContainText('America/Phoenix');
     const restartedRegion = page.getByRole('region', { name: 'Local history archive', exact: true });
-    await restartedRegion.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(exported.id);
+    await selectCadence(restartedRegion, exported.id, original.vault.root, path.join(root, 'vault', 'Companion'));
     await restartedRegion.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(restartedRegion).toContainText('This imported cadence is already connected');
     await expect(restartedRegion.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true })).toBeDisabled();
@@ -992,7 +995,7 @@ test('failed imported cadence registration remains disabled and explicit retry r
     await expect(region).toContainText('Imported daily intake intent is inactive');
     const vaultBefore = await tree(path.join(root, 'vault'));
     for (const name of ['schedule.json', 'scheduler-task.json']) expect(await fs.access(path.join(root, name)).then(() => true, () => false)).toBe(false);
-    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(exported.id);
+    await selectCadence(region, exported.id, original.vault.root, path.join(root, 'vault', 'Companion'));
     await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(region).toContainText(`Original anchor: ${exported.payload.scheduleIntent.anchor}`);
     await expect(region).toContainText('A fresh local task identity will be used');
@@ -1017,7 +1020,7 @@ test('failed imported cadence registration remains disabled and explicit retry r
     expect(await fs.readFile(path.join(root, 'schedule.json'), 'utf8')).toBe(pendingBytes);
     expect(await fs.access(path.join(root, 'scheduler-task.json')).then(() => true, () => false)).toBe(false);
     const retryRegion = page.getByRole('region', { name: 'Local history archive', exact: true });
-    await retryRegion.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(exported.id);
+    await selectCadence(retryRegion, exported.id, original.vault.root, path.join(root, 'vault', 'Companion'));
     await retryRegion.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(retryRegion).toContainText('an unfinished reconnection reuses its already reserved local identity');
     const retry = retryRegion.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true });
@@ -1341,7 +1344,7 @@ test('explicit metadata-only restore preserves inert cadence and Codex hints wit
     await expect(region).toContainText('Archived Codex preferences are inert reconnection hints');
     expect(await archiveSafetyState()).toEqual(before.authority);
     expect(await fs.readFile(targetSetup, 'utf8')).toBe(before.setup);
-    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(exported.id);
+    await selectCadence(region, exported.id, preferences.vault, path.join(root, 'vault', 'Companion'));
     await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true })).toBeEnabled();
     expect(await archiveSafetyState()).toEqual(before.authority);
@@ -1428,12 +1431,12 @@ test('third-installation vault matching reconnects only inherited cadence bound 
     const region = await importMatched(archiveBFile, path.join(middleRoot, 'vault', 'Companion'));
     await expect(region).toContainText('Imported daily intake intent is inactive');
     expect(await archiveSafetyState()).toEqual(before);
-    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(unrelated.archiveId);
+    await selectCadence(region, unrelated.archiveId, unrelated.sourceRoot, unrelated.targetRoot);
     await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(region.locator('#archive-reconnect-summary')).toContainText('Select exactly one imported cadence matched to the current vault');
     await expect(region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true })).toBeDisabled();
     expect(await archiveSafetyState()).toEqual(before);
-    await region.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(archiveA.id);
+    await selectCadence(region, archiveA.id, path.join(sourceRoot, 'vault', 'Companion'), path.join(root, 'vault', 'Companion'));
     await region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
     await expect(region.locator('#archive-reconnect-summary')).toContainText(`Original anchor: ${archiveA.payload.scheduleIntent.anchor}`);
     const reconnect = region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true });

@@ -1,6 +1,7 @@
 const $ = id => document.getElementById(id);
 let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0;
 let checkingIntake = false, connectingIntake = false, savingCapture = false, configuringVault = false;
+let scheduleView, updatingSchedule = false;
 const status = message => { document.querySelector('[role=status]').textContent = message; };
 function scopeError(error, owned) {
   const earlier = error.canReport;
@@ -26,6 +27,8 @@ async function refresh() {
     window.intakeView.render(state.intake, state.location);
     updateIntakeControls();
     $('schedule-state').textContent = state.schedule ? `${state.schedule.mode} | Next scheduled check: ${state.schedule.next} | Anchor: ${state.schedule.anchor} | Last success: ${state.intake?.lastSuccess?.at || state.schedule.lastSuccess?.at || 'None'} | Worker: ${state.schedule.worker?.status || 'Not run'}${state.schedule.taskError || state.schedule.workerError || state.schedule.inspectionError ? ` | Error: ${state.schedule.taskError || state.schedule.workerError || state.schedule.inspectionError}` : ''}${!state.schedule.effective && state.schedule.mode !== 'disabled' ? ' | Task missing: use Repair daily intake.' : ''}${state.schedule.taskMismatch ? ' | Task state differs: use Repair daily intake.' : ''}${state.schedule.policyMismatch ? ' | Task schedule differs: use Repair daily intake.' : ''}` : 'Daily intake is not configured.';
+    scheduleView = state.location ? { location: state.location, scheduleId: state.scheduleRecordId } : null;
+    updateScheduleControls();
     await window.intakeView.repairs(owned);
     if (!owned()) return;
     $('timezone').textContent = `${view === 'today' ? 'Today' : 'All captures'} · ${state.timezone} · ${day(state.now, state.timezone)}`;
@@ -63,11 +66,28 @@ async function refresh() {
   finally { if (owned()) window.intakeView.settleRepairs(); }
 }
 const scheduleControls = ['enable', 'pause', 'resume', 'disable', 'repair'].map(operation => $('schedule-' + operation));
-for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'paused', resume: 'resumed', disable: 'disabled', repair: 'repaired' })) $('schedule-' + operation).onclick = () => action(async () => {
-  scheduleControls.forEach(control => { control.disabled = true; }); status('Updating daily intake...');
-  try { await window.companion['schedule-' + operation](); status('Daily intake ' + result + '.'); }
-  finally { try { await refresh(); } finally { scheduleControls.forEach(control => { control.disabled = false; }); } }
-});
+function updateScheduleControls() {
+  for (const control of scheduleControls) control.disabled = configuringVault || updatingSchedule || !scheduleView;
+}
+for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'paused', resume: 'resumed', disable: 'disabled', repair: 'repaired' })) {
+  const control = $('schedule-' + operation);
+  control.onclick = () => {
+    if (control.disabled || !scheduleView) return;
+    const selection = scheduleView, owner = configurationEpoch;
+    const owned = () => owner === configurationEpoch && !configurationBusy;
+    updatingSchedule = true; updateScheduleControls(); status('Updating daily intake...');
+    return action(async () => {
+      try {
+        await window.companion['schedule-' + operation](selection);
+        if (owned()) status('Daily intake ' + result + '.');
+      } catch (error) { if (owned()) throw scopeError(error, owned); }
+      finally {
+        try { if (owned()) await refresh(); }
+        finally { updatingSchedule = false; updateScheduleControls(); }
+      }
+    });
+  };
+}
 function updateCaptureControl() { $('save').disabled = $('configure').disabled = savingCapture || configuringVault; }
 function updateIntakeControls() {
   const pending = checkingIntake || connectingIntake || configuringVault;
@@ -78,15 +98,25 @@ $('choose').onclick = () => action(async () => { selectedVault = await window.co
 $('configure').onclick = () => {
   if ($('configure').disabled) return;
   const owner = ++configurationEpoch; configurationBusy = true; configuringVault = true; $('vault-repairs').replaceChildren();
-  updateCaptureControl(); updateIntakeControls();
+  scheduleView = null;
+  updateCaptureControl(); updateIntakeControls(); updateScheduleControls();
   retireCaptureLinks();
   return action(async () => {
     try {
       await window.companion.configure({ vault: selectedVault, parent: $('parent').value });
       if (owner !== configurationEpoch) return;
       configurationBusy = false; await refresh(); if (owner === configurationEpoch) status('Vault ready.');
-    } catch (error) { if (owner === configurationEpoch) throw error; }
-    finally { if (owner === configurationEpoch) { configurationBusy = false; configuringVault = false; updateCaptureControl(); updateIntakeControls(); window.dispatchEvent(new Event('companion-vault-configured')); } }
+    } catch (error) {
+      if (owner !== configurationEpoch) return;
+      if (configurationBusy) { configurationBusy = false; await refresh().catch(() => {}); }
+      throw error;
+    } finally {
+      if (owner === configurationEpoch) {
+        configurationBusy = false; configuringVault = false;
+        updateCaptureControl(); updateIntakeControls(); updateScheduleControls();
+        window.dispatchEvent(new Event('companion-vault-configured'));
+      }
+    }
   });
 };
 $('add-excerpt').onclick = () => { $('excerpt-label').hidden = false; $('excerpt').focus(); };
@@ -150,4 +180,6 @@ $('reconnect-source').onclick = () => {
   const { id, folder, kind = 'draft', identity, epoch } = source;
   return connectSource('reconnect-source', { location: state.location, id, folder, kind, identity, epoch, replacement: $('reconnect-folder').value });
 };
+window.addEventListener('companion-schedule-changed', () => action(refresh));
+updateScheduleControls();
 window.addEventListener('focus', () => action(refresh)); setInterval(() => action(refresh), 60000); action(refresh);

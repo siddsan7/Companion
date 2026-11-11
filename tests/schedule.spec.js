@@ -1,5 +1,7 @@
 const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const { readFileSync } = require('node:fs');
+const { randomUUID } = require('node:crypto');
 const os = require('node:os');
 const path = require('node:path');
 let root, app, page;
@@ -54,15 +56,66 @@ test('late desktop launch coalesces missed slots into one retained check without
   await expect(page.getByLabel('Daily intake schedule')).toContainText('Last success: 2026-11-12T08:00:00Z');
 });
 
-function startWorker() {
+function startWorker(expectedId) {
   const { spawn } = require('node:child_process');
-  const child = spawn(require('electron'), ['.', '--intake-worker', '--schedule-file', path.join(root, 'schedule.json')], { env: { ...process.env, COMPANION_TEST_ROOT: root }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const scheduleFile = path.join(root, 'schedule.json');
+  const state = JSON.parse(readFileSync(scheduleFile, 'utf8'));
+  const id = expectedId === undefined ? state.launchBinding === 1 ? state.id : null : expectedId;
+  const args = ['.', '--intake-worker', '--schedule-file', scheduleFile];
+  if (id !== null) args.push('--schedule-id', id);
+  const child = spawn(require('electron'), args, { env: { ...process.env, COMPANION_TEST_ROOT: root }, stdio: ['ignore', 'pipe', 'pipe'] });
   children.add(child);
   let output = ''; child.stderr.on('data', bytes => { output += bytes; });
   const done = new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', code => { children.delete(child); resolve({ code, output }); }); });
   return { child, done };
 }
-async function worker() { return startWorker().done; }
+async function worker(expectedId) { return startWorker(expectedId).done; }
+
+test('a queued worker without the current task identity leaves a bound schedule and its sources untouched', async () => {
+  await launch(); await setup();
+  await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+  await app.close(); app = null;
+  const file = path.join(root, 'schedule.json');
+  const ledgerFile = path.join(root, 'vault', 'Companion', '.intake', 'ledger.json');
+  const before = await fs.readFile(file, 'utf8'), ledger = await fs.readFile(ledgerFile, 'utf8');
+  const state = JSON.parse(before);
+  const task = JSON.parse(await fs.readFile(path.join(root, 'scheduler-task.json'), 'utf8'));
+  await clock('2026-11-09T07:00:00Z');
+  expect((await worker(randomUUID())).code).toBe(0);
+  expect((await worker(null)).code).toBe(0);
+  expect(await fs.readFile(file, 'utf8')).toBe(before);
+  expect(await fs.readFile(ledgerFile, 'utf8')).toBe(ledger);
+  expect(task.arguments).toContain(`"--schedule-id" "${state.id}"`);
+  expect((await worker()).code).toBe(0);
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).lastCheck).toMatchObject({ trigger: 'scheduled', status: 'complete' });
+});
+
+test('an existing unbound task still runs and disables through its original launch action', async () => {
+  await launch(); await setup();
+  await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+  await app.close(); app = null;
+  const file = path.join(root, 'schedule.json'), taskFile = path.join(root, 'scheduler-task.json');
+  const state = JSON.parse(await fs.readFile(file, 'utf8'));
+  const task = JSON.parse(await fs.readFile(taskFile, 'utf8'));
+  const suffix = ` "--schedule-id" "${state.id}"`;
+  if (state.launchBinding === 1) {
+    expect(task.arguments.endsWith(suffix)).toBe(true);
+    task.arguments = task.arguments.slice(0, -suffix.length);
+    delete state.launchBinding;
+    await fs.writeFile(file, JSON.stringify(state));
+    await fs.writeFile(taskFile, JSON.stringify(task));
+  }
+  await clock('2026-11-09T07:00:00Z');
+  expect((await worker(null)).code).toBe(0);
+  expect(JSON.parse(await fs.readFile(file, 'utf8'))).toMatchObject({ id: state.id, handledSlot: 1 });
+  await launch();
+  await page.getByRole('button', { name: 'Disable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake disabled');
+  expect(await fs.lstat(taskFile).then(() => null, error => error.code)).toBe('ENOENT');
+});
+
 test('pause blocks queued headless work and resume preserves the task anchor while disable removes only its registration', async () => {
   await launch(); await setup();
   await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
