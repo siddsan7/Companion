@@ -2,6 +2,8 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
+const { setTimeout: wait } = require('node:timers/promises');
 const { ordinaryDirectories, readExactSync, verifyStageSync } = require('./staged-publication');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
@@ -65,6 +67,24 @@ class IntakeLedger {
       throw error;
     }
   }
+  async publish(stage, proof, expected, guard) {
+    const deadline = performance.now() + 1000;
+    let delay = 15, refusal;
+    for (;;) {
+      if (refusal && performance.now() >= deadline) throw refusal;
+      this.guardSync(expected, guard);
+      try { verifyStageSync(stage, guard, proof); }
+      catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
+      try { local.renameSync(stage, this.file); return; }
+      catch (error) {
+        const remaining = deadline - performance.now();
+        if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
+        refusal = error;
+        await wait(Math.min(delay, remaining));
+        delay = Math.min(delay * 2, 100);
+      }
+    }
+  }
   async replace(text) {
     if (!this.matches(await this.view()) || this.expected.parents.missing) throw changed();
     const stage = path.join(this.directory, `ledger-${randomUUID()}.tmp`), bytes = Buffer.from(text, 'utf8');
@@ -84,10 +104,7 @@ class IntakeLedger {
       const prepared = await this.view(stage);
       if (!this.matches(prepared, { parents: expected.parents, identity: proof })) throw changed();
       if (!this.matches(await this.view(), expected)) throw changed();
-      this.guardSync(expected, guard);
-      try { verifyStageSync(stage, guard, proof); }
-      catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
-      local.renameSync(stage, this.file);
+      await this.publish(stage, proof, expected, guard);
       const published = await this.view();
       if (!this.matches(published, { parents: expected.parents, identity: proof })) throw changed();
       this.guardSync(published, guard);
