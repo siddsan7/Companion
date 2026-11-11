@@ -11,7 +11,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -80,23 +80,9 @@ class Intake {
     validateAnnotationRemovals(ledger);
     await this.storage.replace(JSON.stringify(ledger, null, 2), verifyRelated);
   }
-  async publishJournal(file, value, verifyRelated) {
+  async publishJournal(file, value) {
     await this.vault.contained(this.dir);
     const stage = path.join(this.dir, `journal-${randomUUID()}.stage`);
-    if (verifyRelated) {
-      const { guard } = this.vault.publicationFolders(this.dir);
-      const proof = await writeStage(stage, JSON.stringify(value), guard);
-      verifyRelated();
-      verifyStageSync(stage, guard, proof);
-      verifyAbsentSync(file, guard);
-      await fs.link(stage, file);
-      verifyRelated();
-      verifyStageSync(stage, guard, proof, 2);
-      verifyStageSync(file, guard, proof, 2);
-      await fs.unlink(stage);
-      verifyStageSync(file, guard, proof);
-      return;
-    }
     await fs.writeFile(stage, JSON.stringify(value), { flag: 'wx', flush: true });
     await fs.link(stage, file); await fs.unlink(stage);
   }
@@ -1063,6 +1049,9 @@ class Intake {
     const intentLinks = local.lstatSync(intentFile, { bigint: true }).nlink === 1n ? 1 : 2;
     const intentRecord = readExactSync(intentFile, guard, intentLinks), intent = JSON.parse(intentRecord.bytes);
     this.validateRepairIntent(intent);
+    if (intent.intentIdentity && !sameProofIdentity(intent.intentIdentity, intentRecord.proof)) {
+      throw Error('The repair intent identity changed. Recovery files were preserved.');
+    }
     if (!intentRecord.bytes.equals(Buffer.from(JSON.stringify(intent))) ||
         !journal.bytes.equals(Buffer.from(JSON.stringify(intent.tx)))) {
       throw Error('The active source journal does not match its repair intent. Recovery files were preserved.');
@@ -1070,6 +1059,7 @@ class Intake {
     const previous = this.boundRepairConflict(ledger, tx, intent.priorConflict, guard);
     const verifyIntent = links => {
       previous();
+      if (intent.intentIdentity) verifyAbsentSync(path.join(this.dir, `repair-intent-${tx.resolution}.stage`), guard);
       verifyStageSync(intentFile, guard, intentRecord.proof, links);
       if (links === 2) verifyStageSync(archivedIntent, guard, intentRecord.proof, 2);
       else verifyAbsentSync(archivedIntent, guard);

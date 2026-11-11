@@ -33,6 +33,20 @@ function sourceLink(content, relative) {
   return frontmatter[0] + body.replace(/^(\r?\n# Annotation\r?\n\r?\n)Source: \[Capture\]\([^\r\n]*\)(?=\r?\n|$)/, (_, header) => header + 'Source: [Capture](' + urlPath(relative) + ')');
 }
 function install(Intake, { hash, read, noteText, acceptedOutcome }) {
+  async function writeRepairIntentStage(file, intent, guard) {
+    guard();
+    const handle = await fs.open(file, 'wx');
+    try {
+      const { dev, ino } = await handle.stat({ bigint: true });
+      const identity = { dev: String(dev), ino: String(ino) };
+      const bytes = JSON.stringify({ ...intent, intentIdentity: identity });
+      guard();
+      await handle.writeFile(bytes);
+      await handle.sync();
+      guard();
+      return { identity, proof: { ...identity, digest: hash(bytes) } };
+    } finally { await handle.close(); }
+  }
   Intake.prototype.syncMoves = async function () {
     const annotations = await this.annotations(), ledger = await this.load();
     const { notes, owned, repairable, excluded, heldRestorations, reserved } = await this.vault.captureInventory({ ledger, guardLedger: () => this.storage.guard() });
@@ -331,7 +345,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       const content = noteText(capture, keptCurrent || tx.revision); capture.currentHash = hash(content);
       const id = randomUUID(), annotation = `---\ncompanion_id: ${JSON.stringify(id)}\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ${JSON.stringify(tx.capture.id)}\ncreated_at: ${JSON.stringify(now)}\n---\n\n# Annotation\n\nSource: [Capture](${urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture)))})\n\n${text}\n`;
       const intent = { schema: 1, sourceHash, localHash, annotationId: id, annotation, tx: { ...tx, retainOnly: false, ...(keptCurrent ? { keptCurrent } : {}), capture, content, previous: local, previousHash: localHash, externalConflict: false, resolution: id, backup: `${tx.capture.id}-${tx.revision.id}.before-${id}.md` } };
-      let verifyConflict;
+      const intentFile = path.join(this.dir, 'repair-intent.json');
       if (keptCurrent) {
         const { guard } = this.vault.publicationFolders(this.dir);
         const conflict = this.repairConflictWitness(ledger, intent.tx, block, guard);
@@ -341,13 +355,22 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         this.storage.guardSync();
         conflict.verify();
         intent.sourceProof = await writeStage(sourceStage, JSON.stringify(intent.tx), guard);
-        verifyConflict = () => {
+        const intentStage = path.join(this.dir, `repair-intent-${id}.stage`);
+        const { proof } = await writeRepairIntentStage(intentStage, intent, guard);
+        const verifyConflict = () => {
           this.storage.guardSync();
           conflict.verify();
           verifyStageSync(sourceStage, guard, intent.sourceProof);
         };
-      }
-      await this.publishJournal(path.join(this.dir, 'repair-intent.json'), intent, verifyConflict);
+        verifyConflict();
+        verifyStageSync(intentStage, guard, proof);
+        verifyAbsentSync(intentFile, guard);
+        native.linkSync(intentStage, intentFile);
+        verifyStageSync(intentStage, guard, proof, 2);
+        verifyStageSync(intentFile, guard, proof, 2);
+        native.unlinkSync(intentStage);
+        verifyStageSync(intentFile, guard, proof);
+      } else await this.publishJournal(intentFile, intent);
       await this.vault.checkpoint('repair-intent-published');
       await this.finishRepair();
     });
@@ -371,6 +394,11 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         intent.sourceProof.digest !== hash(JSON.stringify(tx)))) {
       throw Error('Invalid repair source proof. Recovery files were preserved.');
     }
+    const identity = intent.intentIdentity;
+    if (Object.hasOwn(intent, 'intentIdentity') && (!intent.sourceProof || !identity || Object.keys(identity).length !== 2 ||
+        ![identity.dev, identity.ino].every(value => typeof value === 'string' && /^[0-9]+$/.test(value)))) {
+      throw Error('Invalid repair intent identity. Recovery files were preserved.');
+    }
   };
   Intake.prototype.finishRepair = async function (expectedJournal) {
     const ledgerBaseline = this.storage.expected;
@@ -381,7 +409,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       throw error;
     });
     if (!intentIdentity) return;
-    let bytes = await read(intentFile);
+    const bytes = await read(intentFile);
     if (bytes === null) throw Error('The annotation repair intent changed. All remaining files were preserved.');
     const intent = JSON.parse(bytes), tx = intent.tx;
     this.validateRepairIntent(intent);
@@ -398,10 +426,33 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
     const journal = path.join(this.dir, 'transaction.json'), archivedIntent = path.join(this.dir, `repair-${intent.annotationId}.json`);
     const sourceStage = path.join(this.dir, `journal-${intent.annotationId}.stage`);
+    const intentStage = path.join(this.dir, `repair-intent-${intent.annotationId}.stage`);
     const ordinary = this.vault.publicationFolders(this.dir).guard;
     const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
     const guard = () => { ordinary(); annotationGuard(); };
     let intentProof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
+    if (tx.keptCurrent) {
+      const changed = () => Error('The repair intent or its known aliases changed. Recovery files were preserved.');
+      const recorded = intent.intentIdentity;
+      guardPrecommit();
+      guard();
+      if (recorded && (recorded.dev !== intentProof.dev || recorded.ino !== intentProof.ino || bytes !== JSON.stringify(intent))) throw changed();
+      const staged = native.lstatSync(intentStage, { throwIfNoEntry: false });
+      const archived = native.lstatSync(archivedIntent, { throwIfNoEntry: false });
+      if (staged) {
+        if (!recorded || archived || intent.annotationProof) throw changed();
+        this.boundRepairConflict(owner, tx, intent.priorConflict, guard)();
+        verifyStageSync(sourceStage, guard, intent.sourceProof);
+        for (const absent of [journal, archivedIntent, stage, file]) verifyAbsentSync(absent, guard, changed);
+        verifyStageSync(intentFile, guard, intentProof, 2);
+        verifyStageSync(intentStage, guard, intentProof, 2);
+        native.unlinkSync(intentStage);
+        verifyStageSync(intentFile, guard, intentProof);
+      } else if (archived) {
+        verifyStageSync(intentFile, guard, intentProof, 2);
+        verifyStageSync(archivedIntent, guard, intentProof, 2);
+      } else verifyStageSync(intentFile, guard, intentProof);
+    }
     let freshRepair;
     let verifyConflict;
     const settleSourceStage = candidate => {
@@ -416,19 +467,19 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       }
       return settled;
     };
-    const linkPinnedRepairSource = async verifyRelated => {
+    const linkPinnedRepairSource = verifyRelated => {
       if (!intent.sourceProof) throw Error('The repair source stage has no recorded identity. Recovery files were preserved.');
       const verifyStage = links => verifyStageSync(sourceStage, guard, intent.sourceProof, links);
       guardPrecommit();
       verifyRelated();
       verifyStage(1);
       verifyAbsentSync(journal, guard);
-      await fs.link(sourceStage, journal);
+      native.linkSync(sourceStage, journal);
       guardPrecommit();
       verifyRelated();
       verifyStage(2);
       verifyStageSync(journal, guard, intent.sourceProof, 2);
-      await fs.unlink(sourceStage);
+      native.unlinkSync(sourceStage);
       verifyStageSync(journal, guard, intent.sourceProof);
     };
     const retireRecordedAnnotation = () => {
@@ -530,7 +581,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       await this.ownedFile(sourceArchive, journal, 'Repair source archive');
       if (verifyRetainedHold && journalInfo) throw Error('An unproved repair source journal appeared. Recovery files were preserved.');
       if (!journalInfo && !freshRepair) {
-        if (tx.keptCurrent) await linkPinnedRepairSource(() => { verifyArchive(); verifyConflict?.(); });
+        if (tx.keptCurrent) linkPinnedRepairSource(() => { verifyArchive(); verifyConflict?.(); });
         else await this.publishJournal(journal, tx);
         journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
       }
@@ -617,20 +668,21 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     const recordIntentProof = async (field, proof, verifyFiles) => {
       verifyFiles();
       const replacement = path.join(this.dir, `repair-intent-${randomUUID()}.tmp`);
-      const updated = JSON.stringify({ ...intent, [field]: proof });
-      const replacementProof = await writeStage(replacement, updated, guard);
+      const updated = await writeRepairIntentStage(replacement, { ...intent, [field]: proof }, guard);
+      const replacementProof = updated.proof;
       try {
         guardPrecommit();
         verifyStageSync(replacement, guard, replacementProof);
         verifyStageSync(intentFile, guard, intentProof);
+        verifyAbsentSync(intentStage, guard);
         verifyAbsentSync(archivedIntent, guard);
         verifyConflict();
         verifyFiles();
         native.renameSync(replacement, intentFile);
         verifyStageSync(intentFile, guard, replacementProof);
         intentProof = replacementProof;
-        bytes = updated;
         intent[field] = proof;
+        intent.intentIdentity = updated.identity;
       } finally {
         try {
           readExactSync(replacement, guard, 1, replacementProof);
@@ -644,6 +696,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       guardPrecommit();
       verifyConflict();
       verifyStageSync(intentFile, guard, intentProof);
+      verifyAbsentSync(intentStage, guard);
       verifyAbsentSync(archivedIntent, guard);
       verifyStageSync(stage, guard, intent.annotationProof, 2);
       verifyStageSync(file, guard, intent.annotationProof, 2);
@@ -684,6 +737,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         guardPrecommit();
         verifyConflict();
         verifyStageSync(intentFile, guard, intentProof);
+        verifyAbsentSync(intentStage, guard);
         verifyAbsentSync(archivedIntent, guard);
         verifyStageSync(stage, guard, intent.annotationProof);
         verifyAbsentSync(file, guard);
@@ -710,7 +764,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     const ledger = tx.keptCurrent ? await readPrecommit() : await this.load();
     if (!admitted(ledger)) {
       if (freshRepair) expectedJournal.verify();
-      else if (tx.keptCurrent) await linkPinnedRepairSource(verifyAnnotationForSource);
+      else if (tx.keptCurrent) linkPinnedRepairSource(verifyAnnotationForSource);
       else if (await read(journal) === null) await this.publishJournal(journal, tx);
       else if (await read(journal) !== JSON.stringify(tx)) throw Error('Another source publication needs recovery before this repair.');
       if (!freshRepair && tx.keptCurrent) {
