@@ -4,6 +4,8 @@ const path = require('node:path');
 const YAML = require('yaml');
 const { createHash } = require('node:crypto');
 const { uuid } = require('./source-authority');
+const { comparable } = require('./legacy-capture-ownership');
+const { ordinaryDirectories, verifyAbsentSync } = require('./staged-publication');
 
 const decode = new TextDecoder('utf-8', { fatal: true });
 const frontMatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
@@ -53,10 +55,16 @@ async function readHeader(handle, size) {
 async function scanIdeas(vault) {
   const root = path.resolve(vault.vault), managed = path.resolve(vault.root), ideas = path.join(managed, 'Ideas');
   const claims = new Map(), observed = new Map(), publications = new Map();
+  const intake = new (require('./intake').Intake)(vault);
+  const reserved = vault.reservedRestorationIdentities(await intake.load());
   const relative = file => path.relative(root, file) || '.';
   const unavailable = (file, reason) => Error(`Saved idea identity inspection unavailable at ${relative(file)}. ${reason} Restore access or repair the metadata and retry.`);
   const changed = file => unavailable(file, 'Vault entries changed during inspection.');
   const stable = (file, before, after) => { if (!same(before, after)) throw changed(file); };
+  const { directories, missing } = intake.storage.expected.parents;
+  const missingLedgerGuard = missing
+    ? ordinaryDirectories(directories.map(directory => directory.file), changed(intake.dir).message, directories).guard
+    : null;
 
   async function inspect(file, before, work) {
     if (!before.isFile() || before.isSymbolicLink()) throw changed(file);
@@ -131,6 +139,7 @@ async function scanIdeas(vault) {
 
   async function markdown(file, stat, publishedIds) {
     const localIdea = inside(ideas, file), retainedIds = publishedIds.get(inode(stat)) || [];
+    const isReserved = reserved.paths.has(comparable(relative(file).split(path.sep).join('/')));
     await inspect(file, stat, async handle => {
       const front = await readHeader(handle, stat.size);
       let metadata;
@@ -157,10 +166,10 @@ async function scanIdeas(vault) {
       // Editors may replace the file at its recorded destination. This grants
       // read access only. Removal verifies the original publication identity.
       const recordedDestination = publications.get(id)?.destination === file;
-      const owned = retainedIds.includes(id) || recordedDestination || localIdea && isIdea && !publications.has(id);
+      const owned = !isReserved && (retainedIds.includes(id) || recordedDestination || localIdea && isIdea && !publications.has(id));
       const savedIdea = owned && isIdea && metadata.schema_version === 1 && rawId === id;
       const content = savedIdea ? decode.decode(await readBytes(file, stat, handle)) : undefined;
-      record(id, { file, stat, relevant: owned || publications.has(id), savedIdea, ...(savedIdea ? { content, metadata } : {}) });
+      record(id, { file, stat, relevant: owned || localIdea && isReserved && isIdea || publications.has(id), savedIdea, ...(savedIdea ? { content, metadata } : {}) });
     });
   }
 
@@ -180,6 +189,9 @@ async function scanIdeas(vault) {
       try { stable(file, before, local.lstatSync(file, { bigint: true })); }
       catch { throw changed(file); }
     }
+    if (missingLedgerGuard) verifyAbsentSync(intake.dir, missingLedgerGuard);
+    else intake.storage.guardSync();
+    reserved.verify();
   }
 
   try {
