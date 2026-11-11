@@ -3,7 +3,7 @@ const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
-const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
+const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyStageSync, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
 
 const receiptName = '.archive-note-scope-publication.json';
 const folderChanged = 'The reviewed note settings folder changed or is an alias. Files were preserved for inspection.';
@@ -70,7 +70,7 @@ async function readNoteScope(file, { guard = () => {}, assertSelection = () => {
   });
 }
 
-async function changeNoteScope(file, { update, guard = () => {}, assertSelection = () => {}, beforePublish = async () => {}, committed = () => {} }) {
+async function changeNoteScope(file, { update, guard = () => {}, assertSelection = () => {}, beforePublish = async () => {}, beforeFirstLink = async () => {}, committed = () => {} }) {
   const directory = path.dirname(file);
   assertSelection(); guard();
   const parent = ordinaryDirectories([path.dirname(directory)], folderChanged);
@@ -92,8 +92,10 @@ async function changeNoteScope(file, { update, guard = () => {}, assertSelection
       if (current) {
         await verifyStage(file, selected, current.proof);
         await verifyStage(stage, selected, staged);
+        verifyStageSync(file, selected, current.proof);
+        verifyStageSync(stage, selected, staged);
         selected();
-        await fs.rename(stage, file);
+        local.renameSync(stage, file);
         published = true;
         await verifyStage(file, pinned, staged);
       } else {
@@ -102,8 +104,11 @@ async function changeNoteScope(file, { update, guard = () => {}, assertSelection
         recorded = await writeStage(receipt, JSON.stringify({ schema: 1, stage: path.basename(stage), staged, identities: folder.identities }), selected);
         await verifyStage(receipt, selected, recorded);
         await verifyStage(stage, selected, staged);
+        await beforeFirstLink();
+        verifyStageSync(receipt, selected, recorded);
+        verifyStageSync(stage, selected, staged);
         absent(file, selected, scopeChanged);
-        await fs.link(stage, file);
+        local.linkSync(stage, file);
         published = true;
         await verifyPeers(stage, file, pinned, staged);
       }

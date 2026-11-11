@@ -304,6 +304,7 @@ class Archives {
           if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.');
         }
       },
+      beforeFirstLink: () => this.checkpoint('archive-note-scope-before-first-link'),
       committed: count => {
         committed(count);
         this.history.tokens.clear();

@@ -707,20 +707,22 @@ for (const beforeLink of [false, true]) test(beforeLink ?
   const expected = Buffer.from(JSON.stringify({ schema: 1, files: [noteFile] }, null, 2));
   await fs.unlink(scope);
   const observation = path.join(root, 'note-scope-cleanup-refusal.json');
-  await app.evaluate((_, { root, scope, scopeDirectory, observation, beforeLink }) => {
+  const receipt = path.join(scopeDirectory, '.archive-note-scope-publication.json');
+  const firstLink = 'archive-note-scope-before-first-link';
+  if (beforeLink) await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: firstLink }));
+  else await app.evaluate((_, { root, scope, scopeDirectory, observation }) => {
     if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Cleanup refusal requires a disposable archive fixture.');
     const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path');
-    const operation = beforeLink ? 'link' : 'unlink', native = io[operation];
-    io[operation] = async function (file, ...args) {
-      if (paths.dirname(file) !== scopeDirectory || !/^notes-[a-f0-9-]+\.tmp$/.test(paths.basename(file)) || beforeLink && args[0] !== scope) return native.call(this, file, ...args);
+    const unlink = io.unlink;
+    io.unlink = async function (file, ...args) {
+      if (paths.dirname(file) !== scopeDirectory || !/^notes-[a-f0-9-]+\.tmp$/.test(paths.basename(file))) return unlink.call(this, file, ...args);
       const stage = await io.lstat(file, { bigint: true });
-      const published = await io.lstat(scope, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      const published = await io.lstat(scope, { bigint: true });
       const bytes = await io.readFile(file);
-      await io.writeFile(observation, JSON.stringify({ stage: file, same: published !== null && stage.dev === published.dev && stage.ino === published.ino, links: String(stage.nlink), bytes: bytes.toString('base64') }));
-      if (beforeLink) return new Promise(() => {});
+      await io.writeFile(observation, JSON.stringify({ stage: file, same: stage.dev === published.dev && stage.ino === published.ino, links: String(stage.nlink), bytes: bytes.toString('base64') }));
       throw Object.assign(Error('Temporary reviewed note stage cleanup refusal.'), { code: 'EACCES', syscall: 'unlink' });
     };
-  }, { root, scope, scopeDirectory, observation, beforeLink });
+  }, { root, scope, scopeDirectory, observation });
   await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
   await expect(region).toContainText('Integrity and version validated');
   await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
@@ -729,19 +731,27 @@ for (const beforeLink of [false, true]) test(beforeLink ?
   await region.getByLabel(`Restore note inclusion ${noteFile}`, { exact: true }).check();
   await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
   const summary = region.locator('#archive-restore-summary');
-  if (!beforeLink) await expect(summary).toContainText(/cleanup refusal|Restored 1 reviewed note inclusion/i);
-  await expect.poll(() => fs.readFile(observation, 'utf8').catch(() => '')).toContain('links');
-  const refused = JSON.parse(await fs.readFile(observation));
-  expect(refused).toMatchObject({ same: !beforeLink, links: beforeLink ? '1' : '2', bytes: expected.toString('base64') });
-  if (beforeLink) expect(await fs.stat(scope).catch(error => error.code)).toBe('ENOENT');
-  else expect(await fs.readFile(scope)).toEqual(expected);
-  expect(await fs.readFile(refused.stage)).toEqual(expected);
-  expect((await fs.readdir(scopeDirectory)).filter(name => /^notes-.*\.tmp$/.test(name))).toEqual([path.basename(refused.stage)]);
+  let retainedStage;
+  if (beforeLink) {
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(firstLink);
+    const proof = JSON.parse(await fs.readFile(receipt, 'utf8'));
+    expect(proof.stage).toMatch(/^notes-[a-f0-9-]+\.tmp$/);
+    retainedStage = path.join(scopeDirectory, proof.stage);
+    expect((await fs.lstat(retainedStage)).nlink).toBe(1);
+    expect(await fs.stat(scope).catch(error => error.code)).toBe('ENOENT');
+  } else {
+    await expect(summary).toContainText(/cleanup refusal|Restored 1 reviewed note inclusion/i);
+    await expect.poll(() => fs.readFile(observation, 'utf8').catch(() => '')).toContain('links');
+    const refused = JSON.parse(await fs.readFile(observation));
+    expect(refused).toMatchObject({ same: true, links: '2', bytes: expected.toString('base64') });
+    retainedStage = refused.stage;
+    expect(await fs.readFile(scope)).toEqual(expected);
+  }
+  expect(await fs.readFile(retainedStage)).toEqual(expected);
+  expect((await fs.readdir(scopeDirectory)).filter(name => /^notes-.*\.tmp$/.test(name))).toEqual([path.basename(retainedStage)]);
   expect(await fs.readFile(history)).toEqual(savedHistory);
   expect(await fs.readFile(noteFile)).toEqual(noteBytes);
   if (beforeLink) {
-    const receipt = path.join(scopeDirectory, '.archive-note-scope-publication.json');
-    expect(JSON.parse(await fs.readFile(receipt)).stage).toBe(path.basename(refused.stage));
     const child = app.process(), pid = await app.evaluate(() => process.pid);
     const exited = new Promise(resolve => child.once('exit', resolve));
     const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
@@ -772,8 +782,8 @@ for (const beforeLink of [false, true]) test(beforeLink ?
     expect(await fs.readFile(scope)).toEqual(expected);
     expect((await fs.lstat(scope)).nlink).toBe(1);
   }
-  expect(await fs.stat(path.join(scopeDirectory, '.archive-note-scope-publication.json')).catch(error => error.code)).toBe('ENOENT');
-  expect(await fs.stat(refused.stage).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.stat(receipt).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.stat(retainedStage).catch(error => error.code)).toBe('ENOENT');
   expect(await fs.readFile(history)).toEqual(savedHistory);
   expect(await fs.readFile(noteFile)).toEqual(noteBytes);
 });
