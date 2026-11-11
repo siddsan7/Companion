@@ -104,22 +104,66 @@ test('ambiguous copies across sources and incomplete transfers are held while in
 });
 test('interrupted snapshot staging recovers once and overlapping checks cannot publish', async () => {
   await artifact(); await launch(); await setup(); await connect();
-  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-snapshot-staged' }));
-  await page.getByRole('button', { name: 'Check now', exact: true }).click();
-  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('intake-snapshot-staged');
   const base = path.join(root, 'vault', 'Companion');
-  expect((await fs.readdir(path.join(base, 'Revisions'))).filter(x => x.endsWith('.json'))).toHaveLength(0);
-  expect((await fs.readdir(path.join(base, 'Captures'))).filter(x => x.endsWith('.md'))).toHaveLength(0);
-  await page.getByRole('button', { name: 'Check now', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('already running');
-  app.process().kill(); await app.close().catch(() => {}); app = null;
-  await fs.unlink(path.join(root, 'faults.json')); await launch();
+  const faults = path.join(root, 'faults.json');
+  const transaction = path.join(base, '.intake', 'transaction.json');
+  const check = page.getByRole('button', { name: 'Check now', exact: true });
+  const expectNoPublication = async () => {
+    expect((await fs.readdir(path.join(base, 'Revisions'))).filter(x => x.endsWith('.json'))).toHaveLength(0);
+    expect((await fs.readdir(path.join(base, 'Captures'))).filter(x => x.endsWith('.md'))).toHaveLength(0);
+  };
+  await fs.writeFile(faults, JSON.stringify({ pause: 'intake-snapshot-staged' }));
+  try {
+    await check.click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('intake-snapshot-staged');
+    await expect(check).toBeDisabled();
+    await expectNoPublication();
+    const heldTransaction = await fs.readFile(transaction);
+    const mainPid = await app.evaluate((_, root) => {
+      if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Crash recovery requires the disposable fixture.');
+      return process.pid;
+    }, root);
+
+    const execFile = require('node:util').promisify(require('node:child_process').execFile);
+    const script = `
+      const path = require('node:path');
+      const [appDir, vault, parent] = process.argv.slice(1);
+      const { Intake } = require(path.join(appDir, 'intake.js'));
+      const { Vault } = require(path.join(appDir, 'vault.js'));
+      new Intake(new Vault(vault, parent)).reconcile({ trigger: 'manual', now: '2026-11-08T06:59:00Z' }).then(
+        () => console.log(JSON.stringify({ pid: process.pid, admitted: true })),
+        error => console.log(JSON.stringify({ pid: process.pid, code: error.code, message: error.message }))
+      );
+    `;
+    const { stdout } = await execFile(process.execPath, ['-e', script, '--', path.resolve(__dirname, '../app'), path.dirname(base), path.basename(base)]);
+    const contender = JSON.parse(stdout);
+    expect(contender.pid).not.toBe(mainPid);
+    expect(contender).toMatchObject({ code: 'INTAKE_BUSY', message: 'An intake check is already running. Wait for it to finish.' });
+    await expect(check).toBeDisabled();
+    await expectNoPublication();
+    expect(await fs.readFile(transaction)).toEqual(heldTransaction);
+
+    const exited = new Promise(resolve => app.process().once('exit', resolve));
+    const crash = app.evaluate(({ app: electronApp }, { root, mainPid }) => {
+      if (process.env.COMPANION_TEST_ROOT !== root || process.pid !== mainPid) throw Error('The staged write owner changed.');
+      electronApp.exit(77);
+    }, { root, mainPid }).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    await Promise.all([exited, crash]);
+    await expect.poll(() => {
+      try { process.kill(mainPid, 0); return 'alive'; }
+      catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; }
+    }).toBe('exited');
+    app = null;
+  } finally {
+    if (app) await fs.writeFile(path.join(root, 'release.txt'), 'continue after fixture failure');
+  }
+  await fs.unlink(faults); await launch();
   await expect(page.getByRole('heading', { name: fixture.target.title, exact: true })).toBeVisible();
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Intake check complete');
   expect((await fs.readdir(path.join(base, 'Revisions'))).filter(x => x.endsWith('.json'))).toHaveLength(1);
   expect((await fs.readdir(path.join(base, 'Captures'))).filter(x => x.endsWith('.md'))).toHaveLength(1);
-  expect(await fs.stat(path.join(base, '.intake', 'transaction.json')).then(() => true, () => false)).toBe(false);
+  await expect(fs.access(transaction)).rejects.toMatchObject({ code: 'ENOENT' });
 });
 test('repairing a damaged artifact retains its imported attempt identity without duplicate snapshots', async () => {
   const dir = await artifact(); await launch(); await setup(); await connect(true);
