@@ -38,7 +38,7 @@ class Archives {
     };
     guard(); return guard;
   }
-  async snapshot({ locked = false, savedOnly = false, recoveryId } = {}) {
+  async snapshot({ locked = false, savedOnly = false, recoveryId, assertSelection } = {}) {
     // The store lock fences sends/scope writes/resave and keeps unsaved text out of a false complete backup.
     if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
     const collect = async () => {
@@ -77,7 +77,7 @@ class Archives {
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
-        const read = await this.readNoteScope(directory, file, guard); if (!read) continue;
+        const read = await this.readNoteScope(directory, file, guard, assertSelection); if (!read) continue;
         if (read.value.schema !== 1 || !Array.isArray(read.value.files) || read.value.files.some(file => typeof file !== 'string' || !path.isAbsolute(file))) throw Error('Explicit note settings need repair.');
         contextScopes.push({ binding: name.slice('context-settings-'.length), schema: 1, files: read.value.files }); fingerprints[file] = read.digest;
       }
@@ -181,7 +181,7 @@ class Archives {
     assertSelection();
     await this.validatePins(reviewed.archive, sourceRoot, vault);
     assertSelection();
-    const current = await this.snapshot(), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root, reviewed.allocations);
+    const current = await this.snapshot({ assertSelection }), plan = this.restorePlan(reviewed.archive, current, sourceRoot, root, reviewed.allocations);
     const metadata = await this.metadataPlan(reviewed.archive, sourceRoot, root);
     const settingsMode = input.settingsMode || 'keep-current';
     if (!['keep-current', 'review-note-inclusions'].includes(settingsMode)) throw Error('Choose an explicit settings restoration policy.');
@@ -202,7 +202,7 @@ class Archives {
     return this.history.lock(async () => {
       assertSelection();
       await this.revalidateInspectedFile(reviewed);
-      const current = await this.snapshot({ locked: true });
+      const current = await this.snapshot({ locked: true, assertSelection });
       assertSelection();
       if (canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
       await this.validatePins(reviewed.archive, matched.sourceRoot, vault);
@@ -290,16 +290,16 @@ class Archives {
     }
     return candidates;
   }
-  async readNoteScope(directory, file, guard) {
+  async readNoteScope(directory, file, guard, assertSelection) {
     guard();
     const pending = await fs.lstat(path.join(directory, noteScopeReceipt)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
     if (!pending) return this.json(file, guard, true);
     return withBriefMutation(directory, async () => {
-      await this.settleNoteScope(directory, file, guard);
+      await this.settleNoteScope(directory, file, guard, assertSelection);
       return this.json(file, guard, true);
     });
   }
-  async settleNoteScope(directory, file, guard) {
+  async settleNoteScope(directory, file, guard, assertSelection = () => {}) {
     const receipt = path.join(directory, noteScopeReceipt);
     const stored = await readExact(receipt, guard).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     if (!stored) return;
@@ -308,10 +308,23 @@ class Archives {
         typeof proof.stage !== 'string' || !/^notes-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/.test(proof.stage) ||
         !validProof(proof.staged) || !Array.isArray(proof.identities)) throw Error('Archive note scope receipt is invalid. Files were preserved for inspection.');
     const folders = ordinaryDirectories([directory], 'The reviewed note settings folder changed. Files were preserved for inspection.', proof.identities);
-    const pinned = () => { guard(); folders.guard(); };
+    const pinned = () => { assertSelection(); guard(); folders.guard(); };
     await verifyStage(receipt, pinned, stored.proof);
-    await settlePublishedLink(path.join(directory, proof.stage), file, pinned, proof.staged);
-    await removeStage(receipt, pinned, stored.proof);
+    const stage = path.join(directory, proof.stage);
+    const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+    if (await exists(file)) {
+      await settlePublishedLink(stage, file, pinned, proof.staged);
+      await removeStage(receipt, pinned, stored.proof);
+    } else {
+      const stillUnpublished = () => {
+        pinned();
+        try { local.lstatSync(file); }
+        catch (error) { if (error.code === 'ENOENT') return; throw error; }
+        throw Error('Note scope appeared while retiring an unpublished archive stage. Files were preserved for inspection.');
+      };
+      if (await exists(stage)) await removeStage(stage, stillUnpublished, proof.staged);
+      await removeStage(receipt, stillUnpublished, stored.proof);
+    }
   }
   async includeReviewedNotes(files, matched, committed) {
     const { vault, root, assertSelection } = matched;
@@ -322,7 +335,7 @@ class Archives {
     const guard = this.directoryGuard(directory);
     return withBriefMutation(directory, async () => {
       assertSelection();
-      await this.settleNoteScope(directory, file, guard);
+      await this.settleNoteScope(directory, file, guard, assertSelection);
       guard(); const current = await this.json(file, guard, true);
       if ((current?.digest || null) !== (matched.snapshot.fingerprints[file] || null)) throw Error('Current note inclusions changed. Preview settings again.');
       const existing = current?.value.files || [];
@@ -360,8 +373,8 @@ class Archives {
           await fs.link(stage, file); published = true;
           await verifyPeers(stage, file, pinned, staged);
           commit();
-          await settlePublishedLink(stage, file, pinned, staged);
-          await removeStage(receipt, pinned, recorded);
+          await settlePublishedLink(stage, file, guardedSelection, staged);
+          await removeStage(receipt, guardedSelection, recorded);
         }
       } catch (error) {
         if (!published) throw error;
@@ -370,8 +383,8 @@ class Archives {
       } finally {
         if (staged && !published) {
           try {
-            if (recorded) await removeStage(receipt, pinned, recorded);
-            await removeStage(stage, pinned, staged);
+            if (recorded) await removeStage(receipt, guardedSelection, recorded);
+            await removeStage(stage, guardedSelection, staged);
           } catch {}
         }
       }

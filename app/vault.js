@@ -191,6 +191,39 @@ class Vault {
     if (recoveryError) throw recoveryError;
     return true;
   }
+  async hasExactTitleIntent(file, intent) {
+    const directory = path.dirname(file), { guard } = this.publicationFolders(directory);
+    try {
+      const owner = await noteLock(file, guard), publication = owner?.publication;
+      if (publication?.kind !== 'title' || !Array.isArray(publication.identities) ||
+          !validProof(publication.previous) || !validProof(publication.staged) || !validProof(publication.journal) ||
+          publication.previous.digest !== intent.previousHash || publication.staged.digest !== hash(intent.content) ||
+          parse(intent.content)?.id !== intent.id) return false;
+      const pinned = this.publicationFolders(directory, publication.identities).guard;
+      const journal = await verifyStage(file + transactionSuffix, pinned, publication.journal);
+      const transaction = JSON.parse(journal.bytes), backupPrefix = path.basename(file) + '.before-title-';
+      if (transaction.expectedHash !== intent.previousHash || transaction.content !== intent.content ||
+          transaction.sourceGeneration !== intent.sourceGeneration || typeof transaction.backup !== 'string' ||
+          !transaction.backup.startsWith(backupPrefix) || !transactionBackup.test(transaction.backup.slice(backupPrefix.length))) return false;
+      const backup = path.join(directory, transaction.backup), stage = file + '.pending';
+      const previous = await readExact(backup, pinned, 1, publication.previous).catch(missing);
+      const current = await fs.lstat(file, { bigint: true }).catch(missing);
+      if (!previous) {
+        if (!current) return false;
+        await verifyStage(file, pinned, publication.previous);
+        await verifyStage(stage, pinned, publication.staged);
+      } else {
+        if (!current) await verifyStage(stage, pinned, publication.staged);
+        else if (current.nlink === 2n) await verifyPeers(stage, file, pinned, publication.staged);
+        else {
+          await verifyStage(file, pinned, publication.staged);
+          if (await fs.lstat(stage).catch(missing)) return false;
+        }
+      }
+      await verifyStage(file + '.lock', pinned, owner.proof);
+      return true;
+    } catch (error) { if (error.code === 'STAGING_CHANGED' || error instanceof SyntaxError) return false; throw error; }
+  }
   async titleOwned(id, title) {
     if (typeof title !== 'string' || !title.trim() || /[\r\n]/.test(title)) throw Error('Enter a title on one line.');
     const note = await this.find(id);
@@ -308,9 +341,23 @@ class Vault {
     }
     const directory = path.dirname(file), pinned = this.publicationFolders(directory, proof.identities).guard;
     await verifyStage(receipt, pinned, stored.proof);
-    await verifyStage(file + transactionSuffix, pinned, proof.journal);
+    const journal = await verifyStage(file + transactionSuffix, pinned, proof.journal);
     await verifyStage(path.join(directory, proof.backup), pinned, proof.previous);
-    await settlePublishedLink(path.join(directory, proof.stage), file, pinned, proof.staged);
+    const stage = path.join(directory, proof.stage);
+    if (!await fs.lstat(file).catch(missing)) {
+      const transaction = JSON.parse(journal.bytes), proposed = parse(transaction.content);
+      const previous = await verifyStage(stage, pinned, proof.staged);
+      if (transaction.backup !== proof.backup || !proposed || parse(previous.bytes.toString('utf8'))?.id !== proposed.id) {
+        throw Error('Title rollback receipt does not match the retained title. Files were preserved for inspection.');
+      }
+      await this.publication(proposed.id, transaction);
+      await verifyStage(receipt, pinned, stored.proof);
+      await verifyStage(file + transactionSuffix, pinned, proof.journal);
+      await verifyStage(path.join(directory, proof.backup), pinned, proof.previous);
+      await verifyStage(stage, pinned, proof.staged);
+      pinned(); await fs.link(stage, file);
+    }
+    await settlePublishedLink(stage, file, pinned, proof.staged);
     await removeStage(receipt, pinned, stored.proof);
   }
   async recover(dir) {

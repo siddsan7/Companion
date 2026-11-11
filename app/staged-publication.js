@@ -6,7 +6,7 @@ const { createHash } = require('node:crypto');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const identity = stat => ({ dev: String(stat.dev), ino: String(stat.ino) });
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
-const changed = () => Error('Staging file or publication peer changed. Files were preserved for inspection.');
+const changed = () => Object.assign(Error('Staging file or publication peer changed. Files were preserved for inspection.'), { code: 'STAGING_CHANGED' });
 const validProof = proof => proof && typeof proof.dev === 'string' && typeof proof.ino === 'string' && typeof proof.digest === 'string' &&
   /^[0-9]+$/.test(proof.dev) && /^[0-9]+$/.test(proof.ino) && /^[a-f0-9]{64}$/.test(proof.digest);
 

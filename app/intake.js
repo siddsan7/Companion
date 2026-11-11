@@ -128,6 +128,7 @@ class Intake {
       ledger.outcomes[key] = { ...prior, locator: draft.locator, checkedAt: now }; await this.save(ledger); return;
     }
     let capture = ledger.captures[draft.sourceHash];
+    if (capture && capture.id === this.pendingTitleCapture) throw Error('An interrupted title is still being recovered. Its source revision was held for the next intake check.');
     if (capture?.conflict) throw Error(capture.conflict);
     const retainOnly = !!capture?.reviewed;
     const id = capture?.id || randomUUID(), revisionId = randomUUID();
@@ -558,10 +559,13 @@ class Intake {
       const note = await this.vault.find(id); if (hash(note.content) !== capture.currentHash) throw Error('This imported note changed outside Companion. Inspect it before editing.');
       await this.publishJournal(path.join(this.dir, 'title-intent.json'), { id, before: note.content, previousHash: capture.currentHash, title: title.trim(), content: withTitle(note.content, title.trim()), ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) });
       await this.vault.title(id, title);
-      if (!await this.finishTitleIntent()) throw Error('External edit conflict. The title intent and your files were preserved.');
+      const finished = await this.finishTitleIntent();
+      if (finished === 'pending') throw Error('The exact title save still awaits recovery. Restart Companion to continue.');
+      if (!finished) throw Error('External edit conflict. The title intent and your files were preserved.');
     });
   }
   async finishTitleIntent() {
+    this.pendingTitleCapture = undefined;
     const file = path.join(this.dir, 'title-intent.json'), text = await read(file); if (text === null) return true;
     let intent; try { intent = JSON.parse(text); } catch { throw Error('Unreadable imported title intent. Preserve .intake for repair.'); }
     const ledger = await this.load(), capture = Object.values(ledger.captures).find(x => x.id === intent.id);
@@ -572,6 +576,11 @@ class Intake {
       await this.save(ledger); await fs.rename(file, path.join(this.dir, `title-conflict-${intent.id}-${randomUUID()}.json`)); return false;
     };
     let note = (await this.vault.list()).find(x => x.id === intent.id);
+    const destination = this.destination(capture);
+    if ((!note || note.file === destination) && await this.vault.hasExactTitleIntent(destination, intent)) {
+      this.pendingTitleCapture = intent.id;
+      return 'pending';
+    }
     if (!note || ![intent.before, intent.content].includes(note.content)) {
       return hold('External edit conflict during title save. Local writing and title intent were preserved; this source is paused for repair.', note?.file || capture.file);
     }
