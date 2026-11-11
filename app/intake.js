@@ -27,6 +27,19 @@ const exactIdentity = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino
 const publicationIdentity = (info, nlink = info.nlink) => ({ dev: info.dev, ino: info.ino, nlink });
 const fileProof = (info, content) => ({ dev: String(info.dev), ino: String(info.ino), digest: hash(content) });
 const sameProofIdentity = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const fileAccessRefused = error => ['EACCES', 'EPERM', 'EBUSY'].includes(error?.code);
+const validCaptureAccess = proof => validProof(proof) && [1, 2].includes(proof.links) && Array.isArray(proof.directories) &&
+  Object.keys(proof).every(key => ['dev', 'ino', 'digest', 'links', 'directories'].includes(key));
+function matchesCaptureAccess(file, peers, proof, guard) {
+  guard();
+  const matches = name => {
+    const stat = local.lstatSync(name, { bigint: true, throwIfNoEntry: false });
+    return stat?.isFile() && !stat.isSymbolicLink() && stat.nlink === BigInt(proof.links) &&
+      sameProofIdentity({ dev: String(stat.dev), ino: String(stat.ino) }, proof);
+  };
+  try { return matches(file) && peers.filter(matches).length + 1 === proof.links; }
+  catch (error) { if (fileAccessRefused(error)) return false; throw error; }
+}
 const acceptedOutcome = (tx, snapshotBytes = JSON.stringify(tx.revision, null, 2)) => ({
   status: 'imported', identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, revision: tx.revision.id,
   snapshotHash: hash(snapshotBytes), sourceHash: tx.sourceHash, captureId: tx.capture.id, locator: tx.revision.locator,
@@ -193,8 +206,13 @@ class Intake {
   }
   async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit } = {}) {
     return this.locked(async () => {
-      await this.syncMoves();
-      await this.retryPending();
+      let identityScanComplete = true;
+      try { await this.syncMoves(); }
+      catch (error) {
+        if (!await this.heldCaptureReadRefusal(error)) throw error;
+        identityScanComplete = false;
+      }
+      if (identityScanComplete) await this.retryPending();
       let ledger = await this.load(); const seen = new Map(), ready = [];
       const retained = await this.retainedOutcomes(ledger);
       ledger.lastCheck = { at: now, trigger, status: 'running' }; await this.save(ledger);
@@ -222,6 +240,9 @@ class Intake {
       for (const { draft, key, sourceId, guard } of ready) {
         const source = ledger.sources.find(item => item.id === sourceId);
         if (source.error) continue;
+        // The unreadable capture could claim a different existing identity.
+        // Only new source identities can proceed without a full vault scan.
+        if (!identityScanComplete && ledger.captures[draft.sourceHash]) continue;
         if (ledger.blocks[draft.sourceHash]?.reason?.startsWith(outputHold) && retained.has(key)) continue;
         try {
           await guard();
@@ -706,7 +727,7 @@ class Intake {
     const destination = this.destination(capture);
     const parents = [...requiredDirectories(this, [{ file: path.relative(this.vault.vault, destination) }])]
       .map(directory => path.join(this.vault.vault, directory));
-    const { guard } = ordinaryDirectories(parents, changed().message, receipt.directories);
+    const { guard, identities: directories } = ordinaryDirectories(parents, changed().message, receipt.directories);
     const removable = (file, proof) => {
       guard();
       return { file, proof, present: !!local.lstatSync(file, { throwIfNoEntry: false }) };
@@ -769,8 +790,15 @@ class Intake {
         try { verify(published, outputChanged); }
         catch (cause) {
           verifyJournals();
-          if (cause.code !== 'STAGING_CHANGED') throw cause;
-          throw Object.assign(Error(`${outputHold} ${cause.message}${acceptancePreserved}`, { cause }), { intakeOutputChanged: true });
+          if (cause.code !== 'STAGING_CHANGED' && !fileAccessRefused(cause)) throw cause;
+          const held = Object.assign(Error(`${outputHold} ${cause.message}${acceptancePreserved}`, { cause }), { intakeOutputChanged: true });
+          if (transaction && fileAccessRefused(cause) && typeof cause.path === 'string' && samePath(cause.path, destination)) {
+            const links = published.filter(item => item.present && item.proof && sameProofIdentity(item.proof, receipt.capture)).length;
+            const proof = { ...receipt.capture, links, directories };
+            const peers = this.captureAccessPeers(transaction.tx);
+            if (validCaptureAccess(proof) && matchesCaptureAccess(destination, peers, proof, guard)) held.captureAccess = proof;
+          }
+          throw held;
         }
       };
       const retired = { ...receipt, retiring: true };
@@ -794,7 +822,9 @@ class Intake {
           active.present = true;
           verifyJournals();
         }
-        await this.archiveConflict(tx, ledger, error.message, { journalProof: receipt.journal, guard, committed: true, ...(top ? { acceptedCleanup: receipt } : {}) });
+        await this.archiveConflict(tx, ledger, error.message, {
+          journalProof: receipt.journal, guard, committed: true, captureAccess: error.captureAccess, ...(top ? { acceptedCleanup: receipt } : {})
+        });
         throw Object.assign(Error(error.message, { cause: error }), { intakeOutputHeld: true });
       }
     }
@@ -934,8 +964,9 @@ class Intake {
   validOutputHold(witness, pending) {
     return !!witness && Object.hasOwn(witness, 'journal') && Object.hasOwn(witness, 'pending') && validProof(witness.journal) &&
       (witness.pending === null || witness.pending === pending) &&
-      Object.keys(witness).every(key => ['journal', 'pending', 'committed'].includes(key)) &&
-      (!Object.hasOwn(witness, 'committed') || typeof witness.committed === 'boolean');
+      Object.keys(witness).every(key => ['journal', 'pending', 'committed', 'captureAccess'].includes(key)) &&
+      (!Object.hasOwn(witness, 'committed') || typeof witness.committed === 'boolean') &&
+      (!Object.hasOwn(witness, 'captureAccess') || witness.committed === true && validCaptureAccess(witness.captureAccess));
   }
   isCommittedOutputHold(block) {
     const witness = block?.outputHold;
@@ -956,6 +987,34 @@ class Intake {
     const guard = this.vault.publicationFolders(this.dir).guard;
     verifyStageSync(path.join(this.dir, block.journal), guard, witness.journal);
   }
+  captureAccessPeers(tx) {
+    return [path.join(this.dir, tx.revision.id + '.stage'), path.join(this.dir, tx.backup)];
+  }
+  async heldCaptureReadRefusal(error) {
+    const cause = error?.cause;
+    if (!fileAccessRefused(cause) || typeof cause.path !== 'string') return false;
+    const expected = this.storage.expected, ledger = await this.load();
+    if (!this.storage.matches(this.storage.expected, expected)) return false;
+    const entry = Object.entries(ledger.blocks).find(([sourceHash, block]) =>
+      block?.outputHold?.captureAccess && ledger.captures[sourceHash] && samePath(this.destination(ledger.captures[sourceHash]), cause.path));
+    if (!entry) return false;
+    const [sourceHash, block] = entry, capture = ledger.captures[sourceHash], witness = block.outputHold;
+    const proof = witness.captureAccess, file = this.destination(capture);
+    if (!this.isCommittedOutputHold(block) || !validCaptureAccess(proof) || proof.digest !== capture.currentHash ||
+        !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) return false;
+    const parents = [...requiredDirectories(this, [{ file: path.relative(this.vault.vault, file) }])]
+      .map(directory => path.join(this.vault.vault, directory));
+    const { guard } = ordinaryDirectories(parents, 'Held capture folders changed. All files were preserved.', proof.directories);
+    this.storage.guardSync();
+    const { bytes } = verifyStageSync(path.join(this.dir, block.journal), guard, witness.journal);
+    const tx = JSON.parse(bytes.toString('utf8'));
+    this.validateTransaction(tx);
+    if (!this.hasOutputHold(ledger, tx) || !this.validOutputHold(witness, pendingName(tx)) || tx.sourceHash !== sourceHash ||
+        tx.capture.id !== capture.id || tx.capture.currentHash !== proof.digest || !samePath(this.destination(tx.capture), file) ||
+        witness.journal.digest !== hash(JSON.stringify(tx))) return false;
+    assertPublication(ledger, tx.capture.id, tx);
+    return matchesCaptureAccess(file, this.captureAccessPeers(tx), proof, guard);
+  }
   async archiveConflict(tx, ledger, message, retained) {
     this.validateTransaction(tx);
     await this.setup();
@@ -975,7 +1034,10 @@ class Intake {
       if (retained) {
         const association = ledger.pending[tx.sourceHash];
         if (association && (association.journal !== pendingName(tx) || association.key !== tx.key)) throw changed();
-        witness = { journal: retained.journalProof || fileProof(retained.journalInfo, JSON.stringify(tx)), pending: association?.journal || null, committed: retained.committed };
+        witness = {
+          journal: retained.journalProof || fileProof(retained.journalInfo, JSON.stringify(tx)), pending: association?.journal || null,
+          committed: retained.committed, ...(retained.captureAccess ? { captureAccess: retained.captureAccess } : {})
+        };
       } else witness = ledger.blocks[tx.sourceHash].outputHold;
       if (!this.validOutputHold(witness, pendingName(tx)) ||
           witness.journal.digest !== hash(JSON.stringify(tx))) throw changed();
