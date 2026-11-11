@@ -324,6 +324,58 @@ test('two desktop instances cannot publish the same approved version and busy ap
   } finally { await fs.writeFile(path.join(root, 'release.txt'), 'release'); await secondApp.close(); }
 });
 
+test('a held brief refresh displays the prior approved brief after desktop restart', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-approved-1')).toBeAttached();
+  const original = await page.evaluate(() => window.companion['brief-pin'](1));
+  await fs.writeFile(readme, '# MyTune\n\nA rhythm practice coach.\n');
+  await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  await expect(page.getByLabel('Project purpose', { exact: true })).toHaveValue('A rhythm practice coach.');
+  await app.evaluate(() => {
+    if (!process.env.COMPANION_TEST_ROOT) throw Error('Interrupted approval requires a disposable fixture.');
+    const local = process.getBuiltinModule('fs'), path = process.getBuiltinModule('path');
+    const folder = path.join(process.env.COMPANION_TEST_ROOT, 'vault', 'Companion', 'Briefs');
+    const link = local.linkSync;
+    local.linkSync = (source, destination) => {
+      link(source, destination);
+      if (path.dirname(destination) === folder && path.basename(destination).startsWith('approved-2-')) {
+        local.linkSync = link;
+        throw Error('Fixture stopped approval immediately after the exclusive link.');
+      }
+    };
+  });
+  await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
+  await expect(page.locator('#brief-error')).toContainText('Fixture stopped approval');
+  await app.close(); app = null;
+
+  const dir = path.join(root, 'vault', 'Companion', 'Briefs');
+  const names = await fs.readdir(dir);
+  expect(names).toContain('.brief-approval-2.pending.json');
+  const destination = path.join(dir, names.find(name => name.startsWith('approved-2-')));
+  const stage = path.join(dir, names.find(name => name.startsWith('.brief-stage-')));
+  const originalStage = await fs.readFile(stage);
+  expect(await fs.readFile(destination)).toEqual(originalStage);
+  await fs.unlink(destination);
+  const replacement = Buffer.from('Independent writing at the interrupted approval path.\n');
+  await fs.writeFile(destination, replacement, { flag: 'wx' });
+
+  await launch();
+  await expect(page.locator('#brief-view')).toContainText(/Refresh failed:.*(?:held|integrity|changed)/i);
+  await page.getByText('Approved version 1 | pin 1', { exact: true }).click();
+  await expect(page.locator('#brief-approved-1')).toContainText('A guitar practice tutor.');
+  await expect(page.locator('#brief-approved-2')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeDisabled();
+  expect(await page.evaluate(() => window.companion['brief-pin'](1))).toMatchObject({ id: original.id, digest: original.digest });
+  expect(await fs.readFile(destination)).toEqual(replacement);
+  expect(await fs.readFile(stage)).toEqual(originalStage);
+});
+
 test('an exact approved historical pin survives unrelated damaged records without substituting another version', async () => {
   await launch();
   await page.getByRole('button', { name: 'Choose vault' }).click();
