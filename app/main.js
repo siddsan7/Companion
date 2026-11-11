@@ -109,6 +109,10 @@ app.whenReady().then(async () => {
   }
   ipcMain.handle('connect-drafts', (_, { folder, scan }) => intakeRequest((intake, now) => intake.connect(folder, scan, now)));
   ipcMain.handle('connect-reviews', (_, { folder, scan }) => intakeRequest((intake, now) => intake.connect(folder, scan, now, 'review')));
+  ipcMain.handle('reconnect-source', (_, { location, ...input }) => intakeRequest(intake => {
+    if (intake.vault.root !== location) throw Error('Vault selection changed. Refresh and try again.');
+    return intake.reconnect(input);
+  }));
   ipcMain.handle('check-intake', () => intakeRequest((intake, now) => intake.reconcile({ trigger: 'manual', now })));
   ipcMain.handle('add-annotation', async (_, input) => new Intake(vault).addAnnotation(input, clock().now));
   ipcMain.handle('choose-identity', async (_, input) => new Intake(vault).chooseIdentity(input));

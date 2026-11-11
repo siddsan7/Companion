@@ -23,7 +23,8 @@ async function refresh() {
     $('warnings').textContent = [...new Set(state.warnings)].join(' ');
     const sourceHold = state.warnings.find(warning => warning.startsWith('Source restoration held:'));
     if (state.vaultError || sourceHold) status(state.vaultError || sourceHold);
-    window.intakeView.render(state.intake);
+    window.intakeView.render(state.intake, state.location);
+    updateIntakeControls();
     $('schedule-state').textContent = state.schedule ? `${state.schedule.mode} | Next scheduled check: ${state.schedule.next} | Anchor: ${state.schedule.anchor} | Last success: ${state.intake?.lastSuccess?.at || state.schedule.lastSuccess?.at || 'None'} | Worker: ${state.schedule.worker?.status || 'Not run'}${state.schedule.taskError || state.schedule.workerError || state.schedule.inspectionError ? ` | Error: ${state.schedule.taskError || state.schedule.workerError || state.schedule.inspectionError}` : ''}${!state.schedule.effective && state.schedule.mode !== 'disabled' ? ' | Task missing: use Repair daily intake.' : ''}${state.schedule.taskMismatch ? ' | Task state differs: use Repair daily intake.' : ''}${state.schedule.policyMismatch ? ' | Task schedule differs: use Repair daily intake.' : ''}` : 'Daily intake is not configured.';
     await window.intakeView.repairs(owned);
     if (!owned()) return;
@@ -71,6 +72,7 @@ function updateCaptureControl() { $('save').disabled = $('configure').disabled =
 function updateIntakeControls() {
   const pending = checkingIntake || connectingIntake || configuringVault;
   for (const id of ['check-intake', 'connect-drafts', 'connect-reviews']) $(id).disabled = pending;
+  $('reconnect-source').disabled = pending || !$('reconnect-selection').value;
 }
 $('choose').onclick = () => action(async () => { selectedVault = await window.companion['choose-vault'](); $('vault').textContent = selectedVault || 'Selection cancelled.'; });
 $('configure').onclick = () => {
@@ -120,7 +122,7 @@ function connectSource(channel, input) {
       await window.companion[channel](input);
       if (!owned()) return;
       await refresh();
-      if (owned()) status(input.scan ? 'Intake check complete.' : 'Source connected. Use Check now when ready.');
+      if (owned()) status(channel === 'reconnect-source' ? 'Source reconnected. Use Check now when ready.' : input.scan ? 'Intake check complete.' : 'Source connected. Use Check now when ready.');
     } catch (error) { if (owned()) throw scopeError(error, owned); }
     finally { connectingIntake = false; updateIntakeControls(); }
   });
@@ -141,4 +143,11 @@ $('check-intake').onclick = () => {
   });
 };
 $('connect-reviews').onclick = () => connectSource('connect-reviews', { folder: $('review-source').value, scan: false });
+$('reconnect-selection').onchange = updateIntakeControls;
+$('reconnect-source').onclick = () => {
+  const source = state?.intake?.sources.find(item => item.id === $('reconnect-selection').value);
+  if (!source) return;
+  const { id, folder, kind = 'draft', identity, epoch } = source;
+  return connectSource('reconnect-source', { location: state.location, id, folder, kind, identity, epoch, replacement: $('reconnect-folder').value });
+};
 window.addEventListener('focus', () => action(refresh)); setInterval(() => action(refresh), 60000); action(refresh);

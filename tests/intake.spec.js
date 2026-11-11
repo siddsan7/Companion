@@ -356,7 +356,7 @@ test('restored capture backup refuses an equal-byte outside hardlink before inde
   expect((await fs.stat(backup, { bigint: true })).nlink).toBe(1n);
   expect((await fs.stat(outside, { bigint: true })).nlink).toBe(1n);
 });
-test('restored capture recovery preserves a backup recreated after its final ownership check', async () => {
+test('restored capture recovery preserves a recreated backup across same-slot producer reconnection', async () => {
   // Two publication boundaries and a restart exercise the public recovery path.
   test.setTimeout(45000);
   await artifact('a-original'); await launch(); await setup(); await connect(true);
@@ -397,19 +397,57 @@ test('restored capture recovery preserves a backup recreated after its final own
   expect(JSON.parse(heldArchive).evidence).toEqual(hold.evidence);
   expect(await fs.readFile(path.join(intake, hold.evidence.find(item => item.role === 'independent-editor-writing').file), 'utf8')).toBe(recreated);
   expect((await fs.readdir(intake)).filter(name => name.endsWith('.detach.json'))).toEqual([]);
+  const transactionFile = path.join(intake, ledger.blocks[sha].journal);
+  const transactionBytes = await fs.readFile(transactionFile);
+  const recoveryKey = JSON.parse(transactionBytes).key;
+  const recoveryOutcome = ledger.outcomes[recoveryKey];
+  const producer = await fs.realpath(path.join(root, 'producer'));
+  expect(recoveryOutcome).toMatchObject({ status: 'held', reason: hold.reason, locator: path.join(producer, 'b-update') });
   await app.close(); app = null; await fs.unlink(path.join(root, 'faults.json')); await launch();
   await expect(page.locator('#idea-support-status')).toHaveText('Current support inspected. Warnings do not change note ownership or independently verify claims.');
-  const unrelated = await artifact('z-independent', '3'.repeat(32));
-  const run = JSON.parse(await fs.readFile(path.join(unrelated, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
-  await fs.writeFile(path.join(unrelated, 'run.json'), JSON.stringify(run));
+  const occupiedRun = path.join(producer, 'b-update', 'run.json');
+  const run = { ...JSON.parse(await fs.readFile(occupiedRun, 'utf8')), input_sha256: 'c'.repeat(64), attempt_id: '3'.repeat(32) };
+  const occupiedBytes = JSON.stringify(run);
+  await fs.writeFile(occupiedRun, occupiedBytes);
+  const sibling = await artifact('z-independent', '4'.repeat(32));
+  const siblingRun = path.join(sibling, 'run.json'), siblingHash = 'd'.repeat(64);
+  await fs.writeFile(siblingRun, JSON.stringify({ ...JSON.parse(await fs.readFile(siblingRun, 'utf8')), input_sha256: siblingHash }));
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.getByRole('status')).toHaveText('Intake check complete. Inspect held imports and source errors.');
-  await expect(page.locator('#captures article')).toHaveCount(2);
+  const occupied = JSON.parse(await fs.readFile(path.join(intake, 'ledger.json'), 'utf8'));
+  expect(occupied.captures[siblingHash]).toBeDefined();
+  expect(occupied.outcomes[recoveryKey]).toEqual(recoveryOutcome);
+  expect(occupied.captures[run.input_sha256]).toBeUndefined();
+  expect(occupied.blocks[sha]).toEqual(ledger.blocks[sha]);
+  expect(occupied.lastCheck.status).toBe('held');
+  expect(await fs.readFile(transactionFile)).toEqual(transactionBytes);
+  expect(await fs.readFile(occupiedRun, 'utf8')).toBe(occupiedBytes);
+  await expect(page.locator('#held-imports')).toContainText(hold.reason);
+
+  await fs.rename(producer, path.join(root, 'relocated-original'));
+  const unrelated = await artifact('b-update', '3'.repeat(32));
+  const replacement = path.join(root, 'replacement-producer');
+  await fs.rename(path.dirname(unrelated), replacement);
+  const runPath = path.join(replacement, 'b-update', 'run.json');
+  await fs.writeFile(runPath, occupiedBytes);
+  await page.getByLabel('Producer source to reconnect').selectOption({ label: `Drafts: ${producer}` });
+  await page.getByLabel('Replacement producer folder').fill(replacement);
+  await page.getByRole('button', { name: 'Reconnect source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source reconnected');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toHaveText('Intake check complete. Inspect held imports and source errors.');
+  await expect(page.locator('#captures article')).toHaveCount(3);
   expect(await fs.readFile(file, 'utf8')).toBe(original);
   expect(await fs.readFile(path.join(intake, hold.journal), 'utf8')).toBe(heldArchive);
   expect(await fs.readFile(path.join(intake, hold.evidence.find(item => item.role === 'independent-editor-writing').file), 'utf8')).toBe(recreated);
   expect((await fs.stat(file, { bigint: true })).nlink).toBe(1n);
   const after = JSON.parse(await fs.readFile(path.join(intake, 'ledger.json'), 'utf8'));
+  expect(after.captures[run.input_sha256]).toBeDefined();
+  expect(after.blocks[sha]).toEqual(ledger.blocks[sha]);
+  expect(await fs.readFile(transactionFile)).toEqual(transactionBytes);
+  expect(after.outcomes[recoveryKey]).toEqual(recoveryOutcome);
+  expect(Object.values(after.outcomes)).toContainEqual(expect.objectContaining({ status: 'imported', sourceHash: run.input_sha256, locator: await fs.realpath(path.dirname(runPath)) }));
+  expect(after.lastCheck.status).toBe('held');
   for (const [key, attempt] of Object.entries(ledger.attempts)) expect(after.attempts[key]).toEqual(attempt);
 });
 for (const boundary of ['moved', 'published', 'cleaned']) {
@@ -505,4 +543,81 @@ test('producer title syntax remains literal in Markdown and editable without cha
   note = await fs.readFile(path.join(captures, filename), 'utf8');
   expect(note).toContain(String.raw`# My \[literal\] title`);
   expect(note).toContain(sourceNotes);
+});
+
+for (const substitute of ['junction', 'ordinary replacement']) {
+  test(`a ${substitute} at a connected producer path cannot import unselected files`, async () => {
+    const first = await artifact();
+    await launch(); await setup(); await connect(true);
+    const base = path.join(root, 'vault', 'Companion');
+    const ledger = async () => JSON.parse(await fs.readFile(path.join(base, '.intake', 'ledger.json'), 'utf8'));
+    const before = await ledger();
+    const producer = path.dirname(first), relocated = path.join(root, 'relocated-producer');
+    await fs.rename(producer, relocated);
+
+    const unselected = substitute === 'junction' ? path.join(root, 'unselected-producer') : producer;
+    const incoming = path.join(unselected, 'new-attempt');
+    await fs.mkdir(unselected);
+    await fs.cp(path.join(relocated, path.basename(first)), incoming, { recursive: true });
+    const runPath = path.join(incoming, 'run.json');
+    const run = JSON.parse(await fs.readFile(runPath, 'utf8'));
+    await fs.writeFile(runPath, JSON.stringify({ ...run, input_sha256: 'c'.repeat(64), attempt_id: '2'.repeat(32) }));
+    const names = (await fs.readdir(incoming)).sort();
+    const bytes = await Promise.all(names.map(name => fs.readFile(path.join(incoming, name))));
+    if (substitute === 'junction') await fs.symlink(unselected, producer, process.platform === 'win32' ? 'junction' : 'dir');
+
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T07:00:00Z', timezone: 'America/Phoenix' }));
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    const after = await ledger();
+    expect(after.attempts).toEqual(before.attempts);
+    expect(after.captures).toEqual(before.captures);
+    expect(after.lastSuccess).toEqual(before.lastSuccess);
+    expect(after.lastCheck.status).toBe('error');
+    await expect(page.locator('#intake-state')).toContainText('Reconnect it, then Check now.');
+    expect((await fs.readdir(path.join(base, 'Revisions'))).filter(name => name.endsWith('.json'))).toHaveLength(1);
+    expect((await fs.readdir(incoming)).sort()).toEqual(names);
+    expect(await Promise.all(names.map(name => fs.readFile(path.join(incoming, name))))).toEqual(bytes);
+  });
+}
+
+test('a changed nested producer candidate holds only that candidate and imports its sibling', async () => {
+  const stable = await artifact('a-independent');
+  const candidate = await fs.realpath(await artifact(path.join('nested', 'z-volatile'), '2'.repeat(32)));
+  const parked = path.join(root, 'parked-candidate'), substitute = path.join(root, 'unselected-candidate');
+  const observed = path.join(root, 'native-readdir.json');
+  await fs.cp(candidate, substitute, { recursive: true });
+  const substituteRun = path.join(substitute, 'run.json');
+  const run = JSON.parse(await fs.readFile(substituteRun, 'utf8'));
+  await fs.writeFile(substituteRun, JSON.stringify({ ...run, input_sha256: 'c'.repeat(64), attempt_id: '3'.repeat(32) }));
+  const names = (await fs.readdir(substitute)).sort();
+  const unselectedBytes = await Promise.all(names.map(name => fs.readFile(path.join(substitute, name))));
+  const original = await fs.readFile(path.join(candidate, 'run.json'));
+  await launch(); await setup(); await connect();
+  await app.evaluate((_, { candidate, parked, substitute, observed }) => {
+    const nativeFs = process.getBuiltinModule('fs').promises, nativeReadDir = nativeFs.readdir;
+    nativeFs.readdir = async function(folder, ...args) {
+      const entries = await nativeReadDir.call(this, folder, ...args);
+      if (folder === candidate) {
+        nativeFs.readdir = nativeReadDir;
+        await nativeFs.rename(candidate, parked);
+        await nativeFs.rename(substitute, candidate);
+        await nativeFs.writeFile(observed, JSON.stringify(entries.map(entry => entry.name).sort()));
+      }
+      return entries;
+    };
+  }, { candidate, parked, substitute, observed });
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  expect(JSON.parse(await fs.readFile(observed, 'utf8'))).toEqual(names);
+  expect(await fs.readFile(path.join(parked, 'run.json'))).toEqual(original);
+  expect(await Promise.all(names.map(name => fs.readFile(path.join(candidate, name))))).toEqual(unselectedBytes);
+  const base = path.join(root, 'vault', 'Companion');
+  const ledger = JSON.parse(await fs.readFile(path.join(base, '.intake', 'ledger.json'), 'utf8'));
+  expect(Object.keys(ledger.captures)).toEqual([sha]);
+  expect(Object.values(ledger.attempts).map(attempt => attempt.locator)).toEqual([await fs.realpath(stable)]);
+  expect(ledger.sources[0].error).toBeUndefined();
+  expect(ledger.lastCheck.status).toBe('held');
+  expect(Object.values(ledger.outcomes)).toContainEqual(expect.objectContaining({ status: 'held', locator: candidate }));
+  await expect(page.locator('#held-imports')).toContainText(candidate);
 });

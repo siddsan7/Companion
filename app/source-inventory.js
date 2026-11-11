@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
 const { hash, validate, render, bound } = require('./intake-producer');
+const { matchesProducerOutcome } = require('./producer-root');
 const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
 const pendingTitle = require('./pending-title');
@@ -209,7 +210,7 @@ async function readDetachedEditor(intake, ledger, capture, sourceHash, note) {
   transaction(intake, tx, ledger, capture, sourceHash, revisions);
   if (journal.nlink !== 1 || tx.revision.id !== block.incomingRevision || tx.revision.review !== undefined || tx.resolution !== undefined || tx.externalConflict !== false || tx.retainOnly !== false || tx.previous !== canonical || tx.previousHash !== capture.currentHash || tx.content !== noteText(tx.capture, tx.revision) || tx.capture.currentHash !== hash(tx.content) || tx.capture.updatedAt !== tx.revision.importedAt || ledger.attempts[tx.revision.identity] || ledger.admissions?.[tx.revision.id]) fail();
   const producer = ledger.sources.find(item => item.id === tx.key.split(':')[0]);
-  if (!producer || (producer.kind || 'draft') !== 'draft' || !path.isAbsolute(tx.revision.locator) || tx.key !== `${producer.id}:${path.relative(producer.folder, tx.revision.locator) || '.'}`) fail();
+  if (!producer || (producer.kind || 'draft') !== 'draft' || !matchesProducerOutcome(producer, tx.key, tx.revision.locator)) fail();
   const outcome = ledger.outcomes[tx.key];
   if (!exact(outcome, ['status', 'reason', 'locator', 'checkedAt']) || outcome.status !== 'held' || outcome.reason !== reason || outcome.locator !== tx.revision.locator || !date(outcome.checkedAt)) fail();
   const prefix = `${capture.id}-${tx.revision.id}.before.md`, heldPrefix = prefix + '.detach.json.held-';

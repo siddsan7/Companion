@@ -5,10 +5,22 @@ window.intakeView = {
     for (const button of section.querySelectorAll('button')) button.disabled = true;
   },
   settleRepairs() { document.getElementById('vault-repairs').setAttribute('aria-busy', 'false'); },
-  render(intake) {
+  render(intake, location) {
     const state = document.getElementById('intake-state'), held = document.getElementById('held-imports'); state.replaceChildren(); held.replaceChildren();
+    const selection = document.getElementById('reconnect-selection');
+    const previous = this.location === location ? selection.value : '';
+    if (this.location !== location) document.getElementById('reconnect-folder').value = '';
+    this.location = location;
+    selection.replaceChildren(new Option('Choose a connected source', ''));
     if (!intake) { state.textContent = 'Choose a vault before connecting sources.'; return; }
-    for (const source of intake.sources) { const p = document.createElement('p'); p.textContent = `${source.kind === 'review' ? 'Finalized reviews' : 'Drafts'}: ${source.folder}${source.error ? ` — ${source.error}` : ''}`; state.append(p); }
+    for (const source of intake.sources) {
+      const label = `${source.kind === 'review' ? 'Finalized reviews' : 'Drafts'}: ${source.folder}`;
+      const p = document.createElement('p');
+      p.textContent = label + (source.error ? ` — ${source.error}` : '');
+      state.append(p);
+      selection.add(new Option(label, source.id));
+    }
+    if (intake.sources.some(source => source.id === previous)) selection.value = previous;
     const p = document.createElement('p'); p.textContent = intake.lastCheck ? `Last check: ${intake.lastCheck.at} · ${intake.lastCheck.trigger} · ${intake.lastCheck.status}` : 'No intake check yet.'; state.append(p);
     for (const outcome of Object.values(intake.outcomes).filter(x => x.status === 'held')) { const p = document.createElement('p'); p.textContent = `${outcome.locator} — ${outcome.reason}`; held.append(p); }
     for (const capture of Object.values(intake.captures).filter(item => item.reviewChoices?.length)) { const p = document.createElement('p'); p.textContent = `${capture.title} — Choose the current reviewed revision in Inspect source. All revisions are retained; supporting evidence is paused until this choice.`; held.append(p); }

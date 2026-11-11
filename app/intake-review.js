@@ -3,6 +3,7 @@
 // does not itself compare against the selected target.
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { readProducerFile, samePath } = require('./producer-root');
 const { parse, canonical, decode } = require('./producer-json');
 const { schema, validate, validateEvidence, render, hash } = require('./intake-producer');
 const fail = message => { throw Error(message); };
@@ -91,17 +92,26 @@ function normalizeReview(manifest, sourceText, review, metrics) {
   const notes = review.decision === 'reject' ? '> Human review rejected this source. Ineligible as supporting evidence. Original material remains inspectable in revision history.\n' : render(source.evidence, target);
   return { sourceHash, identity: `finalization:${manifest.finalization_id}`, run: source.run, evidence: source.evidence, target, text: notes, synthetic: source.synthetic, humanReview: review.decision, extraction: ['complete', 'partial', 'insufficient_evidence'].includes(target?.status) ? target.status : 'unknown', processing: source.run.state || 'unknown', supportEligible: review.decision !== 'reject', review, manifest, metrics, reviewSourceText: sourceText, uncertainty: { channels: source.evidence.channels, truncated: source.evidence.truncated, uncertainEvidence: source.evidence.evidence.filter(item => item.review_flag === 'uncertain').map(item => item.id), unknowns: target?.unknowns || [], conflicts: target?.conflicts || [] } };
 }
-async function readReview(folder) {
-  const root = await fs.realpath(folder), captured = new Map(); let total = 0;
+async function readReview(folder, guard) {
+  const root = guard ? folder : await fs.realpath(folder), captured = new Map(); let total = 0;
+  const bundleLimit = 256 * 1024 * 1024;
   const read = async (name, limit = 16 * 1024 * 1024) => {
     if (typeof name !== 'string' || !name || name.includes('\\') || name.includes(':') || name.startsWith('/') || name.split('/').some(part => !part || part === '.' || part === '..') || /[. ]$/.test(name)) fail('Unsafe finalized bundle path.');
     const file = path.join(root, ...name.split('/'));
-    let current = root;
-    for (const part of name.split('/')) { current = path.join(current, part); const info = await fs.lstat(current); if (info.isSymbolicLink()) fail('Finalized bundle paths cannot be links.'); }
-    const resolved = await fs.realpath(file), relative = path.relative(root, resolved), info = await fs.lstat(file);
-    if (relative.startsWith('..') || path.isAbsolute(relative) || !info.isFile() || info.size > limit) fail('Unsupported finalized bundle file.');
-    if ((total += info.size) > 256 * 1024 * 1024) fail('Finalized bundle exceeds 256 MiB.');
-    const bytes = await fs.readFile(file); if (bytes.length > limit) fail('Finalized bundle file grew during admission.'); captured.set(name, bytes); return bytes;
+    const guardedPath = async () => {
+      await guard?.();
+      let current = root;
+      for (const part of name.split('/')) {
+        current = path.join(current, part);
+        if ((await fs.lstat(current)).isSymbolicLink()) fail('Finalized bundle paths cannot be links.');
+      }
+      if (!samePath(await fs.realpath(file), file)) fail('Finalized bundle paths cannot be links.');
+    };
+    const remaining = bundleLimit - total;
+    const bytes = await readProducerFile(file, Math.min(remaining, limit), guardedPath, remaining < limit ? 'Finalized bundle exceeds 256 MiB.' : 'Unsupported finalized bundle file.');
+    total += bytes.length;
+    captured.set(name, bytes);
+    return bytes;
   };
   const manifestBytes = await read('manifest.json'), manifest = parse(decode(manifestBytes));
   if (manifest.schema_version !== '1.0' || !uuid(manifest.finalization_id) || !uuid(manifest.review_id) || typeof manifest.finalized_utc !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(manifest.finalized_utc) || !Number.isFinite(Date.parse(manifest.finalized_utc)) || !manifest.files || Array.isArray(manifest.files) || typeof manifest.files !== 'object' || Object.keys(manifest.files).length > 1005) fail('Unsupported finalization manifest identity or structure.');

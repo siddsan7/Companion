@@ -477,3 +477,67 @@ test('kept-current access failure before annotation publication requires fresh e
   expect(await fs.readFile(path.join(base, 'Annotations', annotations[0]), 'utf8')).toContain('Fresh explicit transfer after access restoration.');
   expect(await fs.readFile(path.join(intake, repairArchives[0]), 'utf8')).toContain('Chosen writing preserved in the failed intent.');
 });
+
+test('reconnecting a relocated review source preserves acceptance and the daily schedule', async () => {
+  const originalBundle = await bundle();
+  const producer = await fs.realpath(path.dirname(originalBundle));
+  const replacement = path.join(root, 'relocated-producer');
+  const drafts = path.join(root, 'drafts'), otherReviews = path.join(root, 'other-reviews');
+  await fs.mkdir(drafts);
+  await fs.mkdir(otherReviews);
+  await launch(); await setup();
+  await page.getByLabel('Draft source folder').fill(drafts);
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByLabel('Finalized review folder').fill(otherReviews);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+  await check();
+  const readLedger = async () => JSON.parse(await fs.readFile(path.join(root, 'vault', 'Companion', '.intake', 'ledger.json'), 'utf8'));
+  const readSchedule = async () => JSON.parse(await fs.readFile(path.join(root, 'schedule.json'), 'utf8'));
+  const original = await readLedger(), schedule = await readSchedule(), note = await captureText();
+  const revisions = await snapshots();
+  expect(revisions).toHaveLength(1);
+  expect(revisions[0].humanReview).toBe('accept');
+  expect(Object.keys(original.attempts)).toHaveLength(1);
+
+  await fs.rename(producer, replacement);
+  // A draft-shaped incomplete transfer under the review root is outside this connection's scope.
+  await fs.mkdir(path.join(replacement, 'draft-only'));
+  await fs.writeFile(path.join(replacement, 'draft-only', 'run.json'), '{}');
+  await check('error');
+  await expect(page.locator('#intake-state')).toContainText('missing or unreadable');
+  const failed = await readLedger(), failedSchedule = await readSchedule();
+  expect(failed.lastSuccess).toEqual(original.lastSuccess);
+  expect(failed.captures).toEqual(original.captures);
+
+  await page.getByLabel('Producer source to reconnect').selectOption({ label: `Finalized reviews: ${producer}` });
+  await page.getByLabel('Replacement producer folder').fill(replacement);
+  await page.getByRole('button', { name: 'Reconnect source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source reconnected');
+  const repaired = await readLedger();
+  const oldSource = original.sources.find(source => source.folder === producer);
+  const newSource = repaired.sources.find(source => source.id === oldSource.id);
+  expect(newSource).toMatchObject({ folder: await fs.realpath(replacement), kind: 'review' });
+  expect(newSource.error).toBeUndefined();
+  expect(repaired.sources.filter(source => source.id !== oldSource.id)).toEqual(original.sources.filter(source => source.id !== oldSource.id));
+  expect(repaired.lastCheck).toEqual(failed.lastCheck);
+  expect(repaired.lastSuccess).toEqual(original.lastSuccess);
+  expect(repaired.outcomes).toEqual(failed.outcomes);
+  expect(await readSchedule()).toEqual(failedSchedule);
+
+  await check();
+  const healthy = await readLedger();
+  expect(healthy.lastSuccess).toEqual({ at: healthy.lastCheck.at, trigger: 'manual' });
+  expect(healthy.lastSuccess.at).not.toBe(original.lastSuccess.at);
+  expect(healthy.captures).toEqual(original.captures);
+  expect(healthy.attempts).toEqual(original.attempts);
+  expect(await snapshots()).toEqual(revisions);
+  expect(await captureText()).toBe(note);
+  await expect(page.locator('#held-imports')).toHaveText('No held imports.');
+  const healthySchedule = await readSchedule();
+  expect(healthySchedule).toMatchObject({ id: schedule.id, anchor: schedule.anchor, mode: schedule.mode, lastSuccess: healthy.lastSuccess });
+  expect(healthySchedule.workerError).toBeUndefined();
+});
