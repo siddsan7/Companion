@@ -595,6 +595,9 @@ function retirementFiles(intake, receipt) {
   if (JSON.stringify(receipt.slots.map(slot => slot.file)) !== JSON.stringify(expected)) throw Error('Restoration retirement does not name this intake folder. All files were preserved.');
   return expected;
 }
+function manualOperationCopy(name, operations) {
+  return operations.some(operation => name.startsWith(`manual-${operation}.`) || name.startsWith(`restoration-${operation}.`));
+}
 async function scanManualRecovery(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], current = manualFiles(intake, authority), known = new Set([current.stage, current.journal]);
   const receipts = [...(authority.retiredRestorations || []), ...(authority.restoration.retirement ? [authority.restoration.retirement] : [])], operations = [authority.operationId, ...receipts.map(receipt => receipt.operationId)];
@@ -602,7 +605,7 @@ async function scanManualRecovery(intake, ledger, id) {
   for (const entry of await fs.readdir(intake.dir, { withFileTypes: true })) {
     const file = path.join(intake.dir, entry.name);
     if (known.has(file)) continue;
-    if (operations.some(operation => entry.name.startsWith(`manual-${operation}.`) || entry.name.startsWith(`restoration-${operation}.`))) throw held(id, authority, 'An additional manual-operation recovery copy needs explicit review. All files were preserved.');
+    if (manualOperationCopy(entry.name, operations)) throw held(id, authority, 'An additional manual-operation recovery copy needs explicit review. All files were preserved.');
     const match = entry.name.match(/^(manual|restoration)-([a-f0-9-]{36})\.(stage|json)$/);
     if (!match || !uuid(match[2]) || (match[1] === 'manual') !== (match[3] === 'stage')) continue;
     const other = Object.entries(ledger.sourceAuthority || {}).find(([, value]) => value.operationId === match[2]), peers = [];
@@ -766,7 +769,32 @@ async function finishManualRestoration(intake, ledger, id) {
   }
   await verify(); await vault.checkpoint('capture-restoration-published'); await verify();
   await verifyRetiredSlots(intake, ledger, id);
-  authority.phase = 'active'; delete authority.restoration; await intake.save(ledger);
+  const guard = removalParentGuard(vault, authority.directories);
+  const proof = { ...restoration.publication, digest: authority.manual.currentHash };
+  const receipts = authority.retiredRestorations || [];
+  const retired = receipts.flatMap(receipt => retirementFiles(intake, receipt)).map(name => path.join(vault.vault, name));
+  const operations = [authority.operationId, ...receipts.map(receipt => receipt.operationId)];
+  const verifyActivation = () => {
+    guard();
+    for (const file of [stage, journal, ...retired]) verifyAbsentSync(file, guard, () =>
+      access.fail('A file appeared in a retired manual restoration slot. It was preserved; review the new scope.'));
+    if (native.readdirSync(intake.dir).some(name => manualOperationCopy(name, operations))) {
+      guard();
+      throw access.fail('An additional manual-operation recovery copy needs explicit review. All files were preserved.');
+    }
+    try {
+      const { bytes } = verifyStageSync(destination, guard, proof);
+      if (String(bytes.length) === proof.bytes) return;
+    } catch (error) {
+      if (error.code !== 'STAGING_CHANGED') throw error;
+      guard();
+    }
+    throw access.fail('Manual restoration publication is missing or changed. Old source authority remains unavailable.');
+  };
+  const active = { ...authority, phase: 'active' };
+  delete active.restoration;
+  await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: active } }, verifyActivation);
+  ledger.sourceAuthority[id] = active;
 }
 async function guardRestorationParents(intake, authority) {
   return sourceParents(intake, authority);
