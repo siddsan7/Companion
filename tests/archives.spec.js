@@ -680,6 +680,24 @@ test('archive restore reports an exact published note inclusion when stage clean
   expect(await fs.readFile(noteFile)).toEqual(noteBytes);
   await expect(summary).toContainText(/restored 1 reviewed note inclusion/i);
   await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+  await app.close(); app = null;
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+  const fresh = page.getByRole('region', { name: 'Local history archive', exact: true });
+  const destination = path.join(root, 'archive-after-note-scope-cleanup.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination }));
+  await fresh.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  const exportButton = fresh.getByRole('button', { name: 'Export reviewed archive', exact: true });
+  await expect(exportButton).toBeEnabled();
+  await exportButton.click();
+  await expect(fresh).toContainText('Archive exported');
+  const exported = JSON.parse(await fs.readFile(destination));
+  expect(exported.payload.contextScopes).toEqual(valid.archive.payload.contextScopes);
+  expect(await fs.readFile(scope)).toEqual(expected);
+  expect((await fs.lstat(scope)).nlink).toBe(1);
+  expect(await fs.stat(refused.stage).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(history)).toEqual(savedHistory);
+  expect(await fs.readFile(noteFile)).toEqual(noteBytes);
 });
 
 test('invalid archive inputs and a file changed after matched preview preserve current history and authority', async () => {

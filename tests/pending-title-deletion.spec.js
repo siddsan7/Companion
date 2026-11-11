@@ -32,7 +32,9 @@ async function observe(file) {
   return { sha256: sha(bytes), bytes: String(stat.size), dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) };
 }
 
-test('held imported title substitution leaves an independent note and permits Check now', async () => {
+for (const cleanupRefused of [false, true]) test(cleanupRefused ?
+  'held imported title rollback settles an exact cleanup refusal after restart and permits Check now' :
+  'held imported title substitution leaves an independent note and permits Check now', async () => {
   test.setTimeout(90000);
   const producer = path.join(root, 'producer');
   async function draft(folder, clip, source, attempt, title) {
@@ -68,10 +70,31 @@ test('held imported title substitution leaves an independent note and permits Ch
   const reviewed = await fs.readFile(stage), foreign = Buffer.concat([reviewed, Buffer.from('\nIndependent staged writing.\n')]);
   const moved = path.join(root, 'original-imported-title-stage');
   await fs.rename(stage, moved); await fs.writeFile(stage, foreign, { flag: 'wx' });
+  const observation = path.join(root, 'rollback-stage-cleanup-refusal.json');
+  if (cleanupRefused) await app.evaluate((_, { root, current, observation }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Title rollback refusal requires a disposable import fixture.');
+    const io = process.getBuiltinModule('fs').promises, native = io.unlink;
+    io.unlink = async function (file, ...args) {
+      if (!file.startsWith(current + '.restore-title-') || !file.endsWith('.pending')) return native.call(this, file, ...args);
+      const staged = await io.lstat(file, { bigint: true }), output = await io.lstat(current, { bigint: true });
+      const bytes = await io.readFile(file);
+      await io.writeFile(observation, JSON.stringify({ file, same: staged.dev === output.dev && staged.ino === output.ino, links: String(staged.nlink), bytes: bytes.toString('base64') }));
+      throw Object.assign(Error('Temporary title rollback stage cleanup refusal.'), { code: 'EACCES', syscall: 'unlink' });
+    };
+  }, { root, current, observation });
   await fs.writeFile(path.join(root, 'release.txt'), 'resume');
   await expect(page.getByRole('status')).toContainText(/staging.*preserv/i);
   expect(await fs.readFile(current)).toEqual(original);
   expect(await fs.readFile(backup)).toEqual(original);
+  if (cleanupRefused) {
+    const refusal = JSON.parse(await fs.readFile(observation));
+    expect(refusal).toMatchObject({ same: true, links: '2', bytes: original.toString('base64') });
+    expect(await fs.readFile(refusal.file)).toEqual(original);
+    await app.close(); app = null;
+    await fs.unlink(path.join(root, 'faults.json'));
+    await launch();
+    await expect.poll(() => fs.stat(refusal.file).catch(error => error.code)).toBe('ENOENT');
+  }
   expect.soft((await fs.lstat(current)).nlink).toBe(1);
   expect.soft((await fs.lstat(backup)).nlink).toBe(1);
   const unrelatedTitle = 'Independent draft after held title';

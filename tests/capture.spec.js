@@ -495,6 +495,50 @@ for (const phase of ['title-staged', 'title-moved']) test(`an editor write at ${
   await expect(page.getByRole('status')).toContainText(/conflict|preserved/i);
   expect(await fs.readFile(path.join(dir, file), 'utf8')).toContain('Interleaved external writing.');
 });
+for (const failure of ['link', 'cleanup']) test('active title recovers exactly after a temporary ' + failure + ' refusal', async () => {
+  test.setTimeout(90000);
+  await launch(); await setup();
+  const originalTitle = 'Keep the old title until publication is verified.';
+  const newTitle = 'Recover the exact reviewed title ' + failure;
+  await page.getByLabel('Thought or link').fill(originalTitle);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: originalTitle, exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  const file = path.join(dir, (await fs.readdir(dir)).find(name => name.endsWith('.md')));
+  const original = await fs.readFile(file), stage = file + '.pending', journal = file + '.title-transaction.json', lock = file + '.lock';
+  const observation = path.join(root, 'active-title-io-refusal.json');
+  await app.evaluate((_, { root, stage, file, observation, failure }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Title refusal requires a disposable capture fixture.');
+    const io = process.getBuiltinModule('fs').promises;
+    const operation = failure === 'link' ? 'link' : 'unlink', native = io[operation];
+    io[operation] = async function (from, to, ...args) {
+      if (from !== stage || operation === 'link' && to !== file) return native.call(this, from, ...(operation === 'link' ? [to, ...args] : []));
+      const staged = await io.lstat(stage, { bigint: true });
+      const current = await io.lstat(file, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      const bytes = await io.readFile(stage);
+      await io.writeFile(observation, JSON.stringify({ operation, links: String(staged.nlink), same: current !== null && current.dev === staged.dev && current.ino === staged.ino, bytes: bytes.toString('base64') }));
+      throw Object.assign(Error('Temporary active title ' + failure + ' refusal.'), { code: 'EACCES', syscall: operation });
+    };
+  }, { root, stage, file, observation, failure });
+  await page.getByLabel('Display title').fill(newTitle);
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect(page.getByRole('status')).toContainText(/Temporary active title|title.*recover/i);
+  const refused = JSON.parse(await fs.readFile(observation));
+  const reviewed = await fs.readFile(stage), transaction = JSON.parse(await fs.readFile(journal));
+  const backup = path.join(dir, transaction.backup);
+  expect(refused).toEqual({ operation: failure === 'link' ? 'link' : 'unlink', links: failure === 'link' ? '1' : '2', same: failure === 'cleanup', bytes: reviewed.toString('base64') });
+  expect(await fs.readFile(backup)).toEqual(original);
+  expect.soft(await fs.readFile(lock).then(bytes => JSON.parse(bytes).publication.kind, error => error.code)).toBe('title');
+  if (failure === 'link') expect.soft(await fs.stat(file).catch(error => error.code)).toBe('ENOENT');
+  else expect(await fs.readFile(file)).toEqual(reviewed);
+  await app.close(); app = null; await launch();
+  await expect(page.getByRole('heading', { name: newTitle, exact: true })).toHaveCount(1);
+  expect(await fs.readFile(file)).toEqual(reviewed);
+  expect(await fs.readFile(backup)).toEqual(original);
+  expect((await fs.lstat(file)).nlink).toBe(1);
+  expect((await fs.lstat(backup)).nlink).toBe(1);
+  for (const sidecar of [stage, journal, lock]) expect(await fs.stat(sidecar).catch(error => error.code)).toBe('ENOENT');
+});
 test('a title stage replaced with the same bytes after the move preserves the prior title and recovery journal', async () => {
   await launch(); await setup();
   const draft = 'Keep the original title and body.';
