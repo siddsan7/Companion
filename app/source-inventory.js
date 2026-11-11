@@ -243,6 +243,7 @@ async function inventory(intake, ledger, capture, sourceHash, revisions, initial
   return inventorySources(intake, ledger, capture, sourceHash, revisions, initial);
 }
 async function inventorySources(intake, ledger, capture, sourceHash, revisions, initial, detachedEditor = null) {
+  if (ledger.acceptedCleanup?.sourceHash === sourceHash) fail();
   const pending = await pendingTitle.inventory(intake, ledger, capture, sourceHash, revisions, initial);
   if (pending) initial = pending.targets;
   const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;

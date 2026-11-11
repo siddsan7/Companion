@@ -251,6 +251,115 @@ for (const boundary of ['held ledger rename', 'held journal link', 'edited journ
   expect(await readOptional(pending)).toBeNull();
 });
 
+const ordinaryRestartCases = [
+  ...['unchanged', 'missing capture', 'missing snapshot', 'replaced capture', 'replaced snapshot'].map(change => ({ change })),
+  { change: 'missing snapshot', legacy: true },
+  { change: 'replaced capture', legacy: true }
+];
+for (const { change, legacy } of ordinaryRestartCases) {
+  test('accepted ordinary intake restart preserves the exact publication with ' + change + (legacy ? ' on legacy upgrade' : ''), async ({}, testInfo) => {
+    const producer = testInfo.outputPath('producer');
+    const { vault, intake, ledgerFile } = await setup(testInfo);
+    await writeDraft(producer);
+    const script = `
+      const path = require('node:path');
+      const [app, directory, producer, now] = process.argv.slice(1);
+      const { Vault } = require(path.join(app, 'vault'));
+      const { Intake } = require(path.join(app, 'intake'));
+      const vault = new Vault(directory, 'Companion', { checkpoint: name => {
+        if (name === 'intake-ledger') process.exit(77);
+      } });
+      new Intake(vault).connect(producer, true, now).catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+      });`;
+    const child = spawn(process.execPath, ['-e', script, path.resolve(__dirname, '../app'), vault.vault, producer, now], {
+      stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
+    });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+    const exit = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    expect(exit, stderr).toEqual({ code: 77, signal: null });
+
+    const journal = path.join(intake.dir, 'transaction.json');
+    const raw = await fs.readFile(journal, 'utf8'), tx = JSON.parse(raw);
+    const committed = await readJson(ledgerFile);
+    expect(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+    expect(committed.captures[tx.sourceHash].currentRevision).toBe(tx.revision.id);
+    if (legacy) {
+      const { acceptedCleanup, ...previousSchema } = committed;
+      expect(acceptedCleanup).toMatchObject({ sourceHash: tx.sourceHash, key: tx.key, revision: tx.revision.id });
+      await fs.writeFile(ledgerFile, JSON.stringify(previousSchema, null, 2));
+      expect(await readJson(ledgerFile)).toEqual(previousSchema);
+    }
+    const originalJournal = await fs.lstat(journal, { bigint: true });
+    expect(originalJournal.nlink).toBe(1n);
+    const capture = intake.destination(tx.capture), snapshot = path.join(vault.root, 'Revisions', tx.revision.id + '.json');
+    const files = [
+      { file: capture, stage: path.join(intake.dir, tx.revision.id + '.stage'), bytes: tx.content },
+      { file: snapshot, stage: path.join(intake.dir, tx.revision.id + '.snapshot.stage'), bytes: JSON.stringify(tx.revision, null, 2) }
+    ];
+    for (const item of files) {
+      item.original = await fs.lstat(item.stage, { bigint: true });
+      const published = await fs.lstat(item.file, { bigint: true });
+      expect([published.dev, published.ino, published.nlink]).toEqual([item.original.dev, item.original.ino, 2n]);
+      expect(await fs.readFile(item.file, 'utf8')).toBe(item.bytes);
+    }
+    const changed = change === 'unchanged' ? null : files[change.endsWith('capture') ? 0 : 1];
+    let replacement;
+    if (changed) {
+      await fs.unlink(changed.file);
+      if (change.startsWith('replaced')) {
+        await fs.writeFile(changed.file, changed.bytes, { flag: 'wx' });
+        replacement = await fs.lstat(changed.file, { bigint: true });
+        expect([replacement.dev, replacement.ino]).not.toEqual([changed.original.dev, changed.original.ino]);
+      }
+    }
+
+    let replay = false;
+    const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async boundary => {
+      if (boundary === 'intake-snapshot-staged' && await readOptional(journal) === raw) replay = true;
+    } }));
+    await writeDraft(producer, 'z-independent', '2', 'c');
+    const recovered = await restarted.reconcile({ now: later });
+    expect.soft(replay, 'recovery acknowledges the committed transaction without running publication again').toBe(false);
+    expect(recovered.attempts[tx.revision.identity]).toEqual(committed.attempts[tx.revision.identity]);
+    expect(Object.values(recovered.attempts)).toHaveLength(2);
+    expect(await readOptional(journal)).toBeNull();
+    if (changed) {
+      expect.soft(recovered.lastCheck.status).toBe('held');
+      const name = 'conflict-' + tx.revision.id + '.json', held = path.join(intake.dir, name);
+      expect.soft(recovered.blocks[tx.sourceHash]?.journal).toBe(name);
+      expect.soft(await readOptional(held)).toBe(raw);
+      const heldJournal = await fs.lstat(held, { bigint: true }).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      expect.soft(heldJournal && [heldJournal.dev, heldJournal.ino, heldJournal.nlink]).toEqual([originalJournal.dev, originalJournal.ino, 1n]);
+    } else {
+      expect(recovered.lastCheck.status).toBe('complete');
+      expect(recovered.blocks[tx.sourceHash]).toBeUndefined();
+    }
+    for (const item of files) {
+      expect.soft(await readOptional(item.stage)).toBe(changed ? item.bytes : null);
+      if (changed) {
+        const stage = await fs.lstat(item.stage, { bigint: true }).catch(error => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        expect.soft(stage && [stage.dev, stage.ino, stage.nlink]).toEqual([item.original.dev, item.original.ino, item === changed ? 1n : 2n]);
+      }
+      expect.soft(await readOptional(item.file)).toBe(item === changed && !replacement ? null : item.bytes);
+      if (item === changed && !replacement) continue;
+      const published = await fs.lstat(item.file, { bigint: true }), expected = item === changed ? replacement : item.original;
+      expect([published.dev, published.ino, published.nlink]).toEqual([expected.dev, expected.ino, changed && item !== changed ? 2n : 1n]);
+    }
+  });
+}
+
 test('accepted deferred intake restart settles its unchanged journal pair without replay', async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer'), interruption = Error('Stopped after successful deferred admission.');
   let deferMove = false, stop = false;

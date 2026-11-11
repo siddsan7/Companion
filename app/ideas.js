@@ -167,7 +167,7 @@ class Ideas {
     const revision = JSON.parse(text);
     if (revision.schema !== 1 || revision.id !== revisionId || revision.captureId !== captureId || revision.sourceHash !== sourceHash || typeof revision.text !== 'string') throw Error('Exact cited revision identity is damaged.');
     const warnings = [];
-    if (capture.removed || capture.rejected || capture.supportEligible === false || capture.conflict || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.blocks?.[sourceHash] || ledger.pending?.[sourceHash]) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
+    if (capture.removed || capture.rejected || capture.supportEligible === false || capture.conflict || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.blocks?.[sourceHash] || ledger.pending?.[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
     if (revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview)) warnings.push('The cited revision is ineligible as supporting evidence.');
     if (offering) {
       if (warnings.length) throw Error(warnings.join(' '));
@@ -220,7 +220,7 @@ class Ideas {
       const entries = captureId ? Object.entries(ledger.captures).filter(([, item]) => item.id === captureId) : [];
       const entry = entries.length === 1 ? entries[0] : null, capture = entry?.[1];
       const authorityKey = captureId || dep.key;
-      const authority = { identityChoice: ledger.identityChoices?.[authorityKey] || null, identityIssue: ledger.identityIssues?.[authorityKey] || null, ...(capture ? { sourceHash: entry[0], file: capture.relative || capture.file, currentRevision: capture.currentRevision, currentHash: capture.currentHash, removed: !!capture.removed, rejected: !!capture.rejected, supportEligible: capture.supportEligible !== false, conflict: !!capture.conflict, pending: !!ledger.pending?.[entry[0]], blocked: !!ledger.blocks?.[entry[0]], suppressed: ledger.suppressed.includes(entry[0]) } : {}) };
+      const authority = { identityChoice: ledger.identityChoices?.[authorityKey] || null, identityIssue: ledger.identityIssues?.[authorityKey] || null, ...(capture ? { sourceHash: entry[0], file: capture.relative || capture.file, currentRevision: capture.currentRevision, currentHash: capture.currentHash, removed: !!capture.removed, rejected: !!capture.rejected, supportEligible: capture.supportEligible !== false, conflict: !!capture.conflict, pending: !!ledger.pending?.[entry[0]] || ledger.acceptedCleanup?.sourceHash === entry[0], blocked: !!ledger.blocks?.[entry[0]], suppressed: ledger.suppressed.includes(entry[0]) } : {}) };
       state.push({ key: dep.key, originalDigest: dep.digest, currentDigest: source?.digest || null, originalSourceGenerations: generations(dep.sourceGenerations), currentSourceGenerations: source ? generations(source.sourceGenerations) : null, excluded, authority, warnings: source?.warnings || [] });
       if (!source || excluded) {
         unavailable = true; warnings.push(`Supporting context ${dep.key} is currently unavailable or excluded. Retained writing is independent; no current support is claimed.`);
