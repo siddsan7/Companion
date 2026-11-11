@@ -396,18 +396,25 @@ function install(Intake, { hash, read, noteText }) {
       return { held: true };
     };
     if (this.hasHeldJournal(owner, tx)) return preserveOutputHold(owner);
+    const archivedIntent = path.join(this.dir, `repair-${intent.annotationId}.json`);
+    const intentProof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
+    let verifyRetainedHold;
     const hold = async error => {
       // Retain the complete annotation intent before moving the active source
       // journal into its UUID-specific hold. Cleanup follows durable evidence.
-      const archivedIntent = path.join(this.dir, `repair-${intent.annotationId}.json`);
       await this.ownedFile(intentFile, archivedIntent, 'Repair intent');
       await this.ownedFile(archivedIntent, intentFile, 'Repair evidence archive');
-      try { await fs.link(intentFile, archivedIntent); }
-      catch (archiveError) { if (archiveError.code !== 'EEXIST' || await read(archivedIntent) !== bytes) throw Error('Repair evidence archive conflicts. All active files were preserved.'); }
+      if (expectedJournal?.verifyRepair) expectedJournal.verifyRepair();
+      else if (verifyRetainedHold) verifyRetainedHold();
+      else {
+        try { await fs.link(intentFile, archivedIntent); }
+        catch (archiveError) { if (archiveError.code !== 'EEXIST' || await read(archivedIntent) !== bytes) throw Error('Repair evidence archive conflicts. All active files were preserved.'); }
+      }
       const journal = path.join(this.dir, 'transaction.json');
       const sourceArchive = path.join(this.dir, `conflict-${tx.revision.id}-${tx.resolution}.json`);
       let journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
       await this.ownedFile(sourceArchive, journal, 'Repair source archive');
+      if (verifyRetainedHold && journalInfo) throw Error('An unproved repair source journal appeared. Recovery files were preserved.');
       if (!journalInfo) {
         await this.publishJournal(journal, tx);
         journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
@@ -415,7 +422,7 @@ function install(Intake, { hash, read, noteText }) {
       if (!journalInfo) throw Error('The exact repair source journal is missing. Files were preserved.');
       expectedJournal?.verify();
       const ordinary = this.vault.publicationFolders(this.dir).guard;
-      const guard = () => { ordinary(); expectedJournal?.verifyRepair(); };
+      const guard = () => { ordinary(); expectedJournal?.verifyRepair(); verifyRetainedHold?.(); };
       const links = Number(journalInfo.nlink);
       if (expectedJournal && links !== expectedJournal.links) throw Error('The exact repair journal gained an unknown alias. Recovery files were preserved.');
       const expected = expectedJournal || { dev: String(journalInfo.dev), ino: String(journalInfo.ino), digest: hash(JSON.stringify(tx)) };
@@ -425,10 +432,41 @@ function install(Intake, { hash, read, noteText }) {
       // A kept-snapshot failure can occur before any annotation exists. Require
       // fresh explicit transfer; a pending retry must never publish this tx.
       await this.archivePrecommitConflict(tx, ledger, error.message, proof, guard);
-      if (await this.ownedFile(stage, file, 'Annotation staging file')) await fs.unlink(stage);
-      await fs.unlink(intentFile);
+      const retained = expectedJournal?.verifyRepair || verifyRetainedHold;
+      if (retained) {
+        this.storage.guardSync();
+        retained();
+        native.unlinkSync(intentFile);
+        verifyStageSync(archivedIntent, ordinary, intentProof);
+      } else {
+        if (await this.ownedFile(stage, file, 'Annotation staging file')) await fs.unlink(stage);
+        await fs.unlink(intentFile);
+      }
       throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for repair.'), { intakeRepairHeld: true });
     };
+    if (!expectedJournal) {
+      const candidate = this.ordinaryRecoveryJournal(owner);
+      if (candidate?.verifyRepair) expectedJournal = candidate;
+    }
+    const heldReason = () => Error('This previously held repair needs a fresh explicit transfer. Earlier evidence was preserved.');
+    if (expectedJournal?.verifyRepair) {
+      // The exact retained intent proves this operation already entered hold.
+      // A later repair of its inputs still requires a fresh explicit transfer.
+      expectedJournal.verify();
+      return hold(heldReason());
+    }
+    const ordinary = this.vault.publicationFolders(this.dir).guard;
+    ordinary();
+    if (native.lstatSync(archivedIntent, { throwIfNoEntry: false })) {
+      verifyRetainedHold = () => {
+        verifyStageSync(intentFile, ordinary, intentProof, 2);
+        verifyStageSync(archivedIntent, ordinary, intentProof, 2);
+      };
+      verifyRetainedHold();
+      verifyAbsentSync(path.join(this.dir, 'transaction.json'), ordinary, () =>
+        Error('The retained repair intent has an unproved active source journal. Recovery files were preserved.'));
+      return hold(heldReason());
+    }
     if (tx.keptCurrent) {
       try { await this.verifiedKeptCurrent(tx, await this.load()); }
       catch (error) { if (error.keptCurrentFailure) return hold(error); throw error; }
