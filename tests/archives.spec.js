@@ -900,9 +900,10 @@ test('archive settings stay bound to the canonical data root after its original 
   const alias = path.join(aliasParent, 'launch-root'), outside = path.join(aliasParent, 'outside');
   await fs.mkdir(outside);
   const destination = path.join(root, 'canonical-settings-history.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination }), 'utf8');
   await fs.writeFile(path.join(outside, 'settings.json'), JSON.stringify({ vault: outside, parent: 'DO_NOT_EXPORT_OUTSIDE_SETTINGS_CANARY' }), 'utf8');
-  await fs.writeFile(path.join(outside, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:00Z', timezone: 'America/Phoenix' }), 'utf8');
-  await fs.writeFile(path.join(outside, 'archive-dialog.json'), JSON.stringify({ save: destination }), 'utf8');
+  await fs.writeFile(path.join(outside, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:00Z', timezone: 'UTC' }), 'utf8');
+  await fs.writeFile(path.join(outside, 'archive-dialog.json'), JSON.stringify({ save: path.join(outside, 'not-the-reviewed-destination.json') }), 'utf8');
   let linked = false;
   try {
     await fs.symlink(root, alias, process.platform === 'win32' ? 'junction' : 'dir'); linked = true;
@@ -912,6 +913,8 @@ test('archive settings stay bound to the canonical data root after its original 
     await fs.unlink(alias); linked = false;
     await fs.symlink(outside, alias, process.platform === 'win32' ? 'junction' : 'dir'); linked = true;
     const outsideBefore = await tree(outside);
+    const selected = await page.evaluate(() => window.companion.state());
+    expect(selected).toMatchObject({ location: path.join(root, 'vault', 'Companion'), timezone: 'America/Phoenix' });
     const region = page.getByRole('region', { name: 'Local history archive', exact: true });
     await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
     await expect(region.getByRole('button', { name: 'Export reviewed archive', exact: true })).toBeEnabled();
