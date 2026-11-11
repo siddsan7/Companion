@@ -4,7 +4,10 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const YAML = require('yaml');
 const { withBriefMutation } = require('./briefs-lock');
-const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyStageSync, verifyPeers, removeStage } = require('./staged-publication');
+const {
+  ordinaryDirectories, readExact, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
+  verifyPeersSync, validProof, removeStage, settlePublishedLink
+} = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const sourceByteLimit = 128000;
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
@@ -75,6 +78,9 @@ const approvalName = /^approved-([1-9][0-9]*)(?:-[\w-]+)?\.md$/;
 const checksumName = /^approved-[1-9][0-9]*-[a-f0-9]{64}\.md$/i;
 const receiptName = version => `.brief-approval-${version}.json`;
 const receiptVersion = /^\.brief-approval-([1-9][0-9]*)\.json$/;
+const pendingName = (version, phase = 'pending') => `.brief-approval-${version}.${phase}.json`;
+const pendingVersion = /^\.brief-approval-([1-9][0-9]*)\.(pending|retiring)\.json$/;
+const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
 const integrityError = name => Error(`Approved brief integrity check failed: ${name}. Preserved for repair; this version cannot be pinned.`);
 const duplicateError = () => Error('Duplicate approved brief version. Preserve the files and resolve their identity before pinning.');
 const comparable = value => process.platform === 'win32' ? value.toLowerCase() : value;
@@ -96,13 +102,15 @@ function approvedMetadata(data, version) {
 function versionEntries(names) {
   const versions = new Map();
   for (const name of names) {
-    const approval = checksumName.test(name) && approvalName.exec(name), receipt = receiptVersion.exec(name);
-    const version = Number((approval || receipt)?.[1]);
+    const approval = checksumName.test(name) && approvalName.exec(name);
+    const receipt = receiptVersion.exec(name), pending = pendingVersion.exec(name);
+    const version = Number((approval || receipt || pending)?.[1]);
     if (!Number.isSafeInteger(version)) continue;
-    if (!versions.has(version)) versions.set(version, { canonical: [], receipt: null });
+    if (!versions.has(version)) versions.set(version, { canonical: [], receipt: null, pending: [] });
     const entry = versions.get(version);
     if (approval) entry.canonical.push(name);
-    else entry.receipt = name;
+    else if (receipt) entry.receipt = name;
+    else entry.pending.push(name);
   }
   for (const name of names) {
     if (checksumName.test(name)) continue;
@@ -134,16 +142,89 @@ class Briefs {
     guard();
     return { guard, names, versions: versionEntries(names) };
   }
-  async receipt(version, name, guard) {
+  async recoveredIndex(onlyVersion, lockHeld) {
+    const index = await this.index();
+    const pending = observed => [...observed.versions].filter(([version, entry]) =>
+      entry.pending.length && (onlyVersion === undefined || onlyVersion === version));
+    if (!pending(index).length) return index;
+    const errors = new Map();
+    const recover = async () => {
+      const current = await this.index();
+      for (const [version, entry] of pending(current)) {
+        try {
+          if (entry.pending.length !== 1) throw integrityError(entry.pending.join(', '));
+          await this.recoverApproval(version, entry.pending[0], current.guard);
+        } catch (error) { errors.set(version, error); }
+      }
+      return this.index();
+    };
+    try {
+      const settled = await (lockHeld ? recover() : withBriefMutation(this.vault.root, recover));
+      return { ...settled, errors };
+    } catch (error) {
+      for (const [version] of pending(index)) errors.set(version, error);
+      return { ...index, errors };
+    }
+  }
+  async publishMarker(file, value, guard, linkedMarker = () => {}) {
+    const stage = `${file}.stage-${randomUUID()}`;
+    const proof = await writeStage(stage, JSON.stringify({ ...value, markerStage: path.basename(stage) }), guard);
+    let linked = false;
+    try {
+      verifyStageSync(stage, guard, proof);
+      verifyAbsentSync(file, guard);
+      local.linkSync(stage, file);
+      linked = true;
+      linkedMarker(proof);
+      await settlePublishedLink(stage, file, guard, proof);
+      return proof;
+    } finally {
+      if (!linked) await removeStage(stage, guard, proof).catch(() => {});
+    }
+  }
+  async readMarker(file, guard, { validate, lockHeld = false, stagedFor = path.basename(file), retiring = false }) {
+    const name = path.basename(file);
+    const read = async owned => {
+      guard();
+      const stat = await fs.lstat(file, { bigint: true });
+      if (stat.nlink !== 1n && (stat.nlink !== 2n || retiring)) throw integrityError(name);
+      if (stat.nlink === 2n && !owned) return withBriefMutation(this.vault.root, () => read(true));
+      const { bytes, proof } = await readExact(file, guard, Number(stat.nlink));
+      const value = JSON.parse(bytes.toString('utf8'));
+      validate(value, bytes);
+      const stageName = value.markerStage;
+      let stage;
+      if (stageName !== undefined) {
+        const prefix = `${stagedFor}.stage-`;
+        if (typeof stageName !== 'string' || !stageName.startsWith(prefix) ||
+            !uuid(stageName.slice(prefix.length)) || !bytes.equals(Buffer.from(JSON.stringify(value)))) {
+          throw integrityError(name);
+        }
+        stage = path.join(this.dir, stageName);
+      }
+      if (stat.nlink === 2n) {
+        if (!stage) throw integrityError(name);
+        await settlePublishedLink(stage, file, guard, proof);
+      }
+      if (stage) verifyAbsentSync(stage, guard);
+      verifyStageSync(file, guard, proof);
+      return { value, proof };
+    };
+    return read(lockHeld);
+  }
+  async receipt(version, name, guard, lockHeld) {
     if (!name) return null;
     const file = path.join(this.dir, name);
     try {
-      const { bytes, proof } = await readExact(file, guard);
-      const entry = JSON.parse(bytes.toString('utf8'));
-      if (entry?.schema !== 1 || entry.version !== version || !uuid(entry.id) ||
-          typeof entry.digest !== 'string' || !/^[a-f0-9]{64}$/.test(entry.digest) ||
-          !parentMatches(entry.parent, this.managedParent)) throw integrityError(name);
-      return { ...entry, file, proof };
+      const { value, proof } = await this.readMarker(file, guard, {
+        lockHeld,
+        validate: entry => {
+          if (entry?.schema !== 1 || entry.version !== version || !uuid(entry.id) ||
+              typeof entry.digest !== 'string' || !/^[a-f0-9]{64}$/.test(entry.digest) ||
+              !parentMatches(entry.parent, this.managedParent)) throw integrityError(name);
+        }
+      });
+      return { ...value, file, proof };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
   async managedClaim(version, name, guard, receipt) {
@@ -167,8 +248,129 @@ class Briefs {
       return { file, proof, data, guard };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
-  receiptBytes(version, id, digest) {
-    return JSON.stringify({ schema: 1, parent: this.managedParent, id, version, digest });
+  receiptValue(version, id, digest) {
+    return { schema: 1, parent: this.managedParent, id, version, digest };
+  }
+  async readPending(version, name, guard) {
+    const file = path.join(this.dir, name);
+    const retiring = name === pendingName(version, 'retiring');
+    let parents;
+    const { value: pending, proof } = await this.readMarker(file, guard, {
+      lockHeld: true, stagedFor: pendingName(version), retiring,
+      validate: (entry, bytes) => {
+        if (entry?.schema !== 1 || entry.version !== version || !uuid(entry.id) ||
+            !parentMatches(entry.parent, this.managedParent) || !validProof(entry.staged) ||
+            typeof entry.stage !== 'string' || !entry.stage.startsWith('.brief-stage-') ||
+            !uuid(entry.stage.slice('.brief-stage-'.length)) || !Array.isArray(entry.identities) ||
+            !bytes.equals(Buffer.from(JSON.stringify(entry)))) throw integrityError(name);
+        parents = ordinaryDirectories([this.vault.vault, this.vault.root, this.dir],
+          'The pending approval folders changed. Files were preserved for inspection.', entry.identities);
+      }
+    });
+    const pinned = () => { guard(); parents.guard(); };
+    verifyStageSync(file, pinned, proof);
+    return { ...pending, file, proof, guard: pinned, retiring };
+  }
+  async finishPublishedApproval(pending, destination, guard) {
+    const { version, id, staged } = pending;
+    const stage = path.join(this.dir, pending.stage);
+    const name = receiptName(version), file = path.join(this.dir, name);
+    const verifyPending = () => verifyStageSync(pending.file, pending.guard, pending.proof);
+    const verifyPublication = () => {
+      verifyPending();
+      guard();
+      if (local.lstatSync(destination, { bigint: true }).nlink === 2n) {
+        verifyPeersSync(stage, destination, guard, staged);
+      } else {
+        verifyAbsentSync(stage, guard);
+        verifyStageSync(destination, guard, staged);
+      }
+    };
+    verifyPublication();
+    const links = Number(local.lstatSync(destination, { bigint: true }).nlink);
+    const data = metadata(verifyStageSync(destination, guard, staged, links).bytes);
+    if (!approvedMetadata(data, version) || data.record.id !== id ||
+        !parentMatches(data.managed_parent, this.managedParent)) throw integrityError(path.basename(destination));
+    const existing = await fs.lstat(file).catch(missing);
+    let proof;
+    if (existing) {
+      const receipt = await this.receipt(version, name, pending.guard, true);
+      if (receipt.id !== id || receipt.digest !== staged.digest) throw integrityError(name);
+      proof = receipt.proof;
+    } else {
+      proof = await this.publishMarker(file, this.receiptValue(version, id, staged.digest), verifyPublication);
+    }
+    const verifyReceipts = () => {
+      verifyPending();
+      verifyStageSync(file, pending.guard, proof);
+    };
+    const verifySettlement = () => {
+      verifyStageSync(file, pending.guard, proof);
+      verifyAbsentSync(stage, guard);
+      verifyStageSync(destination, guard, staged);
+    };
+    await settlePublishedLink(stage, destination, guard, staged, verifyReceipts);
+    await removeStage(pending.file, pending.guard, pending.proof, 1, verifySettlement);
+    verifySettlement();
+  }
+  async retireUnpublishedApproval(pending, stage, destination) {
+    const { version, guard, proof, staged } = pending;
+    const receipt = path.join(this.dir, receiptName(version));
+    const unpublished = () => {
+      verifyAbsentSync(receipt, guard);
+      verifyAbsentSync(destination, guard);
+    };
+    let marker = pending.file;
+    if (!pending.retiring) {
+      const retiring = path.join(this.dir, pendingName(version, 'retiring'));
+      verifyStageSync(stage, guard, staged);
+      verifyStageSync(marker, guard, proof);
+      unpublished();
+      verifyAbsentSync(retiring, guard);
+      local.renameSync(marker, retiring);
+      marker = retiring;
+    }
+    const pendingNameBefore = path.join(this.dir, pendingName(version));
+    const verifyRetirement = () => {
+      unpublished();
+      verifyAbsentSync(pendingNameBefore, guard);
+    };
+    guard();
+    if (await fs.lstat(stage).catch(missing)) {
+      await removeStage(stage, guard, staged, 1, () => {
+        verifyRetirement();
+        verifyStageSync(marker, guard, proof);
+      });
+    }
+    await removeStage(marker, guard, proof, 1, () => {
+      verifyRetirement();
+      verifyAbsentSync(stage, guard);
+    });
+  }
+  async recoverApproval(version, name, guard) {
+    try {
+      const pending = await this.readPending(version, name, guard);
+      const stage = path.join(this.dir, pending.stage);
+      const canonical = path.join(this.dir, `approved-${version}-${pending.staged.digest}.md`);
+      pending.guard();
+      if (!pending.retiring && await fs.lstat(canonical).catch(missing)) {
+        await this.finishPublishedApproval(pending, canonical, pending.guard);
+        return;
+      }
+      const claims = await this.scanApprovalClaims(new Set([pending.id]), new Set());
+      const candidates = claims.get(pending.id) || [];
+      if (candidates.length) {
+        if (pending.retiring || candidates.length !== 1) throw integrityError(name);
+        const [moved] = candidates;
+        const movedGuard = () => {
+          verifyAbsentSync(canonical, pending.guard);
+          moved.guard();
+        };
+        await this.finishPublishedApproval(pending, moved.file, movedGuard);
+        return;
+      }
+      await this.retireUnpublishedApproval(pending, stage, canonical);
+    } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
   async observeLegacy(version, candidate, guard, lockHeld) {
     const reserve = async () => {
@@ -180,13 +382,15 @@ class Briefs {
       try { present = local.lstatSync(file); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (present) {
-        const receipt = await this.receipt(version, name, guard);
+        const receipt = await this.receipt(version, name, guard, true);
         if (receipt.id !== data.record.id || receipt.digest !== proof.digest) throw integrityError(name);
         verifyStageSync(file, guard, receipt.proof);
         verifyStageSync(candidate.file, candidate.guard, proof);
         return receipt;
       }
-      const receiptProof = await writeStage(file, this.receiptBytes(version, data.record.id, proof.digest), guard);
+      const canonical = () => verifyStageSync(candidate.file, candidate.guard, proof);
+      const receiptGuard = () => { guard(); canonical(); };
+      const receiptProof = await this.publishMarker(file, this.receiptValue(version, data.record.id, proof.digest), receiptGuard);
       verifyStageSync(file, guard, receiptProof);
       verifyStageSync(candidate.file, candidate.guard, proof);
       return { id: data.record.id, digest: proof.digest, file, proof: receiptProof };
@@ -223,8 +427,10 @@ class Briefs {
     const inspected = new Map(), ids = new Set(), canonicalFiles = new Set();
     for (const [version, entry] of index.versions) {
       if (onlyVersion !== undefined && onlyVersion !== version) continue;
+      const recoveryError = index.errors?.get(version);
+      if (recoveryError) { inspected.set(version, { error: recoveryError }); continue; }
       try {
-        const receipt = await this.receipt(version, entry.receipt, index.guard);
+        const receipt = await this.receipt(version, entry.receipt, index.guard, lockHeld);
         let canonical;
         for (const name of entry.canonical) {
           const claim = await this.managedClaim(version, name, index.guard, receipt);
@@ -241,6 +447,9 @@ class Briefs {
         }
         inspected.set(version, { id, receipt, canonical });
       } catch (error) { inspected.set(version, { error }); }
+    }
+    for (const [version, error] of index.errors || []) {
+      if (!inspected.has(version)) inspected.set(version, { error });
     }
     const claims = await this.scanApprovalClaims(ids, canonicalFiles);
     index.guard();
@@ -274,7 +483,7 @@ class Briefs {
     return approvals;
   }
   async readStore({ onlyVersion, lockHeld = false } = {}) {
-    const index = await this.index();
+    const index = await this.recoveredIndex(onlyVersion, lockHeld);
     const approvals = await this.approvedInventory(index, onlyVersion, lockHeld);
     const records = [];
     for (const { record, error } of approvals.values()) {
@@ -300,11 +509,10 @@ class Briefs {
     this.assertSelection();
     await this.safe();
     const stage = path.join(this.dir, `.brief-stage-${randomUUID()}`), destination = path.join(this.dir, name);
-    const { guard } = ordinaryDirectories([this.vault.vault, this.vault.root, this.dir], 'The Briefs folder changed or is an alias. Files were preserved for inspection.');
+    const { guard, identities } = ordinaryDirectories([this.vault.vault, this.vault.root, this.dir], 'The Briefs folder changed or is an alias. Files were preserved for inspection.');
     const selected = () => { this.assertSelection(); guard(); };
-    let staged, reserved, linked = false;
+    let staged, pending, linked = false;
     const approved = record.kind === 'approved';
-    const receipt = approved && path.join(this.dir, receiptName(record.version));
     try {
       staged = await writeStage(stage, markdown(record, this.managedParent), selected);
       if (approved) {
@@ -316,33 +524,31 @@ class Briefs {
       verifyStageSync(stage, selected, staged);
       if (approved) {
         this.requireCurrentSourcesSync(record);
-        reserved = await writeStage(receipt, this.receiptBytes(record.version, record.id, staged.digest), selected);
-        verifyStageSync(receipt, selected, reserved);
+        const file = path.join(this.dir, pendingName(record.version));
+        const value = {
+          schema: 1, parent: this.managedParent, id: record.id, version: record.version,
+          stage: path.basename(stage), staged, identities
+        };
+        const proof = await this.publishMarker(file, value, selected, markerProof => {
+          pending = { ...value, file, proof: markerProof, guard: selected };
+        });
+        verifyStageSync(file, selected, proof);
         this.requireCurrentSourcesSync(record);
+        verifyAbsentSync(path.join(this.dir, receiptName(record.version)), selected);
+        verifyAbsentSync(path.join(this.dir, pendingName(record.version, 'retiring')), selected);
         verifyStageSync(stage, selected, staged);
       }
       selected();
       local.linkSync(stage, destination);
       linked = true;
-      await verifyPeers(stage, destination, guard, staged);
-      try { await removeStage(stage, guard, staged, 2, () => verifyStageSync(destination, guard, staged, 2)); }
+      try {
+        if (pending) await this.finishPublishedApproval(pending, destination, guard);
+        else await settlePublishedLink(stage, destination, guard, staged);
+      }
       catch (error) { throw Error(`The Project Brief was published, but stage cleanup could not be verified. Inspect the saved version before retrying. ${error.message}`); }
-      await verifyStage(destination, guard, staged);
-      if (reserved) verifyStageSync(receipt, guard, reserved);
       verifyStageSync(destination, guard, staged);
     } finally {
-      if (staged && !linked) await removeStage(stage, guard, staged).catch(() => {});
-      if (reserved && !linked) {
-        try {
-          verifyStageSync(receipt, guard, reserved);
-          try { local.lstatSync(destination); }
-          catch (error) {
-            if (error.code !== 'ENOENT') throw error;
-            guard();
-            local.unlinkSync(receipt);
-          }
-        } catch { /* Preserve a receipt when the unused reservation cannot be proved. */ }
-      }
+      if (staged && !pending && !linked) await removeStage(stage, guard, staged).catch(() => {});
     }
   }
   async readSources(paths) {
@@ -438,7 +644,7 @@ class Briefs {
     return { ...record, issues: await this.outdated(record) };
   }
   async pins() {
-    const inventory = await this.approvedInventory(await this.index());
+    const inventory = await this.approvedInventory(await this.recoveredIndex());
     const ordered = [...inventory].sort(([a], [b]) => a - b);
     return Promise.all(ordered.map(async ([version, { record, error }]) => record
       ? { version, pin: { ...record, issues: await this.outdated(record) } }
