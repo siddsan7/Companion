@@ -461,11 +461,11 @@ class Intake {
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
     await fs.unlink(intentFile);
   }
-  async publicationAuthority(tx, ledger) {
+  async publicationAuthority(tx, ledger, { verifyOnly = false } = {}) {
     if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed before publication. Refresh before retrying; changed authority was preserved.');
     assertPublication(ledger, tx.capture.id, tx);
     if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
-    this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
+    if (!verifyOnly || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
   }
   verifyReservedCaptureIdentity(ledger, id) {
     if (this.vault.reservedRestorationIdentities(ledger).captures.has(id)) {
@@ -613,8 +613,9 @@ class Intake {
     await rememberStage(snapshotStage, snapshotProof, snapshotBytes, snapshot);
     cleanup.push({ file: journal, info: journalInfo, content: journalBytes, label: 'Intake transaction', peers: journalPeers });
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
+    let committed = false;
     const verifyPublished = () => {
-      this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
+      if (!committed || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
       try {
         for (const item of [...outputs, ...cleanup]) verify(item);
       } catch (cause) {
@@ -622,7 +623,6 @@ class Intake {
         throw Object.assign(Error(`${outputHold} ${cause.message}`, { cause }), { intakeOutputChanged: true });
       }
     };
-    let committed = false;
     try {
       await this.vault.checkpoint('intake-published');
       await this.publicationAuthority(tx, ledger);
@@ -667,7 +667,9 @@ class Intake {
       committed = true;
       verifyPublished();
       await this.vault.checkpoint('intake-ledger');
-      await this.publicationAuthority(tx, ledger);
+      // An accepted ordinary transaction can only settle its exact owned
+      // outputs and journal. Later identity claims cannot undo its admission.
+      await this.publicationAuthority(tx, ledger, { verifyOnly: true });
       if (tx.restoreOperation) return;
       if (pending) {
         await this.acknowledgeDeferred(ledger, tx.sourceHash);
@@ -865,7 +867,6 @@ class Intake {
     if (!candidate) return null;
     const authority = ledger.sourceAuthority[id], { tx } = candidate;
     if (tx.sourceHash === authority.sourceHash || tx.capture.id === id) return null;
-    if (this.vault.reservedRestorationIdentities(ledger).captures.has(tx.capture.id)) return null;
     return candidate;
   }
   ordinaryRecoveryJournal(ledger) {
@@ -1011,7 +1012,11 @@ class Intake {
       }
       catch (error) {
         if (!error.intakeOutputHeld) {
-          if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message);
+          if (error.intakeConflict && !ledger.pending[sourceHash]?.acceptedCleanup) {
+            // The hold ledger must retain the exact pending alias identity
+            // before replacing the pending pointer, even before its new link.
+            await this.archiveConflict(tx, ledger, `${outputHold} ${error.message}`, { journalProof: proof, guard, committed: false });
+          }
           else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
           else throw error;
         }
