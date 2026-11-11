@@ -17,11 +17,17 @@ const { installAnnotationRemoval } = require('./annotation-removal');
 const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
 let codex, conversationProvider;
-const testRoot = process.env.COMPANION_TEST_ROOT;
+let testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
 const workerFile = process.argv[process.argv.indexOf('--schedule-file') + 1];
 const workerBinding = process.argv.indexOf('--schedule-id');
+async function resolveDataRoot(requested) {
+  const supplied = path.resolve(requested), actual = await fs.realpath(supplied);
+  // Case alone is not an alias on the supported Windows data volume. Keep the
+  // original spelling because an owned task validates its launch arguments.
+  return process.platform === 'win32' && supplied.toLowerCase() === actual.toLowerCase() ? supplied : actual;
+}
 function scheduleOptions() { return { testRoot, executable: process.execPath, appPath: app.getAppPath(), packaged: app.isPackaged }; }
 async function checkpoint(name) {
   if (!testRoot) return;
@@ -39,6 +45,7 @@ function clock() {
   return { now: new Date().toISOString(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
 }
 app.whenReady().then(async () => {
+  if (testRoot) testRoot = await resolveDataRoot(testRoot);
   if (workerMode) {
     try {
       if (!process.argv.includes('--schedule-file') || typeof workerFile !== 'string' || !path.isAbsolute(workerFile)) throw Error('Worker requires its absolute daily intake settings path.');
@@ -57,8 +64,12 @@ app.whenReady().then(async () => {
     } catch (error) { console.error(error.message); app.exit(1); }
     return;
   }
-  settingsPath = path.join(testRoot || app.getPath('userData'), 'settings.json');
-  codex = new CodexSetup({ dataRoot: path.join(testRoot || app.getPath('userData'), 'codex'), testRoot });
+  const requestedDataRoot = testRoot || app.getPath('userData');
+  await fs.mkdir(requestedDataRoot, { recursive: true });
+  // Keep every local store bound to the same original installation directory.
+  const dataRoot = testRoot || await resolveDataRoot(requestedDataRoot);
+  settingsPath = path.join(dataRoot, 'settings.json');
+  codex = new CodexSetup({ dataRoot: path.join(dataRoot, 'codex'), testRoot });
   ipcMain.handle('codex-state', () => codex.snapshot());
   ipcMain.handle('codex-action', (_, input) => codex.action(input, { vault: vault?.root }));
   try { const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8')); vault = new Vault(settings.vault, settings.parent, { checkpoint }); } catch (error) { if (error.code !== 'ENOENT') console.error('Cannot load settings:', error.message); }
@@ -168,14 +179,14 @@ app.whenReady().then(async () => {
   const evidence = new ConversationEvidence({ setup: codex, getVault: () => vault, settingsPath, testRoot });
   const getEvidence = () => evidence.read();
   let ideas;
-  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot: testRoot || app.getPath('userData'), getEvidence, ideaEligibility: (selected, id) => {
+  const context = installContext({ ipcMain, getVault: () => vault, dialog, testRoot, dataRoot, getEvidence, ideaEligibility: (selected, id) => {
     if (!ideas || ideas.getVault()?.root !== selected.root) throw Error('Selected vault changed. Inspect saved idea context again.');
     ideas.guard(selected);
     if (id) ideas.removal.allow(selected, id);
   } });
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
-  const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, testRoot });
+  const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot, clock, checkpoint, provider: conversationProvider, testRoot });
   installCaptureDeletion({ ipcMain, getVault: () => vault, conversations, clearApprovals: context.clearApprovals, clock });
   installAnnotationRemoval({ ipcMain, getVault: () => vault, clearApprovals: context.clearApprovals });
   installTranscripts({ ipcMain, conversations, getVault: () => vault, getContext: context.store, clock, checkpoint, choose: async selected => {
@@ -186,7 +197,7 @@ app.whenReady().then(async () => {
   ideas = installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
-  installComparisons({ ipcMain, getVault: () => vault, dataRoot: testRoot || app.getPath('userData'), clock, checkpoint, provider: conversationProvider, getEvidence });
+  installComparisons({ ipcMain, getVault: () => vault, dataRoot, clock, checkpoint, provider: conversationProvider, getEvidence });
   const fixtureRendering = testRoot ? { backgroundThrottling: false } : {};
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { ...fixtureRendering, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
