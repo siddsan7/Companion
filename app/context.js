@@ -191,8 +191,8 @@ class Context {
     try { ideas = await scanIdeas(this.vault); }
     catch (error) { issues.push(error.message); }
     for (const [id, claims] of ideas?.claims || []) {
-      if (!claims.some(claim => claim.isIdea)) continue;
-      const [claim] = claims;
+      const claim = claims.find(item => item.relevant);
+      if (!claim) continue;
       try {
         if (claims.length !== 1) throw Error(`duplicate identity ${id}; preserve and resolve these copies: ${claims.map(item => ideas.relative(item.file)).join(', ')}`);
         if (!claim.savedIdea || claim.stat.nlink !== 1n) throw Error('unsupported saved-idea record or linked file');
