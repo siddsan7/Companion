@@ -129,7 +129,7 @@ function selectionTransaction(tx, ledger, capture, sourceHash, revisions) {
     if (!fields(pending, ['reason', 'journal', 'key']) || pending.reason !== reason || pending.journal !== `pending-${tx.revision.id}-${tx.resolution}.json` || pending.key !== tx.key || capture.conflict !== undefined || !isDeepStrictEqual(outcome, { status: 'held', reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
   } else {
     const journal = `conflict-${tx.revision.id}-${tx.resolution}.json`;
-    if (!fields(block, ['reason', 'journal', 'incomingRevision']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
+    if (!fields(block, ['reason', 'journal', 'incomingRevision', 'outputHold']) || typeof block.reason !== 'string' || block.journal !== journal || block.incomingRevision !== tx.revision.id || capture.conflict !== block.reason || !isDeepStrictEqual(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail();
   }
   const authority = ledger.sourceAuthority?.[capture.id];
   if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
@@ -313,7 +313,13 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     const pointer = ledger[kind][sourceHash]; if (!pointer) continue;
     const journal = relative(intake, path.join(intake.dir, pointer.journal || ''));
     const tx = transactions.get(journal);
-    if (!tx || kind === 'blocks' && (!(detachedEditor ? isDeepStrictEqual(pointer, detachedEditor.block) : fields(pointer, ['reason', 'journal', 'incomingRevision'])) || pointer.incomingRevision !== tx.revision.id || capture.conflict !== pointer.reason) || kind === 'pending' && (!fields(pointer, ['reason', 'journal', 'key']) || pointer.key !== tx.key) || typeof pointer.reason !== 'string' || capture.conflict !== undefined && typeof capture.conflict !== 'string') fail();
+    if (!tx || kind === 'blocks' && (!(detachedEditor ? isDeepStrictEqual(pointer, detachedEditor.block) : fields(pointer, ['reason', 'journal', 'incomingRevision', 'outputHold'])) || pointer.incomingRevision !== tx.revision.id || capture.conflict !== pointer.reason) || kind === 'pending' && (!fields(pointer, ['reason', 'journal', 'key']) || pointer.key !== tx.key) || typeof pointer.reason !== 'string' || capture.conflict !== undefined && typeof capture.conflict !== 'string') fail();
+    if (kind === 'blocks' && pointer.outputHold !== undefined) {
+      const held = pointer.outputHold, target = targets.get(journal);
+      const pending = `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
+      if (!target || !intake.validOutputHold(held, pending) || held.journal.dev !== target.dev ||
+          held.journal.ino !== target.ino || held.journal.digest !== target.sha256) fail();
+    }
     recoveryPointers.push({ kind, journal, sha256: hash(JSON.stringify(pointer)), captureConflictSha256: capture.conflict === undefined ? null : hash(capture.conflict) });
   }
   const result = [...targets.values()].sort((a, b) => a.file.localeCompare(b.file)), proof = { targets: result, recovery };
@@ -359,7 +365,7 @@ function inspectPointers(ledger, authority) {
     const pointer = ledger[item.kind][authority.sourceHash];
     if ((capture.conflict === undefined ? null : hash(capture.conflict)) !== item.captureConflictSha256) fail();
     const descriptor = authority.recovery.find(entry => entry.file === item.journal && entry.format === 'transaction');
-    if (pointer && (hash(JSON.stringify(pointer)) !== item.sha256 || !fields(pointer, item.kind === 'blocks' ? ['reason', 'journal', 'incomingRevision'] : ['reason', 'journal', 'key']) || typeof pointer.reason !== 'string' || path.posix.basename(item.journal) !== pointer.journal || (item.kind === 'blocks' ? pointer.incomingRevision !== descriptor.revisionId : typeof pointer.key !== 'string' || !uuid(pointer.key.split(':')[0])))) fail();
+    if (pointer && (hash(JSON.stringify(pointer)) !== item.sha256 || !fields(pointer, item.kind === 'blocks' ? ['reason', 'journal', 'incomingRevision', 'outputHold'] : ['reason', 'journal', 'key']) || typeof pointer.reason !== 'string' || path.posix.basename(item.journal) !== pointer.journal || (item.kind === 'blocks' ? pointer.incomingRevision !== descriptor.revisionId : typeof pointer.key !== 'string' || !uuid(pointer.key.split(':')[0])))) fail();
   }
   for (const kind of ['blocks', 'pending']) if (ledger[kind][authority.sourceHash] && !authority.recoveryPointers.some(item => item.kind === kind)) fail();
 }

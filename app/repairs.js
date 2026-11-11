@@ -1,9 +1,11 @@
 const fs = require('node:fs/promises');
+const native = require('node:fs');
 const { assertAnnotationPublication, annotationRemoved, validateAnnotationRemovals } = require('./annotation-authority');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { parseAnnotation } = require('./vault');
 const { revisionAdmission, activeAdmission, validateAuthority } = require('./source-authority');
+const { verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 
 async function annotationAuthority(intake) {
   // A caller can still hold the ledger it loaded before an awaited publication.
@@ -15,6 +17,12 @@ async function annotationAuthority(intake) {
 }
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
+function admittedOutputHold(intake, ledger, sourceHash) {
+  const block = ledger.blocks[sourceHash];
+  if (!intake.isCommittedOutputHold(block)) return false;
+  const admission = revisionAdmission(ledger, block.incomingRevision);
+  return !!admission && admission.sourceHash === sourceHash && admission.captureId === ledger.captures[sourceHash]?.id;
+}
 function sourceLink(content, relative) {
   const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
   if (!frontmatter) return content;
@@ -51,7 +59,8 @@ function install(Intake, { hash, read, noteText }) {
       else ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) };
     }
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
-      if (capture.removed) continue;
+      // An output hold may deliberately retain a hardlinked capture stage.
+      if (capture.removed || ledger.blocks[sourceHash]?.outputHold) continue;
       if (ledger.identityIssues[capture.id]) { capture.identityIssue = ledger.identityIssues[capture.id].reason; continue; }
       if (capture.id === this.pendingTitleCapture) continue;
       delete capture.identityIssue;
@@ -261,8 +270,13 @@ function install(Intake, { hash, read, noteText }) {
       for (const [id, hold] of Object.entries(ledger.linkHolds || {})) items.push({ kind: 'annotation-link', id, ...hold });
       for (const [sourceHash, block] of Object.entries(ledger.blocks)) {
         if (!/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) continue;
-        const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
         const current = ledger.captures[sourceHash];
+        if (admittedOutputHold(this, ledger, sourceHash)) {
+          items.push({ kind: 'intake-output-hold', sourceHash, id: current.id, title: current.title, reason: block.reason });
+          continue;
+        }
+        const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
+        this.verifyHeldTransaction(ledger, tx);
         if (current?.identityIssue || current?.removed) continue;
         if (tx.sourceHash !== sourceHash || current && current.id !== tx.capture.id) throw Error('Conflict identity does not match current intake history. All files were preserved.');
         const file = this.destination(current || tx.capture);
@@ -276,10 +290,16 @@ function install(Intake, { hash, read, noteText }) {
   Intake.prototype.resolveConflict = async function ({ sourceHash, text, localHash }, now) {
     return this.locked(async () => {
       if (typeof text !== 'string' || !text.trim()) throw Error('Choose local writing to preserve in an annotation before applying the incoming revision.');
+      const checkHold = ledger => {
+        if (admittedOutputHold(this, ledger, sourceHash)) throw Error('This source has a publication hold. Keep its current and recovery files for inspection.');
+      };
+      checkHold(await this.load());
       await this.syncMoves();
       const ledger = await this.load(), block = ledger.blocks[sourceHash];
+      checkHold(ledger);
       if (!block || !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) throw Error('This source has no resolvable incoming conflict.');
       const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
+      this.verifyHeldTransaction(ledger, tx);
       const current = ledger.captures[sourceHash];
       if (!current || current.id !== tx.capture.id || tx.sourceHash !== sourceHash || current.identityIssue || current.removed || ledger.suppressed.includes(sourceHash)) throw Error('Resolve the current capture identity or missing-note state before transferring local writing.');
       const note = await this.vault.find(current.id), file = this.destination(current);
@@ -300,12 +320,61 @@ function install(Intake, { hash, read, noteText }) {
     });
   };
   Intake.prototype.finishRepair = async function () {
-    const intentFile = path.join(this.dir, 'repair-intent.json'), bytes = await read(intentFile); if (bytes === null) return;
+    const intentFile = path.join(this.dir, 'repair-intent.json');
+    const intentIdentity = await fs.lstat(intentFile, { bigint: true }).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!intentIdentity) return;
+    const bytes = await read(intentFile);
+    if (bytes === null) throw Error('The annotation repair intent changed. All remaining files were preserved.');
     const intent = JSON.parse(bytes), tx = intent.tx;
     this.validateTransaction(tx);
     if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
-    if (annotationRemoved(await annotationAuthority(this), intent.annotationId)) return { held: true, removed: true };
+    const owner = await annotationAuthority(this);
+    if (annotationRemoved(owner, intent.annotationId)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
+    const preserveOutputHold = (ledger, error) => {
+      if (!this.hasOutputHold(ledger, tx)) throw Error('The exact intake output hold changed. All files were preserved.');
+      const intentGuard = this.vault.publicationFolders(this.dir).guard;
+      const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
+      const guard = () => { intentGuard(); annotationGuard(); };
+      const archive = path.join(this.dir, `repair-${intent.annotationId}.json`);
+      const proof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
+      this.storage.guardSync();
+      guard();
+      if (native.lstatSync(archive, { throwIfNoEntry: false })) {
+        verifyStageSync(intentFile, guard, proof, 2);
+        verifyStageSync(archive, guard, proof, 2);
+      } else {
+        verifyStageSync(intentFile, guard, proof);
+        verifyAbsentSync(archive, guard);
+        native.linkSync(intentFile, archive);
+      }
+      // The annotation is already published. Only an exact owned pair can
+      // retire its stage. Independent edits and unknown copies stay intact.
+      try {
+        guard();
+        const staged = native.lstatSync(stage, { bigint: true, throwIfNoEntry: false });
+        if (staged) {
+          const annotationProof = { dev: String(staged.dev), ino: String(staged.ino), digest: hash(intent.annotation) };
+          verifyStageSync(stage, guard, annotationProof, 2);
+          verifyStageSync(file, guard, annotationProof, 2);
+          native.unlinkSync(stage);
+          verifyStageSync(file, guard, annotationProof);
+        }
+      } catch (cause) {
+        this.vault.warnings.push(`Held repair annotation files were preserved: ${cause.message}`);
+      }
+      this.storage.guardSync();
+      verifyStageSync(intentFile, guard, proof, 2);
+      verifyStageSync(archive, guard, proof, 2);
+      native.unlinkSync(intentFile);
+      verifyStageSync(archive, guard, proof);
+      if (error) throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for explicit repair.', { cause: error }), { intakeRepairHeld: true });
+      return { held: true };
+    };
+    if (this.hasOutputHold(owner, tx)) return preserveOutputHold(owner);
     const hold = async error => {
       // Retain the complete annotation intent before moving the active source
       // journal into its UUID-specific hold. Cleanup follows durable evidence.
@@ -355,6 +424,7 @@ function install(Intake, { hash, read, noteText }) {
       await this.save(ledger);
       try { await this.finish(tx, ledger); } catch (error) {
         if (error.keptCurrentFailure) return hold(error);
+        if (error.intakeOutputHeld) return preserveOutputHold(await annotationAuthority(this), error);
         if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message);
         else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
         else throw error;
