@@ -10,6 +10,11 @@ const changed = () => Object.assign(Error('Staging file or publication peer chan
 const validProof = proof => proof && typeof proof.dev === 'string' && typeof proof.ino === 'string' && typeof proof.digest === 'string' &&
   /^[0-9]+$/.test(proof.dev) && /^[0-9]+$/.test(proof.ino) && /^[a-f0-9]{64}$/.test(proof.digest);
 
+function checkFile(stat, before, links, expected) {
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== BigInt(links) || !same(stat, before) ||
+      expected && !same(identity(stat), expected)) throw changed();
+}
+
 function ordinaryDirectories(directories, message, expected) {
   const comparable = file => process.platform === 'win32' ? file.toLowerCase() : file;
   function directoryIdentity(directory) {
@@ -29,10 +34,7 @@ function ordinaryDirectories(directories, message, expected) {
 async function readExact(file, guard, links = 1, expected) {
   guard();
   const before = await fs.lstat(file, { bigint: true });
-  const check = stat => {
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== BigInt(links) || !same(stat, before) ||
-        expected && !same(identity(stat), expected)) throw changed();
-  };
+  const check = stat => checkFile(stat, before, links, expected);
   check(before);
   const handle = await fs.open(file, local.constants.O_RDONLY | (local.constants.O_NOFOLLOW || 0));
   try {
@@ -49,6 +51,30 @@ async function readExact(file, guard, links = 1, expected) {
   } finally { await handle.close(); }
 }
 
+// Final synchronous proof keeps cooperative mutations from yielding between
+// verification and the caller's filesystem operation. It is not an OS CAS.
+function readExactSync(file, guard, links = 1, expected) {
+  guard();
+  const options = { bigint: true }, before = local.lstatSync(file, options);
+  const check = stat => checkFile(stat, before, links, expected);
+  check(before);
+  const descriptor = local.openSync(file, local.constants.O_RDONLY | (local.constants.O_NOFOLLOW || 0));
+  try {
+    const opened = local.fstatSync(descriptor, options);
+    check(opened);
+    const bytes = local.readFileSync(descriptor), after = local.fstatSync(descriptor, options);
+    const leaf = local.lstatSync(file, options);
+    guard();
+    for (const stat of [before, after, leaf]) {
+      check(stat);
+      if (stat.size !== BigInt(bytes.length) || stat.mtimeNs !== opened.mtimeNs || stat.ctimeNs !== opened.ctimeNs) throw changed();
+    }
+    const proof = { ...identity(leaf), digest: digest(bytes) };
+    if (expected && proof.digest !== expected.digest) throw changed();
+    return { bytes, proof };
+  } finally { local.closeSync(descriptor); }
+}
+
 async function writeStage(file, content, guard) {
   const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
   guard();
@@ -63,6 +89,11 @@ async function writeStage(file, content, guard) {
 
 async function verifyStage(file, guard, proof, links = 1) {
   try { return await readExact(file, guard, links, proof); }
+  catch (error) { if (error.code === 'ENOENT') throw changed(); throw error; }
+}
+
+function verifyStageSync(file, guard, proof, links = 1) {
+  try { return readExactSync(file, guard, links, proof); }
   catch (error) { if (error.code === 'ENOENT') throw changed(); throw error; }
 }
 
@@ -91,4 +122,4 @@ async function settlePublishedLink(stage, destination, guard, proof) {
   await verifyStage(destination, guard, proof);
 }
 
-module.exports = { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink };
+module.exports = { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyPeers, removeStage, validProof, settlePublishedLink };
