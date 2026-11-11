@@ -58,11 +58,17 @@ function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabl
 function restoreChoices() { return [...archiveConflicts.querySelectorAll('select')].map(select => ({ id: select.dataset.conversationId, choice: select.value })); }
 function selectedArchiveNotes() { return [...archiveNotes.querySelectorAll('input:checked')].map(input => input.dataset.noteFile); }
 function updateRestoreConfirmation() { archiveRestore.disabled = !archiveRestoreToken || archiveMissing === 0 && selectedArchiveNotes().length === 0 && archiveMetadata === 0 || archiveMetadataConflicts > 0 || restoreChoices().some(resolution => resolution.choice !== 'keep-current'); }
+function updateArchiveMatchControls() {
+  for (const control of [archiveMatch, archiveSource, archiveSettings]) control.disabled = !archiveInspection;
+  archiveMatchPreview.disabled = !archiveInspection || !archiveMatch.checked || !archiveSource.value;
+}
+updateArchiveMatchControls();
 archiveMatch.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; };
 archiveSource.onchange = () => { archiveMatch.checked = false; invalidateRestore(); archiveMatchPreview.disabled = true; };
 archiveSettings.onchange = () => { invalidateRestore(); archiveMatchPreview.disabled = !archiveMatch.checked || !archiveInspection || !archiveSource.value; };
 archiveInspect.onclick = async () => {
   archiveInspection = null; invalidateRestore(); archiveMatch.checked = false; archiveSettings.value = 'keep-current'; archiveMatchPreview.disabled = true; archiveInspect.disabled = true;
+  updateArchiveMatchControls();
   try {
     const result = await window.companion['archive-inspect']();
     if (result.cancelled) { archiveRestoreSummary.textContent = 'Inspection cancelled. Nothing was restored.'; return; }
@@ -73,8 +79,8 @@ archiveInspect.onclick = async () => {
     archiveRestoreSummary.textContent = `Integrity and version validated. ${result.missing} missing conversation${result.missing === 1 ? '' : 's'}, ${result.equal} equal, ${result.conflicts} conflicting. Archive vault hints: ${result.roots.join('; ') || 'None'}. Current vault: ${result.currentVault || 'None selected'}. Paths and matching content do not prove vault identity. Current settings and source exclusions remain authoritative. Restore adds only reviewed missing conversations; it does not restore vault files, replace settings or connect a scheduled task. Explicit vault matching is required.`;
     if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Omission metadata is inert and cannot restore their missing content.`;
     showCodexHints(result.codexHints);
-  } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
-  finally { archiveInspect.disabled = false; }
+  } catch (error) { archiveInspection = null; archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+  finally { archiveMatch.checked = false; archiveInspect.disabled = false; updateArchiveMatchControls(); }
 };
 archiveMatchPreview.onclick = async () => {
   invalidateRestore(); archiveMatchPreview.disabled = true;
@@ -119,7 +125,7 @@ archiveRestore.onclick = async () => {
     if (result.preservedMetadata) archiveRestoreSummary.textContent += ` Preserved ${result.preservedMetadata} inert settings records. Active settings and task/provider connections were not changed.`;
     await showArchiveIntents();
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); archiveInspection = null; }
-  finally { archiveInspect.disabled = false; }
+  finally { archiveInspect.disabled = false; updateArchiveMatchControls(); }
 };
 async function showArchiveIntents() {
   try {
