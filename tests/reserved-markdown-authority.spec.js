@@ -1,7 +1,7 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { AnnotationRemoval } = require('../app/annotation-removal');
@@ -10,6 +10,7 @@ const { CaptureDeletion } = require('../app/capture-deletion');
 const { Context } = require('../app/context');
 const { Conversations } = require('../app/conversations');
 const { scanIdeas } = require('../app/idea-inventory');
+const { installIdeas } = require('../app/ideas');
 const { Intake } = require('../app/intake');
 const { Vault } = require('../app/vault');
 const draft = require('./fixtures/reel-draft/example.json');
@@ -18,6 +19,7 @@ const now = '2026-11-08T06:59:00.000Z';
 const later = '2026-11-09T06:59:00.000Z';
 const sourceHash = 'a'.repeat(64);
 const execute = promisify(execFile);
+const digest = value => createHash('sha256').update(value).digest('hex');
 const identity = async file => {
   const { dev, ino } = await fs.lstat(file, { bigint: true });
   return [dev, ino];
@@ -27,19 +29,27 @@ const absent = file => fs.stat(file).then(() => false, error => {
   throw error;
 });
 
-async function publishedRestoration(testInfo, folderName) {
-  const directory = testInfo.outputPath('vault'), producer = testInfo.outputPath('producer');
-  const artifact = path.join(producer, 'draft'), clip = 'b'.repeat(64);
-  await fs.mkdir(directory, { recursive: true });
+async function writeDraftFixture(producer, name, input, attempt) {
+  const artifact = path.join(producer, name), clip = 'b'.repeat(64);
   await fs.mkdir(artifact, { recursive: true });
   await fs.writeFile(path.join(artifact, 'run.json'), JSON.stringify({
-    job_id: clip, attempt_id: '1'.repeat(32), started_utc: now, input_sha256: sourceHash,
+    job_id: clip, attempt_id: attempt.repeat(32), started_utc: now, input_sha256: input,
     input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
   }));
   await fs.writeFile(path.join(artifact, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
   await fs.writeFile(path.join(artifact, 'first-pass-target.json'), JSON.stringify(draft.target));
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(artifact, 'notes.md'));
+  return artifact;
+}
 
+async function publishedRestoration(testInfo, folderName, { independent = false, outsideManaged = false, beforeMove } = {}) {
+  const directory = testInfo.outputPath('vault'), producer = testInfo.outputPath('producer');
+  const artifact = await writeDraftFixture(producer, 'draft', sourceHash, '1');
+  if (independent) {
+    await writeDraftFixture(producer, 'citation', 'c'.repeat(64), '2');
+    await writeDraftFixture(producer, 'unaffected', 'd'.repeat(64), '3');
+  }
+  await fs.mkdir(directory, { recursive: true });
   const interruption = Error('Stopped after restoration publication.');
   const vault = new Vault(await fs.realpath(directory), 'Companion', { checkpoint: async boundary => {
     if (boundary === 'capture-restoration-published') throw interruption;
@@ -47,10 +57,11 @@ async function publishedRestoration(testInfo, folderName) {
   await vault.setup();
   const intake = new Intake(vault), accepted = await intake.connect(producer, true, now);
   const capture = accepted.captures[sourceHash], original = intake.destination(capture);
-  const targetFolder = path.join(vault.root, folderName);
+  const targetFolder = path.join(outsideManaged ? vault.vault : vault.root, folderName);
   await fs.mkdir(targetFolder, { recursive: true });
   const reserved = path.join(targetFolder, path.basename(original));
   if (original !== reserved) {
+    await beforeMove?.(vault, reserved);
     await fs.rename(original, reserved);
     expect(intake.destination((await intake.info()).captures[sourceHash])).toBe(reserved);
   }
@@ -69,6 +80,201 @@ async function publishedRestoration(testInfo, folderName) {
   const journal = path.join(intake.dir, authority.restoration.journal);
   return { vault, intake, reserved, captureId: capture.id, authority, journal, journalBytes: await fs.readFile(journal) };
 }
+
+test('reserved restoration direct reads cannot offer an exact foreign capture citation', async ({}, testInfo) => {
+  const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures', { independent: true });
+  const ledger = await intake.load(), cited = ledger.captures['c'.repeat(64)], unaffected = ledger.captures['d'.repeat(64)];
+  const ideas = installIdeas({ ipcMain: { handle() {} }, getVault: () => vault });
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision, true)).resolves.toMatchObject({ capture: { id: cited.id } });
+  const ordinary = intake.destination(cited), original = testInfo.outputPath('original-cited-capture.md');
+  const citedBytes = await fs.readFile(ordinary), citedIdentity = await identity(ordinary);
+  await fs.rename(ordinary, original);
+  const { displaced, before, replacementIdentity } = await replaceRestoration(testInfo, reserved, citedBytes);
+  expect(replacementIdentity).not.toEqual(citedIdentity);
+
+  await expect.soft(ideas.revision(vault, cited.id, cited.currentRevision, true)).rejects.toThrow(/reserved|capture identity|unavailable/i);
+  await expect(ideas.revision(vault, unaffected.id, unaffected.currentRevision, true)).resolves.toMatchObject({ capture: { id: unaffected.id } });
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision)).resolves.toMatchObject({
+    revision: { id: cited.currentRevision, captureId: cited.id }
+  });
+  expect(await absent(ordinary)).toBe(true);
+  expect(await fs.readFile(original)).toEqual(citedBytes);
+  expect(await identity(original)).toEqual(citedIdentity);
+  expect(await fs.readFile(reserved)).toEqual(citedBytes);
+  expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(displaced)).toEqual(before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+});
+
+for (const claim of ['reserved claim', 'new ordinary duplicate', 'new ordinary duplicate with a YAML document marker']) test(`idea confirmation holds a selected citation changed by a ${claim} after preview`, async ({}, testInfo) => {
+  const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures', { independent: true });
+  const replacement = 'An ordinary restoration replacement before citation review.\n';
+  const initial = await replaceRestoration(testInfo, reserved, replacement);
+  const context = new Context(vault, { scopeFile: testInfo.outputPath('scope', 'notes.json') });
+  const briefStore = new Briefs(vault), readme = testInfo.outputPath('README.md');
+  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
+  const { proposed } = await briefStore.propose([readme], now);
+  const approved = await briefStore.approve({
+    id: proposed.id, digest: proposed.digest,
+    sections: proposed.sections.map(section => section.text),
+    references: proposed.sections.map(section => section.references
+      .map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+  }, now);
+  const { id: briefId, version, digest: briefDigest } = approved.approved[0];
+  const ledger = await intake.load(), cited = ledger.captures['c'.repeat(64)], unaffected = ledger.captures['d'.repeat(64)];
+  const citedFile = intake.destination(cited), citedBytes = await fs.readFile(citedFile);
+  const citedIdentity = await identity(citedFile), duplicate = path.join(vault.vault, 'New capture claim.md');
+  const duplicateBytes = claim.endsWith('YAML document marker')
+    ? Buffer.concat([Buffer.from('---\n'), citedBytes])
+    : citedBytes;
+  const originalCited = testInfo.outputPath('original-cited-before-confirm.md'), displacedReplacement = testInfo.outputPath('prior-reserved-replacement.md');
+  const source = (await context.corpus()).all.find(item => item.captureId === cited.id && item.revisionId === cited.currentRevision);
+  expect(source).toBeDefined();
+  const conversationId = randomUUID(), requestId = randomUUID(), reply = 'A possible training exercise inspired by the source.';
+  const conversations = {
+    read: async id => {
+      expect(id).toBe(conversationId);
+      return record;
+    },
+    getContext: async () => context
+  };
+  const ideas = installIdeas({ ipcMain: { handle() {} }, getVault: () => vault, conversations, clock: () => ({ now }), checkpoint: async () => {} });
+  const current = await ideas.revision(vault, cited.id, cited.currentRevision, true);
+  const evidence = current.revision.evidence.evidence[0];
+  expect(evidence.text).toBeTruthy();
+  const packageText = `${source.provenance}\n${current.revision.text}\n${evidence.text}`.replace(/\r\n?/g, '\n');
+  const dependency = {
+    key: source.key, digest: source.digest, captureId: cited.id, revisionId: cited.currentRevision,
+    ...(source.sourceGenerations ? { sourceGenerations: source.sourceGenerations } : {})
+  };
+  const record = {
+    id: conversationId, vault: { root: vault.root }, brief: { id: briefId, version, digest: briefDigest }, scope: { excludedSources: [] },
+    requests: [{ id: requestId, status: 'completed', reply, package: { text: packageText, digest: digest(packageText), dependencies: [dependency] } }]
+  };
+  const offered = await ideas.draft({ conversationId, requestId });
+  const chosen = offered.references.find(reference => reference.excerpt === evidence.text);
+  expect(chosen).toBeDefined();
+  const proposal = await ideas.preview({
+    conversationId, requestId, title: 'Training exercise', explanation: reply, limitations: 'The exercise has not been tested.',
+    referenceIds: [chosen.referenceId]
+  });
+  expect(proposal.text).toContain(`evidence_id: ${evidence.id}`);
+
+  const preview = ideas.preview.bind(ideas);
+  let changed = false, duplicateIdentity;
+  ideas.preview = async (input, retained) => {
+    const checked = await preview(input, retained);
+    if (retained?.operation === proposal.operation && !changed) {
+      // Let the real confirmation finish its last preview, then change the source files.
+      if (claim === 'reserved claim') {
+        await fs.rename(citedFile, originalCited);
+        await fs.rename(reserved, displacedReplacement);
+        await fs.writeFile(reserved, citedBytes, { flag: 'wx' });
+      } else {
+        await fs.writeFile(duplicate, duplicateBytes, { flag: 'wx' });
+        duplicateIdentity = await identity(duplicate);
+        expect(duplicateIdentity).not.toEqual(citedIdentity);
+        const recognized = (await vault.scan()).filter(note => note.id === cited.id).map(note => note.file).sort();
+        expect(recognized).toEqual([citedFile, duplicate].sort());
+      }
+      changed = true;
+    }
+    return checked;
+  };
+  await expect.soft(ideas.confirm({ operation: proposal.operation })).rejects.toThrow(/reserved|identity|evidence|changed|unavailable/i);
+  expect(changed).toBe(true);
+  const directory = path.join(vault.root, '.ideas'), stage = path.join(directory, `${proposal.operation}.md.pending`);
+  expect.soft(await absent(proposal.destination)).toBe(true);
+  expect.soft(await absent(path.join(directory, `${proposal.operation}.published.json`))).toBe(true);
+  expect.soft(await absent(stage)).toBe(false);
+  if (!await absent(stage)) expect(await fs.readFile(stage, 'utf8')).toBe(proposal.text);
+  if (claim === 'reserved claim') {
+    expect(await absent(citedFile)).toBe(true);
+    expect(await fs.readFile(originalCited)).toEqual(citedBytes);
+    expect(await fs.readFile(reserved)).toEqual(citedBytes);
+    expect(await identity(displacedReplacement)).toEqual(initial.replacementIdentity);
+  } else {
+    expect(await fs.readFile(citedFile)).toEqual(citedBytes);
+    expect(await identity(citedFile)).toEqual(citedIdentity);
+    expect(await fs.readFile(duplicate)).toEqual(duplicateBytes);
+    expect(await identity(duplicate)).toEqual(duplicateIdentity);
+    expect(await fs.readFile(reserved, 'utf8')).toBe(replacement);
+    expect(await identity(reserved)).toEqual(initial.replacementIdentity);
+  }
+  expect(await fs.readFile(initial.displaced)).toEqual(initial.before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+  await expect(ideas.revision(vault, unaffected.id, unaffected.currentRevision, true)).resolves.toMatchObject({ capture: { id: unaffected.id } });
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision)).resolves.toMatchObject({ revision: { id: cited.currentRevision } });
+});
+
+test('current citation holds an excluded capture copy changed after an acknowledged identity scan', async ({}, testInfo) => {
+  const { vault, intake, reserved } = await publishedRestoration(testInfo, 'Captures', { independent: true });
+  await replaceRestoration(testInfo, reserved, 'An ordinary restoration replacement.\n');
+  const cited = (await intake.load()).captures['c'.repeat(64)], canonical = intake.destination(cited);
+  const originalBytes = await fs.readFile(canonical), copy = path.join(vault.vault, 'Excluded capture copy.md');
+  const excluded = Buffer.concat([originalBytes, Buffer.from('\nIndependent writing in the excluded copy.\n')]);
+  const edited = Buffer.concat([excluded, Buffer.from('\nA later edit changes the acknowledged identity choice.\n')]);
+  await fs.writeFile(copy, excluded, { flag: 'wx' });
+  const issue = (await intake.info()).identityIssues[cited.id];
+  expect(issue.kind).toBe('duplicate');
+  const file = path.relative(vault.vault, canonical);
+  await intake.chooseIdentity({ id: cited.id, file, token: issue.token });
+  expect((await intake.load()).identityChoices[cited.id].file).toBe(file);
+  const ideas = installIdeas({ ipcMain: { handle() {} }, getVault: () => vault });
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision, true)).resolves.toMatchObject({ capture: { id: cited.id } });
+
+  const scan = vault.scan.bind(vault);
+  let changed = false;
+  vault.scan = async options => {
+    const matches = await scan(options);
+    if (!changed && matches.some(note => note.file === copy && note.id === cited.id)) {
+      await fs.writeFile(copy, edited);
+      changed = true;
+    }
+    return matches;
+  };
+  await expect.soft(ideas.revision(vault, cited.id, cited.currentRevision, true)).rejects.toThrow(/identity|changed|unavailable/i);
+  expect(changed).toBe(true);
+  expect(await fs.readFile(canonical)).toEqual(originalBytes);
+  expect(await fs.readFile(copy)).toEqual(edited);
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision)).resolves.toMatchObject({ revision: { id: cited.currentRevision } });
+});
+
+test('reserved restoration direct reads cannot supply an explicit note outside Companion', async ({}, testInfo) => {
+  const scopeFile = testInfo.outputPath('scope', 'notes.json');
+  const priorText = 'An ordinary note before the capture moved.\n';
+  const replacement = 'Independent writing at a reserved restoration path.\n';
+  let context, ordinary;
+  const { intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Independent notes', {
+    outsideManaged: true,
+    beforeMove: async (vault, destination) => {
+      context = new Context(vault, { scopeFile });
+      ordinary = path.join(path.dirname(destination), 'Unaffected ordinary note.md');
+      await fs.writeFile(destination, priorText, { flag: 'wx' });
+      await fs.writeFile(ordinary, 'Ordinary project evidence.\n', { flag: 'wx' });
+      await context.include([destination, ordinary]);
+      expect(await context.scope()).toEqual([destination, ordinary]);
+      await fs.rename(destination, testInfo.outputPath('prior-explicit-note.md'));
+    }
+  });
+  const { displaced, before, replacementIdentity } = await replaceRestoration(testInfo, reserved, replacement);
+  const scopeBytes = await fs.readFile(scopeFile);
+  await expect.soft(context.note(reserved)).rejects.toThrow(/reserved|restor|unavailable/i);
+  await expect.soft(context.include([reserved])).rejects.toThrow(/reserved|restor|unavailable/i);
+  await expect(context.note(ordinary)).resolves.toMatchObject({ title: path.basename(ordinary), text: 'Ordinary project evidence.\n' });
+  const { all } = await context.corpus();
+  expect.soft(all.map(source => source.title)).not.toContain(path.basename(reserved));
+  expect(all.map(source => source.title)).toContain(path.basename(ordinary));
+  expect(await fs.readFile(scopeFile)).toEqual(scopeBytes);
+  expect(await fs.readFile(testInfo.outputPath('prior-explicit-note.md'), 'utf8')).toBe(priorText);
+  expect(await fs.readFile(reserved, 'utf8')).toBe(replacement);
+  expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(displaced)).toEqual(before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+});
 
 async function replaceRestoration(testInfo, reserved, replacement) {
   const displaced = testInfo.outputPath('original-restoration.md');

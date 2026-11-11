@@ -88,7 +88,7 @@ async function readNoteScope(file, { guard = () => {}, assertSelection = () => {
   });
 }
 
-async function changeNoteScope(file, { update, guard = () => {}, assertSelection = () => {}, beforePublish = async () => {}, beforeFirstLink = async () => {}, committed = () => {} }) {
+async function changeNoteScope(file, { update, guard = () => {}, assertSelection = () => {}, beforePublish = async () => {}, beforeFirstLink = async () => {}, verifyRelated = () => {}, committed = () => {} }) {
   const directory = path.dirname(file);
   assertSelection(); guard();
   const parent = ordinaryDirectories([path.dirname(directory)], folderChanged);
@@ -113,6 +113,7 @@ async function changeNoteScope(file, { update, guard = () => {}, assertSelection
         verifyStageSync(file, selected, current.proof);
         verifyStageSync(stage, selected, staged);
         selected();
+        verifyRelated();
         local.renameSync(stage, file);
         published = true;
         await verifyStage(file, pinned, staged);
@@ -127,6 +128,7 @@ async function changeNoteScope(file, { update, guard = () => {}, assertSelection
         verifyStageSync(receipt, selected, recorded);
         verifyStageSync(stage, selected, staged);
         absent(file, selected, scopeChanged);
+        verifyRelated();
         local.linkSync(stage, file);
         published = true;
         await verifyPeers(stage, file, pinned, staged);

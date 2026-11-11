@@ -9,6 +9,8 @@ const { readNoteScope, changeNoteScope } = require('./note-scope');
 const { scanIdeas } = require('./idea-inventory');
 const { createHash, randomUUID } = require('node:crypto');
 const { revisionAdmission } = require('./source-authority');
+const { comparable } = require('./legacy-capture-ownership');
+const { ordinaryDirectories, readExactSync, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance } = require('./source-generations');
 const digest = text => createHash('sha256').update(text).digest('hex');
 const body = content => content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '').trim();
@@ -57,27 +59,54 @@ class Context {
   async scope() {
     return (await readNoteScope(this.scopeFile, { assertSelection: this.assertSelection }))?.value.files || [];
   }
-  async note(file) {
+  async noteReservation() {
+    const intake = new Intake(this.vault);
+    const reserved = this.vault.reservedRestorationPaths(await intake.load());
+    const { directories, missing } = intake.storage.expected.parents;
+    const missingLedgerGuard = missing
+      ? ordinaryDirectories(directories.map(directory => directory.file), 'Intake folders changed during note selection.', directories).guard
+      : null;
+    return file => {
+      if (missingLedgerGuard) verifyAbsentSync(intake.dir, missingLedgerGuard);
+      else intake.storage.guardSync();
+      reserved.guard();
+      const relative = comparable(path.relative(this.vault.vault, file).split(path.sep).join('/'));
+      if (reserved.paths.has(relative)) throw Error('This note path is reserved for source restoration. Explicit context is unavailable.');
+    };
+  }
+  async readExplicitNote(file, requireAvailable) {
     if (!path.isAbsolute(file) || !/\.(md|txt)$/i.test(file)) throw Error('Choose a Markdown or text note in the selected vault.');
     await this.vault.contained(file);
     const relative = path.relative(this.vault.root, file);
     if (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)) throw Error('Managed material must use its eligible context source, not explicit note inclusion.');
-    const stat = await fs.lstat(file); if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('Choose an ordinary unlinked vault note.');
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(file));
+    requireAvailable ||= await this.noteReservation();
+    const { guard: guardParents } = this.vault.publicationFolders(path.dirname(file));
+    const guard = () => { requireAvailable(file); guardParents(); };
+    guard();
+    const stat = local.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('Choose an ordinary unlinked vault note.');
+    const { bytes, proof } = readExactSync(file, guard);
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
     const metadata = match && YAML.parse(match[1]);
     if (metadata && typeof metadata === 'object' && (Object.hasOwn(metadata, 'companion_id') || ['capture', 'annotation', 'saved_idea', 'project_brief', 'conversation_transcript'].includes(metadata.artifact_type))) throw Error('Managed artifact metadata cannot bypass context eligibility through note inclusion.');
-    return { key: `note:${digest(file)}`, title: path.basename(file), text, provenance: `Explicit vault note ${path.basename(file)}; sha256 ${digest(text)}; user selected; not independently verified`, digest: digest(text) };
+    const note = { key: `note:${digest(file)}`, title: path.basename(file), text, provenance: `Explicit vault note ${path.basename(file)}; sha256 ${digest(text)}; user selected; not independently verified`, digest: digest(text) };
+    return { note, verify: () => verifyStageSync(file, guard, proof) };
   }
-  async changeScope(update, revalidate = async () => {}) {
+  async note(file) {
+    return (await this.readExplicitNote(file)).note;
+  }
+  async changeScope(update, revalidate = async () => () => {}) {
+    let verify = () => {};
     try {
       return await changeNoteScope(this.scopeFile, {
         update,
         assertSelection: this.assertSelection,
+        verifyRelated: () => verify(),
         beforePublish: async () => {
           await this.vault.checkpoint('context-before-scope-publish');
           this.assertSelection();
-          await revalidate();
+          verify = await revalidate();
         }
       });
     } catch (error) {
@@ -87,9 +116,12 @@ class Context {
   }
   async include(files) {
     if (!Array.isArray(files)) throw Error('Choose explicit vault notes.');
+    const requireAvailable = await this.noteReservation();
     const validate = async () => {
       this.assertSelection();
-      for (const file of files) await this.note(file);
+      const notes = [];
+      for (const file of files) notes.push(await this.readExplicitNote(file, requireAvailable));
+      return () => { for (const { verify } of notes) verify(); };
     };
     await validate();
     await this.changeScope(current => [...new Set([...current, ...files])], validate);

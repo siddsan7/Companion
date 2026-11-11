@@ -4,14 +4,16 @@ const path = require('node:path');
 const YAML = require('yaml');
 const { createHash } = require('node:crypto');
 const { uuid } = require('./source-authority');
-const { comparable } = require('./legacy-capture-ownership');
+const { comparable, storeName } = require('./legacy-capture-ownership');
 const { ordinaryDirectories, verifyAbsentSync } = require('./staged-publication');
+const { parse: parseCapture } = require('./vault');
 
 const decode = new TextDecoder('utf-8', { fatal: true });
 const frontMatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 const same = (before, after) => before.dev === after.dev && before.ino === after.ino && before.mode === after.mode &&
   before.size === after.size && before.nlink === after.nlink && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs;
 const privateStores = new Set(['.codex', '.git', '.ideas', '.intake', '.obsidian', '.transcripts', 'managed-home']);
+const capturePrivateStores = new Set(['.intake', '.obsidian', '.git', '.codex', 'managed-home', storeName]);
 const inode = stat => `${stat.dev}:${stat.ino}`;
 const sha256 = text => createHash('sha256').update(text).digest('hex');
 const idPattern = '[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}';
@@ -52,15 +54,19 @@ async function readHeader(handle, size) {
   return { header, complete: false };
 }
 
-async function scanIdeas(vault) {
+async function scanIdeas(vault, { captureIds = new Set() } = {}) {
   const root = path.resolve(vault.vault), managed = path.resolve(vault.root), ideas = path.join(managed, 'Ideas');
-  const claims = new Map(), observed = new Map(), publications = new Map();
+  const claims = new Map(), captureClaims = new Map(), observed = new Map(), publications = new Map();
   const intake = new (require('./intake').Intake)(vault);
   const reserved = vault.reservedRestorationIdentities(await intake.load());
   const relative = file => path.relative(root, file) || '.';
   const unavailable = (file, reason) => Error(`Saved idea identity inspection unavailable at ${relative(file)}. ${reason} Restore access or repair the metadata and retry.`);
   const changed = file => unavailable(file, 'Vault entries changed during inspection.');
   const stable = (file, before, after) => { if (!same(before, after)) throw changed(file); };
+  const observe = (file, stat) => {
+    if (observed.has(file)) stable(file, observed.get(file), stat);
+    else observed.set(file, stat);
+  };
   const { directories, missing } = intake.storage.expected.parents;
   const missingLedgerGuard = missing
     ? ordinaryDirectories(directories.map(directory => directory.file), changed(intake.dir).message, directories).guard
@@ -76,7 +82,7 @@ async function scanIdeas(vault) {
       const result = await work(handle);
       stable(file, before, await handle.stat({ bigint: true }));
       stable(file, before, await fs.lstat(file, { bigint: true }));
-      observed.set(file, before);
+      observe(file, before);
       return result;
     } finally { await handle.close(); }
   }
@@ -85,7 +91,7 @@ async function scanIdeas(vault) {
     if (!before.isDirectory() || before.isSymbolicLink() || await fs.realpath(directory) !== directory) throw changed(directory);
     const children = await fs.readdir(directory, { withFileTypes: true });
     stable(directory, before, await fs.lstat(directory, { bigint: true }));
-    observed.set(directory, before);
+    observe(directory, before);
     return children;
   }
 
@@ -137,14 +143,24 @@ async function scanIdeas(vault) {
     claims.get(id).push({ id, ...claim });
   }
 
-  async function markdown(file, stat, publishedIds) {
+  async function markdown(file, stat, publishedIds, scanIdea, scanCapture) {
     const localIdea = inside(ideas, file), retainedIds = publishedIds.get(inode(stat)) || [];
     const isReserved = reserved.paths.has(comparable(relative(file).split(path.sep).join('/')));
     await inspect(file, stat, async handle => {
+      const captureBytes = scanCapture ? await readBytes(file, stat, handle) : null;
+      if (captureBytes) {
+        const capture = parseCapture(captureBytes.toString('utf8'));
+        if (captureIds.has(capture?.id)) {
+          if (!captureClaims.has(capture.id)) captureClaims.set(capture.id, []);
+          captureClaims.get(capture.id).push(file);
+        }
+      }
+      if (!scanIdea) return;
       const front = await readHeader(handle, stat.size);
+      const header = front?.complete && Buffer.from(front.header, 'latin1');
       let metadata;
-      if (front?.complete) {
-        try { metadata = parseHeader(decode.decode(Buffer.from(front.header, 'latin1'))); }
+      if (header) {
+        try { metadata = parseHeader(decode.decode(header)); }
         catch { /* An invalid UTF-8 header can still contain an ASCII identity. */ }
       }
       const rawId = metadata?.companion_id, id = typeof rawId === 'string' && rawId.toLowerCase();
@@ -168,18 +184,24 @@ async function scanIdeas(vault) {
       const recordedDestination = publications.get(id)?.destination === file;
       const owned = !isReserved && (retainedIds.includes(id) || recordedDestination || localIdea && isIdea && !publications.has(id));
       const savedIdea = owned && isIdea && metadata.schema_version === 1 && rawId === id;
-      const content = savedIdea ? decode.decode(await readBytes(file, stat, handle)) : undefined;
+      const content = savedIdea ? decode.decode(captureBytes ?? await readBytes(file, stat, handle)) : undefined;
       record(id, { file, stat, relevant: owned || localIdea && isReserved && isIdea || publications.has(id), savedIdea, ...(savedIdea ? { content, metadata } : {}) });
     });
   }
 
-  async function visit(directory, before, publishedIds) {
+  async function visit(directory, before, publishedIds, ideaNamespace, captureNamespace) {
     for (const entry of await entries(directory, before)) {
       const file = path.join(directory, entry.name);
-      if (privateStores.has(entry.name.toLowerCase()) || entry.isSymbolicLink() || !entry.isDirectory() && !/\.md$/i.test(entry.name)) continue;
+      const name = entry.name.toLowerCase();
+      const scanIdea = ideaNamespace && !privateStores.has(name);
+      const scanCapture = captureNamespace && !capturePrivateStores.has(name);
+      if (entry.isSymbolicLink() || !scanIdea && !scanCapture) continue;
+      const ideaMarkdown = scanIdea && /\.md$/i.test(entry.name);
+      const captureMarkdown = scanCapture && entry.name.endsWith('.md');
+      if (!entry.isDirectory() && !ideaMarkdown && !captureMarkdown) continue;
       const stat = await fs.lstat(file, { bigint: true });
-      if (entry.isDirectory()) await visit(file, stat, publishedIds);
-      else if (entry.isFile()) await markdown(file, stat, publishedIds);
+      if (entry.isDirectory()) await visit(file, stat, publishedIds, scanIdea, scanCapture);
+      else if (entry.isFile()) await markdown(file, stat, publishedIds, ideaMarkdown, captureMarkdown);
       else throw changed(file);
     }
   }
@@ -204,14 +226,14 @@ async function scanIdeas(vault) {
       if (!publishedIds.has(identity)) publishedIds.set(identity, []);
       publishedIds.get(identity).push(id);
     }
-    await visit(root, anchor, publishedIds);
+    await visit(root, anchor, publishedIds, true, captureIds.size > 0);
     check();
   }
   catch (error) {
     if (error.code) throw unavailable(error.path || root, 'An ordinary vault entry could not be read.');
     throw error;
   }
-  return { claims, check, relative };
+  return { claims, captureClaims, check, relative };
 }
 
 module.exports = { scanIdeas };

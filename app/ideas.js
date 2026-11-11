@@ -9,6 +9,8 @@ const { withBriefMutation } = require('./briefs-lock');
 const { IdeasRemoval } = require('./ideas-removal');
 const { scanIdeas } = require('./idea-inventory');
 const { generations, sameEvidence, sameGenerations } = require('./source-generations');
+const { Intake } = require('./intake');
+const { readExactSync, verifyStageSync } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -155,33 +157,60 @@ class Ideas {
     if (!uuid(captureId) || !uuid(revisionId)) throw Error('Invalid cited revision identity.');
     const ledgerFile = path.join(vault.root, '.intake', 'ledger.json'), revisionFile = path.join(vault.root, 'Revisions', `${revisionId}.json`);
     const parents = this.parents(vault, [ledgerFile, revisionFile]);
-    const ledger = JSON.parse((await this.readFile(vault, ledgerFile, parents)).text);
+    const intake = offering ? new Intake(vault) : null;
+    const ledger = intake ? await intake.load() : JSON.parse((await this.readFile(vault, ledgerFile, parents)).text);
     if (ledger.schema !== 1 || !ledger.captures || !ledger.attempts || !Array.isArray(ledger.suppressed)) throw Error('Intake admission history is unavailable.');
     const entries = Object.entries(ledger.captures).filter(([, item]) => item.id === captureId);
     if (entries.length !== 1) throw Error('Cited capture admission is unavailable.');
     const [sourceHash, capture] = entries[0];
     const admitted = revisionAdmission(ledger, revisionId), attempts = admitted ? [admitted] : [];
     if (!capture.revisions.includes(revisionId) || !attempts.length || attempts.some(item => item.captureId !== captureId || item.sourceHash !== sourceHash || !/^[a-f0-9]{64}$/.test(item.snapshotHash) || item.snapshotHash !== attempts[0].snapshotHash)) throw Error('Exact cited revision was not admitted for this capture.');
-    const { text } = await this.readFile(vault, revisionFile, parents), snapshotHash = hash(text);
+    const { text, stat } = await this.readFile(vault, revisionFile, parents), snapshotHash = hash(text);
     if (snapshotHash !== attempts[0].snapshotHash) throw Error('Exact cited revision is damaged. No newer revision was substituted.');
     const revision = JSON.parse(text);
     if (revision.schema !== 1 || revision.id !== revisionId || revision.captureId !== captureId || revision.sourceHash !== sourceHash || typeof revision.text !== 'string') throw Error('Exact cited revision identity is damaged.');
     const warnings = [];
     if (capture.removed || capture.rejected || capture.supportEligible === false || capture.conflict || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.blocks?.[sourceHash] || ledger.pending?.[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
     if (revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview)) warnings.push('The cited revision is ineligible as supporting evidence.');
+    let offeringProof;
     if (offering) {
       if (warnings.length) throw Error(warnings.join(' '));
       // Apply the capture identity authority without reading any other revision.
-      const matches = (await vault.scan()).filter(note => note.id === captureId), choice = ledger.identityChoices?.[captureId];
+      const reserved = vault.reservedRestorationIdentities(ledger);
+      if (reserved.heldRestorations.has(captureId) || reserved.captures.has(captureId)) throw Error('A reserved restoration file holds this capture identity. Current evidence is unavailable.');
+      const matches = (await vault.scan({ excludedCapturePaths: reserved.paths })).filter(note => note.id === captureId);
+      const choice = ledger.identityChoices?.[captureId];
       const files = matches.map(note => ({ file: path.relative(vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
       let note;
       if (matches.length === 1 && !choice?.copies.some(copy => copy.file === files[0].file)) note = matches[0];
       else if (choice && files.some(file => file.file === choice.file) && JSON.stringify(files.filter(file => file.file !== choice.file)) === JSON.stringify(choice.copies)) note = matches.find(note => path.relative(vault.vault, note.file) === choice.file);
       if (!note) throw Error('Resolve the canonical capture identity before citing evidence.');
-      const current = await this.readFile(vault, note.file, this.parents(vault, [note.file]));
-      if (hash(current.text) !== capture.currentHash) throw Error('Current capture was changed outside Companion.');
+      const verifyAuthority = () => {
+        intake.storage.guardSync();
+        reserved.verify();
+      };
+      verifyAuthority();
+      const copies = matches.map(match => {
+        const matchParents = this.parents(vault, [match.file]);
+        const guard = () => this.guard(vault, matchParents);
+        const links = match === note ? 1 : local.lstatSync(match.file).nlink;
+        const { bytes, proof } = readExactSync(match.file, guard, links);
+        const currentHash = hash(decode(bytes));
+        if (match === note && currentHash !== capture.currentHash) throw Error('Current capture was changed outside Companion.');
+        if (currentHash !== hash(match.content)) throw Error('A capture identity copy changed after inspection. Review the identity before citing evidence.');
+        return { file: match.file, guard, proof, links };
+      });
+      const snapshotProof = { dev: String(stat.dev), ino: String(stat.ino), digest: snapshotHash };
+      const verify = () => {
+        verifyAuthority();
+        for (const copy of copies) verifyStageSync(copy.file, copy.guard, copy.proof, copy.links);
+        verifyStageSync(revisionFile, () => this.guard(vault, parents), snapshotProof);
+        verifyAuthority();
+      };
+      verify();
+      offeringProof = { captureId, files: copies.map(copy => copy.file).sort(), verify };
     }
-    return { capture, revision, snapshotHash, warnings };
+    return { capture, revision, snapshotHash, warnings, ...(offeringProof ? { offeringProof } : {}) };
   }
   anchor(resolved, evidence) {
     if (typeof evidence.id !== 'string' || typeof evidence.text !== 'string' || !evidence.text.trim()) throw Error('Evidence text is unavailable.');
@@ -191,7 +220,7 @@ class Ideas {
     const text = request.package.text;
     return hash(text) === request.package.digest && text.includes(`Imported capture ${anchor.capture_id}; exact imported revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}`) && text.includes(resolved.revision.text.replace(/\r\n?/g, '\n')) && text.includes(anchor.excerpt.replace(/\r\n?/g, '\n'));
   }
-  async selectedReferences(input, origin) {
+  async selectedReferences(input, origin, verifyCitation) {
     const ids = input.referenceIds ?? [];
     if (!Array.isArray(ids) || new Set(ids).size !== ids.length) throw Error('Inspect and select valid evidence references.');
     const citations = [];
@@ -205,6 +234,7 @@ class Ideas {
       const resolved = await this.revision(origin.vault, anchor.capture_id, anchor.revision_id, true);
       const evidence = resolved.revision.evidence?.evidence?.find(item => item.id === anchor.evidence_id);
       if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor) || !this.inPackage(origin.request, resolved, anchor)) throw Error('Selected exact evidence changed or is unavailable.');
+      verifyCitation?.(resolved.offeringProof);
       citations.push(structuredClone(anchor));
     }
     return citations.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
@@ -244,7 +274,7 @@ class Ideas {
   async preview(input, identity) {
     const { vault, record, request } = await this.origin(input);
     if (identity) this.removal.allow(vault, identity.id);
-    const citations = await this.selectedReferences(input, { vault, record, request });
+    const citations = await this.selectedReferences(input, { vault, record, request }, identity?.verifyCitation);
     for (const field of ['title', 'explanation', 'limitations']) if (typeof input[field] !== 'string' || !input[field].trim()) throw Error(`Enter the idea ${field} before previewing.`);
     if (/[\r\n]/.test(input.title)) throw Error('Use a title on one line.');
     const kind = input.kind ?? 'observation';
@@ -415,14 +445,27 @@ class Ideas {
       if (staged.text !== preview.text) throw Error('Saved idea stage conflict. The proposal was preserved.');
       await this.checkpoint('idea-before-publication');
       this.removal.allow(vault, preview.id);
-      const currentPreview = await this.preview(preview.input, { ...preview, createdAt: metadata(preview.text).created_at });
+      const citationChecks = [];
+      const currentPreview = await this.preview(preview.input, {
+        ...preview, createdAt: metadata(preview.text).created_at,
+        verifyCitation: check => citationChecks.push(check)
+      });
       if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
-      const inventory = await scanIdeas(vault), claims = inventory.claims.get(preview.id) || [];
+      const captureIds = new Set(citationChecks.map(check => check.captureId));
+      const inventory = await scanIdeas(vault, { captureIds }), claims = inventory.claims.get(preview.id) || [];
       const freshLinks = local.lstatSync(stage).nlink;
       if (![1, 2].includes(freshLinks)) throw Error('Saved idea stage has unknown linked copies. No destination was created.');
       const freshStage = await this.readFile(vault, stage, parents, freshLinks);
       if (!same(staged.stat, freshStage.stat) || freshStage.text !== preview.text) throw Error('Saved idea stage changed. The proposal and existing files were preserved.');
       this.guard(vault, parents); inventory.check();
+      if (freshLinks === 1) {
+        if (citationChecks.length !== (preview.input.referenceIds?.length ?? 0)) throw Error('Current citation proofs are unavailable. The proposal was preserved.');
+        for (const { captureId, files, verify } of citationChecks) {
+          const current = [...(inventory.captureClaims.get(captureId) || [])].sort();
+          if (JSON.stringify(current) !== JSON.stringify(files)) throw Error('Current citation capture identity changed. The proposal and all copies were preserved.');
+          verify();
+        }
+      }
       // Check exact peers after every asynchronous checkpoint, immediately before
       // exclusive publication. Two links are valid only for our known destination.
       const finalStage = local.lstatSync(stage, { bigint: true });
