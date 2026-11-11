@@ -324,7 +324,10 @@ class Intake {
     const { bytes, proof } = readExactSync(journal, journalGuard);
     if (!bytes.equals(Buffer.from(JSON.stringify(transaction)))) throw Error('Intake journal changed after publication. All files were preserved.');
     await this.vault.checkpoint('intake-journaled');
-    if (externalConflict) throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
+    if (externalConflict) {
+      this.ordinaryPublicationControls(transaction, ledger, proof)?.();
+      throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
+    }
     await this.finish(transaction, ledger, proof);
   }
   destination(capture) {
@@ -503,14 +506,16 @@ class Intake {
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
     await fs.unlink(intentFile);
   }
-  async publicationAuthority(tx, ledger, { verifyOnly = false, verifyIndependentJournal } = {}) {
+  async publicationAuthority(tx, ledger, { verifyOnly = false, verifyRestorationControls, verifyIndependentJournal } = {}) {
     if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed before publication. Refresh before retrying; changed authority was preserved.');
     assertPublication(ledger, tx.capture.id, tx);
     if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
-    if (!verifyOnly || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
+    if (!verifyOnly || tx.restoreOperation) {
+      verifyRestorationControls?.();
+      this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
+    }
   }
   verifyReservedCaptureIdentity(ledger, id, verifyIndependentJournal) {
-    verifyIndependentJournal?.();
     const reserved = this.vault.reservedRestorationIdentities(ledger, { verifyIndependentJournal });
     if (reserved.captures.has(id)) {
       throw Object.assign(Error('A preserved file at a held restoration path claims this capture identity. Both files were preserved.'),
@@ -518,26 +523,35 @@ class Intake {
     }
     if (verifyIndependentJournal) reserved.verify();
   }
-  independentNewSourceJournal(tx, ledger, proof) {
-    if (!validProof(proof) || proof.digest !== hash(JSON.stringify(tx)) || tx.previousHash !== null ||
-        tx.restore || tx.restoreOperation || tx.sourceGeneration || tx.resolution || tx.retainOnly ||
-        ledger.captures[tx.sourceHash] || ledger.attempts[tx.revision.identity] || ledger.suppressed.includes(tx.sourceHash) ||
-        ledger.blocks[tx.sourceHash] || ledger.pending[tx.sourceHash] ||
-        Object.values(ledger.captures).some(capture => capture.id === tx.capture.id)) return undefined;
+  isIndependentNewSource(tx, ledger) {
+    return tx.previousHash === null && !tx.restore && !tx.restoreOperation && !tx.sourceGeneration &&
+      !tx.resolution && !tx.retainOnly && !ledger.captures[tx.sourceHash] &&
+      !ledger.attempts[tx.revision.identity] && !ledger.suppressed.includes(tx.sourceHash) &&
+      !ledger.blocks[tx.sourceHash] && !ledger.pending[tx.sourceHash] &&
+      !Object.values(ledger.captures).some(capture => capture.id === tx.capture.id);
+  }
+  ordinaryPublicationControls(tx, ledger, expectedJournal) {
     const restorations = publishedImportedRestorations(ledger);
-    if (!restorations.length) return undefined;
-    const journal = path.join(this.dir, 'transaction.json'), guard = this.vault.publicationFolders(this.dir).guard;
+    if (!restorations.length || tx.restoreOperation) return undefined;
     const { verifyImportedRestorationHold } = require('./capture-deletion');
-    const verifyShared = () => verifyStageSync(journal, guard, proof);
-    return () => {
-      try {
-        for (const authority of restorations) verifyImportedRestorationHold(this, authority, verifyShared);
-      } catch (error) {
+    const guarded = work => {
+      try { return work(); }
+      catch (error) {
         const failure = error instanceof Error ? error : Error('Shared restoration or intake journal proof failed.', { cause: error });
         sharedRestorationFailures.add(failure);
         throw failure;
       }
     };
+    const journal = guarded(() => {
+      const observed = this.ordinaryRecoveryJournal(ledger, tx);
+      if (!observed || expectedJournal && (!sameProofIdentity(observed, expectedJournal) || observed.digest !== expectedJournal.digest)) {
+        throw Error('The exact active intake journal changed. Shared restoration controls were preserved.');
+      }
+      return observed;
+    });
+    return () => guarded(() => {
+      for (const authority of restorations) verifyImportedRestorationHold(this, authority, journal.verify);
+    });
   }
   async finish(tx, ledger, journalProof) {
     const publication = {};
@@ -555,8 +569,9 @@ class Intake {
   }
   async publishTransaction(tx, ledger, journalProof, publication) {
     this.validateTransaction(tx);
-    const verifyIndependentJournal = this.independentNewSourceJournal(tx, ledger, journalProof);
-    const checkPublication = () => this.publicationAuthority(tx, ledger, { verifyIndependentJournal });
+    const verifyRestorationControls = this.ordinaryPublicationControls(tx, ledger, journalProof);
+    const verifyIndependentJournal = validProof(journalProof) && this.isIndependentNewSource(tx, ledger) ? verifyRestorationControls : undefined;
+    const checkPublication = () => this.publicationAuthority(tx, ledger, { verifyRestorationControls, verifyIndependentJournal });
     await checkPublication();
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
@@ -689,7 +704,10 @@ class Intake {
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
     let committed = false;
     const verifyPublished = () => {
-      if (!committed || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
+      if (!committed || tx.restoreOperation) {
+        verifyRestorationControls?.();
+        this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
+      }
       try {
         for (const item of [...outputs, ...cleanup]) verify(item);
       } catch (cause) {
@@ -990,7 +1008,7 @@ class Intake {
     if (tx.sourceHash === authority.sourceHash || tx.capture.id === id) return null;
     return candidate;
   }
-  ordinaryRecoveryJournal(ledger) {
+  ordinaryRecoveryJournal(ledger, knownPublication) {
     const journal = path.join(this.dir, 'transaction.json');
     const guard = this.vault.publicationFolders(this.dir).guard;
     this.storage.guardSync();
@@ -1003,6 +1021,7 @@ class Intake {
     const links = Number(info.nlink), changed = () => Error('The independent intake journal or its known aliases changed. Recovery files were preserved.');
     if (links < 1 || links > 3) throw changed();
     const { bytes, proof } = readExactSync(journal, guard, links);
+    if (knownPublication && !bytes.equals(Buffer.from(JSON.stringify(knownPublication)))) throw changed();
     const tx = JSON.parse(bytes);
     this.validateTransaction(tx);
     if (tx.restoreOperation) return null;
@@ -1016,11 +1035,12 @@ class Intake {
       names.push(path.join(this.dir, pending.journal));
     }
     if (held) {
-      if (held.journal !== heldName(tx) || held.incomingRevision !== tx.revision.id) {
+      const isPeer = held.journal === heldName(tx) && held.incomingRevision === tx.revision.id;
+      if (!isPeer && !knownPublication) {
         if (links !== 1 || pending) return null;
         verifyRepair = this.verifyDistinctHeldRepair(ledger, tx, bytes, held, guard);
         if (!verifyRepair) return null;
-      } else {
+      } else if (isPeer) {
         names.push(path.join(this.dir, held.journal));
         if (held.outputHold) {
           const witness = held.outputHold;
