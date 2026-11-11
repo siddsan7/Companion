@@ -23,6 +23,60 @@ async function tree(directory) {
   }
   return records;
 }
+test('archive matching waits for actual inspection delivery before accepting an explicit match', async () => {
+  test.setTimeout(90000);
+  const valid = await createSafetyArchive(), before = await archiveSafetyState();
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  const inspect = region.getByRole('button', { name: 'Inspect history archive', exact: true });
+  const match = region.getByLabel('Match archive vault to the currently selected vault', { exact: true });
+  const source = region.locator('#archive-source'), settings = region.getByLabel('Application settings restoration', { exact: true });
+  const preview = region.getByRole('button', { name: 'Preview matched restore', exact: true });
+  await inspect.click();
+  await expect(region).toContainText('Integrity and version validated');
+  await expect(source).toHaveValue(valid.record.vault.root);
+  await app.evaluate(({ ipcMain }, root) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Inspection delivery hold requires the disposable archive fixture.');
+    const original = ipcMain._invokeHandlers.get('archive-inspect');
+    const gate = globalThis.__archiveInspectionDelivery = { original, held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('archive-inspect', async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      gate.actual = { id: result.id, currentVault: result.currentVault, roots: result.roots };
+      gate.held = true;
+      await delivery;
+      return result;
+    });
+  }, root);
+  try {
+    await inspect.click();
+    await expect.poll(() => app.evaluate(() => globalThis.__archiveInspectionDelivery.held)).toBe(true);
+    const actual = await app.evaluate(() => globalThis.__archiveInspectionDelivery.actual);
+    expect(actual).toMatchObject({ id: expect.any(String), currentVault: valid.record.vault.root, roots: expect.arrayContaining([valid.record.vault.root]) });
+    expect.soft(await match.isDisabled(), 'Match stays disabled until inspected archive details arrive').toBe(true);
+    expect.soft(await source.isDisabled(), 'The previous archived root cannot be selected during inspection').toBe(true);
+    expect.soft(await settings.isDisabled(), 'Settings choices await the inspected archive').toBe(true);
+    await expect(preview).toBeDisabled();
+    await expect(match).not.toBeChecked();
+  } finally {
+    await app.evaluate(({ ipcMain }) => {
+      const gate = globalThis.__archiveInspectionDelivery;
+      ipcMain._invokeHandlers.set('archive-inspect', gate.original); gate.release();
+      delete globalThis.__archiveInspectionDelivery;
+    });
+  }
+  await expect(inspect).toBeEnabled();
+  await expect(match).toBeEnabled();
+  await expect(source).toBeEnabled();
+  await expect(settings).toBeEnabled();
+  await expect(match).not.toBeChecked();
+  await expect(preview).toBeDisabled();
+  await match.check();
+  await expect(preview).toBeEnabled();
+  await preview.click();
+  await expect(region).toContainText('Matched restore preview');
+  expect(await archiveSafetyState()).toEqual(before);
+});
+
 test('explicit archive preview exports full controlled history and whitelisted settings without changing source bytes', async () => {
   test.setTimeout(90000);
   const reply = 'Authored synthetic archive reply: ' + 'retained passage 🎸 café 漢字\n'.repeat(900) + 'FINAL_LONG_REPLY_ARCHIVE_CANARY';
