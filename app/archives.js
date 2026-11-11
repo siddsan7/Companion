@@ -6,7 +6,7 @@ const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveInte
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { readNoteScope, changeNoteScope } = require('./note-scope');
-const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyPeers, verifyPeersSync, removeStage, removeLinkedStage } = require('./staged-publication');
+const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyAbsentSync, verifyPeers, verifyPeersSync, removeStage, removeLinkedStage } = require('./staged-publication');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
@@ -510,6 +510,7 @@ class Archives {
   async publishGenerationAddition(record, transition, assertSelection, committed) {
     const controls = this.history.controls, directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
     const guard = () => this.history.safeDirectory(false, directory);
+    const selected = () => { assertSelection(); guard(); };
     const baseline = await controls.state(record.id);
     if (canonical(baseline) !== canonical(transition.baseline)) throw Error('Local generation or exclusion authority changed. Inspect the archive again.');
     assertSelection();
@@ -517,7 +518,7 @@ class Archives {
     const stage = path.join(this.history.directory, `${randomUUID()}.pending`), text = JSON.stringify(record, null, 2), digest = hash(text);
     // This source-bearing stage is preserved on failure; only its exact published peer can finish it.
     assertSelection();
-    const proof = await writeStage(stage, text, () => { assertSelection(); guard(); });
+    const proof = await writeStage(stage, text, selected);
     await verifyStage(stage, guard, proof);
     const staged = await controls.file(stage, directory), target = { ...staged.owned, name: `${record.id}.json` };
     if (staged.text !== text || staged.owned.dev !== proof.dev || staged.owned.ino !== proof.ino) throw Error('Restoration stage changed. Preserve the retained writing.');
@@ -528,23 +529,39 @@ class Archives {
       assertSelection();
       if (exact.rawDigest !== digest || destinationExists) throw Error('Restoration stage or destination changed. Preserve the retained writing.');
     };
-    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation, assertSelection);
+    const verifyReservation = () => {
+      verifyAbsentSync(destination, selected);
+      verifyStageSync(stage, selected, proof);
+    };
+    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation, verifyReservation);
+    const verifyMarker = await controls.restorationMarkerGuard(marker, selected);
     this.history.tokens.clear(); this.history.durable.delete(record.id);
     await this.checkpoint('archive-restore-after-reservation');
     await controls.file(stage, directory, staged.owned);
-    const selected = () => { assertSelection(); guard(); };
+    verifyMarker();
     verifyStageSync(stage, selected, proof);
     local.linkSync(stage, destination);
     guard();
     await this.checkpoint('archive-restore-after-link');
     const a = await controls.file(stage, directory, staged.owned, 2), b = await controls.file(destination, directory, target, 2);
     if (!same(a.stat, b.stat) || a.text !== text || b.text !== text || canonical(await controls.state(record.id)) !== canonical(marker)) throw Error('Restoration publication changed. Preserve both copies and local authority for explicit recovery.');
-    await removeLinkedStage(stage, destination, selected, proof);
+    await removeLinkedStage(stage, destination, selected, proof, verifyMarker);
     await this.checkpoint('archive-restore-before-active');
     assertSelection();
     await controls.file(destination, directory, target);
-    await controls.put({ ...marker, phase: 'active', targets: [] }, marker, () => controls.verifyRestorationComplete(marker, directory), assertSelection);
-    await controls.check(record); this.history.durable.set(record.id, digest); committed();
+    const verifySettled = () => {
+      verifyAbsentSync(stage, selected);
+      verifyStageSync(destination, selected, proof);
+    };
+    await controls.put({ ...marker, phase: 'active', targets: [] }, marker,
+      () => controls.verifyRestorationComplete(marker, directory), () => {
+        verifyMarker();
+        verifySettled();
+      });
+    await controls.check(record);
+    verifySettled();
+    this.history.durable.set(record.id, digest);
+    committed();
   }
   async publishAddition(record, transition, assertSelection, committed) {
     if (transition) return this.publishGenerationAddition(record, transition, assertSelection, committed);

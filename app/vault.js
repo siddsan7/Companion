@@ -561,7 +561,14 @@ class Vault {
       try {
         const lock = await noteLock(file, guard);
         if (lock?.unknown) this.warnings.push(`Unrecognized lock ${entry}. Its bytes were preserved for inspection.`);
-        else if (lock && !lock.live) await this.release(file, lock.proof, guard);
+        else if (lock && !lock.live) {
+          if (lock.publication?.kind === 'capture') {
+            const { staged, identities } = lock.publication;
+            if (!validProof(staged) || !Array.isArray(identities)) throw stagingHeld();
+            const pinned = this.publicationFolders(dir, identities).guard;
+            await this.releaseCaptureLock(file, `${file}.pending`, pinned, lock.proof, staged);
+          } else await this.release(file, lock.proof, guard);
+        }
       } catch (error) { this.warnings.push(error.message); }
     }
   }
