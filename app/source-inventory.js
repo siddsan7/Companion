@@ -6,7 +6,6 @@ const { matchesProducerOutcome } = require('./producer-root');
 const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
 const pendingTitle = require('./pending-title');
-const { validProof } = require('./staged-publication');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -318,8 +317,7 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     if (kind === 'blocks' && pointer.outputHold !== undefined) {
       const held = pointer.outputHold, target = targets.get(journal);
       const pending = `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
-      if (!target || !exact(held, ['journal', 'pending']) || !validProof(held.journal) ||
-          held.pending !== null && held.pending !== pending || held.journal.dev !== target.dev ||
+      if (!target || !intake.validOutputHold(held, pending) || held.journal.dev !== target.dev ||
           held.journal.ino !== target.ino || held.journal.digest !== target.sha256) fail();
     }
     recoveryPointers.push({ kind, journal, sha256: hash(JSON.stringify(pointer)), captureConflictSha256: capture.conflict === undefined ? null : hash(capture.conflict) });

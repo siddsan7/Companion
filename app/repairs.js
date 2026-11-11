@@ -17,9 +17,9 @@ async function annotationAuthority(intake) {
 }
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
-function admittedOutputHold(ledger, sourceHash) {
+function admittedOutputHold(intake, ledger, sourceHash) {
   const block = ledger.blocks[sourceHash];
-  if (!block?.outputHold) return false;
+  if (!intake.isCommittedOutputHold(block)) return false;
   const admission = revisionAdmission(ledger, block.incomingRevision);
   return !!admission && admission.sourceHash === sourceHash && admission.captureId === ledger.captures[sourceHash]?.id;
 }
@@ -271,7 +271,7 @@ function install(Intake, { hash, read, noteText }) {
       for (const [sourceHash, block] of Object.entries(ledger.blocks)) {
         if (!/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) continue;
         const current = ledger.captures[sourceHash];
-        if (admittedOutputHold(ledger, sourceHash)) {
+        if (admittedOutputHold(this, ledger, sourceHash)) {
           items.push({ kind: 'intake-output-hold', sourceHash, id: current.id, title: current.title, reason: block.reason });
           continue;
         }
@@ -291,7 +291,7 @@ function install(Intake, { hash, read, noteText }) {
     return this.locked(async () => {
       if (typeof text !== 'string' || !text.trim()) throw Error('Choose local writing to preserve in an annotation before applying the incoming revision.');
       const checkHold = ledger => {
-        if (admittedOutputHold(ledger, sourceHash)) throw Error('This source has a publication hold. Keep its current and recovery files for inspection.');
+        if (admittedOutputHold(this, ledger, sourceHash)) throw Error('This source has a publication hold. Keep its current and recovery files for inspection.');
       };
       checkHold(await this.load());
       await this.syncMoves();

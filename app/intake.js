@@ -18,6 +18,7 @@ const conflict = message => Object.assign(Error(message), { intakeConflict: true
 const deferred = message => Object.assign(Error(message), { intakeDeferred: true });
 const conflictPause = ' Updates to this source are paused for explicit conflict repair.';
 const outputHold = 'Published intake output or recovery evidence changed.';
+const acceptancePreserved = ' The recorded producer acceptance was preserved.';
 const heldName = tx => `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
 const pendingName = tx => `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
 const exactIdentity = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino;
@@ -658,8 +659,8 @@ class Intake {
       this.vault.expected.set(tx.capture.id, tx.capture.currentHash);
     } catch (error) {
       if (!error.intakeOutputChanged || tx.restoreOperation || !cleanup.some(item => item.file === journal)) throw error;
-      const reason = error.message + (committed ? ' The recorded producer acceptance was preserved.' : '');
-      await this.archiveConflict(tx, ledger, reason, { journalInfo, guard });
+      const reason = error.message + (committed ? acceptancePreserved : '');
+      await this.archiveConflict(tx, ledger, reason, { journalInfo, guard, committed });
       throw Object.assign(Error(reason, { cause: error }), { intakeOutputHeld: true });
     }
   }
@@ -729,7 +730,7 @@ class Intake {
         catch (cause) {
           verifyJournals();
           if (cause.code !== 'STAGING_CHANGED') throw cause;
-          throw Object.assign(Error(`${outputHold} ${cause.message} The recorded producer acceptance was preserved.`, { cause }), { intakeOutputChanged: true });
+          throw Object.assign(Error(`${outputHold} ${cause.message}${acceptancePreserved}`, { cause }), { intakeOutputChanged: true });
         }
       };
       const retiring = { ...ledger.pending, [sourceHash]: { ...pending, acceptedCleanup: { ...receipt, retiring: true } } };
@@ -759,7 +760,7 @@ class Intake {
           active.present = true;
           verifyJournals();
         }
-        await this.archiveConflict(tx, ledger, error.message, { journalProof: receipt.journal, guard });
+        await this.archiveConflict(tx, ledger, error.message, { journalProof: receipt.journal, guard, committed: true });
         return;
       }
     }
@@ -848,12 +849,26 @@ class Intake {
     const block = ledger.blocks?.[tx.sourceHash];
     return !!block?.reason?.startsWith(outputHold) && block.incomingRevision === tx.revision.id && block.journal === heldName(tx);
   }
+  validOutputHold(witness, pending) {
+    return !!witness && Object.hasOwn(witness, 'journal') && Object.hasOwn(witness, 'pending') && validProof(witness.journal) &&
+      (witness.pending === null || witness.pending === pending) &&
+      Object.keys(witness).every(key => ['journal', 'pending', 'committed'].includes(key)) &&
+      (!Object.hasOwn(witness, 'committed') || typeof witness.committed === 'boolean');
+  }
+  isCommittedOutputHold(block) {
+    const witness = block?.outputHold;
+    if (!witness || !block.reason?.startsWith(outputHold)) return false;
+    if (Object.hasOwn(witness, 'committed')) return witness.committed === true;
+    // Earlier holds recorded this distinction only in the exact fixed reason.
+    // Use it for repair presentation and refusal, never for publication proof.
+    return block.reason.endsWith(acceptancePreserved + conflictPause);
+  }
   verifyHeldTransaction(ledger, tx) {
     const block = ledger.blocks?.[tx.sourceHash];
     if (!block?.reason?.startsWith(outputHold)) return;
     const witness = block.outputHold;
-    if (!this.hasOutputHold(ledger, tx) || !witness || Object.keys(witness).length !== 2 || !validProof(witness.journal) ||
-        witness.pending !== null && witness.pending !== pendingName(tx) || witness.journal.digest !== hash(JSON.stringify(tx))) {
+    if (!this.hasOutputHold(ledger, tx) || !this.validOutputHold(witness, pendingName(tx)) ||
+        witness.journal.digest !== hash(JSON.stringify(tx))) {
       throw Error('The exact held intake journal proof changed. All files were preserved.');
     }
     const guard = this.vault.publicationFolders(this.dir).guard;
@@ -878,10 +893,9 @@ class Intake {
       if (retained) {
         const association = ledger.pending[tx.sourceHash];
         if (association && (association.journal !== pendingName(tx) || association.key !== tx.key)) throw changed();
-        witness = { journal: retained.journalProof || fileProof(retained.journalInfo, JSON.stringify(tx)), pending: association?.journal || null };
+        witness = { journal: retained.journalProof || fileProof(retained.journalInfo, JSON.stringify(tx)), pending: association?.journal || null, committed: retained.committed };
       } else witness = ledger.blocks[tx.sourceHash].outputHold;
-      if (!witness || Object.keys(witness).length !== 2 || !validProof(witness.journal) ||
-          witness.pending !== null && witness.pending !== pendingName(tx) ||
+      if (!this.validOutputHold(witness, pendingName(tx)) ||
           witness.journal.digest !== hash(JSON.stringify(tx))) throw changed();
       const proof = witness.journal;
       const present = new Set(names.filter(file => {
