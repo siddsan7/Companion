@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const fixture = require('./fixtures/reel-draft/example.json');
 const YAML = require('yaml');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 let root, app, page, readerEntry, diagnosticFile;
 function diagnostic(event, details = {}) { local.appendFileSync(diagnosticFile, JSON.stringify({ timestamp: Date.now(), source: 'test', event, ...details }) + '\n'); }
 
@@ -389,24 +389,25 @@ for (const ambiguous of [false, true]) test(ambiguous ? 'duplicate annotation jo
 const io = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
-const root = process.env.COMPANION_TEST_ROOT, originalLink = io.link;
+const root = process.env.COMPANION_TEST_ROOT, originalLink = io.link, originalLinkSync = local.linkSync;
 let selectedId;
-io.link = async function (from, to) {
+const faultAtLink = (from, to) => {
   const match = typeof from === 'string' && path.basename(from).match(/^annotation-([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})\\.stage$/);
   if (match && typeof to === 'string') {
     const id = match[1], stage = path.join(root, 'vault', 'Companion', '.intake', 'annotation-' + id + '.stage'), output = path.join(root, 'vault', 'Companion', 'Annotations', id + '.md');
     if (path.resolve(from) === stage && path.resolve(to) === output && (selectedId === id || !selectedId && local.existsSync(path.join(root, 'pending-link-arm.txt')))) {
-      const stat = await io.lstat(stage);
+      const stat = local.lstatSync(stage);
       if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1) {
         selectedId ||= id;
-        const outputAbsent = await io.lstat(output).then(() => false, error => { if (error.code === 'ENOENT') return true; throw error; });
-        await io.writeFile(path.join(root, 'pending-link-checkpoint.json'), JSON.stringify({ id, from, to, outputAbsent }));
+        const outputAbsent = !local.lstatSync(output, { throwIfNoEntry: false });
+        local.writeFileSync(path.join(root, 'pending-link-checkpoint.json'), JSON.stringify({ id, from, to, outputAbsent }));
         throw Object.assign(Error('Controlled unpublished annotation link failure.'), { code: 'EACCES' });
       }
     }
   }
-  return originalLink.call(this, from, to);
 };
+io.link = async function (from, to) { faultAtLink(from, to); return originalLink.call(this, from, to); };
+local.linkSync = function (from, to) { faultAtLink(from, to); return originalLinkSync.call(this, from, to); };
 require(${JSON.stringify(path.resolve(__dirname, '..', 'app', 'main'))});
 `, 'utf8');
   const base = await importedCapture(), intake = path.join(base, '.intake'), annotationFolder = path.join(base, 'Annotations'), ledgerFile = path.join(intake, 'ledger.json');
@@ -426,11 +427,14 @@ require(${JSON.stringify(path.resolve(__dirname, '..', 'app', 'main'))});
   const intentFile = path.join(intake, 'annotation-intent.json'), stage = path.join(intake, `annotation-${fault.id}.stage`), output = path.join(annotationFolder, fault.id + '.md');
   expect(fault.from).toBe(stage); expect(fault.to).toBe(output);
   const intentBytes = await fs.readFile(intentFile), intent = JSON.parse(intentBytes.toString('utf8')), stageBytes = await fs.readFile(stage);
-  expect(Object.keys(intent).sort()).toEqual(['annotation', 'captureId', 'id', 'schema']);
+  expect(Object.keys(intent).sort()).toEqual(['annotation', 'annotationProof', 'captureId', 'id', 'intentIdentity', 'schema']);
   expect(intent.schema).toBe(1); expect(intent.id).toBe(fault.id); expect(intent.annotation).toContain(pendingText);
   const metadata = YAML.parse(intent.annotation.match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]);
   expect(metadata.companion_id).toBe(intent.id); expect(metadata.capture_id).toBe(intent.captureId);
   expect(stageBytes.toString('utf8')).toBe(intent.annotation);
+  const journalIdentity = await fs.lstat(intentFile, { bigint: true }), stageIdentity = await fs.lstat(stage, { bigint: true });
+  expect(intent.intentIdentity).toEqual({ dev: String(journalIdentity.dev), ino: String(journalIdentity.ino) });
+  expect(intent.annotationProof).toEqual({ dev: String(stageIdentity.dev), ino: String(stageIdentity.ino), digest: createHash('sha256').update(stageBytes).digest('hex') });
   for (const file of [intentFile, stage]) { const stat = await fs.lstat(file); expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1); }
   expect(await fs.access(output).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
   let changedIntent;

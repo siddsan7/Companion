@@ -33,6 +33,17 @@ async function leaf(vault, file) {
   } finally { await handle.close(); }
   return { file: rel(vault, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), links: Number(before.nlink), raw: bytes, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
 }
+function readStandaloneIntent(intake, value) {
+  let intent, note;
+  try {
+    intent = JSON.parse(value.text);
+    note = intake.validateAnnotationIntent(intent);
+  } catch { throw changed(); }
+  if (value.links !== 1 || !value.raw.equals(Buffer.from(JSON.stringify(intent), 'utf8')) || intent.intentIdentity &&
+      (intent.intentIdentity.dev !== value.dev || intent.intentIdentity.ino !== value.ino)) throw changed();
+  return { intent, note };
+}
+const matchesPublication = (value, proof) => value.dev === proof.dev && value.ino === proof.ino && value.sha256 === proof.digest;
 async function raw(vault, reserved) {
   const notes = [], directories = [], unsupported = new Set(), reservedIds = new Set(reserved.annotations);
   async function visit(folder) {
@@ -89,20 +100,21 @@ async function inventory(vault, intake, ledger, id, captureId) {
     const value = await leaf(vault, file); entries.set(entry.name, value);
   }
   const links = new Map();
+  let publication;
   for (const [name, value] of entries) {
     if (!value.text.includes(id)) continue;
-    let object; try { object = JSON.parse(value.text); } catch {}
     if (/^repair(?:-intent|-[a-f0-9-]{36})\.json$/.test(name)) throw Error('This annotation remains in mixed source repair data. Preserve and split that repair before selecting annotation removal.');
     if (name === 'annotation-intent.json') {
-      if (!strict(object, ['schema', 'id', 'captureId', 'annotation']) || object.schema !== 1 || object.id !== id || typeof object.annotation !== 'string') throw changed();
-      if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
-      const note = parseAnnotation(object.annotation); if (!note || note.captureId !== object.captureId) throw changed(); bind(note);
+      const { intent, note } = readStandaloneIntent(intake, value);
+      bind(note);
+      publication = intent;
       candidates.push({ ...value, kind: 'annotation-intent' }); continue;
     }
     if (name === `annotation-${id}.stage`) {
       const note = parseAnnotation(value.text); if (!note) throw changed(); bind(note); candidates.push({ ...value, kind: 'annotation-stage' }); continue;
     }
     if (name === 'link-intent.json' || /^link-[a-f0-9-]{36}\.json$/.test(name)) {
+      let object; try { object = JSON.parse(value.text); } catch {}
       if (!strict(object, ['schema', 'id', 'file', 'before', 'content', 'relative']) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
       if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
       // Journals retain their native serialized path. Only manifest paths use
@@ -117,6 +129,22 @@ async function inventory(vault, intake, ledger, id, captureId) {
     }
     if (/^link-[a-f0-9-]{36}\.(?:before\.md|stage|held-(?:before|stage)-[a-f0-9]{64}\.md)$/.test(name)) continue;
     throw changed();
+  }
+  if (publication?.intentIdentity) {
+    const staged = candidates.find(candidate => candidate.kind === 'annotation-stage');
+    const publishedPath = rel(vault, path.join(vault.root, 'Annotations', `${id}.md`));
+    const published = candidates.find(candidate => candidate.kind === 'annotation-note' && comparable(candidate.file) === comparable(publishedPath));
+    const proof = publication.annotationProof;
+    const matchesAnnotation = candidate => ['annotation-note', 'annotation-stage'].includes(candidate.kind) && matchesPublication(candidate, proof);
+    const removal = ledger.annotationRemovals?.[id];
+    // After confirmed removal retires the note and stage, the exact approved
+    // targets still prove the intent while its own retirement is pending.
+    const recorded = proof && removal?.phase === 'removing' && removal.captureId === captureId && removal.targets.some(matchesAnnotation);
+    if (!proof && (staged || published)) throw changed();
+    if (proof && (
+      staged && !matchesPublication(staged, proof) || published && !matchesPublication(published, proof) ||
+      !candidates.some(matchesAnnotation) && !recorded
+    )) throw changed();
   }
   for (const [name, value] of entries) {
     const match = name.match(/^link-([a-f0-9-]{36})\.(before\.md|stage|held-(?:before|stage)-[a-f0-9]{64}\.md)$/);
@@ -156,14 +184,10 @@ class AnnotationRemoval {
     const intentFile = path.join(intake.dir, 'annotation-intent.json');
     const pending = await leaf(vault, intentFile).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     if (pending) {
-      const intent = JSON.parse(pending.text);
-      if (!strict(intent, ['schema', 'id', 'captureId', 'annotation']) || intent.schema !== 1 || !uuid(intent.id) || !uuid(intent.captureId) || typeof intent.annotation !== 'string') throw changed();
-      if (!pending.raw.equals(Buffer.from(JSON.stringify(intent), 'utf8'))) throw changed();
-      const annotation = parseAnnotation(intent.annotation);
-      if (!annotation || annotation.id !== intent.id || annotation.captureId !== intent.captureId) throw changed();
+      const { intent } = readStandaloneIntent(intake, pending);
       if (!ledger.annotationRemovals?.[intent.id] && !scanned.reservedIds.has(intent.id)) {
         const stage = await leaf(vault, path.join(intake.dir, `annotation-${intent.id}.stage`));
-        if (stage.text !== intent.annotation) throw changed();
+        if (stage.text !== intent.annotation || intent.annotationProof && !matchesPublication(stage, intent.annotationProof)) throw changed();
         // Reuse the raw classifier and exact parent/peer rules. Listing never
         // completes the pending writer or materializes its absent note.
         await inventory(vault, intake, ledger, intent.id, intent.captureId);
