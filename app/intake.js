@@ -987,9 +987,10 @@ class Intake {
     }
     if (held) {
       if (held.journal !== heldName(tx) || held.incomingRevision !== tx.revision.id) {
-        if (links !== 1 || pending) return null;
-        repair = this.distinctRepairRecovery(ledger, tx, bytes, held, guard);
-        if (!repair) return null;
+        if (links > 2 || pending) return null;
+        repair = this.distinctRepairRecovery(ledger, tx, { bytes, proof }, held, guard);
+        if (!repair || links !== 1 && !repair.freshRepair) return null;
+        if (repair.freshRepair) names.push(repair.freshRepair.sourceStage);
       } else {
         names.push(path.join(this.dir, held.journal));
         if (held.outputHold) {
@@ -1013,7 +1014,8 @@ class Intake {
     verify();
     return { ...proof, tx, links, verify, guard, ...repair };
   }
-  distinctRepairRecovery(ledger, tx, journalBytes, held, guard) {
+  repairConflictWitness(ledger, tx, held, guard, pinned) {
+    if (!held) return null;
     const witness = held.outputHold, capture = ledger.captures[tx.sourceHash];
     // Any repairable prior hold can prove this handoff; committed output holds cannot.
     if (witness === null || witness?.committed === true || this.isCommittedOutputHold(held) || held.incomingRevision !== tx.revision.id ||
@@ -1021,7 +1023,11 @@ class Intake {
         !tx.resolution || !tx.keptCurrent || capture?.id !== tx.capture.id || capture.conflict !== held.reason ||
         capture.currentRevision !== tx.keptCurrent.id) return null;
     const previous = path.join(this.dir, held.journal);
-    const previousJournal = readExactSync(previous, guard, 1, witness?.journal);
+    const previousJournal = readExactSync(previous, guard, 1, pinned || witness?.journal);
+    if (witness && (!validProof(witness.journal) || !sameProofIdentity(witness.journal, previousJournal.proof) ||
+        witness.journal.digest !== previousJournal.proof.digest)) {
+      throw Error('The older held source journal changed. Recovery files were preserved.');
+    }
     const old = JSON.parse(previousJournal.bytes);
     this.validateTransaction(old);
     if (old.sourceHash !== tx.sourceHash || old.capture.id !== tx.capture.id || old.revision.id !== tx.revision.id ||
@@ -1035,6 +1041,22 @@ class Intake {
     if (!validPrevious) {
       throw Error('The older held source journal changed. Recovery files were preserved.');
     }
+    return { proof: previousJournal.proof, verify: () => verifyStageSync(previous, guard, previousJournal.proof) };
+  }
+  boundRepairConflict(ledger, tx, binding, guard) {
+    const held = ledger.blocks[tx.sourceHash];
+    const capture = ledger.captures[tx.sourceHash];
+    if (!binding || !isDeepStrictEqual(held, binding.block) || !capture || capture.identityIssue || capture.removed ||
+        ledger.suppressed.includes(tx.sourceHash) || ledger.pending[tx.sourceHash]) {
+      throw Error('The original repair conflict changed. Recovery files were preserved.');
+    }
+    assertPublication(ledger, tx.capture.id, tx);
+    const previous = this.repairConflictWitness(ledger, tx, held, guard, binding.journalProof);
+    if (!previous) throw Error('The original repair conflict has no exact journal proof. Recovery files were preserved.');
+    return previous.verify;
+  }
+  distinctRepairRecovery(ledger, tx, journal, held, guard) {
+    if (!tx.resolution || !tx.keptCurrent) return null;
     const intentFile = path.join(this.dir, 'repair-intent.json');
     const archivedIntent = path.join(this.dir, `repair-${tx.resolution}.json`);
     guard();
@@ -1042,11 +1064,14 @@ class Intake {
     const intentRecord = readExactSync(intentFile, guard, intentLinks), intent = JSON.parse(intentRecord.bytes);
     this.validateRepairIntent(intent);
     if (!intentRecord.bytes.equals(Buffer.from(JSON.stringify(intent))) ||
-        !journalBytes.equals(Buffer.from(JSON.stringify(intent.tx)))) {
+        !journal.bytes.equals(Buffer.from(JSON.stringify(intent.tx)))) {
       throw Error('The active source journal does not match its repair intent. Recovery files were preserved.');
     }
+    const previous = intentLinks === 2 ? this.repairConflictWitness(ledger, tx, held, guard, intent.priorConflict?.journalProof)?.verify :
+      this.boundRepairConflict(ledger, tx, intent.priorConflict, guard);
+    if (!previous) return null;
     const verifyIntent = links => {
-      verifyStageSync(previous, guard, previousJournal.proof);
+      previous();
       verifyStageSync(intentFile, guard, intentRecord.proof, links);
       if (links === 2) verifyStageSync(archivedIntent, guard, intentRecord.proof, 2);
       else verifyAbsentSync(archivedIntent, guard);
@@ -1063,6 +1088,7 @@ class Intake {
         tx.retainOnly !== false || tx.externalConflict !== false) return null;
     const proof = intent.annotationProof;
     if (!proof) throw Error('The active repair has no recorded annotation identity. Recovery files were preserved.');
+    if (!isDeepStrictEqual(journal.proof, intent.sourceProof)) throw Error('The active repair source journal changed. Recovery files were preserved.');
     const stage = path.join(this.dir, `annotation-${tx.resolution}.stage`);
     const directory = path.join(this.vault.root, 'Annotations');
     const file = path.join(directory, `${tx.resolution}.md`);
@@ -1074,6 +1100,7 @@ class Intake {
     };
     const freshRepair = {
       intentProof: intentRecord.proof,
+      sourceStage: path.join(this.dir, `journal-${tx.resolution}.stage`),
       verify: (links = 1) => { verifyIntent(links); verifyAnnotation(); },
       retireAnnotation: () => {
         verifyAnnotation();
@@ -1161,8 +1188,8 @@ class Intake {
     this.validateTransaction(tx);
     if (tx.restoreOperation || this.hasHeldJournal(ledger, tx) || ledger.pending[tx.sourceHash]) return;
     const priorBlock = ledger.blocks[tx.sourceHash];
-    if (priorBlock && priorBlock.journal !== heldName(tx) && observed.nlink === 1n &&
-        this.distinctRepairRecovery(ledger, tx, bytes, priorBlock, guard)) return;
+    if (priorBlock && priorBlock.journal !== heldName(tx) && observed.nlink <= 2n &&
+        this.distinctRepairRecovery(ledger, tx, { bytes, proof }, priorBlock, guard)) return;
     const current = ledger.captures[tx.sourceHash], outcome = ledger.outcomes[tx.key];
     const sameCapture = isDeepStrictEqual(current, tx.capture);
     const referencesOutcome = outcome?.status === 'imported' && outcome.sourceHash === tx.sourceHash &&
