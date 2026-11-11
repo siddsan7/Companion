@@ -84,11 +84,15 @@ class CaptureDeletion {
     const directories = new Map();
     for (const name of requiredDirectories(intake, targets, mixed?.preservedWriting)) { const value = await this.directory(vault, path.join(vault.vault, name)); directories.set(name, value); }
     await inspectAdjacentTitlePrefix(vault, targets);
-    const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
+    const reserved = vault.reservedRestorationIdentities(ledger);
+    const annotations = (await vault.scan({ annotations: true, excludedCapturePaths: reserved.paths }))
+      .filter(note => note.captureId === id && !reserved.annotations.has(note.id))
+      .map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
     await inspectManualPeers(vault, { captureId: id }, new Set([...(imported?.titleProofs || manualTitles?.titleProofs || []).map(proof => proof.before), ...pendingTitle.sidecars(imported?.titleRecovery)]));
     const dependents = await deletionDependents.inventory(vault, this.conversations, id);
     const root = await fs.realpath(vault.vault);
     if (!intake.storage.matches(await intake.storage.view()) || this.getVault() !== vault) throw changed();
+    reserved.verify();
     return { id, root, managedRoot: vault.root, ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
   }
   async preview(id) {

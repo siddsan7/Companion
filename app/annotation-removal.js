@@ -10,7 +10,9 @@ const { uuid } = require('./source-authority');
 const { sourceLink } = require('./repairs');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
+const { comparable } = require('./legacy-capture-ownership');
 const rel = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
+const reservedPath = (vault, reserved, file) => reserved.paths.has(comparable(rel(vault, file)));
 const changed = () => Error('Annotation removal scope changed or contains an unknown copy. Preserve the writing and review again.');
 const strict = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 async function directory(vault, file) {
@@ -31,8 +33,8 @@ async function leaf(vault, file) {
   } finally { await handle.close(); }
   return { file: rel(vault, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), links: Number(before.nlink), raw: bytes, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
 }
-async function raw(vault) {
-  const notes = [], directories = [], unsupported = new Set();
+async function raw(vault, reserved) {
+  const notes = [], directories = [], unsupported = new Set(), reservedIds = new Set(reserved.annotations);
   async function visit(folder) {
     directories.push(await directory(vault, folder));
     for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
@@ -42,7 +44,9 @@ async function raw(vault) {
       if (entry.isDirectory()) await visit(file);
       else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
         const value = await leaf(vault, file), note = parseAnnotation(value.text);
-        if (note && entry.name.endsWith('.md')) notes.push({ ...value, ...note });
+        const isReserved = reservedPath(vault, reserved, file);
+        if (note && isReserved) reservedIds.add(note.id);
+        else if (note && entry.name.endsWith('.md')) notes.push({ ...value, ...note });
         else if (note) unsupported.add(note.id);
         else {
           // Unsupported copies still invalidate consent for their declared
@@ -56,18 +60,25 @@ async function raw(vault) {
             // this withholds deletion and never establishes ownership.
             const declarations = document.contents.items.filter(pair => YAML.isScalar(pair.key) && YAML.isScalar(pair.value));
             if (declarations.some(pair => pair.key.value === 'artifact_type' && pair.value.value === 'annotation')) {
-              for (const pair of declarations) if (pair.key.value === 'companion_id' && uuid(pair.value.value)) unsupported.add(pair.value.value);
+              for (const pair of declarations) {
+                if (pair.key.value !== 'companion_id' || !uuid(pair.value.value)) continue;
+                unsupported.add(pair.value.value);
+                if (isReserved) reservedIds.add(pair.value.value);
+              }
             }
           }
         }
       }
     }
   }
-  await visit(vault.vault); return { notes, directories, unsupported };
+  await visit(vault.vault);
+  reserved.verify();
+  return { notes, directories, unsupported, reservedIds };
 }
-async function inventory(vault, intake, id, captureId) {
-  const scanned = await raw(vault), notes = scanned.notes.filter(note => note.id === id), candidates = [];
-  if (scanned.unsupported.has(id)) throw changed();
+async function inventory(vault, intake, ledger, id, captureId) {
+  const reserved = vault.reservedRestorationIdentities(ledger);
+  const scanned = await raw(vault, reserved), notes = scanned.notes.filter(note => note.id === id), candidates = [];
+  if (scanned.unsupported.has(id) || scanned.reservedIds.has(id)) throw changed();
   const bind = note => { if (note.id !== id || captureId && note.captureId !== captureId) throw changed(); captureId ||= note.captureId; };
   for (const note of notes) { bind(note); candidates.push({ ...note, kind: 'annotation-note' }); }
   const entries = new Map();
@@ -97,6 +108,7 @@ async function inventory(vault, intake, id, captureId) {
       // Journals retain their native serialized path. Only manifest paths use
       // canonical separators; the normal destination boundary validates both.
       const destination = intake.destination({ relative: object.file });
+      if (reservedPath(vault, reserved, destination)) throw changed();
       await vault.contained(path.dirname(destination));
       const before = parseAnnotation(object.before), after = parseAnnotation(object.content); if (!before || !after || after.id !== id || after.captureId !== before.captureId) throw changed(); bind(before);
       if (sourceLink(object.before, object.relative) !== object.content) throw changed();
@@ -129,14 +141,18 @@ async function inventory(vault, intake, id, captureId) {
       const parent = path.relative(vault.vault, current); if (parent === '..' || parent.startsWith('..' + path.sep) || path.isAbsolute(parent)) throw changed();
     }
   }
-  return { captureId, root: await fs.realpath(vault.vault), targets, directories: [...directories.values()].sort((a, b) => a.file < b.file ? -1 : 1) };
+  const root = await fs.realpath(vault.vault);
+  reserved.verify();
+  const scope = { captureId, root, targets, directories: [...directories.values()].sort((a, b) => a.file < b.file ? -1 : 1) };
+  return { scope, verifyReserved: reserved.verify };
 }
 class AnnotationRemoval {
   constructor({ getVault, clearApprovals }) { Object.assign(this, { getVault, clearApprovals }); this.previews = new Map(); }
   vault() { const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.'); return vault; }
   async list() {
-    const vault = this.vault(), intake = new Intake(vault), ledger = await intake.load(), scanned = await raw(vault);
-    const notes = scanned.notes.filter(note => !ledger.annotationRemovals?.[note.id]).map(note => ({ id: note.id, captureId: note.captureId, file: note.file, text: note.content }));
+    const vault = this.vault(), intake = new Intake(vault), ledger = await intake.load();
+    const reserved = vault.reservedRestorationIdentities(ledger), scanned = await raw(vault, reserved);
+    const notes = scanned.notes.filter(note => !ledger.annotationRemovals?.[note.id] && !scanned.reservedIds.has(note.id)).map(note => ({ id: note.id, captureId: note.captureId, file: note.file, text: note.content }));
     const intentFile = path.join(intake.dir, 'annotation-intent.json');
     const pending = await leaf(vault, intentFile).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
     if (pending) {
@@ -145,23 +161,26 @@ class AnnotationRemoval {
       if (!pending.raw.equals(Buffer.from(JSON.stringify(intent), 'utf8'))) throw changed();
       const annotation = parseAnnotation(intent.annotation);
       if (!annotation || annotation.id !== intent.id || annotation.captureId !== intent.captureId) throw changed();
-      if (!ledger.annotationRemovals?.[intent.id]) {
+      if (!ledger.annotationRemovals?.[intent.id] && !scanned.reservedIds.has(intent.id)) {
         const stage = await leaf(vault, path.join(intake.dir, `annotation-${intent.id}.stage`));
         if (stage.text !== intent.annotation) throw changed();
         // Reuse the raw classifier and exact parent/peer rules. Listing never
         // completes the pending writer or materializes its absent note.
-        await inventory(vault, intake, intent.id, intent.captureId);
+        await inventory(vault, intake, ledger, intent.id, intent.captureId);
         notes.push({ id: intent.id, captureId: intent.captureId, file: rel(vault, intentFile), text: intent.annotation, pending: true });
       }
     }
     if (!intake.storage.matches(await intake.storage.view())) throw changed();
+    reserved.verify();
     return notes;
   }
   async preview(id) {
     if (!uuid(id)) throw changed();
     const vault = this.vault(), intake = new Intake(vault), ledger = await intake.load();
     if (ledger.annotationRemovals?.[id]) throw Error('Review the existing annotation removal operation.');
-    const scope = await inventory(vault, intake, id); if (!scope.targets.length || !intake.storage.matches(await intake.storage.view())) throw changed();
+    const { scope, verifyReserved } = await inventory(vault, intake, ledger, id);
+    if (!scope.targets.length || !intake.storage.matches(await intake.storage.view())) throw changed();
+    verifyReserved();
     const token = randomUUID(); this.previews.set(token, { id, scope, ledger: intake.storage.expected });
     return { token, id, targets: scope.targets.map(target => target.file) };
   }
@@ -169,10 +188,11 @@ class AnnotationRemoval {
     const selected = this.previews.get(token); if (!selected) throw Error('Preview annotation removal again.');
     const vault = this.vault();
     return sourceMutation(vault.root, async () => {
-      const intake = new Intake(vault), ledger = await intake.load(), scope = await inventory(vault, intake, selected.id);
+      const intake = new Intake(vault), ledger = await intake.load();
+      const { scope, verifyReserved } = await inventory(vault, intake, ledger, selected.id);
       if (JSON.stringify(scope) !== JSON.stringify(selected.scope) || !intake.storage.matches(await intake.storage.view(), selected.ledger) || ledger.annotationRemovals?.[selected.id]) throw changed();
       ledger.annotationRemovals ||= {}; ledger.annotationRemovals[selected.id] = { operationId: randomUUID(), phase: 'removing', ...scope };
-      await intake.save(ledger); this.previews.delete(token); this.clearApprovals();
+      await intake.save(ledger, verifyReserved); this.previews.delete(token); this.clearApprovals();
       await vault.checkpoint('annotation-removal-authorized');
       return this.finish(vault, intake, ledger, selected.id);
     });
@@ -194,13 +214,13 @@ class AnnotationRemoval {
     const verify = async () => {
       if (await fs.realpath(vault.vault) !== authority.root || !intake.storage.matches(await intake.storage.view())) throw changed();
       for (const expected of authority.directories) if (JSON.stringify(await directory(vault, path.join(vault.vault, expected.file))) !== JSON.stringify(expected)) throw changed();
-      const fresh = await inventory(vault, intake, id, authority.captureId);
-      for (const target of fresh.targets) {
+      const { scope, verifyReserved } = await inventory(vault, intake, ledger, id, authority.captureId);
+      for (const target of scope.targets) {
         const expected = authority.targets.find(item => item.file === target.file);
         if (!expected || ['sha256', 'dev', 'ino', 'bytes', 'kind'].some(key => target[key] !== expected[key]) || target.peers.some(peer => !expected.peers.includes(peer))) throw changed();
       }
       for (const target of authority.targets) {
-        const actual = fresh.targets.find(item => item.file === target.file);
+        const actual = scope.targets.find(item => item.file === target.file);
         if (!actual) {
           const present = await fs.lstat(path.join(vault.vault, target.file)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
           if (present) throw changed();
@@ -208,7 +228,8 @@ class AnnotationRemoval {
       }
       for (const expected of authority.directories) if (JSON.stringify(await directory(vault, path.join(vault.vault, expected.file))) !== JSON.stringify(expected)) throw changed();
       if (!intake.storage.matches(await intake.storage.view())) throw changed();
-      return fresh;
+      verifyReserved();
+      return { ...scope, verifyReserved };
     };
     // Relationship payloads must go before their validating journals. A crash
     // must leave enough reviewed association to classify every remaining copy.
@@ -219,11 +240,13 @@ class AnnotationRemoval {
       const expected = current.targets.find(item => item.file === target.file), actual = await leaf(vault, path.join(vault.vault, target.file));
       if (!expected || ['sha256', 'dev', 'ino', 'bytes'].some(key => actual[key] !== expected[key]) || actual.links !== expected.peers.length || !intake.storage.matches(await intake.storage.view())) throw changed();
       intake.storage.guardSync();
+      current.verifyReserved();
       verifyRemovalTarget(vault, target, expected.peers, guard, changed);
       await fs.unlink(path.join(vault.vault, target.file)); await vault.checkpoint('annotation-removal-unlinked');
     }
-    if ((await verify()).targets.length) throw changed();
-    authority.phase = 'removed'; await intake.save(ledger); return true;
+    const final = await verify();
+    if (final.targets.length) throw changed();
+    authority.phase = 'removed'; await intake.save(ledger, final.verifyReserved); return true;
   }
 }
 function installAnnotationRemoval(options) {
