@@ -166,12 +166,13 @@ async function inventory(intake, ledger, capture, sourceHash, note, seed, now) {
   if (!candidates.length) return null;
   if (candidates.length !== 1) fail('more than one selected repair');
   const repairLeaf = candidates[0], repair = json(repairLeaf);
-  const repairProofs = ['priorConflict', 'annotationProof', 'sourceProof'];
+  const repairProofs = ['priorConflict', 'annotationProof', 'sourceProof', 'intentIdentity'];
   if (!shape(repair, ['schema', 'sourceHash', 'localHash', 'annotationId', 'annotation', 'tx'], repairProofs) || repair.schema !== 1 || repair.sourceHash !== sourceHash || !uuid(repair.annotationId) || !sha(repair.localHash)) fail('repair wrapper');
   if (repairProofs.some(key => Object.hasOwn(repair, key))) {
     if (!repair.priorConflict) fail('missing original repair proof');
     try { intake.validateRepairIntent(repair); } catch { fail('invalid repair publication proof'); }
   }
+  if (repair.intentIdentity && !equal(repair.intentIdentity, { dev: repairLeaf.target.dev, ino: repairLeaf.target.ino })) fail('retained repair intent identity changed');
   const tx = repair.tx, originalFile = path.join(intake.dir, `conflict-${tx?.revision?.id}.json`), resolutionFile = path.join(intake.dir, `conflict-${tx?.revision?.id}-${repair.annotationId}.json`);
   // Read the other selected leaves only after the wrapper identities are proven.
   if (!uuid(tx?.revision?.id) || tx.capture?.id !== capture.id || tx.sourceHash !== sourceHash || tx.resolution !== repair.annotationId) fail('repair source identity');
