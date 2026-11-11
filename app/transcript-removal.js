@@ -179,18 +179,33 @@ class TranscriptRemoval {
     const hasMarker = await exists(file), hasStage = await exists(stage), links = hasMarker && hasStage ? 2 : 1;
     if (!hasMarker && !hasStage) throw held();
     this.rememberRefusal(vault, id);
-    const raw = await this.store.read(vault, this.placeholder(vault), hasMarker ? file : stage, parents, links);
+    const controlFile = hasMarker ? file : stage;
+    const raw = await this.store.read(vault, this.placeholder(vault), controlFile, parents, links);
     const marker = this.validate(JSON.parse(raw.text), vault, id);
     if (!same(marker.control, raw.stat)) throw held();
+    const controls = new Map([[file, null], [stage, null]]);
+    controls.set(controlFile, raw.stat);
     if (hasMarker && hasStage) {
       const peer = await this.store.read(vault, marker.destination, stage, parents, 2);
       if (!same(raw.stat, peer.stat) || peer.text !== raw.text) throw held();
+      controls.set(stage, peer.stat);
     }
-    return { vault, marker, bytes: raw.text, hasMarker, hasStage };
+    return { vault, marker, bytes: raw.text, hasMarker, hasStage, controls };
   }
   async verifyAuthority(expected) {
     const current = await this.load(expected.vault, expected.marker.id);
     if (current.bytes !== expected.bytes || current.hasMarker !== expected.hasMarker || current.hasStage !== expected.hasStage || !same(current.marker.control, expected.marker.control)) throw held();
+    return current;
+  }
+  scopeParents(marker, vault) {
+    return new Map(marker.parents.map(item => [item.file === '.' ? path.resolve(vault.vault) : this.absolute(vault, item.file), { dev: BigInt(item.dev), ino: BigInt(item.ino) }]));
+  }
+  checkAuthority({ vault, marker, controls }) {
+    this.store.guard(vault, marker.destination, this.scopeParents(marker, vault));
+    for (const [file, stat] of controls) {
+      if (stat) this.store.checkLeaf(file, stat);
+      else if (local.lstatSync(file, { throwIfNoEntry: false })) throw held();
+    }
   }
   async remaining(marker, vault) {
     this.validate(marker, vault, marker.id);
@@ -206,10 +221,12 @@ class TranscriptRemoval {
     return remaining;
   }
   async checkTarget(marker, vault, target, remaining) {
-    const parents = new Map(marker.parents.map(item => [item.file === '.' ? path.resolve(vault.vault) : this.absolute(vault, item.file), { dev: BigInt(item.dev), ino: BigInt(item.ino) }]));
+    const parents = this.scopeParents(marker, vault);
+    const file = this.absolute(vault, target.file);
     const peers = remaining.filter(item => target.peers.includes(item.file));
-    const read = await this.store.read(vault, marker.destination, this.absolute(vault, target.file), parents, peers.length);
+    const read = await this.store.read(vault, marker.destination, file, parents, peers.length);
     if (!same(read.stat, target) || String(read.stat.size) !== target.bytes || sha(read.text) !== target.sha256) throw held();
+    return { file, stat: read.stat, peers };
   }
   async resume(id) {
     const record = await this.load(this.vault(), id);
@@ -230,15 +247,15 @@ class TranscriptRemoval {
         const fresh = await this.inventory(scope.exportOperation);
         if (JSON.stringify(fresh.scope) !== JSON.stringify(scope)) throw held();
         const { stage } = this.location(vault, scope.id);
-        const handle = await fs.open(stage, 'wx');
-        try {
-          const stat = await handle.stat({ bigint: true });
-          const marker = { schema: 1, kind: 'transcript-removal', ...scope, operation: randomUUID(), control: { dev: String(stat.dev), ino: String(stat.ino) } };
-          const bytes = JSON.stringify(marker, null, 2);
-          record = { vault, marker, bytes, hasMarker: false, hasStage: true };
+        this.store.guard(vault, scope.destination, fresh.parents);
+        this.fenceSync(fresh.intent, vault);
+        let marker;
+        this.store.writeControl(stage, stat => {
+          marker = { schema: 1, kind: 'transcript-removal', ...scope, operation: randomUUID(), control: { dev: String(stat.dev), ino: String(stat.ino) } };
           this.rememberRefusal(vault, scope.id);
-          await handle.writeFile(bytes); await handle.sync();
-        } finally { await handle.close(); }
+          return marker;
+        });
+        record = { vault, marker, bytes: JSON.stringify(marker, null, 2), hasMarker: false, hasStage: true };
         await this.store.checkpoint('transcript-remove-after-stage');
         await this.verifyAuthority(record);
       }
@@ -246,15 +263,18 @@ class TranscriptRemoval {
       await this.verifyAuthority(record);
       await this.remaining(record.marker, vault);
       if (!record.hasMarker) {
-        await this.verifyAuthority(record);
-        await fs.link(stage, file);
+        const authority = await this.verifyAuthority(record);
+        this.checkAuthority(authority);
+        local.linkSync(stage, file);
         record.hasMarker = true;
         await this.verifyAuthority(record);
       }
       await this.store.checkpoint('transcript-remove-after-tombstone');
       await this.verifyAuthority(record);
       if (record.hasStage) {
-        await this.verifyAuthority(record); await fs.unlink(stage);
+        const authority = await this.verifyAuthority(record);
+        this.checkAuthority(authority);
+        local.unlinkSync(stage);
         record.hasStage = false;
         await this.verifyAuthority(record);
       }
@@ -262,9 +282,12 @@ class TranscriptRemoval {
       for (const target of [...remaining]) {
         await this.verifyAuthority(record);
         remaining = await this.remaining(record.marker, vault);
-        await this.verifyAuthority(record);
-        await this.checkTarget(record.marker, vault, target, remaining);
-        await fs.unlink(this.absolute(vault, target.file));
+        const authority = await this.verifyAuthority(record);
+        const checked = await this.checkTarget(record.marker, vault, target, remaining);
+        // Close the guarded reads before the final synchronous proof and unlink.
+        this.checkAuthority(authority);
+        for (const peer of checked.peers) this.store.checkLeaf(this.absolute(vault, peer.file), checked.stat);
+        local.unlinkSync(checked.file);
         await this.store.checkpoint('transcript-remove-after-unlink');
         await this.verifyAuthority(record);
       }
