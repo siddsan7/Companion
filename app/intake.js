@@ -2,6 +2,7 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { readDraft, hash } = require('./intake-producer');
 const { readReview } = require('./intake-review');
 const { sourceMutation } = require('./source-mutation');
@@ -10,7 +11,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -26,6 +27,11 @@ const exactIdentity = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino
 const publicationIdentity = (info, nlink = info.nlink) => ({ dev: info.dev, ino: info.ino, nlink });
 const fileProof = (info, content) => ({ dev: String(info.dev), ino: String(info.ino), digest: hash(content) });
 const sameProofIdentity = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const acceptedOutcome = (tx, snapshotBytes = JSON.stringify(tx.revision, null, 2)) => ({
+  status: 'imported', identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, revision: tx.revision.id,
+  snapshotHash: hash(snapshotBytes), sourceHash: tx.sourceHash, captureId: tx.capture.id, locator: tx.revision.locator,
+  checkedAt: tx.revision.importedAt, ...(tx.sourceGeneration ? { sourceGeneration: tx.sourceGeneration } : {})
+});
 const heldArtifact = (folder, error, now) => ({
   status: 'held', locator: folder, checkedAt: now,
   reason: error.code ? 'Unreadable artifact. Check source access and complete the producer transfer, then Check now.' : error.message
@@ -33,6 +39,15 @@ const heldArtifact = (folder, error, now) => ({
 function noteText(capture, revision) {
   const fields = { companion_id: capture.id, artifact_type: 'capture', schema_version: 1, capture_type: 'reel_import', captured_at: capture.capturedAt, title: capture.title, source_hash: revision.sourceHash, source_revision: revision.id, source_started_at: revision.run.started_utc, imported_at: revision.importedAt, extraction_status: revision.extraction, human_review: revision.humanReview, ...(revision.review ? { processing_status: revision.processing || revision.run.state || 'unknown', support_eligible: revision.supportEligible !== false } : {}), provenance: revision.review ? 'Reel to MD finalized human decision; acceptance does not verify every claim' : 'Reel to MD validated draft; structural grounding is not factual verification' };
   return `---\n${Object.entries(fields).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n')}\n---\n\n${captureHeading(capture.title, 'reel_import')}\n\n${revision.text}`;
+}
+function selectedCapture(previous, revision, now) {
+  const capture = {
+    ...previous, currentRevision: revision.id, reviewed: true, rejected: revision.humanReview === 'reject',
+    supportEligible: revision.supportEligible !== false, reviewChoices: [], updatedAt: now,
+    selectionHistory: [...(previous.selectionHistory || []), { revision: revision.id, selectedAt: now }]
+  };
+  capture.currentHash = hash(noteText(capture, revision));
+  return capture;
 }
 class Intake {
   constructor(vault) { this.vault = vault; this.dir = path.join(vault.root, '.intake'); this.storage = new IntakeLedger(vault); }
@@ -611,7 +626,7 @@ class Intake {
         outcomes: { ...ledger.outcomes }, attempts: { ...ledger.attempts }, pending: { ...ledger.pending },
         ...(ledger.admissions || tx.sourceGeneration ? { admissions: { ...ledger.admissions } } : {})
       };
-      const outcome = { status: 'imported', identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, revision: tx.revision.id, snapshotHash: hash(snapshotBytes), sourceHash: tx.sourceHash, captureId: tx.capture.id, locator: tx.revision.locator, checkedAt: tx.revision.importedAt, ...(tx.sourceGeneration ? { sourceGeneration: tx.sourceGeneration } : {}) };
+      const outcome = acceptedOutcome(tx, snapshotBytes);
       const accepted = ledger.attempts[tx.revision.identity];
       if (accepted && (accepted.fingerprint !== outcome.fingerprint || accepted.captureId !== outcome.captureId || accepted.sourceHash !== outcome.sourceHash)) throw Error('Producer acceptance facts changed. All files were preserved.');
       next.outcomes[tx.key] = outcome;
@@ -827,6 +842,7 @@ class Intake {
         catch (error) { if (!error.intakeOutputHeld) throw error; }
       }
     }
+    await this.holdLegacyAccepted();
     await this.finishLink();
     await this.finishAnnotation();
     try { await this.finishRepair(); }
@@ -847,6 +863,42 @@ class Intake {
       else if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message);
       else throw error;
     }
+  }
+  async holdLegacyAccepted() {
+    const file = path.join(this.dir, 'transaction.json');
+    const guard = this.vault.publicationFolders(this.dir).guard;
+    guard();
+    const observed = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!observed) return;
+    const expected = this.storage.expected, ledger = await this.load();
+    const changed = () => Error('Older intake publication authority is ambiguous. All files were preserved.');
+    if (!this.storage.matches(this.storage.expected, expected)) throw changed();
+    this.storage.guardSync();
+    const { bytes, proof } = readExactSync(file, guard, Number(observed.nlink));
+    if (proof.dev !== String(observed.dev) || proof.ino !== String(observed.ino)) throw changed();
+    const tx = JSON.parse(bytes.toString('utf8'));
+    this.validateTransaction(tx);
+    if (tx.restoreOperation || this.hasOutputHold(ledger, tx) || ledger.pending[tx.sourceHash]) return;
+    const current = ledger.captures[tx.sourceHash], outcome = ledger.outcomes[tx.key];
+    const sameCapture = isDeepStrictEqual(current, tx.capture);
+    const referencesOutcome = outcome?.status === 'imported' && outcome.sourceHash === tx.sourceHash &&
+      outcome.revision === tx.revision.id && outcome.identity === tx.revision.identity;
+    if (!sameCapture && !referencesOutcome) return;
+    if (!sameCapture && current?.id === tx.capture.id) {
+      const selection = tx.resolution && tx.externalConflict === undefined && tx.revision.review &&
+        tx.previousHash === current.currentHash && isDeepStrictEqual(selectedCapture(current, tx.revision, tx.capture.updatedAt), tx.capture);
+      const missingNote = tx.restore && current.identityIssue && tx.previous === null && current.currentRevision === tx.revision.id &&
+        current.currentHash === tx.capture.currentHash;
+      if (selection || missingNote) return;
+    }
+    const acceptance = acceptedOutcome(tx);
+    if (!sameCapture || !isDeepStrictEqual(outcome, acceptance) || !isDeepStrictEqual(revisionAdmission(ledger, tx.revision.id), acceptance) ||
+        observed.nlink !== 1n || proof.digest !== hash(JSON.stringify(tx))) throw changed();
+    assertPublication(ledger, tx.capture.id, tx);
+    // The previous ledger has no publication inode proofs. The newly observed
+    // exact journal only authorizes preserving that journal in a hold.
+    const reason = `${outputHold} The original publication file identities were not recorded.${acceptancePreserved}`;
+    await this.archiveConflict(tx, ledger, reason, { journalProof: proof, guard, committed: true });
   }
   async defer(tx, ledger, reason) {
     this.validateTransaction(tx);
@@ -1026,8 +1078,8 @@ class Intake {
       if (!revision.review || revision.captureId !== id || revision.sourceHash !== sourceHash) throw Error('Only a finalized reviewed revision from this capture can be chosen.');
       const current = await read(this.destination(previous));
       if (current === null || hash(current) !== previous.currentHash) throw Error('Destination changed outside Companion. Resolve the local edit before choosing current evidence.');
-      const capture = { ...previous, currentRevision: revisionId, reviewed: true, rejected: revision.humanReview === 'reject', supportEligible: revision.supportEligible !== false, reviewChoices: [], updatedAt: now, selectionHistory: [...(previous.selectionHistory || []), { revision: revisionId, selectedAt: now }] };
-      const content = noteText(capture, revision), resolution = randomUUID(); capture.currentHash = hash(content);
+      const capture = selectedCapture(previous, revision, now);
+      const content = noteText(capture, revision), resolution = randomUUID();
       const key = Object.entries(ledger.outcomes).find(([, item]) => item.revision === revisionId)?.[0] || `${randomUUID()}:selection`;
       const tx = { schema: 1, resolution, retainOnly: content === current, key, sourceHash, capture, revision, content, previous: current, previousHash: hash(current), backup: `${id}-${revisionId}.before-${resolution}.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
       await this.publishJournal(path.join(this.dir, 'transaction.json'), tx);
