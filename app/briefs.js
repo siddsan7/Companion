@@ -72,6 +72,7 @@ function blockStaleApproval(issues) {
 
 const privateStores = new Set(['.codex', '.companion-capture-owners', '.git', '.ideas', '.intake', '.obsidian', '.transcripts', 'managed-home']);
 const approvalName = /^approved-([1-9][0-9]*)(?:-[\w-]+)?\.md$/;
+const checksumName = /^approved-[1-9][0-9]*-[a-f0-9]{64}\.md$/i;
 const receiptName = version => `.brief-approval-${version}.json`;
 const receiptVersion = /^\.brief-approval-([1-9][0-9]*)\.json$/;
 const integrityError = name => Error(`Approved brief integrity check failed: ${name}. Preserved for repair; this version cannot be pinned.`);
@@ -93,13 +94,18 @@ function approvedMetadata(data, version) {
 function versionEntries(names) {
   const versions = new Map();
   for (const name of names) {
-    const approval = approvalName.exec(name), receipt = receiptVersion.exec(name);
+    const approval = checksumName.test(name) && approvalName.exec(name), receipt = receiptVersion.exec(name);
     const version = Number((approval || receipt)?.[1]);
     if (!Number.isSafeInteger(version)) continue;
     if (!versions.has(version)) versions.set(version, { canonical: [], receipt: null });
     const entry = versions.get(version);
     if (approval) entry.canonical.push(name);
     else entry.receipt = name;
+  }
+  for (const name of names) {
+    if (checksumName.test(name)) continue;
+    const match = approvalName.exec(name);
+    if (match) versions.get(Number(match[1]))?.canonical.push(name);
   }
   return versions;
 }
@@ -138,15 +144,47 @@ class Briefs {
       return { ...entry, file, proof };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
-  async canonical(version, name, guard) {
+  async managedClaim(version, name, guard, receipt) {
     const file = path.join(this.dir, name);
     try {
       const { bytes, proof } = await readExact(file, guard);
       const data = metadata(bytes);
-      if (name !== `approved-${version}-${proof.digest}.md` || !approvedMetadata(data, version) ||
+      if (!checksumName.test(name) && data?.record?.version !== version &&
+          approvedMetadata(data, data?.record?.version)) return null;
+      const checksumMatches = name === `approved-${version}-${proof.digest}.md`;
+      const readableRename = !checksumName.test(name) && receipt &&
+        receipt.id === data?.record?.id && receipt.digest === proof.digest;
+      if ((!checksumMatches && !readableRename) || !approvedMetadata(data, version) ||
+          !receipt && data.managed_parent !== undefined ||
           data.managed_parent !== undefined && !parentMatches(data.managed_parent, this.managedParent)) throw integrityError(name);
       return { file, proof, data, guard };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
+  }
+  receiptBytes(version, id, digest) {
+    return JSON.stringify({ schema: 1, parent: this.managedParent, id, version, digest });
+  }
+  async observeLegacy(version, candidate, guard, lockHeld) {
+    const reserve = async () => {
+      const name = receiptName(version);
+      const file = path.join(this.dir, name);
+      const { proof, data } = candidate;
+      verifyStageSync(candidate.file, candidate.guard, proof);
+      let present;
+      try { present = local.lstatSync(file); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (present) {
+        const receipt = await this.receipt(version, name, guard);
+        if (receipt.id !== data.record.id || receipt.digest !== proof.digest) throw integrityError(name);
+        verifyStageSync(file, guard, receipt.proof);
+        verifyStageSync(candidate.file, candidate.guard, proof);
+        return receipt;
+      }
+      const receiptProof = await writeStage(file, this.receiptBytes(version, data.record.id, proof.digest), guard);
+      verifyStageSync(file, guard, receiptProof);
+      verifyStageSync(candidate.file, candidate.guard, proof);
+      return { id: data.record.id, digest: proof.digest, file, proof: receiptProof };
+    };
+    return lockHeld ? reserve() : withBriefMutation(this.vault.root, reserve);
   }
   async scanApprovalClaims(ids, canonicalFiles) {
     const claims = new Map();
@@ -174,62 +212,81 @@ class Briefs {
     await visit(this.vault.vault, this.folderGuard(this.vault.vault));
     return claims;
   }
-  async approvedInventory(index, onlyVersion) {
+  async approvedInventory(index, onlyVersion, lockHeld) {
     const inspected = new Map(), ids = new Set(), canonicalFiles = new Set();
     for (const [version, entry] of index.versions) {
       if (onlyVersion !== undefined && onlyVersion !== version) continue;
-      for (const name of entry.canonical) canonicalFiles.add(path.join(this.dir, name));
       try {
-        if (entry.canonical.length > 1) throw duplicateError();
         const receipt = await this.receipt(version, entry.receipt, index.guard);
-        const canonical = entry.canonical[0] && await this.canonical(version, entry.canonical[0], index.guard);
+        let canonical;
+        for (const name of entry.canonical) {
+          const claim = await this.managedClaim(version, name, index.guard, receipt);
+          if (!claim) continue;
+          canonicalFiles.add(claim.file);
+          if (canonical) throw duplicateError();
+          canonical = claim;
+        }
         const id = receipt?.id || canonical?.data.record.id;
         if (id) ids.add(id);
         if (receipt && canonical && (receipt.id !== canonical.data.record.id || receipt.digest !== canonical.proof.digest)) {
-          throw integrityError(entry.canonical[0]);
+          throw integrityError(path.basename(canonical.file));
         }
         inspected.set(version, { id, receipt, canonical });
       } catch (error) { inspected.set(version, { error }); }
     }
     const claims = await this.scanApprovalClaims(ids, canonicalFiles);
     index.guard();
-    return new Map([...inspected].map(([version, entry]) => {
-      if (entry.error) return [version, entry];
-      const { id, receipt, canonical } = entry;
+    const approvals = new Map();
+    for (const [version, entry] of inspected) {
+      if (entry.error) { approvals.set(version, entry); continue; }
+      const { id, canonical } = entry;
+      let { receipt } = entry;
       const moved = claims.get(id) || [];
-      if (moved.length + Number(Boolean(canonical)) > 1) return [version, { error: duplicateError() }];
+      if (moved.length + Number(Boolean(canonical)) > 1) {
+        approvals.set(version, { error: duplicateError() });
+        continue;
+      }
       const candidate = canonical || moved[0];
-      if (!candidate || !canonical && !receipt) return [version, {}];
+      if (!candidate || !canonical && !receipt) { approvals.set(version, { receipt }); continue; }
       try {
-        if (receipt) verifyStageSync(receipt.file, index.guard, receipt.proof);
         verifyStageSync(candidate.file, candidate.guard, candidate.proof);
         const { data, proof, file } = candidate;
         if (!approvedMetadata(data, version) || receipt && receipt.digest !== proof.digest ||
             data.managed_parent !== undefined && !parentMatches(data.managed_parent, this.managedParent)) {
           throw integrityError(path.basename(file));
         }
-        return [version, { record: { ...data.record, file: path.relative(this.dir, file), digest: proof.digest } }];
-      } catch (error) { return [version, { error: Error(integrityError(path.basename(candidate.file)).message, { cause: error }) }]; }
-    }));
+        receipt ||= await this.observeLegacy(version, candidate, index.guard, lockHeld);
+        verifyStageSync(receipt.file, index.guard, receipt.proof);
+        verifyStageSync(file, candidate.guard, proof);
+        approvals.set(version, { receipt, record: { ...data.record, file: path.relative(this.dir, file), digest: proof.digest } });
+      } catch (error) {
+        approvals.set(version, { error: Error(integrityError(path.basename(candidate.file)).message, { cause: error }) });
+      }
+    }
+    return approvals;
   }
-  async records(onlyVersion, index = null) {
-    index ||= await this.index();
-    const approvals = await this.approvedInventory(index, onlyVersion);
+  async readStore({ onlyVersion, lockHeld = false } = {}) {
+    const index = await this.index();
+    const approvals = await this.approvedInventory(index, onlyVersion, lockHeld);
     const records = [];
     for (const { record, error } of approvals.values()) {
       if (error) throw error;
       if (record) records.push(record);
     }
-    if (onlyVersion !== undefined) return records;
-    for (const name of index.names) {
-      if (!/^(proposal|failure)-[\w-]+\.md$/.test(name)) continue;
-      const { bytes, proof } = await readExact(path.join(this.dir, name), index.guard);
-      const data = metadata(bytes);
-      if (!data || data.artifact_type !== 'project_brief' || data.schema_version !== 1 || !validRecord(data.record) ||
-          name !== `${data.record.kind}-${data.record.id}.md`) throw Error(`Invalid brief file ${name}. Preserved for repair.`);
-      records.push({ ...data.record, file: name, digest: proof.digest });
+    if (onlyVersion === undefined) {
+      for (const name of index.names) {
+        if (!/^(proposal|failure)-[\w-]+\.md$/.test(name)) continue;
+        const { bytes, proof } = await readExact(path.join(this.dir, name), index.guard);
+        const data = metadata(bytes);
+        if (!data || data.artifact_type !== 'project_brief' || data.schema_version !== 1 || !validRecord(data.record) ||
+            name !== `${data.record.kind}-${data.record.id}.md`) throw Error(`Invalid brief file ${name}. Preserved for repair.`);
+        records.push({ ...data.record, file: name, digest: proof.digest });
+      }
     }
-    return records;
+    return { records, approvals };
+  }
+  async records(onlyVersion) {
+    return (await this.readStore({ onlyVersion })).records;
   }
   async write(record, name) {
     this.assertSelection();
@@ -251,9 +308,7 @@ class Briefs {
       verifyStageSync(stage, selected, staged);
       if (approved) {
         this.requireCurrentSourcesSync(record);
-        reserved = await writeStage(receipt, JSON.stringify({
-          schema: 1, parent: this.managedParent, id: record.id, version: record.version, digest: staged.digest
-        }), selected);
+        reserved = await writeStage(receipt, this.receiptBytes(record.version, record.id, staged.digest), selected);
         verifyStageSync(receipt, selected, reserved);
         this.requireCurrentSourcesSync(record);
         verifyStageSync(stage, selected, staged);
@@ -262,7 +317,7 @@ class Briefs {
       local.linkSync(stage, destination);
       linked = true;
       await verifyPeers(stage, destination, guard, staged);
-      try { await removeStage(stage, guard, staged, 2); }
+      try { await removeStage(stage, guard, staged, 2, () => verifyStageSync(destination, guard, staged, 2)); }
       catch (error) { throw Error(`The Project Brief was published, but stage cleanup could not be verified. Inspect the saved version before retrying. ${error.message}`); }
       await verifyStage(destination, guard, staged);
       if (reserved) verifyStageSync(receipt, guard, reserved);
@@ -299,14 +354,14 @@ class Briefs {
   }
   async propose(paths, now) {
     return withBriefMutation(this.vault.root, async () => {
-      const records = await this.records(); let sources;
+      const { records } = await this.readStore({ lockHeld: true }); let sources;
       try { sources = await this.readSources(paths); }
       catch (error) {
         const failure = { id: randomUUID(), kind: 'failure', ordinal: Math.max(0, ...records.map(r => r.ordinal || 0)) + 1, createdAt: now, sources: [], sections: [], error: error.message };
         await this.write(failure, `failure-${failure.id}.md`); throw error;
       }
       const record = { id: randomUUID(), kind: 'proposal', ordinal: Math.max(0, ...records.map(r => r.ordinal || 0)) + 1, createdAt: now, sources, sections: extract(sources) };
-      await this.write(record, `proposal-${record.id}.md`); return this.state();
+      await this.write(record, `proposal-${record.id}.md`); return this.state(true);
     });
   }
   async outdated(record) {
@@ -328,21 +383,24 @@ class Briefs {
     }
     blockStaleApproval(issues);
   }
-  async state() {
-    const records = await this.records(); const approved = records.filter(r => r.kind === 'approved').sort((a, b) => b.version - a.version);
+  async state(lockHeld = false) {
+    const { records } = await this.readStore({ lockHeld });
+    const approved = records.filter(r => r.kind === 'approved').sort((a, b) => b.version - a.version);
     const proposed = records.filter(r => r.kind === 'proposal').sort((a, b) => b.ordinal - a.ordinal)[0];
     const latestAttempt = records.filter(r => r.kind !== 'approved').sort((a, b) => b.ordinal - a.ordinal)[0];
     return { approved, proposed, failure: latestAttempt?.kind === 'failure' ? latestAttempt.error : null, issues: await this.outdated(approved[0]), proposalIssues: await this.outdated(proposed) };
   }
   async approve({ id, digest, sections, references }, now) {
     return withBriefMutation(this.vault.root, async () => {
-      const index = await this.index();
-      const records = await this.records(undefined, index), proposed = records.find(r => r.kind === 'proposal' && r.id === id);
+      const { records, approvals } = await this.readStore({ lockHeld: true });
+      const proposed = records.find(r => r.kind === 'proposal' && r.id === id);
       if (!proposed || proposed.digest !== digest) throw Error('Proposal changed. Inspect it again.');
+      const prior = [...approvals.values()].find(entry => entry.receipt?.id === id);
+      if (prior && !prior.record) throw Error('This proposal was already approved. Its reserved version is unavailable.');
       await this.requireCurrentSources(proposed);
       const latestAttempt = records.filter(r => r.kind !== 'approved').sort((a, b) => b.ordinal - a.ordinal)[0];
       if (latestAttempt?.kind === 'failure') throw Error('Refresh approval blocked. Resolve the failed refresh and propose again.');
-      if (records.some(r => r.kind === 'approved' && r.id === id)) return this.state();
+      if (prior) return this.state(true);
       if (!Array.isArray(sections) || sections.length !== titles.length || sections.some(s => typeof s !== 'string' || !s.trim())) throw Error('Fill every brief section or retain its explicit gap.');
       if (sections.some(s => [...s].length > 32000)) throw Error('Brief section exceeds 32000 characters. Nothing was shortened.');
       if (!Array.isArray(references) || references.length !== titles.length) throw Error('Inspect the passage references for every section.');
@@ -357,12 +415,12 @@ class Briefs {
         if (!refs.length && !sections[i].startsWith('Gap:')) throw Error('An unsupported section must keep an explicit Gap: or add a passage reference.');
         return { ...s, text: sections[i], references: refs };
     });
-    const version = Math.max(0, ...index.versions.keys()) + 1;
+    const version = Math.max(0, ...approvals.keys()) + 1;
     if (!Number.isSafeInteger(version)) throw Error('No unused approved brief version is available.');
     const { digest: _digest, file: _file, ...base } = proposed;
     const approved = { ...base, kind: 'approved', version, approvedAt: now, sections: reviewedSections };
     await this.write(approved, `approved-${version}-${hash(markdown(approved, this.managedParent))}.md`);
-    return this.state();
+    return this.state(true);
     });
   }
   async pinned(version) {
