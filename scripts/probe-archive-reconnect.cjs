@@ -143,12 +143,14 @@ async function main() {
     await expect(region).toContainText('Imported daily intake intent is inactive');
     await missing(scheduleFile(target));
     assert.deepEqual(matchingNativeNames(scheduleFile(target)), [], 'Inactive restore or preview must not register a task.');
+    const sourceRoot = path.join(source, 'vault', 'Companion'), targetRoot = path.join(target, 'vault', 'Companion');
     async function preview(view) {
-      await view.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(archive.id);
+      await view.getByLabel('Imported cadence to reconnect', { exact: true }).selectOption(JSON.stringify({ archiveId: archive.id, sourceRoot, targetRoot }));
       await view.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true }).click();
       return view.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true });
     }
     const confirm = await preview(region);
+    await expect(region.locator('#archive-reconnect-summary')).toContainText(`Matched vault: ${targetRoot}`);
     await expect(region).toContainText(`Original anchor: ${intent.anchor}`);
     await expect(region).toContainText('A fresh local task identity will be used');
     await missing(scheduleFile(target));

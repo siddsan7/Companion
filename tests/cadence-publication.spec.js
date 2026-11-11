@@ -45,7 +45,7 @@ async function importedCadence(vault) {
   const intent = { schema: 1, id: randomUUID(), anchor, vault: oldVault, parent: 'Companion', mode: 'enabled', reconnectRequired: true };
   const filename = `archive-intent-${archiveId}-${hash(sourceRoot + '\n' + vault.root)}.json`;
   await fs.writeFile(path.join(root, filename), JSON.stringify({ schema: 1, archiveId, sourceRoot, targetRoot: vault.root, intent }));
-  return archiveId;
+  return { archiveId, sourceRoot, targetRoot: vault.root };
 }
 
 async function reconnectFixture() {
@@ -53,7 +53,7 @@ async function reconnectFixture() {
   await vault.setup();
   const settingsPath = path.join(root, 'settings.json');
   await fs.writeFile(settingsPath, JSON.stringify({ vault: vault.vault, parent: 'Companion' }));
-  const archiveId = await importedCadence(vault);
+  const selection = await importedCadence(vault);
   const scheduleFile = path.join(root, 'schedule.json'), taskFile = path.join(root, 'scheduler-task.json');
   const schedule = new Schedule(scheduleFile, vault, { testRoot: root });
   const calls = [];
@@ -66,13 +66,12 @@ async function reconnectFixture() {
   const handlers = new Map();
   const history = new Conversations({ dataRoot: root, getVault: () => vault, clock, checkpoint: async () => {}, testRoot: root });
   installArchives({ ipcMain: { handle: (name, handle) => handlers.set(name, handle) }, history, settingsPath, testRoot: root, clock, checkpoint: async () => {}, getSchedule: () => schedule });
-  const preview = (request = { archiveId }) => handlers.get('archive-reconnect-preview')(null, request);
+  const preview = (request = selection) => handlers.get('archive-reconnect-preview')(null, request);
   const confirm = review => handlers.get('archive-reconnect')(null, { token: review.token });
-  return { vault, archiveId, scheduleFile, taskFile, calls, preview, confirm };
+  return { vault, ...selection, scheduleFile, taskFile, calls, preview, confirm };
 }
 
-async function secondMatch({ vault, archiveId }) {
-  const sourceRoot = path.join(root, 'previous-vault', 'Companion');
+async function secondMatch({ vault, archiveId, sourceRoot }) {
   const currentName = `archive-intent-${archiveId}-${hash(sourceRoot + '\n' + vault.root)}.json`;
   const record = JSON.parse(await readOptional(path.join(root, currentName)));
   const other = new Vault(vault.vault, 'Other managed parent');
@@ -328,7 +327,7 @@ test('Configure cannot switch managed parents during native cadence reconnection
   const originalSettings = JSON.stringify({ vault: vault.vault, parent: 'Companion' });
   await fs.writeFile(settingsFile, originalSettings);
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify(clock()));
-  const archiveId = await importedCadence(vault);
+  const selection = await importedCadence(vault);
   const app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   try {
     const page = await app.firstWindow();
@@ -347,7 +346,7 @@ test('Configure cannot switch managed parents during native cadence reconnection
         return apply.call(this, operation, ...args);
       };
     });
-    const review = await page.evaluate(id => window.companion['archive-reconnect-preview']({ archiveId: id }), archiveId);
+    const review = await page.evaluate(input => window.companion['archive-reconnect-preview'](input), selection);
     const reconnect = page.evaluate(async token => {
       try { return { value: await window.companion['archive-reconnect']({ token }) }; }
       catch (error) { return { error: error.message }; }

@@ -522,7 +522,9 @@ class Archives {
         const guard = () => { this.guard(); directoryGuard(); };
         const assertSelection = () => this.assertReconnectSelection(vault, schedule, guard);
         await assertSelection();
-        const intents = (await this.inactiveIntents()).filter(record => record.archiveId === input?.archiveId && record.targetRoot === vault.root);
+        if (input?.targetRoot !== vault.root) throw Error('Select exactly one imported cadence matched to the current vault.');
+        const intents = (await this.inactiveIntents()).filter(record => record.archiveId === input.archiveId &&
+          record.sourceRoot === input.sourceRoot && record.targetRoot === input.targetRoot);
         if (intents.length !== 1) throw Error('Select exactly one imported cadence matched to the current vault.');
         const imported = intents[0], prior = await schedule.snapshot(guard), existing = prior?.state;
         if (existing && (!existing.archiveReconnect || existing.archiveReconnect.archiveId !== imported.archiveId || existing.archiveReconnect.sourceRoot !== imported.sourceRoot || existing.archiveReconnect.targetRoot !== imported.targetRoot || existing.archiveReconnect.intentId !== imported.intent.id || !schedule.matches(existing))) throw Error('Current daily intake settings belong to another schedule. Preserve them and resolve that schedule explicitly before reconnection.');
@@ -535,7 +537,7 @@ class Archives {
         const alreadyConnected = state.archiveReconnect.status === 'connected' && state.mode === imported.intent.mode && (state.mode === 'disabled' ? !effective : effective && effective.enabled === (state.mode === 'enabled'));
         const token = randomUUID();
         this.reconnectReview = { token, imported, state, prior: prior?.proof || null, vault, alreadyConnected };
-        return { token, anchor: state.anchor, mode: imported.intent.mode, alreadyConnected, pending: !!existing && state.archiveReconnect.status !== 'connected' };
+        return { token, sourceRoot: imported.sourceRoot, targetRoot: imported.targetRoot, anchor: state.anchor, mode: imported.intent.mode, alreadyConnected, pending: !!existing && state.archiveReconnect.status !== 'connected' };
       });
     });
   }
@@ -579,7 +581,7 @@ class Archives {
           // The persisted pending/disabled record owns the attempted ID. Retry reuses it, even if task creation succeeded.
           throw Error(`Imported cadence reconnection did not finish. A pending disabled local record was saved before registration; the task or final connection write may have succeeded. Preview again to inspect the same local identity before an explicit retry. ${error.message}`);
         }
-        return { connected: true, id: state.id, anchor: state.anchor };
+        return { connected: true, id: state.id, anchor: state.anchor, sourceRoot: review.imported.sourceRoot, targetRoot: review.imported.targetRoot };
       });
     });
   }

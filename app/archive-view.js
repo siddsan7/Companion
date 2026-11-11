@@ -52,7 +52,7 @@ const archiveCadence = document.getElementById('archive-cadence');
 const archiveReconnectPreview = document.getElementById('archive-reconnect-preview');
 const archiveReconnectConfirm = document.getElementById('archive-reconnect');
 const archiveReconnectSummary = document.getElementById('archive-reconnect-summary');
-let archiveReconnectToken;
+let archiveReconnectToken, archiveReconnectEpoch = 0;
 let archiveInspection, archiveRestoreToken, archiveMissing = 0, archiveMetadata = 0, archiveMetadataConflicts = 0;
 function invalidateRestore() { archiveRestoreToken = null; archiveRestore.disabled = true; archiveConflicts.replaceChildren(); archiveNotes.replaceChildren(); }
 function restoreChoices() { return [...archiveConflicts.querySelectorAll('select')].map(select => ({ id: select.dataset.conversationId, choice: select.value })); }
@@ -132,31 +132,48 @@ async function showArchiveIntents() {
     const result = await window.companion['archive-state']();
     archiveIntentSummary.textContent = result.inactiveIntents.length ? `Imported daily intake intent is inactive. ${result.inactiveIntents.map(record => `Requested ${record.intent.mode}; anchor ${record.intent.anchor}; original vault ${record.sourceRoot}; matched vault ${record.targetRoot}.`).join(' ')} Explicit scheduled-task reconnection is required. Startup does not run imported cadence.` : 'No imported daily intake intent.';
     const previous = archiveCadence.value; archiveCadence.replaceChildren();
-    for (const record of [null, ...result.inactiveIntents]) { const option = document.createElement('option'); option.value = record?.archiveId || ''; option.textContent = record ? `${record.archiveId}: ${record.intent.mode}; ${record.intent.anchor}; ${record.targetRoot}` : 'Choose an imported cadence'; archiveCadence.append(option); }
+    for (const record of [null, ...result.inactiveIntents]) {
+      const option = document.createElement('option');
+      option.value = record ? JSON.stringify({ archiveId: record.archiveId, sourceRoot: record.sourceRoot, targetRoot: record.targetRoot }) : '';
+      option.textContent = record ? `${record.archiveId}: ${record.intent.mode}; ${record.intent.anchor}; matched vault ${record.targetRoot}; original vault ${record.sourceRoot}` : 'Choose an imported cadence';
+      archiveCadence.append(option);
+    }
     if ([...archiveCadence.options].some(option => option.value === previous)) archiveCadence.value = previous;
+    else invalidateCadenceReview();
     showCodexHints(result.codexHints);
   } catch (error) { archiveIntentSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
 }
 function showCodexHints(records) {
   archiveCodexHintSummary.textContent = records.length ? `Archived Codex preferences are inert reconnection hints. ${records.map(record => `Archive ${record.archiveId}: executable ${record.preferences.executable}; project ${record.preferences.project}; former vault ${record.preferences.vault}; requested sandbox ${record.preferences.sandbox}.`).join(' ')} Reapproval is required in the existing Check Codex setup workflow. No imported path, sandbox permission, authentication, readiness or connection is applied.` : 'No archived Codex reconnection hints.';
 }
-archiveCadence.onchange = () => { archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectSummary.textContent = 'Preview the selected imported cadence before connecting it.'; };
+function invalidateCadenceReview() {
+  archiveReconnectEpoch++;
+  archiveReconnectToken = null;
+  archiveReconnectConfirm.disabled = true;
+  archiveReconnectSummary.textContent = 'Preview the selected imported cadence before connecting it.';
+}
+archiveCadence.onchange = invalidateCadenceReview;
 archiveReconnectPreview.onclick = async () => {
   archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectPreview.disabled = true;
+  const request = ++archiveReconnectEpoch, choice = archiveCadence.value;
+  const current = () => request === archiveReconnectEpoch && choice === archiveCadence.value;
   try {
-    const result = await window.companion['archive-reconnect-preview']({ archiveId: archiveCadence.value });
-    if (result.alreadyConnected) { archiveReconnectSummary.textContent = 'This imported cadence is already connected. The existing local task was inspected; no duplicate was created.'; return; }
+    const result = await window.companion['archive-reconnect-preview'](choice ? JSON.parse(choice) : null);
+    if (!current()) return;
+    if (result.alreadyConnected) { archiveReconnectSummary.textContent = `This imported cadence is already connected to ${result.targetRoot}. The existing local task was inspected; no duplicate was created.`; return; }
     archiveReconnectToken = result.token;
-    archiveReconnectSummary.textContent = `Original anchor: ${result.anchor}. Requested mode: ${result.mode}. A fresh local task identity will be used; an unfinished reconnection reuses its already reserved local identity. No missed checks run during reconnection. Historical due slots are skipped explicitly; later checks keep this anchor. Current vault sources require their own connection review. Only confirm if this current vault and cadence are intended. This does not authenticate Codex or submit model requests.`;
+    archiveReconnectSummary.textContent = `Matched vault: ${result.targetRoot}. Original vault: ${result.sourceRoot}. Original anchor: ${result.anchor}. Requested mode: ${result.mode}. A fresh local task identity will be used; an unfinished reconnection reuses its already reserved local identity. No missed checks run during reconnection. Historical due slots are skipped explicitly; later checks keep this anchor. Current vault sources require their own connection review. Only confirm if this current vault and cadence are intended. This does not authenticate Codex or submit model requests.`;
     archiveReconnectConfirm.disabled = false;
-  } catch (error) { archiveReconnectSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
+  } catch (error) { if (current()) archiveReconnectSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
   finally { archiveReconnectPreview.disabled = false; }
 };
 archiveReconnectConfirm.onclick = async () => {
-  const token = archiveReconnectToken; archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectPreview.disabled = true;
-  try { const result = await window.companion['archive-reconnect']({ token }); archiveReconnectSummary.textContent = `Imported daily intake connected. Original anchor: ${result.anchor}. Current local schedule: ${result.id}. No historical missed checks were run.`; }
+  const token = archiveReconnectToken;
+  if (!token) return;
+  archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectPreview.disabled = true; archiveCadence.disabled = true;
+  try { const result = await window.companion['archive-reconnect']({ token }); archiveReconnectSummary.textContent = `Imported daily intake connected. Matched vault: ${result.targetRoot}. Original vault: ${result.sourceRoot}. Original anchor: ${result.anchor}. Current local schedule: ${result.id}. No historical missed checks were run.`; }
   catch (error) { archiveReconnectSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
-  finally { archiveReconnectPreview.disabled = false; window.dispatchEvent(new Event('companion-schedule-changed')); }
+  finally { archiveCadence.disabled = false; archiveReconnectPreview.disabled = false; window.dispatchEvent(new Event('companion-schedule-changed')); }
 };
 showArchiveIntents();
 
@@ -210,6 +227,6 @@ document.getElementById('archive-recovery-confirm').onclick = async () => {
 };
 document.getElementById('archive-recovery-cancel').onclick = invalidateRestorationRecovery;
 for (const [id, event] of [['conversation-new', 'click'], ['conversation-select', 'change']]) document.getElementById(id).addEventListener(event, invalidateRestorationRecovery);
-document.getElementById('configure').addEventListener('click', () => { restorationPendingEpoch++; invalidateRestorationRecovery(); document.getElementById('archive-recovery-pending').replaceChildren(); });
+document.getElementById('configure').addEventListener('click', () => { invalidateCadenceReview(); restorationPendingEpoch++; invalidateRestorationRecovery(); document.getElementById('archive-recovery-pending').replaceChildren(); });
 window.addEventListener('companion-vault-configured', () => refreshRestorationRecovery());
 refreshRestorationRecovery();
