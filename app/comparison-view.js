@@ -88,6 +88,16 @@
         brief.append(citations);
       }
     }
+    const sourceDetails = document.createElement('details'), sourceSummary = document.createElement('summary');
+    sourceSummary.textContent = 'Inspect pinned source lines';
+    sourceDetails.append(sourceSummary);
+    for (const { number, text } of result.brief.sources) {
+      const heading = document.createElement('h5'), lines = document.createElement('pre');
+      heading.textContent = `Source ${number}`;
+      lines.textContent = text.split(/\r?\n/).map((line, index) => `${index + 1} | ${line}`).join('\n');
+      sourceDetails.append(heading, lines);
+    }
+    brief.append(sourceDetails);
     byId('comparison-score').replaceChildren();
     for (const output of result.outputs) {
       const article = document.createElement('article'), heading = document.createElement('h4'), text = document.createElement('pre'), state = document.createElement('p'), feedback = document.createElement('p'), save = document.createElement('button');

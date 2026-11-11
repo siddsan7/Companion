@@ -5,13 +5,17 @@ const { createHash, randomUUID, randomInt } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
-const { readExact, readExactSync, writeStage, verifyStageSync, verifyPeersSync } = require('./staged-publication');
+const { readExact, readExactSync, writeStage, verifyStageSync, verifyPeersSync, verifyAbsentSync, validProof } = require('./staged-publication');
 const { fixtures, prompts } = require('./comparison-fixtures');
 const rubric = require('./comparison-rubric');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 const sameProof = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino && a.digest === b.digest;
 const historyChanged = () => Object.assign(Error('Comparison history changed or is unavailable. Existing history was not replaced. Preserve the retained text.'), { code: 'HISTORY_CONFLICT' });
+const creationName = id => `.${id}.creation`;
+const identity = stat => ({ dev: String(stat.dev), ino: String(stat.ino) });
+const sameIdentity = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
+const creationChanged = () => Error('Comparison first-save history or its stage changed. Preserve the files for inspection.');
 const packageHeader = 'Synthetic comparison input. Authored source material is not actual reel evidence.';
 const terminal = slot => ['completed', 'failed', 'interrupted'].includes(slot.status);
 const candidateDigest = slot => hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
@@ -55,13 +59,12 @@ class Comparisons {
   }
   safeDirectory(create = false, expected) {
     this.anchor();
-    const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
     const reject = () => { throw Error('Comparison directory is not an ordinary contained local history folder. Restore the folder before continuing.'); };
     const root = local.lstatSync(this.dataRoot, { bigint: true });
-    if (!root.isDirectory() || root.isSymbolicLink() || !same(root, this.rootIdentity) || local.realpathSync(this.dataRoot) !== this.dataRoot) reject();
+    if (!root.isDirectory() || root.isSymbolicLink() || !sameIdentity(root, this.rootIdentity) || local.realpathSync(this.dataRoot) !== this.dataRoot) reject();
     if (create) { try { local.mkdirSync(this.directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } }
     const directory = local.lstatSync(this.directory, { bigint: true });
-    if (!directory.isDirectory() || directory.isSymbolicLink() || local.realpathSync(this.directory) !== this.directory || expected && !same(directory, expected)) reject();
+    if (!directory.isDirectory() || directory.isSymbolicLink() || local.realpathSync(this.directory) !== this.directory || expected && !sameIdentity(directory, expected)) reject();
     return directory;
   }
   async lock(work) {
@@ -72,10 +75,19 @@ class Comparisons {
     if (this.unsaved.has(id)) return structuredClone(this.unsaved.get(id));
     return this.readStored(id, forMutation);
   }
+  decodeHistory(id, bytes) {
+    const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    if (record.schema !== 1 || record.id !== id || !Array.isArray(record.fixtures) || record.fixtures.length !== 3 || !Array.isArray(record.slots) || record.slots.length !== 6 || !Array.isArray(record.displayOrder) || record.displayOrder.length !== 6 || new Set(record.displayOrder).size !== 6 || record.displayOrder.some(slotId => !record.slots.some(slot => slot.id === slotId)) || record.slots.some(slot => !uuid(slot.id) || !['direct', 'analogy'].includes(slot.method) || slot.package?.digest !== hash(slot.package.text))) throw Error('Comparison history needs repair. Preserve the file.');
+    const pairs = record.slots.map(slot => `${slot.fixtureId}:${slot.method}`);
+    if (new Set(pairs).size !== 6 || fixtures.some(fixture => ['direct', 'analogy'].some(method => !pairs.includes(`${fixture.id}:${method}`))) || record.slots.some(slot => !['pending', 'inProgress', 'completed', 'failed', 'interrupted'].includes(slot.status))) throw Error('Comparison outcome slots need repair. Preserve the file.');
+    if (record.blindOrder !== undefined && (!Array.isArray(record.blindOrder) || record.blindOrder.length !== 6 || record.blindOrder.some(entry => !entry || !/^Sample [a-f0-9]{8}$/.test(entry.label) || !record.slots.some(slot => slot.id === entry.slotId)) || new Set(record.blindOrder.map(entry => entry.label)).size !== 6 || new Set(record.blindOrder.map(entry => entry.slotId)).size !== 6)) throw Error('Comparison blind mapping needs repair. Preserve the file; labels were not reassigned.');
+    return record;
+  }
   async readStored(id, forMutation = false, withProof = false) {
     if (!uuid(id)) throw Error('Comparison identity is invalid.');
     const directory = this.safeDirectory(), file = path.join(this.directory, `${id}.json`);
     const guard = () => this.safeDirectory(false, directory);
+    if (forMutation) this.recoverCreation(id, directory);
     let exact;
     try { exact = await readExact(file, guard); }
     catch (error) {
@@ -83,16 +95,52 @@ class Comparisons {
       throw error;
     }
     const { bytes, proof } = exact;
-    const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-    if (record.schema !== 1 || record.id !== id || !Array.isArray(record.fixtures) || record.fixtures.length !== 3 || !Array.isArray(record.slots) || record.slots.length !== 6 || !Array.isArray(record.displayOrder) || record.displayOrder.length !== 6 || new Set(record.displayOrder).size !== 6 || record.displayOrder.some(slotId => !record.slots.some(slot => slot.id === slotId)) || record.slots.some(slot => !uuid(slot.id) || !['direct', 'analogy'].includes(slot.method) || slot.package?.digest !== hash(slot.package.text))) throw Error('Comparison history needs repair. Preserve the file.');
-    const pairs = record.slots.map(slot => `${slot.fixtureId}:${slot.method}`);
-    if (new Set(pairs).size !== 6 || fixtures.some(fixture => ['direct', 'analogy'].some(method => !pairs.includes(`${fixture.id}:${method}`))) || record.slots.some(slot => !['pending', 'inProgress', 'completed', 'failed', 'interrupted'].includes(slot.status))) throw Error('Comparison outcome slots need repair. Preserve the file.');
-    if (record.blindOrder !== undefined && (!Array.isArray(record.blindOrder) || record.blindOrder.length !== 6 || record.blindOrder.some(entry => !entry || !/^Sample [a-f0-9]{8}$/.test(entry.label) || !record.slots.some(slot => slot.id === entry.slotId)) || new Set(record.blindOrder.map(entry => entry.label)).size !== 6 || new Set(record.blindOrder.map(entry => entry.slotId)).size !== 6)) throw Error('Comparison blind mapping needs repair. Preserve the file; labels were not reassigned.');
+    const record = this.decodeHistory(id, bytes);
     // Only an intentional fresh read under the mutation lock establishes a
     // writer baseline. Background reads must not bless another writer's bytes
     // for an already active request. Its own successful writes advance it.
     if (forMutation) this.durable.set(id, { directory, proof });
     return withProof ? { record, proof } : record;
+  }
+  finishCreation(stage, destination, receipt, staged, receiptProof, guard) {
+    verifyStageSync(receipt, guard, receiptProof);
+    if (local.lstatSync(destination, { bigint: true }).nlink === 2n) {
+      verifyPeersSync(stage, destination, guard, staged);
+      verifyStageSync(receipt, guard, receiptProof);
+      verifyStageSync(stage, guard, staged, 2);
+      local.unlinkSync(stage);
+    }
+    verifyAbsentSync(stage, guard, creationChanged);
+    verifyStageSync(destination, guard, staged);
+    verifyStageSync(receipt, guard, receiptProof);
+    local.unlinkSync(receipt);
+  }
+  recoverCreation(id, directory) {
+    const guard = () => this.safeDirectory(false, directory);
+    const receipt = path.join(this.directory, creationName(id));
+    let exact;
+    try { exact = readExactSync(receipt, guard); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    let entry;
+    try { entry = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(exact.bytes)); }
+    catch { throw creationChanged(); }
+    if (entry?.schema !== 1 || entry.id !== id || typeof entry.stage !== 'string' || !entry.stage.endsWith('.pending') ||
+        !uuid(entry.stage.slice(0, -8)) || !validProof(entry.staged) || !sameIdentity(entry.root, identity(this.rootIdentity)) ||
+        !sameIdentity(entry.directory, identity(directory))) throw creationChanged();
+    const stage = path.join(this.directory, entry.stage), destination = path.join(this.directory, `${id}.json`);
+    try {
+      const links = local.lstatSync(destination, { bigint: true }).nlink;
+      if (links !== 1n && links !== 2n) throw creationChanged();
+      const { bytes } = readExactSync(destination, guard, Number(links), entry.staged);
+      let record;
+      try { record = this.decodeHistory(id, bytes); }
+      catch { throw creationChanged(); }
+      if (!record.slots.every(slot => slot.status === 'pending') || record.generationPin || record.blindOrder || record.revealedAt) throw creationChanged();
+      this.finishCreation(stage, destination, receipt, entry.staged, exact.proof, guard);
+    } catch (error) {
+      if (['ENOENT', 'STAGING_CHANGED'].includes(error.code)) throw creationChanged();
+      throw error;
+    }
   }
   async replace(stage, destination, staged, expected, guard) {
     const deadline = performance.now() + 1000;
@@ -124,24 +172,30 @@ class Comparisons {
     await this.checkpoint('comparison-before-store');
     const stage = path.join(this.directory, `${randomUUID()}.pending`);
     const destination = path.join(this.directory, `${record.id}.json`);
-    let staged, retired = false;
+    const receipt = path.join(this.directory, creationName(record.id));
+    let staged, receiptProof, linked = false, retired = false;
     try {
       staged = await writeStage(stage, JSON.stringify(record, null, 2), guard);
       if (create) {
+        const entry = { schema: 1, id: record.id, stage: path.basename(stage), staged, root: identity(this.rootIdentity), directory: identity(directory) };
+        receiptProof = await writeStage(receipt, JSON.stringify(entry), guard);
+        verifyStageSync(receipt, guard, receiptProof);
         verifyStageSync(stage, guard, staged);
         local.linkSync(stage, destination);
-        verifyPeersSync(stage, destination, guard, staged);
-        local.unlinkSync(stage);
+        linked = true;
+        this.finishCreation(stage, destination, receipt, staged, receiptProof, guard);
       } else await this.replace(stage, destination, staged, expected.proof, guard);
       retired = true;
       verifyStageSync(destination, guard, staged);
       this.durable.set(record.id, { directory, proof: staged });
     } finally {
-      if (staged && !retired) {
-        try {
-          readExactSync(stage, guard, 1, staged);
-          local.unlinkSync(stage);
-        } catch { /* Preserve an unproved stage or parent and surface the original failure. */ }
+      if (!retired && !linked) {
+        for (const [file, proof] of [[receipt, receiptProof], [stage, staged]]) if (proof) {
+          try {
+            readExactSync(file, guard, 1, proof);
+            local.unlinkSync(file);
+          } catch { /* Preserve an unproved file or parent and surface the original failure. */ }
+        }
       }
     }
   }
@@ -162,7 +216,9 @@ class Comparisons {
     this.safeDirectory(false, directory);
     const records = [];
     for (const name of names) if (name.endsWith('.json')) {
-      let record = await this.read(name.slice(0, -5));
+      const id = name.slice(0, -5);
+      if (uuid(id) && names.has(creationName(id))) await this.lock(() => this.recoverCreation(id, directory));
+      let record = await this.read(id);
       if (!this.unsaved.has(record.id) && !this.running.has(record.id) && record.slots.some(slot => slot.status === 'inProgress')) record = await this.lock(async () => {
         const latest = await this.read(record.id, true);
         for (const slot of latest.slots) if (slot.status === 'inProgress') {
@@ -299,7 +355,7 @@ class Comparisons {
     const { brief } = record;
     const scoringBrief = { version: brief.version, sections: brief.snapshot.sections.map(({ title, text, references }) => ({
       title, text, references: references.map(({ source, start, end }) => ({ source: source + 1, start, end }))
-    })) };
+    })), sources: brief.snapshot.sources.map(({ text }, index) => ({ number: index + 1, text })) };
     const outputs = [];
     for (const entry of record.blindOrder) {
       const slot = record.slots.find(item => item.id === entry.slotId);
