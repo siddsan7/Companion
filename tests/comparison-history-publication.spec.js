@@ -2,11 +2,10 @@ const { test, expect } = require('@playwright/test');
 const { spawn } = require('node:child_process');
 const { randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { installComparisons } = require('../app/comparisons');
-
-const sharingRefusals = ['EPERM', 'EBUSY', 'EACCES'];
 
 function holdHistory(file) {
   const script = [
@@ -48,42 +47,43 @@ test.describe('Windows comparison history publication', () => {
       const temp = await fs.realpath(os.tmpdir());
       const root = await fs.mkdtemp(path.join(temp, 'companion-comparison-publication-'));
       const rootIdentity = await fs.lstat(root, { bigint: true });
-      const store = installComparisons({ ipcMain: { handle() {} }, dataRoot: root, checkpoint: async () => {} });
       const record = { id: randomUUID(), text: 'Original durable comparison history.' };
       const updated = { ...record, text: 'Only the original staged comparison may publish.' };
-      const destination = path.join(store.directory, `${record.id}.json`);
       const moved = path.join(root, 'original-artifact');
-      const nativeRename = fs.rename;
+      const nativeRename = local.renameSync;
       const attempts = [];
       let holder, stage, prior, staged, foreign;
+      const store = installComparisons({ ipcMain: { handle() {} }, dataRoot: root, checkpoint: async name => {
+        if (name !== 'comparison-after-rename-refusal' || attempts.length !== 1) return;
+        expect(await holder.release()).toEqual({ code: 0, signal: null });
+        if (replacement !== 'none') {
+          const changed = replacement === 'destination' ? destination : stage;
+          nativeRename(changed, moved);
+          const contents = replacement === 'destination' ? Buffer.from('External history must remain byte for byte.') : staged.bytes;
+          await fs.writeFile(changed, contents, { flag: 'wx' });
+          foreign = await exactFile(changed);
+        }
+      } });
+      const destination = path.join(store.directory, `${record.id}.json`);
       try {
         await store.lock(() => store.write(record, true));
-        fs.rename = async (source, target) => {
+        prior = await exactFile(destination);
+        holder = holdHistory(destination);
+        await holder.ready();
+        local.renameSync = (source, target) => {
           if (target !== destination || path.dirname(source) !== store.directory || !/^[a-f0-9-]{36}\.pending$/.test(path.basename(source))) {
             return nativeRename(source, target);
           }
           if (!attempts.length) {
             stage = source;
-            prior = await exactFile(destination);
-            staged = await exactFile(stage);
-            holder = holdHistory(destination);
-            await holder.ready();
+            const { dev, ino } = local.lstatSync(stage, { bigint: true });
+            staged = { dev, ino, bytes: local.readFileSync(stage) };
           }
           try {
-            await nativeRename(source, target);
+            nativeRename(source, target);
             attempts.push({ source, code: null });
           } catch (error) {
             attempts.push({ source, code: error.code, syscall: error.syscall });
-            if (attempts.length === 1 && sharingRefusals.includes(error.code)) {
-              expect(await holder.release()).toEqual({ code: 0, signal: null });
-              if (replacement !== 'none') {
-                const changed = replacement === 'destination' ? destination : stage;
-                await nativeRename(changed, moved);
-                const contents = replacement === 'destination' ? Buffer.from('External history must remain byte for byte.') : staged.bytes;
-                await fs.writeFile(changed, contents, { flag: 'wx' });
-                foreign = await exactFile(changed);
-              }
-            }
             throw error;
           }
         };
@@ -105,10 +105,10 @@ test.describe('Windows comparison history publication', () => {
           expect(retainedForeign).toEqual(foreign);
           if (!replacingDestination) expect(await exactFile(destination)).toEqual(prior);
           expect(attempts).toHaveLength(1);
-          expect(failure).toBeInstanceOf(Error);
+          expect(failure).toMatchObject({ code: replacingDestination ? 'HISTORY_CONFLICT' : 'STAGING_CHANGED' });
         }
       } finally {
-        fs.rename = nativeRename;
+        local.renameSync = nativeRename;
         if (holder) await holder.release();
         const current = await fs.lstat(root, { bigint: true });
         if (path.dirname(root) !== temp || await fs.realpath(root) !== root || current.isSymbolicLink() || current.dev !== rootIdentity.dev || current.ino !== rootIdentity.ino) {

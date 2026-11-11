@@ -5,10 +5,13 @@ const { createHash, randomUUID, randomInt } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
+const { readExact, readExactSync, writeStage, verifyStageSync, verifyPeersSync } = require('./staged-publication');
 const { fixtures, prompts } = require('./comparison-fixtures');
 const rubric = require('./comparison-rubric');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
+const sameProof = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino && a.digest === b.digest;
+const historyChanged = () => Object.assign(Error('Comparison history changed or is unavailable. Existing history was not replaced. Preserve the retained text.'), { code: 'HISTORY_CONFLICT' });
 function makePackage(brief, fixture, method) {
   // Fit labels are inspection metadata, never part of a model request.
   const source = { id: fixture.id, version: fixture.version, synthetic: true, passages: fixture.passages, limitations: fixture.limitations };
@@ -50,12 +53,17 @@ class Comparisons {
     if (this.unsaved.has(id)) return structuredClone(this.unsaved.get(id));
     return this.readStored(id, forMutation);
   }
-  async readStored(id, forMutation = false, withBytes = false) {
+  async readStored(id, forMutation = false, withProof = false) {
     if (!uuid(id)) throw Error('Comparison identity is invalid.');
     const directory = this.safeDirectory(), file = path.join(this.directory, `${id}.json`);
-    const stat = await fs.lstat(file); this.safeDirectory(false, directory);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('Comparison is not an ordinary local history file.');
-    const bytes = await fs.readFile(file); this.safeDirectory(false, directory);
+    const guard = () => this.safeDirectory(false, directory);
+    let exact;
+    try { exact = await readExact(file, guard); }
+    catch (error) {
+      if (error.code === 'STAGING_CHANGED') throw Error('Comparison is not an ordinary local history file or changed during the read.');
+      throw error;
+    }
+    const { bytes, proof } = exact;
     const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
     if (record.schema !== 1 || record.id !== id || !Array.isArray(record.fixtures) || record.fixtures.length !== 3 || !Array.isArray(record.slots) || record.slots.length !== 6 || !Array.isArray(record.displayOrder) || record.displayOrder.length !== 6 || new Set(record.displayOrder).size !== 6 || record.displayOrder.some(slotId => !record.slots.some(slot => slot.id === slotId)) || record.slots.some(slot => !uuid(slot.id) || !['direct', 'analogy'].includes(slot.method) || slot.package?.digest !== hash(slot.package.text))) throw Error('Comparison history needs repair. Preserve the file.');
     const pairs = record.slots.map(slot => `${slot.fixtureId}:${slot.method}`);
@@ -64,43 +72,58 @@ class Comparisons {
     // Only an intentional fresh read under the mutation lock establishes a
     // writer baseline. Background reads must not bless another writer's bytes
     // for an already active request. Its own successful writes advance it.
-    if (forMutation) this.durable.set(id, hash(bytes));
-    return withBytes ? { record, bytes } : record;
+    if (forMutation) this.durable.set(id, { directory, proof });
+    return withProof ? { record, proof } : record;
+  }
+  async replace(stage, destination, staged, expected, guard) {
+    const deadline = performance.now() + 1000;
+    let delay = 15, refusal;
+    while (true) {
+      if (refusal && performance.now() >= deadline) throw refusal;
+      try { readExactSync(destination, guard, 1, expected); }
+      catch (error) {
+        if (['ENOENT', 'STAGING_CHANGED'].includes(error.code)) throw historyChanged();
+        throw error;
+      }
+      verifyStageSync(stage, guard, staged);
+      try { local.renameSync(stage, destination); return; }
+      catch (error) {
+        const remaining = deadline - performance.now();
+        if (process.platform !== 'win32' || error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
+        refusal = error;
+        await this.checkpoint('comparison-after-rename-refusal');
+        await new Promise(resolve => setTimeout(resolve, Math.min(delay, remaining)));
+        delay = Math.min(delay * 2, 100);
+      }
+    }
   }
   async write(record, create = false) {
+    const expected = this.durable.get(record.id);
+    if (!create && !expected) throw historyChanged();
+    const directory = this.safeDirectory(false, create ? undefined : expected.directory);
+    const guard = () => this.safeDirectory(false, directory);
     await this.checkpoint('comparison-before-store');
-    const directory = this.safeDirectory(), stage = path.join(this.directory, `${randomUUID()}.pending`);
-    let handle;
+    const stage = path.join(this.directory, `${randomUUID()}.pending`);
+    const destination = path.join(this.directory, `${record.id}.json`);
+    let staged, retired = false;
     try {
-      handle = await fs.open(stage, 'wx'); this.safeDirectory(false, directory);
-      const text = JSON.stringify(record, null, 2);
-      await handle.writeFile(text, 'utf8'); await handle.sync();
-      await handle.close(); handle = null; this.safeDirectory(false, directory);
-      const destination = path.join(this.directory, `${record.id}.json`);
-      if (create) await fs.link(stage, destination);
-      else {
-        const expected = this.durable.get(record.id);
-        const directoryIdentity = this.safeDirectory(false, directory), stat = await fs.lstat(destination);
-        this.safeDirectory(false, directoryIdentity);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || !expected) throw Error('Comparison history changed or is unavailable. Preserve the retained text.');
-        const bytes = await fs.readFile(destination); this.safeDirectory(false, directory);
-        if (hash(bytes) !== expected) throw Error('Comparison history changed in another process. Existing history was not replaced.');
-        const deadline = performance.now() + 1000; let delay = 15;
-        while (true) {
-          try { this.safeDirectory(false, directory); await fs.rename(stage, destination); this.safeDirectory(false, directory); break; }
-          catch (error) {
-            const remaining = deadline - performance.now();
-            if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
-            await new Promise(resolve => setTimeout(resolve, Math.min(delay, remaining))); delay = Math.min(delay * 2, 100);
-          }
-        }
-      }
-      this.safeDirectory(false, directory);
-      this.durable.set(record.id, hash(text));
+      staged = await writeStage(stage, JSON.stringify(record, null, 2), guard);
+      if (create) {
+        verifyStageSync(stage, guard, staged);
+        local.linkSync(stage, destination);
+        verifyPeersSync(stage, destination, guard, staged);
+        local.unlinkSync(stage);
+      } else await this.replace(stage, destination, staged, expected.proof, guard);
+      retired = true;
+      verifyStageSync(destination, guard, staged);
+      this.durable.set(record.id, { directory, proof: staged });
     } finally {
-      await handle?.close();
-      this.safeDirectory(false, directory);
-      await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      if (staged && !retired) {
+        try {
+          readExactSync(stage, guard, 1, staged);
+          local.unlinkSync(stage);
+        } catch { /* Preserve an unproved stage or parent and surface the original failure. */ }
+      }
     }
   }
   view(record) {
@@ -239,7 +262,7 @@ class Comparisons {
         try { stored = await this.readStored(retained.id, false, true); }
         catch { throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' }); }
         const expected = this.durable.get(retained.id);
-        if (!expected || hash(stored.bytes) !== expected) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
+        if (!sameProof(stored.proof, expected?.proof)) throw historyChanged();
         const record = structuredClone(retained); delete record.storageWarning;
         // This publication uses the exact last-owned durable baseline. It does
         // not establish a new baseline from the observed conflicting file.
