@@ -10,6 +10,7 @@ const { CaptureDeletion } = require('../app/capture-deletion');
 const { Context } = require('../app/context');
 const { Conversations } = require('../app/conversations');
 const { scanIdeas } = require('../app/idea-inventory');
+const { installIdeas } = require('../app/ideas');
 const { Intake } = require('../app/intake');
 const { Vault } = require('../app/vault');
 const draft = require('./fixtures/reel-draft/example.json');
@@ -27,19 +28,27 @@ const absent = file => fs.stat(file).then(() => false, error => {
   throw error;
 });
 
-async function publishedRestoration(testInfo, folderName) {
-  const directory = testInfo.outputPath('vault'), producer = testInfo.outputPath('producer');
-  const artifact = path.join(producer, 'draft'), clip = 'b'.repeat(64);
-  await fs.mkdir(directory, { recursive: true });
+async function writeDraftFixture(producer, name, input, attempt) {
+  const artifact = path.join(producer, name), clip = 'b'.repeat(64);
   await fs.mkdir(artifact, { recursive: true });
   await fs.writeFile(path.join(artifact, 'run.json'), JSON.stringify({
-    job_id: clip, attempt_id: '1'.repeat(32), started_utc: now, input_sha256: sourceHash,
+    job_id: clip, attempt_id: attempt.repeat(32), started_utc: now, input_sha256: input,
     input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
   }));
   await fs.writeFile(path.join(artifact, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
   await fs.writeFile(path.join(artifact, 'first-pass-target.json'), JSON.stringify(draft.target));
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(artifact, 'notes.md'));
+  return artifact;
+}
 
+async function publishedRestoration(testInfo, folderName, { independent = false, outsideManaged = false, beforeMove } = {}) {
+  const directory = testInfo.outputPath('vault'), producer = testInfo.outputPath('producer');
+  const artifact = await writeDraftFixture(producer, 'draft', sourceHash, '1');
+  if (independent) {
+    await writeDraftFixture(producer, 'citation', 'c'.repeat(64), '2');
+    await writeDraftFixture(producer, 'unaffected', 'd'.repeat(64), '3');
+  }
+  await fs.mkdir(directory, { recursive: true });
   const interruption = Error('Stopped after restoration publication.');
   const vault = new Vault(await fs.realpath(directory), 'Companion', { checkpoint: async boundary => {
     if (boundary === 'capture-restoration-published') throw interruption;
@@ -47,10 +56,11 @@ async function publishedRestoration(testInfo, folderName) {
   await vault.setup();
   const intake = new Intake(vault), accepted = await intake.connect(producer, true, now);
   const capture = accepted.captures[sourceHash], original = intake.destination(capture);
-  const targetFolder = path.join(vault.root, folderName);
+  const targetFolder = path.join(outsideManaged ? vault.vault : vault.root, folderName);
   await fs.mkdir(targetFolder, { recursive: true });
   const reserved = path.join(targetFolder, path.basename(original));
   if (original !== reserved) {
+    await beforeMove?.(vault, reserved);
     await fs.rename(original, reserved);
     expect(intake.destination((await intake.info()).captures[sourceHash])).toBe(reserved);
   }
@@ -69,6 +79,66 @@ async function publishedRestoration(testInfo, folderName) {
   const journal = path.join(intake.dir, authority.restoration.journal);
   return { vault, intake, reserved, captureId: capture.id, authority, journal, journalBytes: await fs.readFile(journal) };
 }
+
+test('reserved restoration direct reads cannot offer an exact foreign capture citation', async ({}, testInfo) => {
+  const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures', { independent: true });
+  const ledger = await intake.load(), cited = ledger.captures['c'.repeat(64)], unaffected = ledger.captures['d'.repeat(64)];
+  const ideas = installIdeas({ ipcMain: { handle() {} }, getVault: () => vault });
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision, true)).resolves.toMatchObject({ capture: { id: cited.id } });
+  const ordinary = intake.destination(cited), original = testInfo.outputPath('original-cited-capture.md');
+  const citedBytes = await fs.readFile(ordinary), citedIdentity = await identity(ordinary);
+  await fs.rename(ordinary, original);
+  const { displaced, before, replacementIdentity } = await replaceRestoration(testInfo, reserved, citedBytes);
+  expect(replacementIdentity).not.toEqual(citedIdentity);
+
+  await expect.soft(ideas.revision(vault, cited.id, cited.currentRevision, true)).rejects.toThrow(/reserved|capture identity|unavailable/i);
+  await expect(ideas.revision(vault, unaffected.id, unaffected.currentRevision, true)).resolves.toMatchObject({ capture: { id: unaffected.id } });
+  await expect(ideas.revision(vault, cited.id, cited.currentRevision)).resolves.toMatchObject({
+    revision: { id: cited.currentRevision, captureId: cited.id }
+  });
+  expect(await absent(ordinary)).toBe(true);
+  expect(await fs.readFile(original)).toEqual(citedBytes);
+  expect(await identity(original)).toEqual(citedIdentity);
+  expect(await fs.readFile(reserved)).toEqual(citedBytes);
+  expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(displaced)).toEqual(before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+});
+
+test('reserved restoration direct reads cannot supply an explicit note outside Companion', async ({}, testInfo) => {
+  const scopeFile = testInfo.outputPath('scope', 'notes.json');
+  const priorText = 'An ordinary note before the capture moved.\n';
+  const replacement = 'Independent writing at a reserved restoration path.\n';
+  let context, ordinary;
+  const { intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Independent notes', {
+    outsideManaged: true,
+    beforeMove: async (vault, destination) => {
+      context = new Context(vault, { scopeFile });
+      ordinary = path.join(path.dirname(destination), 'Unaffected ordinary note.md');
+      await fs.writeFile(destination, priorText, { flag: 'wx' });
+      await fs.writeFile(ordinary, 'Ordinary project evidence.\n', { flag: 'wx' });
+      await context.include([destination, ordinary]);
+      expect(await context.scope()).toEqual([destination, ordinary]);
+      await fs.rename(destination, testInfo.outputPath('prior-explicit-note.md'));
+    }
+  });
+  const { displaced, before, replacementIdentity } = await replaceRestoration(testInfo, reserved, replacement);
+  const scopeBytes = await fs.readFile(scopeFile);
+  await expect.soft(context.note(reserved)).rejects.toThrow(/reserved|restor|unavailable/i);
+  await expect.soft(context.include([reserved])).rejects.toThrow(/reserved|restor|unavailable/i);
+  await expect(context.note(ordinary)).resolves.toMatchObject({ title: path.basename(ordinary), text: 'Ordinary project evidence.\n' });
+  const { all } = await context.corpus();
+  expect.soft(all.map(source => source.title)).not.toContain(path.basename(reserved));
+  expect(all.map(source => source.title)).toContain(path.basename(ordinary));
+  expect(await fs.readFile(scopeFile)).toEqual(scopeBytes);
+  expect(await fs.readFile(testInfo.outputPath('prior-explicit-note.md'), 'utf8')).toBe(priorText);
+  expect(await fs.readFile(reserved, 'utf8')).toBe(replacement);
+  expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(displaced)).toEqual(before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+});
 
 async function replaceRestoration(testInfo, reserved, replacement) {
   const displaced = testInfo.outputPath('original-restoration.md');
