@@ -9,6 +9,8 @@ const { withBriefMutation } = require('./briefs-lock');
 const { IdeasRemoval } = require('./ideas-removal');
 const { scanIdeas } = require('./idea-inventory');
 const { generations, sameEvidence, sameGenerations } = require('./source-generations');
+const { Intake } = require('./intake');
+const { readExactSync, verifyStageSync } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -155,14 +157,15 @@ class Ideas {
     if (!uuid(captureId) || !uuid(revisionId)) throw Error('Invalid cited revision identity.');
     const ledgerFile = path.join(vault.root, '.intake', 'ledger.json'), revisionFile = path.join(vault.root, 'Revisions', `${revisionId}.json`);
     const parents = this.parents(vault, [ledgerFile, revisionFile]);
-    const ledger = JSON.parse((await this.readFile(vault, ledgerFile, parents)).text);
+    const intake = offering ? new Intake(vault) : null;
+    const ledger = intake ? await intake.load() : JSON.parse((await this.readFile(vault, ledgerFile, parents)).text);
     if (ledger.schema !== 1 || !ledger.captures || !ledger.attempts || !Array.isArray(ledger.suppressed)) throw Error('Intake admission history is unavailable.');
     const entries = Object.entries(ledger.captures).filter(([, item]) => item.id === captureId);
     if (entries.length !== 1) throw Error('Cited capture admission is unavailable.');
     const [sourceHash, capture] = entries[0];
     const admitted = revisionAdmission(ledger, revisionId), attempts = admitted ? [admitted] : [];
     if (!capture.revisions.includes(revisionId) || !attempts.length || attempts.some(item => item.captureId !== captureId || item.sourceHash !== sourceHash || !/^[a-f0-9]{64}$/.test(item.snapshotHash) || item.snapshotHash !== attempts[0].snapshotHash)) throw Error('Exact cited revision was not admitted for this capture.');
-    const { text } = await this.readFile(vault, revisionFile, parents), snapshotHash = hash(text);
+    const { text, stat } = await this.readFile(vault, revisionFile, parents), snapshotHash = hash(text);
     if (snapshotHash !== attempts[0].snapshotHash) throw Error('Exact cited revision is damaged. No newer revision was substituted.');
     const revision = JSON.parse(text);
     if (revision.schema !== 1 || revision.id !== revisionId || revision.captureId !== captureId || revision.sourceHash !== sourceHash || typeof revision.text !== 'string') throw Error('Exact cited revision identity is damaged.');
@@ -172,14 +175,24 @@ class Ideas {
     if (offering) {
       if (warnings.length) throw Error(warnings.join(' '));
       // Apply the capture identity authority without reading any other revision.
-      const matches = (await vault.scan()).filter(note => note.id === captureId), choice = ledger.identityChoices?.[captureId];
+      const reserved = vault.reservedRestorationIdentities(ledger);
+      if (reserved.heldRestorations.has(captureId) || reserved.captures.has(captureId)) throw Error('A reserved restoration file holds this capture identity. Current evidence is unavailable.');
+      const matches = (await vault.scan({ excludedCapturePaths: reserved.paths })).filter(note => note.id === captureId);
+      const choice = ledger.identityChoices?.[captureId];
       const files = matches.map(note => ({ file: path.relative(vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
       let note;
       if (matches.length === 1 && !choice?.copies.some(copy => copy.file === files[0].file)) note = matches[0];
       else if (choice && files.some(file => file.file === choice.file) && JSON.stringify(files.filter(file => file.file !== choice.file)) === JSON.stringify(choice.copies)) note = matches.find(note => path.relative(vault.vault, note.file) === choice.file);
       if (!note) throw Error('Resolve the canonical capture identity before citing evidence.');
-      const current = await this.readFile(vault, note.file, this.parents(vault, [note.file]));
-      if (hash(current.text) !== capture.currentHash) throw Error('Current capture was changed outside Companion.');
+      const currentParents = this.parents(vault, [note.file]);
+      const verify = () => {
+        intake.storage.guardSync();
+        reserved.verify();
+      };
+      const { bytes } = readExactSync(note.file, () => { this.guard(vault, currentParents); verify(); });
+      if (hash(decode(bytes)) !== capture.currentHash) throw Error('Current capture was changed outside Companion.');
+      const snapshotProof = { dev: String(stat.dev), ino: String(stat.ino), digest: snapshotHash };
+      verifyStageSync(revisionFile, () => { this.guard(vault, parents); verify(); }, snapshotProof);
     }
     return { capture, revision, snapshotHash, warnings };
   }
