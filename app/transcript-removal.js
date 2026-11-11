@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
@@ -10,6 +11,7 @@ const same = (a, b) => String(a.dev) === String(b.dev) && String(a.ino) === Stri
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join('|') === [...keys].sort().join('|');
 const exists = file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
 const held = () => Error('Transcript removal scope or identity changed. Preserve all remaining files and review the exact copies again.');
+const removed = () => Error('This transcript identity has an observed removal record. Old export confirmations and recovery cannot recreate or acknowledge it, even if that control is later missing.');
 
 // This store owns only explicitly selected transcript exports, never their origins.
 class TranscriptRemoval {
@@ -34,7 +36,14 @@ class TranscriptRemoval {
     const { marker, stage } = this.location(vault, intent.id);
     if (this.refusals(vault).has(intent.id) || await exists(marker) || await exists(stage)) {
       this.rememberRefusal(vault, intent.id);
-      throw Error('This transcript identity has an observed removal record. Old export confirmations and recovery cannot recreate or acknowledge it, even if that control is later missing.');
+      throw removed();
+    }
+  }
+  fenceSync(intent, vault) {
+    const { marker, stage } = this.location(vault, intent.id);
+    if (this.refusals(vault).has(intent.id) || local.lstatSync(marker, { throwIfNoEntry: false }) || local.lstatSync(stage, { throwIfNoEntry: false })) {
+      this.rememberRefusal(vault, intent.id);
+      throw removed();
     }
   }
   relative(vault, file) {
@@ -83,10 +92,13 @@ class TranscriptRemoval {
     }
     const output = present.find(item => item.kind === 'output'), stage = present.find(item => item.kind === 'stage');
     if (output && stage && !same(output.stat, stage.stat)) throw held();
+    let receipt;
     if (texts.has('receipt')) {
-      const receipt = JSON.parse(texts.get('receipt')), target = output || stage;
+      receipt = JSON.parse(texts.get('receipt'));
+      const target = output || stage;
       if (!exact(receipt, ['schema', 'operation', 'id', 'digest', 'dev', 'ino']) || receipt.schema !== 1 || receipt.operation !== operation || receipt.id !== intent.id || receipt.digest !== intent.digest || !number(receipt.dev) || !number(receipt.ino) || target && !same(receipt, target.stat)) throw held();
     } else if (output && !stage) throw held();
+    if (stage) this.store.checkStage(intent, stage.stat, receipt);
     return {
       vault, intent, parents,
       scope: {
