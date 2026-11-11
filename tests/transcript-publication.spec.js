@@ -225,6 +225,73 @@ for (const mode of ['fresh export', 'receipt-backed resume']) {
   });
 }
 
+test('transcript confirmation checks one-link content after an in-place edit preserves metadata', async ({}, testInfo) => {
+  const stamp = new Date('2025-01-01T00:00:00Z');
+  const stampNs = BigInt(stamp.getTime()) * 1000000n;
+  let linked, edit;
+  const { store, preview, directory, destination } = await transcriptFixture(testInfo, async boundary => {
+    if (boundary !== 'transcript-after-link') return;
+    await fs.utimes(destination, stamp, stamp);
+    linked = await fs.lstat(destination, { bigint: true });
+    expect(linked.nlink).toBe(2n);
+    expect(linked.mtimeNs).toBe(stampNs);
+  });
+  const open = fs.open, unlink = local.unlinkSync;
+  fs.open = async (file, ...args) => {
+    const handle = await open(file, ...args);
+    if (path.dirname(file) !== directory || !file.endsWith('.md.pending') || args[0] !== 'wx') return handle;
+    const stat = handle.stat.bind(handle);
+    // Give the exact stage proof the same restorable mtime as its linked inode.
+    handle.stat = async (...options) => {
+      await handle.utimes(stamp, stamp);
+      await handle.sync();
+      return stat(...options);
+    };
+    return handle;
+  };
+  const checkedMetadata = stat => [stat.dev, stat.ino, stat.birthtimeNs, stat.mtimeNs, stat.size, stat.nlink];
+  local.unlinkSync = file => {
+    unlink(file);
+    if (path.dirname(file) !== directory || !file.endsWith('.md.pending')) return;
+    expect(linked, 'the exact first link was proved').toBeDefined();
+    const before = local.lstatSync(destination, { bigint: true });
+    expect(checkedMetadata(before)).toEqual([...checkedMetadata(linked).slice(0, -1), 1n]);
+    const original = local.readFileSync(destination);
+    expect(original.toString('utf8')).toBe(preview.text);
+    const edited = Buffer.from(original);
+    const position = original.indexOf('Retained question');
+    expect(position).toBeGreaterThanOrEqual(0);
+    edited[position] = 'X'.charCodeAt(0);
+    const handle = local.openSync(destination, 'r+');
+    try {
+      expect(local.writeSync(handle, edited, position, 1, position)).toBe(1);
+      local.fsyncSync(handle);
+    } finally { local.closeSync(handle); }
+    local.utimesSync(destination, stamp, stamp);
+    const after = local.lstatSync(destination, { bigint: true });
+    expect(checkedMetadata(after)).toEqual(checkedMetadata(before));
+    expect(local.readFileSync(destination)).toEqual(edited);
+    const operation = path.basename(file, '.md.pending');
+    const receipt = path.join(directory, `${operation}.published.json`);
+    const journal = path.join(directory, `${operation}.intent.json`);
+    edit = { stage: file, before, edited, receipt, journal, receiptBytes: local.readFileSync(receipt), journalBytes: local.readFileSync(journal) };
+  };
+  let outcome;
+  try {
+    outcome = await store.confirm(preview.token).then(result => ({ result }), error => ({ error: error.message }));
+  } finally {
+    fs.open = open;
+    local.unlinkSync = unlink;
+  }
+  expect(edit, 'the real output was edited after exact stage cleanup').toBeDefined();
+  expect.soft(outcome).toMatchObject({ error: expect.stringMatching(/identity|changed|preserve|edited/i) });
+  expect(await absent(edit.stage)).toBe('ENOENT');
+  expect(await fs.readFile(destination)).toEqual(edit.edited);
+  expect(checkedMetadata(await fs.lstat(destination, { bigint: true }))).toEqual(checkedMetadata(edit.before));
+  expect(await fs.readFile(edit.receipt)).toEqual(edit.receiptBytes);
+  expect(await fs.readFile(edit.journal)).toEqual(edit.journalBytes);
+});
+
 for (const state of ['independent replacement', 'unchanged pair']) {
   test(`transcript legacy resume binds the reviewed receipt-backed pair: ${state}`, async ({}, testInfo) => {
     const fixture = await interruptedTranscript(testInfo, 'transcript-after-receipt');
