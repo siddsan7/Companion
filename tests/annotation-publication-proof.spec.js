@@ -2,10 +2,13 @@ const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const { Vault } = require('../app/vault');
 const { Intake } = require('../app/intake');
+const draft = require('./fixtures/reel-draft/example.json');
 
 const now = '2026-11-08T06:59:00.000Z';
+const later = '2026-11-09T06:59:00.000Z';
 const id = 'd081d203-1749-4f98-8b86-b140f491f7ba';
 const selectedWriting = 'Writing selected for a standalone annotation.';
 const identity = async file => {
@@ -17,17 +20,30 @@ const readOptional = file => fs.readFile(file).catch(error => {
   throw error;
 });
 
-async function fixture(testInfo, checkpoint) {
-  const directory = testInfo.outputPath('vault'), review = testInfo.outputPath('review');
+async function writeDraft(producer, attempt, startedAt) {
+  const folder = path.join(producer, attempt), clip = 'b'.repeat(64);
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify({
+    job_id: clip, attempt_id: attempt.repeat(32), started_utc: startedAt, input_sha256: 'a'.repeat(64),
+    input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
+  }));
+  await fs.writeFile(path.join(folder, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
+  await fs.writeFile(path.join(folder, 'first-pass-target.json'), JSON.stringify(draft.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(folder, 'notes.md'));
+}
+
+async function fixture(testInfo, checkpoint, kind = 'review') {
+  const directory = testInfo.outputPath('vault'), producer = testInfo.outputPath('producer');
   await fs.mkdir(directory, { recursive: true });
-  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(review, 'accept'), { recursive: true });
+  if (kind === 'draft') await writeDraft(producer, '1', now);
+  else await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
   const vault = new Vault(await fs.realpath(directory), 'Companion', { checkpoint });
   await vault.setup();
-  const intake = new Intake(vault), ledger = await intake.connect(review, true, now, 'review');
+  const intake = new Intake(vault), ledger = await intake.connect(producer, true, now, kind);
   expect(ledger.lastCheck.status).toBe('complete');
-  const [capture] = Object.values(ledger.captures);
+  const [[sourceHash, capture]] = Object.entries(ledger.captures);
   expect(capture).toBeDefined();
-  return { vault, intake, input: { id, captureId: capture.id, text: selectedWriting },
+  return { vault, intake, producer, sourceHash, capture, input: { id, captureId: capture.id, text: selectedWriting },
     journal: path.join(intake.dir, 'annotation-intent.json'),
     stage: path.join(intake.dir, `annotation-${id}.stage`),
     note: path.join(vault.root, 'Annotations', `${id}.md`) };
@@ -130,4 +146,99 @@ test('standalone annotation restart settles the unchanged published pair', async
   expect(await identity(context.note)).toEqual({ ...witness.original, nlink: 1n });
   for (const file of [context.stage, context.journal]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await restarted.annotations(context.input.captureId)).toMatchObject([{ id, captureId: context.input.captureId }]);
+});
+
+test('ordinary conflict transfer preserves its only-copy writing when the published annotation moves', async ({}, testInfo) => {
+  const displaced = testInfo.outputPath('moved-transfer.md');
+  const transfer = 'Only-copy writing authored in the conflict transfer field.';
+  let context, witness;
+  context = await fixture(testInfo, async boundary => {
+    if (boundary !== 'repair-annotation-published') return;
+    const { vault, intake } = context;
+    const journal = path.join(intake.dir, 'repair-intent.json');
+    const bytes = await fs.readFile(journal), intent = JSON.parse(bytes), journalIdentity = await identity(journal);
+    const note = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
+    const stage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
+    const original = await identity(note);
+    expect(intent.tx.keptCurrent).toBeUndefined();
+    expect(intent.annotation).toContain(transfer);
+    expect(intent.tx.previous).not.toContain(transfer);
+    expect(intent.tx.content).not.toContain(transfer);
+    expect(original.nlink).toBe(2n);
+    expect(await identity(stage)).toEqual(original);
+    expect(await fs.readFile(note, 'utf8')).toBe(intent.annotation);
+    await fs.rename(note, displaced);
+    expect(await identity(displaced)).toEqual(original);
+    witness = { journal, bytes, intent, journalIdentity, note, stage, original };
+  }, 'draft');
+  const { intake, producer, sourceHash, capture } = context;
+  const destination = intake.destination(capture);
+  await fs.appendFile(destination, '\nIndependent local capture writing.\n');
+  const local = await fs.readFile(destination), localIdentity = await identity(destination);
+  await writeDraft(producer, '2', later);
+  const before = await intake.reconcile({ now: later }), block = before.blocks[sourceHash];
+  expect(block).toBeDefined();
+  const older = path.join(intake.dir, block.journal), olderBytes = await fs.readFile(older), olderIdentity = await identity(older);
+  const ledger = path.join(intake.dir, 'ledger.json');
+  const ledgerBytes = await fs.readFile(ledger);
+
+  let refusal;
+  try { await intake.resolveConflict({ sourceHash, text: transfer, localHash: createHash('sha256').update(local).digest('hex') }, later); }
+  catch (error) { refusal = error; }
+  expect(witness, 'the real annotation moved after it was linked and before the source transfer').toBeDefined();
+  expect.soft(refusal).toBeInstanceOf(Error);
+  expect.soft(await fs.readFile(ledger)).toEqual(ledgerBytes);
+  expect.soft(JSON.parse(await fs.readFile(ledger)).attempts[witness.intent.tx.revision.identity]).toBeUndefined();
+  expect.soft(await fs.readFile(destination)).toEqual(local);
+  expect.soft(await identity(destination)).toEqual(localIdentity);
+  expect(await fs.readFile(older)).toEqual(olderBytes);
+  expect(await identity(older)).toEqual(olderIdentity);
+  expect.soft(await readOptional(witness.journal)).toEqual(witness.bytes);
+  expect.soft(await identity(witness.journal).catch(error => error.code)).toEqual(witness.journalIdentity);
+  expect.soft((await readOptional(witness.stage))?.toString('utf8')).toBe(witness.intent.annotation);
+  expect.soft(await identity(witness.stage).catch(error => error.code)).toEqual(witness.original);
+  expect(await fs.readFile(displaced, 'utf8')).toBe(witness.intent.annotation);
+  expect.soft(await identity(displaced)).toEqual(witness.original);
+  for (const file of [witness.note, path.join(intake.dir, 'transaction.json')]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('relationship repair preserves an independent backup created during authority verification', async ({}, testInfo) => {
+  const foreignText = 'Independent backup writing created after the backup was observed absent.\n';
+  let armed = false, views = 0, context, witness;
+  context = await fixture(testInfo, boundary => { if (boundary === 'link-intent-published') armed = true; });
+  const { intake, input, note } = context;
+  await intake.addAnnotation(input, now);
+  const original = await fs.readFile(note), noteIdentity = await identity(note);
+  const moved = path.join(path.dirname(note), 'Nested', path.basename(note));
+  await fs.mkdir(path.dirname(moved));
+  await fs.rename(note, moved);
+  const view = intake.storage.view.bind(intake.storage);
+  intake.storage.view = async (...args) => {
+    const observed = await view(...args);
+    if (!armed || args.length || ++views !== 2) return observed;
+    const journal = path.join(intake.dir, 'link-intent.json');
+    const bytes = await fs.readFile(journal), intent = JSON.parse(bytes), journalIdentity = await identity(journal);
+    const backup = path.join(intake.dir, `link-${intent.id}.before.md`);
+    expect(intake.destination({ relative: intent.file })).toBe(moved);
+    expect(intent.before).toBe(original.toString('utf8'));
+    expect(intent.content).not.toBe(intent.before);
+    expect(await identity(moved)).toEqual(noteIdentity);
+    await expect(fs.lstat(backup)).rejects.toMatchObject({ code: 'ENOENT' });
+    await fs.writeFile(backup, foreignText, { flag: 'wx' });
+    const backupIdentity = await identity(backup);
+    expect(backupIdentity).not.toEqual(noteIdentity);
+    witness = { journal, bytes, intent, journalIdentity, backup, backupIdentity };
+    return observed;
+  };
+
+  await intake.info().catch(() => {});
+  expect(witness, 'an independent backup arrived during the last authority view before the move').toBeDefined();
+  expect.soft(await fs.readFile(witness.backup, 'utf8')).toBe(foreignText);
+  expect.soft(await identity(witness.backup)).toEqual(witness.backupIdentity);
+  expect.soft(await readOptional(moved)).toEqual(original);
+  expect.soft(await identity(moved).catch(error => error.code)).toEqual(noteIdentity);
+  const archive = path.join(intake.dir, `link-${witness.intent.id}.json`);
+  const evidence = await readOptional(witness.journal) ? witness.journal : archive;
+  expect.soft(await readOptional(evidence)).toEqual(witness.bytes);
+  expect.soft(await identity(evidence).catch(error => error.code)).toEqual(witness.journalIdentity);
 });
