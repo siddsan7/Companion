@@ -11,7 +11,8 @@ const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const stageFields = ['dev', 'ino', 'birthtimeNs', 'mtimeNs', 'size'];
 const stageProof = stat => Object.fromEntries(stageFields.map(field => [field, String(stat[field])]));
 const matchesStage = (proof, stat) => Boolean(proof && stageFields.every(field => proof[field] === String(stat[field])));
-const sameRead = (a, b) => same(a, b) && a.birthtimeNs === b.birthtimeNs && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.size === b.size && a.nlink === b.nlink;
+const sameStage = (a, b) => stageFields.every(field => a[field] === b[field]);
+const sameRead = (a, b) => sameStage(a, b) && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
 const changed = () => Error('Transcript publication identity changed. Preserve all files for review.');
 const missingPublication = () => Error('A transcript publication may already have occurred. Its exact output is missing. Preserve the retained writing for review.');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -222,8 +223,8 @@ class Transcripts {
     const hasDestination = await exists(intent.destination);
     if (hasDestination) {
       if (!saved && !attempt) throw changed();
-      await this.readPair(intent, vault, stage, parents, saved?.value);
-      return { completed: false, published: true, attempt: attempt?.stat };
+      const pair = await this.readPair(intent, vault, stage, parents, saved?.value);
+      return { completed: false, published: true, attempt: attempt?.stat, pair, receipt: saved?.stat };
     }
     if (saved || attempt) throw missingPublication();
     const stageFile = await this.read(vault, intent.destination, stage, parents);
@@ -268,7 +269,10 @@ class Transcripts {
       if (JSON.stringify(fresh.state) !== JSON.stringify(intent.reviewState) || this.markdown(fresh, intent.id, intent.createdAt) !== intent.text) throw Error('The original conversation or support warnings changed. Retained writing remains inspectable; new publication requires a fresh preview.');
     }
     const token = randomUUID(); if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
-    this.previews.set(token, { intent, parents, journal, published: state.published, attempt: state.attempt });
+    this.previews.set(token, {
+      intent, parents, journal, published: state.published, attempt: state.attempt,
+      reviewedPair: state.pair, reviewedReceipt: state.receipt
+    });
     return { token, destination: intent.destination, text: intent.text };
   }
   async confirm(token) {
@@ -301,6 +305,18 @@ class Transcripts {
           this.checkLeaf(intent.destination, stat);
           this.removal.fenceSync(intent, vault);
         };
+        const checkReviewedPair = stat => {
+          // Retiring the stage changes the link count and may change the change time.
+          if (preview.reviewedPair && !sameStage(preview.reviewedPair, stat)) throw changed();
+        };
+        const checkCompletedControls = receiptStat => {
+          this.guard(vault, intent.destination, parents);
+          this.checkLeaf(journalFile, journal);
+          this.checkLeaf(receipt, receiptStat);
+          if (attempt) this.checkLeaf(attemptFile, attempt.stat);
+          this.removal.fenceSync(intent, vault);
+          if (local.lstatSync(stage, { throwIfNoEntry: false })) throw changed();
+        };
         const retireAttempt = receiptStat => {
           this.checkLeaf(receipt, receiptStat);
           if (!attempt) return;
@@ -308,8 +324,7 @@ class Transcripts {
           local.unlinkSync(attemptFile);
           attempt = null;
         };
-        const retireStage = async (stat, receiptStat) => {
-          await this.removal.fence(intent, vault);
+        const retireStage = (stat, receiptStat) => {
           checkPair(stat);
           if (attempt) {
             retireAttempt(receiptStat);
@@ -317,29 +332,33 @@ class Transcripts {
           }
           this.checkLeaf(receipt, receiptStat);
           local.unlinkSync(stage);
+          checkCompletedControls(receiptStat);
+          const output = local.lstatSync(intent.destination, { bigint: true, throwIfNoEntry: false });
+          if (!output?.isFile() || output.nlink !== 1n || !sameStage(stat, output)) throw changed();
         };
 
-        if (await exists(receipt)) {
+        const hasReceipt = await exists(receipt);
+        if (preview.reviewedReceipt && !hasReceipt) throw changed();
+        if (hasReceipt) {
           if (!journal) throw changed();
           const saved = await this.readReceipt(intent, vault, receipt, parents);
+          if (preview.reviewedReceipt && !sameRead(preview.reviewedReceipt, saved.stat)) throw changed();
           if (await exists(stage)) {
             const stat = await this.readPair(intent, vault, stage, parents, saved.value);
-            await retireStage(stat, saved.stat);
+            checkReviewedPair(stat);
+            await this.removal.fence(intent, vault);
+            retireStage(stat, saved.stat);
           } else {
             const output = await this.read(vault, intent.destination, intent.destination, parents).catch(error => {
               if (error.code === 'ENOENT') throw missingPublication();
               throw error;
             });
             this.checkStage(intent, output.stat, saved.value);
+            checkReviewedPair(output.stat);
             if (output.text !== intent.text) throw changed();
             await this.removal.fence(intent, vault);
-            this.guard(vault, intent.destination, parents);
-            this.checkLeaf(journalFile, journal);
-            this.checkLeaf(receipt, saved.stat);
+            checkCompletedControls(saved.stat);
             this.checkLeaf(intent.destination, output.stat);
-            if (attempt) this.checkLeaf(attemptFile, attempt.stat);
-            this.removal.fenceSync(intent, vault);
-            if (local.lstatSync(stage, { throwIfNoEntry: false })) throw changed();
           }
           this.previews.delete(token); return { destination: intent.destination, completed: true };
         }
@@ -399,6 +418,7 @@ class Transcripts {
         }
 
         const stat = await this.readPair(intent, vault, stage, parents);
+        checkReviewedPair(stat);
         await this.removal.fence(intent, vault);
         checkPair(stat);
         this.checkLeaf(attemptFile, attempt.stat);
@@ -410,7 +430,8 @@ class Transcripts {
         await this.removal.fence(intent, vault);
         const ready = await this.readPair(intent, vault, stage, parents, saved);
         if (!sameRead(stat, ready)) throw changed();
-        await retireStage(ready, receiptStat);
+        await this.removal.fence(intent, vault);
+        retireStage(ready, receiptStat);
         this.previews.delete(token); return { destination: intent.destination, completed: true };
       });
     });
