@@ -5,7 +5,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const YAML = require('yaml');
 const { withBriefMutation } = require('./briefs-lock');
 const {
-  ordinaryDirectories, readExact, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
+  ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
   verifyPeersSync, validProof, removeStage, settlePublishedLink
 } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -143,28 +143,67 @@ class Briefs {
     return { guard, names, versions: versionEntries(names) };
   }
   async recoveredIndex(onlyVersion, lockHeld) {
+    const reservation = await this.restorationReservation();
     const index = await this.index();
     const pending = observed => [...observed.versions].filter(([version, entry]) =>
       entry.pending.length && (onlyVersion === undefined || onlyVersion === version));
-    if (!pending(index).length) return index;
+    if (!pending(index).length) return { ...index, reservation };
     const errors = new Map();
     const recover = async () => {
       const current = await this.index();
       for (const [version, entry] of pending(current)) {
         try {
           if (entry.pending.length !== 1) throw integrityError(entry.pending.join(', '));
-          await this.recoverApproval(version, entry.pending[0], current.guard);
+          await this.recoverApproval(version, entry.pending[0], current.guard, reservation);
         } catch (error) { errors.set(version, error); }
       }
       return this.index();
     };
     try {
       const settled = await (lockHeld ? recover() : withBriefMutation(this.vault.root, recover));
-      return { ...settled, errors };
+      return { ...settled, errors, reservation };
     } catch (error) {
       for (const [version] of pending(index)) errors.set(version, error);
-      return { ...index, errors };
+      return { ...index, errors, reservation };
     }
+  }
+  async restorationReservation() {
+    const intake = new (require('./intake').Intake)(this.vault);
+    const held = this.vault.restoringImportedCaptures(await intake.load());
+    const comparableFile = file => comparable(path.resolve(file));
+    const reserved = new Set([...held.values()].map(comparableFile));
+    const { directories, missing } = intake.storage.expected.parents;
+    const missingLedgerGuard = missing
+      ? ordinaryDirectories(directories.map(directory => directory.file), 'Intake folders changed during brief inspection.', directories).guard
+      : null;
+    const verify = () => {
+      if (missingLedgerGuard) verifyAbsentSync(intake.dir, missingLedgerGuard);
+      else intake.storage.guardSync();
+    };
+    const requireAvailable = file => {
+      verify();
+      if (reserved.has(comparableFile(file))) throw integrityError(path.basename(file));
+    };
+    const observeClaims = () => {
+      verify();
+      const observations = [...held.values()].map(file => {
+        const { guard } = this.vault.publicationFolders(path.dirname(file));
+        guard();
+        const stat = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+        if (!stat) {
+          verifyAbsentSync(file, guard);
+          return () => verifyAbsentSync(file, guard);
+        }
+        // A linked reserved leaf can witness a claim without granting ownership.
+        const links = Number(stat.nlink), { proof } = readExactSync(file, guard, links);
+        return () => verifyStageSync(file, guard, proof, links);
+      });
+      return () => {
+        verify();
+        for (const check of observations) check();
+      };
+    };
+    return { verify, requireAvailable, observeClaims };
   }
   async publishMarker(file, value, guard, linkedMarker = () => {}) {
     const stage = `${file}.stage-${randomUUID()}`;
@@ -347,14 +386,17 @@ class Briefs {
       verifyAbsentSync(stage, guard);
     });
   }
-  async recoverApproval(version, name, guard) {
+  async recoverApproval(version, name, guard, reservation) {
     try {
-      const pending = await this.readPending(version, name, guard);
+      const pendingGuard = () => { guard(); reservation.verify(); };
+      const pending = await this.readPending(version, name, pendingGuard);
       const stage = path.join(this.dir, pending.stage);
       const canonical = path.join(this.dir, `approved-${version}-${pending.staged.digest}.md`);
       pending.guard();
       if (!pending.retiring && await fs.lstat(canonical).catch(missing)) {
-        await this.finishPublishedApproval(pending, canonical, pending.guard);
+        const canonicalGuard = () => { pending.guard(); reservation.requireAvailable(canonical); };
+        canonicalGuard();
+        await this.finishPublishedApproval(pending, canonical, canonicalGuard);
         return;
       }
       const claims = await this.scanApprovalClaims(new Set([pending.id]), new Set());
@@ -363,9 +405,11 @@ class Briefs {
         if (pending.retiring || candidates.length !== 1) throw integrityError(name);
         const [moved] = candidates;
         const movedGuard = () => {
+          reservation.requireAvailable(moved.file);
           verifyAbsentSync(canonical, pending.guard);
           moved.guard();
         };
+        movedGuard();
         await this.finishPublishedApproval(pending, moved.file, movedGuard);
         return;
       }
@@ -424,18 +468,9 @@ class Briefs {
     return claims;
   }
   async approvedInventory(index, onlyVersion, lockHeld) {
-    const intake = new (require('./intake').Intake)(this.vault);
-    const reserved = this.vault.reservedRestorationIdentities(await intake.load());
-    const { directories, missing } = intake.storage.expected.parents;
-    const missingLedgerGuard = missing
-      ? ordinaryDirectories(directories.map(directory => directory.file), 'Intake folders changed during brief inspection.', directories).guard
-      : null;
-    const guard = () => {
-      index.guard();
-      if (missingLedgerGuard) verifyAbsentSync(intake.dir, missingLedgerGuard);
-      else intake.storage.guardSync();
-      reserved.verify();
-    };
+    const { reservation } = index;
+    const verifyClaims = reservation.observeClaims();
+    const guard = () => { index.guard(); verifyClaims(); };
     const inspected = new Map(), ids = new Set(), canonicalFiles = new Set();
     for (const [version, entry] of index.versions) {
       if (onlyVersion !== undefined && onlyVersion !== version) continue;
@@ -480,8 +515,7 @@ class Briefs {
       try {
         const { data, proof, file } = candidate;
         // A reserved leaf contributes a claim, but cannot supply an approval.
-        const relative = comparable(path.relative(this.vault.vault, file).split(path.sep).join('/'));
-        if (reserved.paths.has(relative)) throw integrityError(path.basename(file));
+        reservation.requireAvailable(file);
         verifyStageSync(file, candidate.guard, proof);
         if (!approvedMetadata(data, version) || receipt && receipt.digest !== proof.digest ||
             data.managed_parent !== undefined && !parentMatches(data.managed_parent, this.managedParent)) {
