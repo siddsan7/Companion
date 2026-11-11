@@ -335,7 +335,13 @@ function install(Intake, { hash, read, noteText }) {
       await this.finishRepair();
     });
   };
-  Intake.prototype.finishRepair = async function () {
+  Intake.prototype.validateRepairIntent = function (intent) {
+    const tx = intent?.tx;
+    this.validateTransaction(tx);
+    if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
+  };
+  Intake.prototype.finishRepair = async function (expectedJournal) {
+    expectedJournal?.verify();
     const intentFile = path.join(this.dir, 'repair-intent.json');
     const intentIdentity = await fs.lstat(intentFile, { bigint: true }).catch(error => {
       if (error.code === 'ENOENT') return null;
@@ -345,8 +351,7 @@ function install(Intake, { hash, read, noteText }) {
     const bytes = await read(intentFile);
     if (bytes === null) throw Error('The annotation repair intent changed. All remaining files were preserved.');
     const intent = JSON.parse(bytes), tx = intent.tx;
-    this.validateTransaction(tx);
-    if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
+    this.validateRepairIntent(intent);
     const owner = await annotationAuthority(this);
     if (annotationRemoved(owner, intent.annotationId)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
@@ -408,9 +413,12 @@ function install(Intake, { hash, read, noteText }) {
         journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
       }
       if (!journalInfo) throw Error('The exact repair source journal is missing. Files were preserved.');
-      const guard = this.vault.publicationFolders(this.dir).guard;
+      expectedJournal?.verify();
+      const ordinary = this.vault.publicationFolders(this.dir).guard;
+      const guard = () => { ordinary(); expectedJournal?.verifyRepair(); };
       const links = Number(journalInfo.nlink);
-      const expected = { dev: String(journalInfo.dev), ino: String(journalInfo.ino), digest: hash(JSON.stringify(tx)) };
+      if (expectedJournal && links !== expectedJournal.links) throw Error('The exact repair journal gained an unknown alias. Recovery files were preserved.');
+      const expected = expectedJournal || { dev: String(journalInfo.dev), ino: String(journalInfo.ino), digest: hash(JSON.stringify(tx)) };
       const { proof } = readExactSync(journal, guard, links, expected);
       if (links === 2) verifyStageSync(sourceArchive, guard, proof, 2);
       const ledger = await this.load();
