@@ -172,6 +172,67 @@ test('restoration hold allows independent import after a published output change
   expect(await readOptional(shared)).toBeNull();
 });
 
+test('restoration reserves the selected capture path as soon as authorization is durable', async ({}, testInfo) => {
+  const interruption = Error('Stopped after restoration authorization.');
+  const { vault, intake, deletion, restoration, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
+    if (name === 'capture-restoration-authorized') throw interruption;
+  }, { existing: true });
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+  const ledger = await intake.load(), authority = ledger.sourceAuthority[id], other = ledger.captures['c'.repeat(64)];
+  expect(authority.phase).toBe('restoring');
+  expect(authority.restoration.published).toBeUndefined();
+  expect(ledger.suppressed).toContain(sourceHash);
+  const journal = path.join(intake.dir, authority.restoration.journal), tx = await readJson(journal);
+  const reserved = intake.destination(tx.capture), existing = intake.destination(other);
+  expect(reserved).toBe(intake.destination(ledger.captures[sourceHash]));
+  expect(await readOptional(reserved)).toBeNull();
+  const bytes = await fs.readFile(existing), existingIdentity = await identity(existing);
+  await fs.writeFile(reserved, bytes, { flag: 'wx' });
+  const foreignIdentity = await identity(reserved);
+  expect(foreignIdentity).not.toEqual(existingIdentity);
+
+  const reservations = vault.reservedRestorationIdentities(ledger);
+  expect.soft(reservations.heldRestorations.get(id)).toBe(reserved);
+  expect.soft(reservations.captures.has(other.id)).toBe(true);
+  const inventory = await vault.captureInventory({ ledger, guardLedger: () => intake.storage.guard() });
+  expect.soft(inventory.notes.some(note => note.file === reserved)).toBe(false);
+  expect.soft([...inventory.owned].some(note => note.id === other.id)).toBe(false);
+  expect(await readJson(ledgerFile)).toEqual(ledger);
+  expect(await readOptional(path.join(intake.dir, 'transaction.json'))).toBeNull();
+  expect(await fs.readFile(reserved)).toEqual(bytes);
+  expect(await identity(reserved)).toEqual(foreignIdentity);
+  expect(await fs.readFile(existing)).toEqual(bytes);
+  expect(await identity(existing)).toEqual(existingIdentity);
+});
+
+test('direct restoration reservation read refuses an ordinary replacement of a recorded parent', async ({}, testInfo) => {
+  const interruption = Error('Stopped after restoration publication.');
+  const { vault, intake, deletion, restoration, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
+    if (name === 'capture-restoration-published') throw interruption;
+  });
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+  const ledger = await readJson(ledgerFile), authority = ledger.sourceAuthority[id];
+  expect(authority.restoration.published).toBe(true);
+  const destination = intake.destination(ledger.captures[sourceHash]), parent = path.dirname(destination);
+  const relative = path.relative(vault.vault, parent).split(path.sep).join('/');
+  const recorded = authority.directories.find(item => item.file === relative);
+  const parentIdentity = await identity(parent), originalBytes = await fs.readFile(destination);
+  expect(recorded).toMatchObject({ dev: String(parentIdentity[0]), ino: String(parentIdentity[1]) });
+  const displaced = testInfo.outputPath('original-restoration-parent');
+  await fs.rename(parent, displaced);
+  await fs.mkdir(parent);
+  await fs.writeFile(destination, originalBytes, { flag: 'wx' });
+  const replacementIdentity = await identity(parent);
+  expect(replacementIdentity).not.toEqual(parentIdentity);
+
+  expect.soft(() => vault.reservedRestorationIdentities(ledger)).toThrow(/folder|parent|identity/i);
+  expect(await identity(parent)).toEqual(replacementIdentity);
+  expect(await identity(displaced)).toEqual(parentIdentity);
+  expect(await fs.readFile(destination)).toEqual(originalBytes);
+  expect(await fs.readFile(path.join(displaced, path.basename(destination)))).toEqual(originalBytes);
+  expect(await readJson(ledgerFile)).toEqual(ledger);
+});
+
 test('restoration hold preserves a reserved identity collision and imports a disjoint draft', async ({}, testInfo) => {
   const interruption = Error('Stopped after restoration publication.');
   const { vault, intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = await fixture(testInfo, async boundary => {
