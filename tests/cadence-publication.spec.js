@@ -66,10 +66,81 @@ async function reconnectFixture() {
   const handlers = new Map();
   const history = new Conversations({ dataRoot: root, getVault: () => vault, clock, checkpoint: async () => {}, testRoot: root });
   installArchives({ ipcMain: { handle: (name, handle) => handlers.set(name, handle) }, history, settingsPath, testRoot: root, clock, checkpoint: async () => {}, getSchedule: () => schedule });
-  const preview = () => handlers.get('archive-reconnect-preview')(null, { archiveId });
+  const preview = (request = { archiveId }) => handlers.get('archive-reconnect-preview')(null, request);
   const confirm = review => handlers.get('archive-reconnect')(null, { token: review.token });
-  return { scheduleFile, taskFile, calls, preview, confirm };
+  return { vault, archiveId, scheduleFile, taskFile, calls, preview, confirm };
 }
+
+async function secondMatch({ vault, archiveId }) {
+  const sourceRoot = path.join(root, 'previous-vault', 'Companion');
+  const currentName = `archive-intent-${archiveId}-${hash(sourceRoot + '\n' + vault.root)}.json`;
+  const record = JSON.parse(await readOptional(path.join(root, currentName)));
+  const other = new Vault(vault.vault, 'Other managed parent');
+  await other.setup();
+  const otherName = `archive-intent-${archiveId}-${hash(sourceRoot + '\n' + other.root)}.json`;
+  await fs.writeFile(path.join(root, otherName), JSON.stringify({ ...record, targetRoot: other.root }), { flag: 'wx' });
+  return { sourceRoot, other };
+}
+
+test('archive cadence IPC requires the exact retained match when an archive has two targets', async () => {
+  const fixture = await reconnectFixture();
+  const { sourceRoot, other } = await secondMatch(fixture);
+  const selected = { archiveId: fixture.archiveId, sourceRoot, targetRoot: fixture.vault.root };
+  await expect(fixture.preview({ ...selected, targetRoot: other.root }), 'choosing the other match must not preview the current vault').rejects.toThrow('Select exactly one imported cadence matched to the current vault');
+  await expect(fixture.preview({ archiveId: fixture.archiveId })).rejects.toThrow('Select exactly one imported cadence matched to the current vault');
+  expect(await readOptional(fixture.scheduleFile)).toBeNull();
+  expect(await readOptional(fixture.taskFile)).toBeNull();
+
+  const reviewed = await fixture.preview(selected);
+  expect(reviewed).toMatchObject({ targetRoot: fixture.vault.root, sourceRoot, anchor, mode: 'enabled' });
+  expect(await readOptional(fixture.scheduleFile)).toBeNull();
+  expect(await readOptional(fixture.taskFile)).toBeNull();
+  const result = await fixture.confirm(reviewed);
+  expect(result).toMatchObject({ connected: true, anchor });
+  expect(JSON.parse(await readOptional(fixture.scheduleFile))).toMatchObject({
+    id: result.id,
+    mode: 'enabled',
+    archiveReconnect: { ...selected, status: 'connected' }
+  });
+  expect(JSON.parse(await readOptional(fixture.taskFile)).name).toBe(`Companion-${result.id}`);
+});
+
+test('archive cadence menu preserves the chosen target when an archive has two matches', async () => {
+  const fixture = await reconnectFixture();
+  const { other } = await secondMatch(fixture);
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify(clock()));
+  const app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const page = await app.firstWindow();
+    const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+    const choices = region.getByLabel('Imported cadence to reconnect', { exact: true });
+    const preview = region.getByRole('button', { name: 'Preview imported daily intake reconnect', exact: true });
+    const confirm = region.getByRole('button', { name: 'Reconnect reviewed daily intake', exact: true });
+    const summary = region.locator('#archive-reconnect-summary');
+    await expect(page.locator('#location')).toHaveText(fixture.vault.root);
+    await expect(choices.locator('option')).toHaveCount(3);
+
+    const choose = async location => {
+      const entry = choices.locator('option').filter({ hasText: location });
+      await expect(entry).toHaveCount(1);
+      await choices.selectOption({ label: await entry.textContent() });
+      await preview.click();
+      await expect(preview).toBeEnabled();
+    };
+    await choose(other.root);
+    expect(await summary.textContent(), 'the menu must send the exact chosen target').toContain('Select exactly one imported cadence matched to the current vault');
+    await expect(confirm).toBeDisabled();
+    expect(await readOptional(fixture.scheduleFile)).toBeNull();
+    expect(await readOptional(fixture.taskFile)).toBeNull();
+
+    await choose(fixture.vault.root);
+    await expect(summary).toContainText(fixture.vault.root);
+    await expect(summary).toContainText(anchor);
+    await expect(confirm).toBeEnabled();
+    expect(await readOptional(fixture.scheduleFile)).toBeNull();
+    expect(await readOptional(fixture.taskFile)).toBeNull();
+  } finally { await app.close(); }
+});
 
 for (const phase of ['pending', 'connected']) {
   test(`archive cadence preserves a substituted ${phase} stage and does not publish it`, async () => {
