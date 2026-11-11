@@ -931,18 +931,23 @@ class Intake {
   }
   verifyDistinctHeldRepair(ledger, tx, journalBytes, held, guard) {
     const witness = held.outputHold, capture = ledger.captures[tx.sourceHash];
-    if (witness?.mode !== precommitConflict || held.incomingRevision !== tx.revision.id ||
+    if (witness !== undefined && witness?.mode !== precommitConflict || held.incomingRevision !== tx.revision.id ||
         !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(held.journal) ||
         !tx.resolution || !tx.keptCurrent || capture?.id !== tx.capture.id || capture.conflict !== held.reason ||
         capture.currentRevision !== tx.keptCurrent.id) return null;
     const previous = path.join(this.dir, held.journal);
-    const previousJournal = readExactSync(previous, guard, 1, witness.journal);
+    const previousJournal = readExactSync(previous, guard, 1, witness?.journal);
     const old = JSON.parse(previousJournal.bytes);
     this.validateTransaction(old);
     if (old.sourceHash !== tx.sourceHash || old.capture.id !== tx.capture.id || old.revision.id !== tx.revision.id ||
-        old.resolution === tx.resolution || !this.hasHeldJournal(ledger, old) ||
-        !this.validOutputHold(witness, pendingName(old), old.previousHash) ||
-        !previousJournal.bytes.equals(Buffer.from(JSON.stringify(old)))) {
+        old.resolution === tx.resolution || old.key !== tx.key || !isDeepStrictEqual(old.revision, tx.revision) ||
+        held.journal !== heldName(old) || !previousJournal.bytes.equals(Buffer.from(JSON.stringify(old)))) {
+      throw Error('The older held source journal changed. Recovery files were preserved.');
+    }
+    const validPrevious = witness
+      ? this.hasHeldJournal(ledger, old) && this.validOutputHold(witness, pendingName(old), old.previousHash)
+      : this.matchesOrdinaryHeldRepair(ledger, tx, old, held, capture);
+    if (!validPrevious) {
       throw Error('The older held source journal changed. Recovery files were preserved.');
     }
     const intentFile = path.join(this.dir, 'repair-intent.json');
@@ -958,6 +963,19 @@ class Intake {
       verifyStageSync(intentFile, guard, intentRecord.proof, 2);
       verifyStageSync(archivedIntent, guard, intentRecord.proof, 2);
     };
+  }
+  matchesOrdinaryHeldRepair(ledger, tx, old, held, capture) {
+    if (Object.keys(held).length !== 3 || typeof held.reason !== 'string' || held.reason.startsWith(outputHold) ||
+        !held.reason.endsWith(conflictPause) || !capture.reviewed || !old.capture.reviewed ||
+        old.capture.currentRevision !== capture.currentRevision ||
+        old.retainOnly !== true && old.keptCurrent?.id !== capture.currentRevision) return false;
+    const accepted = revisionAdmission(ledger, capture.currentRevision);
+    if (accepted?.status !== 'imported' || accepted.captureId !== capture.id || accepted.sourceHash !== tx.sourceHash ||
+        accepted.snapshotHash !== hash(JSON.stringify(tx.keptCurrent, null, 2))) return false;
+    const outcome = ledger.outcomes[old.key], locator = old.revision.locator;
+    const archived = { status: 'held', reason: held.reason, locator, sourceHash: old.sourceHash, pendingRevision: old.revision.id };
+    const scanned = { status: 'held', reason: held.reason.slice(0, -conflictPause.length), locator, checkedAt: old.revision.importedAt };
+    return isDeepStrictEqual(outcome, archived) || isDeepStrictEqual(outcome, scanned);
   }
   verifyIndependentRecoveryDisposition(ledger, journal) {
     const { tx } = journal, outcome = ledger.outcomes[tx.key];
