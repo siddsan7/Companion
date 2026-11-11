@@ -11,7 +11,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const { revisionAdmission } = require('./source-authority');
 const { comparable } = require('./legacy-capture-ownership');
 const { ordinaryDirectories, readExactSync, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
-const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance } = require('./source-generations');
+const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance, scopeKey } = require('./source-generations');
 const digest = text => createHash('sha256').update(text).digest('hex');
 const body = content => content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '').trim();
 function importedProvenance(id, revision, snapshotHash) {
@@ -142,36 +142,35 @@ class Context {
         ledger.acceptedCleanup?.sourceHash === sourceHash || comparable(path.resolve(note.file)) !== comparable(path.resolve(intake.destination(capture))) ||
         (block ? block.outputHold !== undefined || !capture.conflict || block.reason !== capture.conflict : !!capture.conflict || localHash === capture.currentHash)) return [];
     const choices = [];
-    const exact = (file, work) => {
+    const exact = file => {
       const parent = this.vault.publicationFolders(path.dirname(file)).guard;
       const guard = () => { intake.storage.guardSync(observed); parent(); };
       const { bytes, proof } = readExactSync(file, guard);
-      const source = work(bytes, proof.digest);
-      if (!source) return;
+      return { bytes, hash: proof.digest, verify: () => verifyStageSync(file, guard, proof) };
+    };
+    const add = (source, verify) => {
       Object.assign(source, { captureId: capture.id, ...generationFields(sourceGenerations) });
       source.provenance += generationProvenance(source);
-      choices.push({ source, verify: () => verifyStageSync(file, guard, proof) });
+      choices.push({ source, file: note.file, verify });
     };
+    let local;
     try {
-      exact(note.file, (bytes, hash) => {
-        if (hash !== localHash || hash === capture.currentHash) return null;
-        const text = body(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
-        if (!text) return null;
-        return { key: `conflict-local:${capture.id}`, conflictChoice: 'local', title: `Local writing (conflict): ${note.title}`, text,
-          provenance: `Conflicted capture ${capture.id}; exact local content sha256 ${hash}; user-selected unverified local writing, not producer evidence.`, digest: hash };
-      });
-    } catch { /* An unproved local copy never becomes a selection. */ }
+      local = exact(note.file);
+      if (local.hash !== localHash) return [];
+      const text = body(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(local.bytes));
+      if (text && localHash !== capture.currentHash) add({ key: `conflict-local:${capture.id}`, conflictChoice: 'local', title: `Local writing (conflict): ${note.title}`, text,
+        provenance: `Conflicted capture ${capture.id}; exact local content sha256 ${localHash}; user-selected unverified local writing, not producer evidence.`, digest: localHash }, local.verify);
+    } catch { return []; }
     const revisionId = capture.currentRevision, admission = revisionAdmission(ledger, revisionId);
     if (!/^[a-f0-9-]{36}$/.test(revisionId) || admission?.captureId !== capture.id || admission.sourceHash !== sourceHash) return choices;
     try {
-      exact(path.join(this.vault.root, 'Revisions', `${revisionId}.json`), (bytes, hash) => {
-        const revision = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-        if (hash !== admission.snapshotHash || revision.id !== revisionId || revision.captureId !== capture.id || revision.sourceHash !== sourceHash ||
-            revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') return null;
-        const provenance = `${importedProvenance(capture.id, revision, hash)} Explicitly selected retained revision; unresolved local conflict. Local changes were not included.`;
-        return { key: `conflict-imported:${capture.id}`, conflictChoice: 'imported', revisionId, title: `Imported revision (conflict): ${note.title}`, text: revision.text,
-          provenance, digest: digest(provenance + revision.text) };
-      });
+      const { bytes, hash, verify } = exact(path.join(this.vault.root, 'Revisions', `${revisionId}.json`));
+      const revision = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+      if (hash !== admission.snapshotHash || revision.id !== revisionId || revision.captureId !== capture.id || revision.sourceHash !== sourceHash ||
+          revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') return choices;
+      const provenance = `${importedProvenance(capture.id, revision, hash)} Explicitly selected retained revision; unresolved local conflict. Local changes were not included.`;
+      add({ key: `capture:${capture.id}`, conflictChoice: 'imported', conflictContentHash: localHash, revisionId, title: `Imported revision (conflict): ${note.title}`, text: revision.text,
+        provenance, digest: digest(provenance + revision.text + localHash) }, () => { local.verify(); verify(); });
     } catch { /* A missing or changed snapshot never becomes a selection. */ }
     return choices;
   }
@@ -267,7 +266,8 @@ class Context {
     }
     this.ideaEligibility(this.vault);
     let ideas;
-    try { ideas = await scanIdeas(this.vault); }
+    const captureIds = new Set(manualChoices.map(({ source }) => source.captureId));
+    try { ideas = await scanIdeas(this.vault, { captureIds }); }
     catch (error) { issues.push(error.message); }
     for (const [id, claims] of ideas?.claims || []) {
       const claim = claims.find(item => item.relevant);
@@ -318,8 +318,12 @@ class Context {
     const keys = available.map(source => source.key), duplicates = new Set(keys.filter((key, i) => keys.indexOf(key) !== i));
     for (const key of duplicates) issues.push(`Evidence unavailable: duplicate source identity ${key}.`);
     const manual = [], normalized = source => ({ ...source, text: source.text.replace(/\r\n?/g, '\n') });
-    for (const { source, verify } of manualChoices) {
-      try { verify(); manual.push(normalized(source)); }
+    for (const { source, file, verify } of manualChoices) {
+      try {
+        const claims = ideas?.captureClaims.get(source.captureId);
+        if (claims?.length !== 1 || comparable(claims[0]) !== comparable(file)) throw Error('Capture identity changed.');
+        verify(); manual.push(normalized(source));
+      }
       catch { issues.push(`Unavailable manual choice ${source.title}; its exact file changed.`); }
     }
     intake.storage.guardSync(observed);
@@ -357,7 +361,7 @@ class Context {
   async preview({ question, selections, excludedSources = [] }) {
     await this.vault.checkpoint('context-before-preview-read');
     if (!Array.isArray(excludedSources) || excludedSources.some(key => typeof key !== 'string')) throw Error('Invalid explicit package exclusions.');
-    const { all: eligible, manual } = await this.corpus(), all = [...eligible, ...manual], excluded = new Set(excludedSources), omissions = [];
+    const { all: eligible, manual } = await this.corpus(), all = [...eligible, ...manual], excluded = new Set(excludedSources.map(scopeKey)), omissions = [];
     const dependencies = source => [...[source.associated, ...(source.associatedIds || []), source.conflictChoice && source.captureId].filter(Boolean).map(id => `capture:${id}`), ...(source.projectVersion === undefined ? [] : [`brief:${source.projectVersion}`])];
     for (const [token, approval] of this.approvals) {
       const source = all.find(item => item.key === approval.key);

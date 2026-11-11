@@ -8,7 +8,7 @@
   byId('conversation-preview').before(priorSearch);
   const historySelections = new Map();
   let conversationId = null, conversationToken = null, conversationGeneration = 0;
-  let viewEpoch = 0, draftMode = false;
+  let viewEpoch = 0, draftMode = false, switchingVault = false;
   const retained = new Map();
   let renderedChoices = '';
   let displayedHistory = '';
@@ -59,7 +59,8 @@
       historyExclusions = record.requests.at(-1)?.package?.historyExclusions || [];
       const scope = record.scope || { excludedSources: [], excludedHistory: record.requests.at(-1)?.package?.excludedHistory || [] };
       // A delayed initial read must not undo explicit controls already changed in this window.
-      for (const key of scope.excludedSources) if (!restoredSources.has(key)) excluded.add(key);
+      const restored = new Set([...restoredSources].map(scopeKey));
+      for (const key of scope.excludedSources.map(scopeKey)) if (!restored.has(key)) excluded.add(key);
       for (const id of scope.excludedHistory) if (!restoredHistory.has(id)) excludedHistory.add(id);
     }
     byId('conversation-error').textContent = record.storageWarning || '';
@@ -104,6 +105,7 @@
     warnHistory();
   }
   async function restoreConversation() {
+    if (switchingVault) return;
     const request = conversationGeneration, epoch = viewEpoch;
     try {
       const state = await window.companion['conversation-list'](); if (request !== conversationGeneration || epoch !== viewEpoch) return;
@@ -131,7 +133,12 @@
     byId('conversation-preview').disabled = selectionAction !== null;
   };
   const clearPreview = () => { selectionAction = null; selectionControls(); generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
-  const run = async work => { try { byId('context-error').textContent = ''; await work(); } catch (error) { clearPreview(); byId('context-error').textContent = error.message; } };
+  const run = async work => {
+    if (switchingVault) return;
+    const epoch = viewEpoch, current = () => epoch === viewEpoch;
+    try { byId('context-error').textContent = ''; await work(current); }
+    catch (error) { if (current()) { clearPreview(); byId('context-error').textContent = error.message; } }
+  };
   async function selectPassage(work) {
     clearPreview(); byId('context-error').textContent = '';
     const action = selectionAction = { generation, epoch: viewEpoch };
@@ -146,11 +153,13 @@
     }
   }
   const dependentOn = (item, key) => [item.associated, ...(item.associatedIds || [])].some(id => `capture:${id}` === key) || item.projectVersion !== undefined && `brief:${item.projectVersion}` === key;
+  const scopeKey = key => key.replace(/^conflict-(?:local|imported):/, 'capture:');
   function revoke(item) { delete item.approval; delete item.approvedText; delete item.approvalLabel; }
   function add(source) {
     if (source) {
       restoredSources.add(source.key);
-      if (excluded.delete(source.key)) for (const item of selections) if (dependentOn(item, source.key)) revoke(item);
+      const family = scopeKey(source.key);
+      if (excluded.delete(family)) for (const item of selections) if (dependentOn(item, family)) revoke(item);
       selections = selections.filter(item => {
         const keep = item.key !== source.key && !(source.conflictChoice && item.conflictChoice && item.captureId === source.captureId);
         if (!keep && item.key !== source.key) restoredSources.delete(item.key);
@@ -165,7 +174,7 @@
     for (const source of selections) {
       const article = document.createElement('article'), title = document.createElement('p'), remove = document.createElement('button');
       title.textContent = source.title; remove.textContent = 'Remove from context';
-      remove.onclick = () => { excluded.add(source.key); restoredSources.delete(source.key); selections = selections.filter(item => item.key !== source.key); for (const item of selections) if (dependentOn(item, source.key)) revoke(item); selected(); clearPreview(); };
+      remove.onclick = () => { const family = scopeKey(source.key); excluded.add(family); restoredSources.delete(source.key); selections = selections.filter(item => item.key !== source.key); for (const item of selections) if (dependentOn(item, family)) revoke(item); selected(); clearPreview(); };
       const label = document.createElement('label'), editor = document.createElement('textarea'), approve = document.createElement('button'), proposed = document.createElement('pre'), state = document.createElement('p');
       label.textContent = 'Shorter passage'; editor.rows = 4; editor.value = source.approvedText || source.text; label.append(editor);
       const proposal = () => { proposed.textContent = `${source.provenance}; ${source.approvalLabel || 'Explicitly shortened passage'}\n${editor.value}`; };
@@ -182,6 +191,7 @@
     }
   }
   async function find() {
+    if (switchingVault) return;
     retireFind(); clearPreview();
     const request = findGeneration, epoch = viewEpoch, question = byId('context-question').value;
     const current = () => request === findGeneration && epoch === viewEpoch && question === byId('context-question').value;
@@ -194,7 +204,7 @@
       byId('context-error').textContent = result.issues.join('\n');
       for (const note of result.included) {
         const row = document.createElement('p'), remove = document.createElement('button'); row.textContent = note.file; remove.textContent = 'Exclude note';
-        remove.onclick = () => run(async () => { clearPreview(); await window.companion['context-exclude'](note.key); selections = selections.filter(source => source.key !== note.key); selected(); await find(); }); row.append(remove); byId('context-notes').append(row);
+        remove.onclick = () => run(async current => { clearPreview(); await window.companion['context-exclude'](note.key); if (!current()) return; selections = selections.filter(source => source.key !== note.key); selected(); await find(); }); row.append(remove); byId('context-notes').append(row);
       }
       for (const source of all) { const option = document.createElement('option'); option.value = source.key; option.textContent = source.title; byId('context-manual').append(option); }
       for (const source of result.matches) {
@@ -229,13 +239,14 @@
     }
   }
   byId('context-find').onclick = find;
-  byId('context-include').onclick = () => run(async () => { clearPreview(); await window.companion['context-include'](); await find(); });
+  byId('context-include').onclick = () => run(async current => { clearPreview(); await window.companion['context-include'](); if (current()) await find(); });
   byId('context-add-manual').onclick = () => { if (!byId('context-add-manual').disabled) add(all.find(source => source.key === byId('context-manual').value)); };
   byId('context-question').oninput = () => { retireFind(); clearPreview(); };
   byId('context-preview').onclick = async () => {
-    if (selectionAction) return;
-    clearPreview(); const request = generation; byId('context-error').textContent = '';
+    if (switchingVault || selectionAction) return;
+    clearPreview(); const request = generation, epoch = viewEpoch; byId('context-error').textContent = '';
     const outdated = () => {
+      if (epoch !== viewEpoch) return true;
       if (request === generation) return false;
       const summary = byId('context-summary');
       if (!byId('context-package').value) summary.textContent = 'Earlier preview ignored. Preview the current controls.';
@@ -266,6 +277,7 @@
     }
   }
   byId('history-search').onclick = async () => {
+    if (switchingVault) return;
     invalidateConversation(); const version = conversationGeneration;
     byId('history-search-results').replaceChildren(); byId('history-search-status').textContent = 'Searching prior dialogue…';
     try {
@@ -282,7 +294,7 @@
     } catch (error) { if (version === conversationGeneration) byId('history-search-status').textContent = error.message; }
   };
   byId('conversation-preview').onclick = async () => {
-    if (selectionAction) return;
+    if (switchingVault || selectionAction) return;
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
       const preview = await window.companion['conversation-preview'](conversationInput());
@@ -300,6 +312,13 @@
     try { const record = await window.companion['conversation-send']({ packageId }); if (epoch === viewEpoch) showConversation(record); }
     catch (error) { if (epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
   };
+  window.addEventListener('companion-vault-configuring', () => {
+    switchingVault = true;
+    retained.clear();
+    byId('conversation-location').textContent = '';
+    resetView();
+  });
+  window.addEventListener('companion-vault-configured', () => { switchingVault = false; restoreConversation(); });
   restoreConversation();
   setInterval(restoreConversation, 300);
 })();

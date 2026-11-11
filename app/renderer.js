@@ -104,6 +104,7 @@ $('configure').onclick = () => {
   if ($('configure').disabled) return;
   const owner = ++configurationEpoch; configurationBusy = true; configuringVault = true; $('vault-repairs').replaceChildren();
   window.intakeView.retireInspection();
+  window.dispatchEvent(new Event('companion-vault-configuring'));
   scheduleView = null;
   updateCaptureControl(); updateIntakeControls(); updateScheduleControls();
   retireCaptureLinks();
