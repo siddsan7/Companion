@@ -166,12 +166,22 @@ async function inventory(intake, ledger, capture, sourceHash, note, seed, now) {
   if (!candidates.length) return null;
   if (candidates.length !== 1) fail('more than one selected repair');
   const repairLeaf = candidates[0], repair = json(repairLeaf);
-  if (!shape(repair, ['schema', 'sourceHash', 'localHash', 'annotationId', 'annotation', 'tx']) || repair.schema !== 1 || repair.sourceHash !== sourceHash || !uuid(repair.annotationId) || !sha(repair.localHash)) fail('repair wrapper');
+  const repairProofs = ['priorConflict', 'annotationProof', 'sourceProof', 'intentIdentity'];
+  if (!shape(repair, ['schema', 'sourceHash', 'localHash', 'annotationId', 'annotation', 'tx'], repairProofs) || repair.schema !== 1 || repair.sourceHash !== sourceHash || !uuid(repair.annotationId) || !sha(repair.localHash)) fail('repair wrapper');
+  if (repairProofs.some(key => Object.hasOwn(repair, key))) {
+    if (!repair.priorConflict) fail('missing original repair proof');
+    try { intake.validateRepairIntent(repair); } catch { fail('invalid repair publication proof'); }
+  }
+  if (repair.intentIdentity && !equal(repair.intentIdentity, { dev: repairLeaf.target.dev, ino: repairLeaf.target.ino })) fail('retained repair intent identity changed');
   const tx = repair.tx, originalFile = path.join(intake.dir, `conflict-${tx?.revision?.id}.json`), resolutionFile = path.join(intake.dir, `conflict-${tx?.revision?.id}-${repair.annotationId}.json`);
   // Read the other selected leaves only after the wrapper identities are proven.
   if (!uuid(tx?.revision?.id) || tx.capture?.id !== capture.id || tx.sourceHash !== sourceHash || tx.resolution !== repair.annotationId) fail('repair source identity');
   const originalLeaf = await leaf(intake, originalFile, 'mixed-recovery'), resolutionLeaf = await leaf(intake, resolutionFile, 'mixed-recovery');
   if (!originalLeaf || !resolutionLeaf) fail('missing conflict evidence');
+  const matchesJournal = (proof, { target }) => equal(proof, { dev: target.dev, ino: target.ino, digest: target.sha256 });
+  if (repair.priorConflict && (repair.priorConflict.block.journal !== path.basename(originalFile) ||
+      !matchesJournal(repair.priorConflict.journalProof, originalLeaf))) fail('original repair journal changed');
+  if (repair.sourceProof && !matchesJournal(repair.sourceProof, resolutionLeaf)) fail('repair source journal changed');
   const original = json(originalLeaf), resolution = json(resolutionLeaf), currentLeaf = await leaf(intake, note.file, 'capture');
   const snapshotLeaf = await leaf(intake, path.join(intake.vault.root, 'Revisions', capture.currentRevision + '.json'), 'snapshot');
   if (!snapshotLeaf || !currentLeaf) fail('missing current evidence');

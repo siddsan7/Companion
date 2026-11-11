@@ -3,9 +3,10 @@ const native = require('node:fs');
 const { assertAnnotationPublication, annotationRemoved, validateAnnotationRemovals } = require('./annotation-authority');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { parseAnnotation } = require('./vault');
 const { revisionAdmission, activeAdmission, validateAuthority } = require('./source-authority');
-const { readExactSync, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
+const { readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
 
 async function annotationAuthority(intake) {
   // A caller can still hold the ledger it loaded before an awaited publication.
@@ -31,7 +32,21 @@ function sourceLink(content, relative) {
   const body = content.slice(frontmatter[0].length);
   return frontmatter[0] + body.replace(/^(\r?\n# Annotation\r?\n\r?\n)Source: \[Capture\]\([^\r\n]*\)(?=\r?\n|$)/, (_, header) => header + 'Source: [Capture](' + urlPath(relative) + ')');
 }
-function install(Intake, { hash, read, noteText }) {
+function install(Intake, { hash, read, noteText, acceptedOutcome }) {
+  async function writeRepairIntentStage(file, intent, guard) {
+    guard();
+    const handle = await fs.open(file, 'wx');
+    try {
+      const { dev, ino } = await handle.stat({ bigint: true });
+      const identity = { dev: String(dev), ino: String(ino) };
+      const bytes = JSON.stringify({ ...intent, intentIdentity: identity });
+      guard();
+      await handle.writeFile(bytes);
+      await handle.sync();
+      guard();
+      return { identity, proof: { ...identity, digest: hash(bytes) } };
+    } finally { await handle.close(); }
+  }
   Intake.prototype.syncMoves = async function () {
     const annotations = await this.annotations(), ledger = await this.load();
     const { notes, owned, repairable, excluded, heldRestorations, reserved } = await this.vault.captureInventory({ ledger, guardLedger: () => this.storage.guard() });
@@ -330,7 +345,32 @@ function install(Intake, { hash, read, noteText }) {
       const content = noteText(capture, keptCurrent || tx.revision); capture.currentHash = hash(content);
       const id = randomUUID(), annotation = `---\ncompanion_id: ${JSON.stringify(id)}\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ${JSON.stringify(tx.capture.id)}\ncreated_at: ${JSON.stringify(now)}\n---\n\n# Annotation\n\nSource: [Capture](${urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture)))})\n\n${text}\n`;
       const intent = { schema: 1, sourceHash, localHash, annotationId: id, annotation, tx: { ...tx, retainOnly: false, ...(keptCurrent ? { keptCurrent } : {}), capture, content, previous: local, previousHash: localHash, externalConflict: false, resolution: id, backup: `${tx.capture.id}-${tx.revision.id}.before-${id}.md` } };
-      await this.publishJournal(path.join(this.dir, 'repair-intent.json'), intent);
+      const intentFile = path.join(this.dir, 'repair-intent.json');
+      if (keptCurrent) {
+        const { guard } = this.vault.publicationFolders(this.dir);
+        const conflict = this.repairConflictWitness(ledger, intent.tx, block, guard);
+        if (!conflict) throw Error('The original repair conflict has no exact journal proof. Recovery files were preserved.');
+        intent.priorConflict = { block, journalProof: conflict.proof };
+        const sourceStage = path.join(this.dir, `journal-${id}.stage`);
+        this.storage.guardSync();
+        conflict.verify();
+        intent.sourceProof = await writeStage(sourceStage, JSON.stringify(intent.tx), guard);
+        const intentStage = path.join(this.dir, `repair-intent-${id}.stage`);
+        const { proof } = await writeRepairIntentStage(intentStage, intent, guard);
+        const verifyConflict = () => {
+          this.storage.guardSync();
+          conflict.verify();
+          verifyStageSync(sourceStage, guard, intent.sourceProof);
+        };
+        verifyConflict();
+        verifyStageSync(intentStage, guard, proof);
+        verifyAbsentSync(intentFile, guard);
+        native.linkSync(intentStage, intentFile);
+        verifyStageSync(intentStage, guard, proof, 2);
+        verifyStageSync(intentFile, guard, proof, 2);
+        native.unlinkSync(intentStage);
+        verifyStageSync(intentFile, guard, proof);
+      } else await this.publishJournal(intentFile, intent);
       await this.vault.checkpoint('repair-intent-published');
       await this.finishRepair();
     });
@@ -339,8 +379,29 @@ function install(Intake, { hash, read, noteText }) {
     const tx = intent?.tx;
     this.validateTransaction(tx);
     if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
+    const exactProof = proof => validProof(proof) && Object.keys(proof).length === 3;
+    const prior = intent.priorConflict;
+    if (Object.hasOwn(intent, 'priorConflict') && (!tx.keptCurrent || !prior || Object.keys(prior).length !== 2 ||
+        !exactProof(prior.journalProof) || prior.block?.incomingRevision !== tx.revision.id ||
+        typeof prior.block.reason !== 'string' || !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(prior.block.journal))) {
+      throw Error('Invalid original repair conflict proof. Recovery files were preserved.');
+    }
+    if (Object.hasOwn(intent, 'annotationProof') && (!tx.keptCurrent || !exactProof(intent.annotationProof) ||
+        intent.annotationProof.digest !== hash(intent.annotation))) {
+      throw Error('Invalid repair annotation proof. Recovery files were preserved.');
+    }
+    if (Object.hasOwn(intent, 'sourceProof') && (!prior || !exactProof(intent.sourceProof) ||
+        intent.sourceProof.digest !== hash(JSON.stringify(tx)))) {
+      throw Error('Invalid repair source proof. Recovery files were preserved.');
+    }
+    const identity = intent.intentIdentity;
+    if (Object.hasOwn(intent, 'intentIdentity') && (!intent.sourceProof || !identity || Object.keys(identity).length !== 2 ||
+        ![identity.dev, identity.ino].every(value => typeof value === 'string' && /^[0-9]+$/.test(value)))) {
+      throw Error('Invalid repair intent identity. Recovery files were preserved.');
+    }
   };
   Intake.prototype.finishRepair = async function (expectedJournal) {
+    const ledgerBaseline = this.storage.expected;
     expectedJournal?.verify();
     const intentFile = path.join(this.dir, 'repair-intent.json');
     const intentIdentity = await fs.lstat(intentFile, { bigint: true }).catch(error => {
@@ -353,22 +414,99 @@ function install(Intake, { hash, read, noteText }) {
     const intent = JSON.parse(bytes), tx = intent.tx;
     this.validateRepairIntent(intent);
     const owner = await annotationAuthority(this);
+    // The repair can change its active journal names. The selected restoration
+    // journals must remain exact across both that transition and hold cleanup.
+    const guardRestorations = this.publishedRestorationControlGuard(owner);
+    const guardPrecommit = () => { this.storage.guardSync(ledgerBaseline); guardRestorations(); };
+    const readPrecommit = async () => {
+      const ledger = await this.load();
+      if (!this.storage.matches(this.storage.expected, ledgerBaseline)) throw Error('The repair ledger changed. Recovery files were preserved.');
+      guardPrecommit();
+      return ledger;
+    };
+    if (tx.keptCurrent) guardPrecommit();
     if (annotationRemoved(owner, intent.annotationId)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
-    const preserveOutputHold = (ledger, error) => {
-      if (!this.hasHeldJournal(ledger, tx)) throw Error('The exact intake hold changed. All files were preserved.');
-      const intentGuard = this.vault.publicationFolders(this.dir).guard;
-      const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
-      const guard = () => { intentGuard(); annotationGuard(); };
-      const archive = path.join(this.dir, `repair-${intent.annotationId}.json`);
-      const proof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
-      this.storage.guardSync();
+    const journal = path.join(this.dir, 'transaction.json'), archivedIntent = path.join(this.dir, `repair-${intent.annotationId}.json`);
+    const sourceStage = path.join(this.dir, `journal-${intent.annotationId}.stage`);
+    const intentStage = path.join(this.dir, `repair-intent-${intent.annotationId}.stage`);
+    const ordinary = this.vault.publicationFolders(this.dir).guard;
+    const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
+    const guard = () => { ordinary(); annotationGuard(); guardRestorations(); };
+    let intentProof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
+    if (tx.keptCurrent) {
+      const changed = () => Error('The repair intent or its known aliases changed. Recovery files were preserved.');
+      const recorded = intent.intentIdentity;
+      guardPrecommit();
       guard();
+      if (recorded && (recorded.dev !== intentProof.dev || recorded.ino !== intentProof.ino || bytes !== JSON.stringify(intent))) throw changed();
+      const staged = native.lstatSync(intentStage, { throwIfNoEntry: false });
+      const archived = native.lstatSync(archivedIntent, { throwIfNoEntry: false });
+      if (staged) {
+        if (!recorded || archived || intent.annotationProof) throw changed();
+        this.boundRepairConflict(owner, tx, intent.priorConflict, guard)();
+        verifyStageSync(sourceStage, guard, intent.sourceProof);
+        for (const absent of [journal, archivedIntent, stage, file]) verifyAbsentSync(absent, guard, changed);
+        verifyStageSync(intentFile, guard, intentProof, 2);
+        verifyStageSync(intentStage, guard, intentProof, 2);
+        native.unlinkSync(intentStage);
+        verifyStageSync(intentFile, guard, intentProof);
+      } else if (archived) {
+        verifyStageSync(intentFile, guard, intentProof, 2);
+        verifyStageSync(archivedIntent, guard, intentProof, 2);
+      } else verifyStageSync(intentFile, guard, intentProof);
+    }
+    let freshRepair;
+    let verifyConflict;
+    const settleSourceStage = candidate => {
+      candidate.verify();
+      if (candidate.links === 1) return candidate;
+      guardPrecommit();
+      candidate.verify();
+      native.unlinkSync(candidate.sourceStage);
+      const settled = this.ordinaryRecoveryJournal(owner);
+      if (settled?.links !== 1 || settled.sourceStage !== candidate.sourceStage) {
+        throw Error('The repair source stage changed. Recovery files were preserved.');
+      }
+      return settled;
+    };
+    const linkPinnedRepairSource = verifyRelated => {
+      if (!intent.sourceProof) throw Error('The repair source stage has no recorded identity. Recovery files were preserved.');
+      const verifyStage = links => verifyStageSync(sourceStage, guard, intent.sourceProof, links);
+      guardPrecommit();
+      verifyRelated();
+      verifyStage(1);
+      verifyAbsentSync(journal, guard);
+      native.linkSync(sourceStage, journal);
+      guardPrecommit();
+      verifyRelated();
+      verifyStage(2);
+      verifyStageSync(journal, guard, intent.sourceProof, 2);
+      native.unlinkSync(sourceStage);
+      verifyStageSync(journal, guard, intent.sourceProof);
+    };
+    const retireRecordedAnnotation = () => {
+      this.storage.guardSync();
+      verifyStageSync(intentFile, guard, intentProof);
+      verifyAbsentSync(archivedIntent, guard);
+      if (native.lstatSync(stage, { throwIfNoEntry: false })) {
+        verifyStageSync(stage, guard, intent.annotationProof, 2);
+        verifyStageSync(file, guard, intent.annotationProof, 2);
+        native.unlinkSync(stage);
+      }
+      verifyStageSync(file, guard, intent.annotationProof);
+      native.unlinkSync(intentFile);
+    };
+    const preserveOutputHold = (ledger, error) => {
+      const verifySource = this.heldRepairSourceVerifier(ledger, tx, intent.sourceProof, guard);
+      const archive = archivedIntent;
+      this.storage.guardSync();
+      verifySource();
       if (native.lstatSync(archive, { throwIfNoEntry: false })) {
-        verifyStageSync(intentFile, guard, proof, 2);
-        verifyStageSync(archive, guard, proof, 2);
+        verifyStageSync(intentFile, guard, intentProof, 2);
+        verifyStageSync(archive, guard, intentProof, 2);
       } else {
-        verifyStageSync(intentFile, guard, proof);
+        verifyStageSync(intentFile, guard, intentProof);
         verifyAbsentSync(archive, guard);
         native.linkSync(intentFile, archive);
       }
@@ -377,8 +515,9 @@ function install(Intake, { hash, read, noteText }) {
       try {
         guard();
         const staged = native.lstatSync(stage, { bigint: true, throwIfNoEntry: false });
-        if (staged) {
-          const annotationProof = { dev: String(staged.dev), ino: String(staged.ino), digest: hash(intent.annotation) };
+        if (freshRepair) freshRepair.retireAnnotation();
+        else if (staged && (intent.annotationProof || !tx.keptCurrent)) {
+          const annotationProof = intent.annotationProof || { dev: String(staged.dev), ino: String(staged.ino), digest: hash(intent.annotation) };
           verifyStageSync(stage, guard, annotationProof, 2);
           verifyStageSync(file, guard, annotationProof, 2);
           native.unlinkSync(stage);
@@ -388,65 +527,113 @@ function install(Intake, { hash, read, noteText }) {
         this.vault.warnings.push(`Held repair annotation files were preserved: ${cause.message}`);
       }
       this.storage.guardSync();
-      verifyStageSync(intentFile, guard, proof, 2);
-      verifyStageSync(archive, guard, proof, 2);
+      verifySource();
+      verifyStageSync(intentFile, guard, intentProof, 2);
+      verifyStageSync(archive, guard, intentProof, 2);
       native.unlinkSync(intentFile);
-      verifyStageSync(archive, guard, proof);
+      verifyStageSync(archive, guard, intentProof);
       if (error) throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for explicit repair.', { cause: error }), { intakeRepairHeld: true });
       return { held: true };
     };
     if (this.hasHeldJournal(owner, tx)) return preserveOutputHold(owner);
-    const archivedIntent = path.join(this.dir, `repair-${intent.annotationId}.json`);
-    const intentProof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
+    const admission = tx.keptCurrent && activeAdmission(owner, tx.revision.identity, tx.capture.id);
+    if (admission?.revision === tx.revision.id) {
+      if (!intent.annotationProof || !isDeepStrictEqual(admission, acceptedOutcome(tx)) ||
+          !isDeepStrictEqual(owner.outcomes?.[tx.key], admission) || !isDeepStrictEqual(owner.captures?.[tx.sourceHash], tx.capture)) {
+        throw Error('The accepted repair has no exact annotation cleanup proof. Recovery files were preserved.');
+      }
+      this.storage.guardSync();
+      verifyAbsentSync(journal, guard);
+      if (intent.sourceProof) verifyAbsentSync(sourceStage, guard);
+      return retireRecordedAnnotation();
+    }
     let verifyRetainedHold;
     const hold = async error => {
       // Retain the complete annotation intent before moving the active source
       // journal into its UUID-specific hold. Cleanup follows durable evidence.
       await this.ownedFile(intentFile, archivedIntent, 'Repair intent');
       await this.ownedFile(archivedIntent, intentFile, 'Repair evidence archive');
-      if (expectedJournal?.verifyRepair) expectedJournal.verifyRepair();
+      if (freshRepair) {
+        guardPrecommit();
+        expectedJournal.verify();
+        native.linkSync(intentFile, archivedIntent);
+      } else if (expectedJournal?.verifyRepair) {
+        expectedJournal = settleSourceStage(expectedJournal);
+        expectedJournal.verifyRepair();
+      }
       else if (verifyRetainedHold) verifyRetainedHold();
       else {
-        try { await fs.link(intentFile, archivedIntent); }
-        catch (archiveError) { if (archiveError.code !== 'EEXIST' || await read(archivedIntent) !== bytes) throw Error('Repair evidence archive conflicts. All active files were preserved.'); }
+        if (tx.keptCurrent) {
+          guardPrecommit();
+          if (!intent.sourceProof) throw Error('The repair source stage has no recorded identity. Recovery files were preserved.');
+          verifyStageSync(sourceStage, guard, intent.sourceProof);
+        } else this.storage.guardSync();
+        verifyConflict?.();
+        verifyStageSync(intentFile, guard, intentProof);
+        verifyAbsentSync(archivedIntent, guard);
+        native.linkSync(intentFile, archivedIntent);
       }
+      const verifyArchive = () => {
+        verifyStageSync(intentFile, guard, intentProof, 2);
+        verifyStageSync(archivedIntent, guard, intentProof, 2);
+      };
+      verifyArchive();
       const journal = path.join(this.dir, 'transaction.json');
       const sourceArchive = path.join(this.dir, `conflict-${tx.revision.id}-${tx.resolution}.json`);
       let journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
       await this.ownedFile(sourceArchive, journal, 'Repair source archive');
       if (verifyRetainedHold && journalInfo) throw Error('An unproved repair source journal appeared. Recovery files were preserved.');
-      if (!journalInfo) {
-        await this.publishJournal(journal, tx);
+      if (!journalInfo && !freshRepair) {
+        if (tx.keptCurrent) linkPinnedRepairSource(() => { verifyArchive(); verifyConflict?.(); });
+        else await this.publishJournal(journal, tx);
         journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
       }
       if (!journalInfo) throw Error('The exact repair source journal is missing. Files were preserved.');
-      expectedJournal?.verify();
+      if (!freshRepair) expectedJournal?.verify();
       const ordinary = this.vault.publicationFolders(this.dir).guard;
-      const guard = () => { ordinary(); expectedJournal?.verifyRepair(); verifyRetainedHold?.(); };
+      const retained = expectedJournal?.verifyRepair || verifyRetainedHold || (freshRepair && (() => freshRepair.verify(2)));
+      const guardJournal = () => { ordinary(); retained?.(); verifyArchive(); verifyConflict?.(); };
       const links = Number(journalInfo.nlink);
       if (expectedJournal && links !== expectedJournal.links) throw Error('The exact repair journal gained an unknown alias. Recovery files were preserved.');
-      const expected = expectedJournal || { dev: String(journalInfo.dev), ino: String(journalInfo.ino), digest: hash(JSON.stringify(tx)) };
-      const { proof } = readExactSync(journal, guard, links, expected);
-      if (links === 2) verifyStageSync(sourceArchive, guard, proof, 2);
-      const ledger = await this.load();
+      const expected = intent.sourceProof || expectedJournal || { dev: String(journalInfo.dev), ino: String(journalInfo.ino), digest: hash(JSON.stringify(tx)) };
+      const { proof } = readExactSync(journal, guardJournal, links, expected);
+      if (links === 2) verifyStageSync(sourceArchive, guardJournal, proof, 2);
+      const ledger = tx.keptCurrent ? await readPrecommit() : await this.load();
       // A kept-snapshot failure can occur before any annotation exists. Require
       // fresh explicit transfer; a pending retry must never publish this tx.
-      await this.archivePrecommitConflict(tx, ledger, error.message, proof, guard);
-      const retained = expectedJournal?.verifyRepair || verifyRetainedHold;
+      await this.archivePrecommitConflict(tx, ledger, error.message, proof, guardJournal);
+      const verifySource = this.heldRepairSourceVerifier(ledger, tx, intent.sourceProof, guard);
+      this.storage.guardSync();
+      verifySource();
       if (retained) {
         this.storage.guardSync();
         retained();
+        freshRepair?.retireAnnotation();
         native.unlinkSync(intentFile);
         verifyStageSync(archivedIntent, ordinary, intentProof);
       } else {
-        if (await this.ownedFile(stage, file, 'Annotation staging file')) await fs.unlink(stage);
-        await fs.unlink(intentFile);
+        if (intent.annotationProof) {
+          try {
+            this.storage.guardSync();
+            verifyStageSync(stage, guard, intent.annotationProof, 2);
+            verifyStageSync(file, guard, intent.annotationProof, 2);
+            native.unlinkSync(stage);
+            verifyStageSync(file, guard, intent.annotationProof);
+          } catch (cause) {
+            this.vault.warnings.push(`Held repair annotation files were preserved: ${cause.message}`);
+          }
+        } else if (!tx.keptCurrent && await this.ownedFile(stage, file, 'Annotation staging file')) await fs.unlink(stage);
+        this.storage.guardSync();
+        verifySource();
+        verifyArchive();
+        native.unlinkSync(intentFile);
+        verifyStageSync(archivedIntent, guard, intentProof);
       }
       throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for repair.'), { intakeRepairHeld: true });
     };
     if (!expectedJournal) {
       const candidate = this.ordinaryRecoveryJournal(owner);
-      if (candidate?.verifyRepair) expectedJournal = candidate;
+      if (candidate?.verifyRepair || candidate?.freshRepair) expectedJournal = candidate;
     }
     const heldReason = () => Error('This previously held repair needs a fresh explicit transfer. Earlier evidence was preserved.');
     if (expectedJournal?.verifyRepair) {
@@ -455,56 +642,163 @@ function install(Intake, { hash, read, noteText }) {
       expectedJournal.verify();
       return hold(heldReason());
     }
-    const ordinary = this.vault.publicationFolders(this.dir).guard;
     ordinary();
-    if (native.lstatSync(archivedIntent, { throwIfNoEntry: false })) {
+    const selectFreshRepair = candidate => {
+      candidate = settleSourceStage(candidate);
+      expectedJournal = candidate;
+      freshRepair = candidate.freshRepair;
+      candidate.verify();
+      if (intentProof.dev !== freshRepair.intentProof.dev || intentProof.ino !== freshRepair.intentProof.ino ||
+          intentProof.digest !== freshRepair.intentProof.digest) throw Error('The fresh repair intent changed. Recovery files were preserved.');
+    };
+    if (expectedJournal?.freshRepair) selectFreshRepair(expectedJournal);
+    else if (native.lstatSync(archivedIntent, { throwIfNoEntry: false })) {
       verifyRetainedHold = () => {
         verifyStageSync(intentFile, ordinary, intentProof, 2);
         verifyStageSync(archivedIntent, ordinary, intentProof, 2);
       };
       verifyRetainedHold();
-      verifyAbsentSync(path.join(this.dir, 'transaction.json'), ordinary, () =>
+      verifyAbsentSync(journal, ordinary, () =>
         Error('The retained repair intent has an unproved active source journal. Recovery files were preserved.'));
+      if (tx.keptCurrent) verifyConflict = this.boundRepairConflict(owner, tx, intent.priorConflict, guard);
       return hold(heldReason());
     }
+    if (tx.keptCurrent) verifyConflict = this.boundRepairConflict(owner, tx, intent.priorConflict, guard);
+    if (!freshRepair && tx.keptCurrent) verifyAbsentSync(journal, guard);
+    const admitted = ledger => activeAdmission(ledger, tx.revision.identity, tx.capture.id)?.revision === tx.revision.id &&
+      ledger.captures[tx.sourceHash]?.currentRevision === tx.capture.currentRevision &&
+      ledger.captures[tx.sourceHash]?.currentHash === tx.capture.currentHash;
+    const recordIntentProof = async (field, proof, verifyFiles) => {
+      verifyFiles();
+      const replacement = path.join(this.dir, `repair-intent-${randomUUID()}.tmp`);
+      const updated = await writeRepairIntentStage(replacement, { ...intent, [field]: proof }, guard);
+      const replacementProof = updated.proof;
+      try {
+        guardPrecommit();
+        verifyStageSync(replacement, guard, replacementProof);
+        verifyStageSync(intentFile, guard, intentProof);
+        verifyAbsentSync(intentStage, guard);
+        verifyAbsentSync(archivedIntent, guard);
+        verifyConflict();
+        verifyFiles();
+        native.renameSync(replacement, intentFile);
+        verifyStageSync(intentFile, guard, replacementProof);
+        intentProof = replacementProof;
+        intent[field] = proof;
+        intent.intentIdentity = updated.identity;
+      } finally {
+        try {
+          readExactSync(replacement, guard, 1, replacementProof);
+          native.unlinkSync(replacement);
+        } catch (error) {
+          if (error.code !== 'ENOENT') this.vault.warnings.push('A repair intent stage remains for guarded inspection.');
+        }
+      }
+    };
+    const verifyAnnotationForSource = () => {
+      guardPrecommit();
+      verifyConflict();
+      verifyStageSync(intentFile, guard, intentProof);
+      verifyAbsentSync(intentStage, guard);
+      verifyAbsentSync(archivedIntent, guard);
+      verifyStageSync(stage, guard, intent.annotationProof, 2);
+      verifyStageSync(file, guard, intent.annotationProof, 2);
+    };
+    const retireRepair = async () => {
+      if (freshRepair) {
+        this.storage.guardSync();
+        guard();
+        freshRepair.verify();
+        freshRepair.retireAnnotation();
+        native.unlinkSync(intentFile);
+        return;
+      }
+      if (intent.annotationProof) return retireRecordedAnnotation();
+      await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      await fs.unlink(intentFile);
+    };
     if (tx.keptCurrent) {
-      try { await this.verifiedKeptCurrent(tx, await this.load()); }
+      try { await this.verifiedKeptCurrent(tx, await readPrecommit()); }
       catch (error) { if (error.keptCurrentFailure) return hold(error); throw error; }
     }
     await this.vault.contained(path.dirname(file));
     const existing = await this.ownedFile(file, stage, 'Annotation destination');
+    if (tx.keptCurrent && existing && !intent.annotationProof) {
+      throw Error('The published repair annotation has no recorded identity. Recovery files were preserved.');
+    }
     if (!existing) {
-      await this.ownedFile(stage, file, 'Annotation staging file');
       assertAnnotationPublication(await annotationAuthority(this), intent.annotationId);
-      try { await fs.writeFile(stage, intent.annotation, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(stage) !== intent.annotation) throw Error('Annotation staging conflict. Both files were preserved.'); }
-      await this.ownedFile(stage, file, 'Annotation staging file');
-      assertAnnotationPublication(await annotationAuthority(this), intent.annotationId);
-      try { await fs.link(stage, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+      if (tx.keptCurrent) {
+        guardPrecommit();
+        verifyConflict();
+        if (!intent.annotationProof) {
+          const proof = await writeStage(stage, intent.annotation, guard);
+          await recordIntentProof('annotationProof', proof, () => {
+            verifyAbsentSync(file, guard);
+            verifyStageSync(stage, guard, proof);
+          });
+        }
+        guardPrecommit();
+        verifyConflict();
+        verifyStageSync(intentFile, guard, intentProof);
+        verifyAbsentSync(intentStage, guard);
+        verifyAbsentSync(archivedIntent, guard);
+        verifyStageSync(stage, guard, intent.annotationProof);
+        verifyAbsentSync(file, guard);
+        native.linkSync(stage, file);
+      } else {
+        await this.ownedFile(stage, file, 'Annotation staging file');
+        try { await fs.writeFile(stage, intent.annotation, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(stage) !== intent.annotation) throw Error('Annotation staging conflict. Both files were preserved.'); }
+        await this.ownedFile(stage, file, 'Annotation staging file');
+        assertAnnotationPublication(await annotationAuthority(this), intent.annotationId);
+        try { await fs.link(stage, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+      }
     }
     await this.ownedFile(file, stage, 'Annotation destination');
     if (await read(file) !== intent.annotation) throw Error('Annotation changed. Incoming source remains paused; preserve both versions.');
-    await this.vault.checkpoint('repair-annotation-published');
-    assertAnnotationPublication(await annotationAuthority(this), intent.annotationId);
-    const ledger = await this.load();
-    if (activeAdmission(ledger, tx.revision.identity, tx.capture.id)?.revision !== tx.revision.id || ledger.captures[tx.sourceHash]?.currentRevision !== tx.capture.currentRevision || ledger.captures[tx.sourceHash]?.currentHash !== tx.capture.currentHash) {
-      const journal = path.join(this.dir, 'transaction.json');
-      if (await read(journal) === null) await this.publishJournal(journal, tx);
-      else if (await read(journal) !== JSON.stringify(tx)) throw Error('Another source publication needs recovery before this repair.');
-      delete ledger.blocks[tx.sourceHash]; if (ledger.captures[tx.sourceHash]) delete ledger.captures[tx.sourceHash].conflict;
-      await this.save(ledger);
-      try { await this.finish(tx, ledger); } catch (error) {
-        if (error.keptCurrentFailure) return hold(error);
-        if (error.intakeOutputHeld) return preserveOutputHold(await annotationAuthority(this), error);
-        if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message, error.intakeConflictProof);
-        else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
-        else throw error;
-        await fs.unlink(stage).catch(cleanup => { if (cleanup.code !== 'ENOENT') throw cleanup; });
-        await fs.unlink(intentFile);
-        throw Error('Annotation preserved. Incoming publication remains paused for repair.');
+    if (intent.annotationProof) {
+      if (existing?.nlink === 1n && admitted(owner)) verifyStageSync(file, guard, intent.annotationProof);
+      else {
+        verifyStageSync(stage, guard, intent.annotationProof, 2);
+        verifyStageSync(file, guard, intent.annotationProof, 2);
       }
     }
-    await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
-    await fs.unlink(intentFile);
+    await this.vault.checkpoint('repair-annotation-published');
+    assertAnnotationPublication(await annotationAuthority(this), intent.annotationId);
+    const ledger = tx.keptCurrent ? await readPrecommit() : await this.load();
+    if (!admitted(ledger)) {
+      if (freshRepair) expectedJournal.verify();
+      else if (tx.keptCurrent) linkPinnedRepairSource(verifyAnnotationForSource);
+      else if (await read(journal) === null) await this.publishJournal(journal, tx);
+      else if (await read(journal) !== JSON.stringify(tx)) throw Error('Another source publication needs recovery before this repair.');
+      if (!freshRepair && tx.keptCurrent) {
+        const candidate = this.ordinaryRecoveryJournal(ledger);
+        if (!candidate?.freshRepair) throw Error('The active repair journal has no exact publication proof. Recovery files were preserved.');
+        selectFreshRepair(candidate);
+      }
+      const clearConflict = () => {
+        delete ledger.blocks[tx.sourceHash];
+        if (ledger.captures[tx.sourceHash]) delete ledger.captures[tx.sourceHash].conflict;
+      };
+      if (!freshRepair) {
+        clearConflict();
+        await this.save(ledger);
+      }
+      try { await this.finish(tx, ledger, freshRepair && expectedJournal); } catch (error) {
+        if (error.keptCurrentFailure) return hold(error);
+        if (error.intakeOutputHeld) return preserveOutputHold(await annotationAuthority(this), error);
+        if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message,
+          freshRepair ? { expectedJournal, ...error.intakeConflictProof } : error.intakeConflictProof);
+        else if (error.intakeDeferred) {
+          clearConflict();
+          await this.defer(tx, ledger, error.message, freshRepair && expectedJournal);
+        }
+        else throw error;
+        await retireRepair();
+        throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for repair.'), { intakeRepairHeld: !!freshRepair });
+      }
+    }
+    await retireRepair();
   };
 }
 module.exports = { install, sourceLink };
