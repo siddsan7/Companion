@@ -243,7 +243,8 @@ class Intake {
         if (source.error) continue;
         // The unreadable capture could claim a different existing identity.
         // Only new source identities can proceed without a full vault scan.
-        if (!identityScanComplete && ledger.captures[draft.sourceHash]) continue;
+        if (!identityScanComplete && (ledger.captures[draft.sourceHash] || ledger.attempts[draft.identity] ||
+            ledger.pending[draft.sourceHash] || ledger.blocks[draft.sourceHash])) continue;
         if (ledger.blocks[draft.sourceHash]?.outputHold && retained.has(key)) continue;
         try {
           await guard();
@@ -499,17 +500,31 @@ class Intake {
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
     await fs.unlink(intentFile);
   }
-  async publicationAuthority(tx, ledger, { verifyOnly = false } = {}) {
+  async publicationAuthority(tx, ledger, { verifyOnly = false, verifyIndependentJournal } = {}) {
     if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed before publication. Refresh before retrying; changed authority was preserved.');
     assertPublication(ledger, tx.capture.id, tx);
     if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
-    if (!verifyOnly || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
+    if (!verifyOnly || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
   }
-  verifyReservedCaptureIdentity(ledger, id) {
-    if (this.vault.reservedRestorationIdentities(ledger).captures.has(id)) {
+  verifyReservedCaptureIdentity(ledger, id, verifyIndependentJournal) {
+    const reserved = this.vault.reservedRestorationIdentities(ledger, { verifyIndependentJournal });
+    if (reserved.captures.has(id)) {
       throw Object.assign(Error('A preserved file at a held restoration path claims this capture identity. Both files were preserved.'),
         { intakeReservedIdentity: true });
     }
+    if (verifyIndependentJournal) reserved.verify();
+  }
+  independentNewSourceJournal(tx, ledger, proof) {
+    if (!validProof(proof) || proof.digest !== hash(JSON.stringify(tx)) || tx.previousHash !== null ||
+        tx.restore || tx.restoreOperation || tx.sourceGeneration || tx.resolution || tx.retainOnly ||
+        ledger.captures[tx.sourceHash] || ledger.attempts[tx.revision.identity] || ledger.suppressed.includes(tx.sourceHash) ||
+        ledger.blocks[tx.sourceHash] || ledger.pending[tx.sourceHash] ||
+        Object.values(ledger.captures).some(capture => capture.id === tx.capture.id)) return undefined;
+    const journal = path.join(this.dir, 'transaction.json'), guard = this.vault.publicationFolders(this.dir).guard;
+    return () => {
+      this.storage.guardSync();
+      verifyStageSync(journal, guard, proof);
+    };
   }
   async finish(tx, ledger, journalProof) {
     const publication = {};
@@ -527,7 +542,9 @@ class Intake {
   }
   async publishTransaction(tx, ledger, journalProof, publication) {
     this.validateTransaction(tx);
-    await this.publicationAuthority(tx, ledger);
+    const verifyIndependentJournal = this.independentNewSourceJournal(tx, ledger, journalProof);
+    const checkPublication = () => this.publicationAuthority(tx, ledger, { verifyIndependentJournal });
+    await checkPublication();
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
     const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
@@ -568,7 +585,7 @@ class Intake {
       try { await fs.writeFile(file, content, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(file) !== content) throw Error('Immutable import file conflicts. Preserve the vault for repair.'); }
     };
     const staged = async (file, content, peer) => {
-      await this.publicationAuthority(tx, ledger);
+      await checkPublication();
       const info = await this.ownedFile(file, peer, 'Unsafe import staging file');
       const existing = await read(file);
       if (existing !== null && existing !== content) {
@@ -580,7 +597,7 @@ class Intake {
     };
     const snapshotProof = await staged(snapshotStage, snapshotBytes, snapshot);
     await this.vault.checkpoint('intake-snapshot-staged');
-    await this.publicationAuthority(tx, ledger);
+    await checkPublication();
     if (!await this.ownedFile(snapshotStage, snapshot, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
     await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
     this.storage.guardSync();
@@ -610,7 +627,7 @@ class Intake {
           if (current === null || hash(current) !== tx.previousHash) throw conflict('Destination changed outside Companion. Both source revision and local writing were preserved.');
           try {
             await this.vault.checkpoint('intake-before-move');
-            await this.publicationAuthority(tx, ledger);
+            await checkPublication();
             this.storage.guardSync();
             exact(destination, currentProof, tx.previous, 'Capture destination');
             guard();
@@ -627,7 +644,7 @@ class Intake {
       if (current !== null) throw conflict('Destination changed outside Companion. The new destination was preserved.');
       captureStageProof = await staged(stage, tx.content, destination);
       await this.vault.checkpoint('intake-capture-staged');
-      await this.publicationAuthority(tx, ledger);
+      await checkPublication();
       if (!await this.ownedFile(stage, destination, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
       this.storage.guardSync();
       exact(stage, captureStageProof, tx.content, 'Imported capture stage', [destination]);
@@ -659,7 +676,7 @@ class Intake {
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
     let committed = false;
     const verifyPublished = () => {
-      if (!committed || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
+      if (!committed || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
       try {
         for (const item of [...outputs, ...cleanup]) verify(item);
       } catch (cause) {
@@ -669,7 +686,7 @@ class Intake {
     };
     try {
       await this.vault.checkpoint('intake-published');
-      await this.publicationAuthority(tx, ledger);
+      await checkPublication();
       verifyPublished();
       const next = {
         captures: { ...ledger.captures, [tx.sourceHash]: structuredClone(tx.capture) },
@@ -1250,6 +1267,11 @@ class Intake {
     if (!fileAccessRefused(cause) || typeof cause.path !== 'string') return false;
     const expected = this.storage.expected, ledger = await this.load();
     if (!this.storage.matches(this.storage.expected, expected)) return false;
+    this.storage.guardSync();
+    if (this.vault.heldRestorationCaptureReadRefusal(ledger, cause)) {
+      this.storage.guardSync();
+      return true;
+    }
     const entry = Object.entries(ledger.blocks).find(([sourceHash, block]) =>
       block?.outputHold?.captureAccess && ledger.captures[sourceHash] && samePath(this.destination(ledger.captures[sourceHash]), cause.path));
     if (!entry) return false;

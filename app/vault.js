@@ -17,6 +17,16 @@ const comparableRelative = value => comparable(process.platform === 'win32' ? va
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
 const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
+function restorationReadRefused(error, file) {
+  return process.platform === 'win32' && ['EACCES', 'EPERM', 'EBUSY'].includes(error?.code) &&
+    typeof error.path === 'string' && comparable(path.resolve(error.path)) === comparable(path.resolve(file));
+}
+function matchesRestorationFile(file, proof, guard) {
+  guard();
+  const stat = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  return validProof(proof) && stat?.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n &&
+    String(stat.dev) === proof.dev && String(stat.ino) === proof.ino;
+}
 const titleRollbackSuffix = '.title-rollback.json';
 const transactionSuffix = '.title-transaction.json';
 const transactionBackup = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.bak$/;
@@ -178,17 +188,18 @@ class Vault {
         throw Error('The recorded restoration folder scope is incomplete. Files were preserved.');
       }
       const guard = removalParentGuard(this, authority.directories);
-      slots.push({ id, file, guard, authority });
+      slots.push({ id, file, guard, authority, capture });
       heldRestorations.set(id, file);
       paths.add(relative);
     }
     const guard = () => { for (const slot of slots) slot.guard(); };
     return { heldRestorations, paths, guard, slots };
   }
-  reservedRestorationIdentities(ledger) {
+  reservedRestorationIdentities(ledger, { verifyIndependentJournal } = {}) {
     const reservation = this.reservedRestorationPaths(ledger);
     const captures = new Set(), annotations = new Set(), observations = [];
-    for (const { id, file, guard, authority } of reservation.slots) {
+    for (const slot of reservation.slots) {
+      const { id, file, guard, authority } = slot;
       guard();
       const stat = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
       if (!stat) {
@@ -201,8 +212,19 @@ class Vault {
         continue;
       }
       // Observe only identity claims. A reserved slot can never confer ownership.
-      const { bytes, proof } = readExactSync(file, guard), text = bytes.toString('utf8');
-      observations.push(() => verifyStageSync(file, guard, proof));
+      const links = authority.restoration.published ? Number(stat.nlink) : 1;
+      let observed;
+      try { observed = readExactSync(file, guard, links); }
+      catch (error) {
+        if (!restorationReadRefused(error, file)) throw error;
+        if (!verifyIndependentJournal) throw Error('A reserved restoration capture cannot be read. Identity inspection is paused.', { cause: error });
+        const verify = this.restorationCaptureReadProof(slot, error, verifyIndependentJournal);
+        if (!verify) throw error;
+        observations.push(verify);
+        continue;
+      }
+      const { bytes, proof } = observed, text = bytes.toString('utf8');
+      observations.push(() => verifyStageSync(file, guard, proof, links));
       const capture = parse(text), annotation = parseAnnotation(text);
       if (capture && capture.id !== id) captures.add(capture.id);
       if (annotation) annotations.add(annotation.id);
@@ -212,6 +234,30 @@ class Vault {
       for (const observe of observations) observe();
     };
     return { heldRestorations: reservation.heldRestorations, paths: reservation.paths, captures, annotations, verify };
+  }
+  restorationCaptureReadProof({ file, guard, authority, capture }, error, verifyIndependentJournal) {
+    const { published, importedPublication, journal, revision } = authority.restoration;
+    if (!published || !importedPublication || importedPublication.capture.digest !== capture.currentHash ||
+        capture.currentRevision !== revision || !restorationReadRefused(error, file) ||
+        !matchesRestorationFile(file, importedPublication.capture, guard)) return null;
+    const dir = path.join(this.root, '.intake');
+    const verify = () => {
+      if (verifyIndependentJournal) verifyIndependentJournal();
+      else verifyAbsentSync(path.join(dir, 'transaction.json'), guard);
+      verifyStageSync(path.join(dir, journal), guard, importedPublication.journal);
+      verifyAbsentSync(path.join(dir, revision + '.stage'), guard);
+      verifyAbsentSync(path.join(dir, revision + '.snapshot.stage'), guard);
+      if (!matchesRestorationFile(file, importedPublication.capture, guard)) {
+        throw Error('The exact unreadable restoration capture changed. Files were preserved.');
+      }
+    };
+    verify();
+    return verify;
+  }
+  heldRestorationCaptureReadRefusal(ledger, error) {
+    const { slots } = this.reservedRestorationPaths(ledger);
+    const slot = slots.find(item => restorationReadRefused(error, item.file));
+    return !!slot && !!this.restorationCaptureReadProof(slot, error);
   }
   verifyActiveRestorationPair(id, file, guard, authority) {
     const intake = new (require('./intake').Intake)(this);
@@ -661,4 +707,4 @@ class Vault {
     }
   }
 }
-module.exports = { Vault, withTitle, captureHeading, parseAnnotation, parse };
+module.exports = { Vault, withTitle, captureHeading, parseAnnotation, parse, restorationReadRefused, matchesRestorationFile };

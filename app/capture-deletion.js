@@ -8,7 +8,7 @@ const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
 const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
-const { parse } = require('./vault');
+const { parse, restorationReadRefused, matchesRestorationFile } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf, removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const sourceInventory = require('./source-inventory');
 const sourceTitle = require('./source-title');
@@ -533,11 +533,13 @@ function recordRestorationAdmission(ledger, tx, proof) {
   }
   return { ...ledger.sourceAuthority, [id]: { ...authority, restoration: { ...item, importedPublication: proof } } };
 }
-function importedRestorationLeaf(id, authority, message, verify) {
+function importedRestorationLeaf(id, authority, message, verify, readRefusal) {
   try { return verify(); }
   catch (error) {
-    if (error.code !== 'STAGING_CHANGED') throw error;
-    throw Object.assign(Error(message, { cause: error }), {
+    const changed = error.code === 'STAGING_CHANGED';
+    if (!changed && !readRefusal?.(error)) throw error;
+    const reason = changed ? message : 'A published restoration output could not be read. It was preserved and suppression remains.';
+    throw Object.assign(Error(reason, { cause: error }), {
       code: 'SOURCE_OPERATION_HELD', family: 'imported-restoration', captureId: id,
       operationId: authority.operationId, generation: authority.generation, phase: authority.phase
     });
@@ -806,7 +808,8 @@ async function verifyRestorationPublication(intake, ledger, id) {
     for (const pair of pairs.slice(0, 2)) {
       importedRestorationLeaf(id, current,
         'A published restoration output changed. It was preserved and suppression remains.',
-        () => verifyStageSync(pair.peer, guard, pair.proof));
+        () => verifyStageSync(pair.peer, guard, pair.proof),
+        error => restorationReadRefused(error, pair.peer) && matchesRestorationFile(pair.peer, pair.proof, guard));
     }
   };
   verify();
