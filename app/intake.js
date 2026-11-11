@@ -11,7 +11,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -83,8 +83,21 @@ class Intake {
   async publishJournal(file, value, verifyRelated) {
     await this.vault.contained(this.dir);
     const stage = path.join(this.dir, `journal-${randomUUID()}.stage`);
+    if (verifyRelated) {
+      const { guard } = this.vault.publicationFolders(this.dir);
+      const proof = await writeStage(stage, JSON.stringify(value), guard);
+      verifyRelated();
+      verifyStageSync(stage, guard, proof);
+      verifyAbsentSync(file, guard);
+      await fs.link(stage, file);
+      verifyRelated();
+      verifyStageSync(stage, guard, proof, 2);
+      verifyStageSync(file, guard, proof, 2);
+      await fs.unlink(stage);
+      verifyStageSync(file, guard, proof);
+      return;
+    }
     await fs.writeFile(stage, JSON.stringify(value), { flag: 'wx', flush: true });
-    verifyRelated?.();
     await fs.link(stage, file); await fs.unlink(stage);
   }
   async locked(work, admit) {
@@ -1519,5 +1532,5 @@ class Intake {
     return { capture, revisions, related, links };
   }
 }
-require('./repairs').install(Intake, { hash, read, noteText });
+require('./repairs').install(Intake, { hash, read, noteText, acceptedOutcome });
 module.exports = { Intake, noteText };
