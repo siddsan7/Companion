@@ -163,6 +163,113 @@ test('an Experiment Proposal requires all five fields before preview and explici
   expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
 });
 
+test('Saved idea completion waits for its source inspection before the next explicit Check now', async () => {
+  await completedConversation({ imported: true });
+  const vault = path.join(root, 'vault', 'Companion');
+  const ideas = path.join(vault, 'Ideas');
+  const submissionsFile = path.join(root, 'conversation-submissions.jsonl');
+  const submissions = await fs.readFile(submissionsFile, 'utf8');
+  expect(submissions.trim().split('\n')).toHaveLength(1);
+  const title = 'Keep an observation from the authored evidence';
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('The reviewed evidence helps explain where this observation came from.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic fixture. No learning outcome was measured.');
+  await page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(title));
+  const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  expect(await fs.readdir(ideas)).toEqual([]);
+
+  await app.evaluate(({ app: mainApp, ipcMain }, { root, vault }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Held idea inspection requires the disposable fixture.');
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Intake } = load('./intake');
+    const { AsyncLocalStorage } = process.getBuiltinModule('async_hooks');
+    const scope = new AsyncLocalStorage(), originalInfo = Intake.prototype.info;
+    const handlers = new Map(['idea-confirm', 'idea-list', 'check-intake'].map(channel => [channel, ipcMain._invokeHandlers.get(channel)]));
+    const gate = globalThis.__ideaSaveCompletion = { held: false, claimed: false, confirms: 0, checks: [] };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    ipcMain._invokeHandlers.set('idea-confirm', async function (...args) {
+      gate.confirms++;
+      const result = await Reflect.apply(handlers.get('idea-confirm'), this, args);
+      gate.publication = result;
+      return result;
+    });
+    ipcMain._invokeHandlers.set('idea-list', function (...args) {
+      const original = handlers.get('idea-list');
+      if (!gate.publication || gate.list) return Reflect.apply(original, this, args);
+      gate.list = scope.run(gate, () => Reflect.apply(original, this, args));
+      return gate.list;
+    });
+    ipcMain._invokeHandlers.set('check-intake', async function (...args) {
+      const check = {};
+      gate.checks.push(check);
+      try {
+        const result = await Reflect.apply(handlers.get('check-intake'), this, args);
+        check.lastCheck = result.lastCheck;
+        return result;
+      } catch (error) { check.error = error.message; throw error; }
+    });
+    Intake.prototype.info = async function (...args) {
+      if (scope.getStore() !== gate || this.vault.root !== vault || gate.claimed) return Reflect.apply(originalInfo, this, args);
+      gate.claimed = true;
+      const ownLocked = Object.getOwnPropertyDescriptor(this, 'locked'), nativeLocked = this.locked;
+      this.locked = function (work, ...lockedArgs) {
+        return Reflect.apply(nativeLocked, this, [async function (...workArgs) {
+          // Context already holds the native source owner for this idea-list inspection.
+          gate.held = true;
+          await delivery;
+          return Reflect.apply(work, this, workArgs);
+        }, ...lockedArgs]);
+      };
+      try { return await Reflect.apply(originalInfo, this, args); }
+      finally { if (ownLocked) Object.defineProperty(this, 'locked', ownLocked); else delete this.locked; }
+    };
+    gate.restore = () => {
+      Intake.prototype.info = originalInfo;
+      for (const [channel, original] of handlers) ipcMain._invokeHandlers.set(channel, original);
+    };
+  }, { root, vault });
+
+  const status = page.locator('#idea-status'), now = '2026-11-09T12:00:01Z';
+  const expectedCheck = { at: now, trigger: 'manual', status: 'complete' };
+  try {
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__ideaSaveCompletion.held)).toBe(true);
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect(await fs.readdir(ideas)).toEqual([path.basename(destination)]);
+    expect.soft(await status.textContent(), 'The saved note is durable while its support inspection is pending').not.toContain('Saved idea.');
+
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now, timezone: 'America/Phoenix' }), 'utf8');
+    const listed = await app.evaluate(async () => {
+      const gate = globalThis.__ideaSaveCompletion;
+      gate.release();
+      return (await gate.list).map(({ title, file }) => ({ title, file }));
+    });
+    await expect(status).toContainText('Saved idea.');
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__ideaSaveCompletion.checks)).toEqual([{ lastCheck: expectedCheck }]);
+    await expect(page.locator('#intake-state')).toContainText(`Last check: ${now} · manual · complete`);
+    const ledger = JSON.parse(await fs.readFile(path.join(vault, '.intake', 'ledger.json'), 'utf8'));
+    expect(ledger.lastCheck).toEqual(expectedCheck);
+    await expect(page.locator('#saved-ideas').getByRole('heading', { name: title, exact: true })).toHaveCount(1);
+    expect(listed).toEqual([{ title, file: destination }]);
+    expect(await app.evaluate(() => globalThis.__ideaSaveCompletion.confirms)).toBe(1);
+    expect(await fs.readdir(ideas)).toEqual([path.basename(destination)]);
+    expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
+    expect(await fs.readFile(submissionsFile, 'utf8')).toBe(submissions);
+  } finally {
+    await app.evaluate(async () => {
+      const gate = globalThis.__ideaSaveCompletion;
+      gate.release();
+      try { await gate.list?.catch(() => {}); }
+      finally { gate.restore(); delete globalThis.__ideaSaveCompletion; }
+    });
+  }
+});
+
 test('an explicitly selected imported evidence citation opens its original revision after a reviewed update', async () => {
   test.setTimeout(120000);
   await completedConversation({ imported: true });

@@ -291,15 +291,23 @@ test('current choice recovers after a crash and a later reviewed successor still
 
 for (const successor of ['draft', 'review']) test(`external writing on reviewed current transfers without replacing it with a later ${successor}`, async () => {
   const accepted = await bundle('accept'); await launch(); await setup(); await check();
+  // Last check renders before Browse finishes inspecting the original path.
+  await expect(page.getByRole('status')).toContainText('Intake check complete.');
+  await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeEnabled();
   const base = path.join(root, 'vault', 'Companion'), ledgerFile = path.join(base, '.intake', 'ledger.json');
   const first = (await snapshots())[0], initialLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
   const initial = initialLedger.captures[first.sourceHash];
+  const currentCapture = page.locator('#captures article').filter({ hasText: initial.id });
+  await expect(currentCapture.getByRole('button', { name: 'Open in Obsidian', exact: true })).toBeEnabled();
+  const beforeRefresh = await currentCapture.elementHandle();
   const moved = path.join(root, 'vault', 'Moved reviewed source.md');
   await fs.rename(path.join(base, 'Captures', initial.file), moved);
-  const beforeRefresh = await page.locator('#captures article').elementHandle();
   await page.getByRole('button', { name: 'Refresh', exact: true }).click();
   await expect.poll(() => beforeRefresh.evaluate(element => element.isConnected)).toBe(false);
   await expect(page.locator('#captures article')).toHaveCount(1);
+  await expect(currentCapture).toHaveCount(1);
+  const afterRefresh = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  expect(afterRefresh.captures[first.sourceHash].relative).toBe(path.relative(path.join(root, 'vault'), moved));
   await page.getByLabel('Display title', { exact: true }).fill('Current reviewed title');
   await page.getByRole('button', { name: 'Save title', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Title saved.');

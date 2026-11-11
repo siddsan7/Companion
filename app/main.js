@@ -63,29 +63,62 @@ app.whenReady().then(async () => {
     await fs.mkdir(path.dirname(settingsPath), { recursive: true });
     await fs.writeFile(settingsPath, JSON.stringify(settings)); vault = next; codex.invalidate(); return true;
   });
-  const schedule = () => new Schedule(path.join(path.dirname(settingsPath), 'schedule.json'), vault, scheduleOptions());
+  const schedule = (selected = vault) => new Schedule(path.join(path.dirname(settingsPath), 'schedule.json'), selected, scheduleOptions());
+  const localVaultWork = new Map();
+  async function orderVaultWork(selected, work) {
+    if (!selected) return work();
+    const root = await fs.realpath(selected.root).catch(() => selected.root);
+    const key = process.platform === 'win32' ? root.toLowerCase() : root;
+    const result = (localVaultWork.get(key) || Promise.resolve()).then(() => {
+      if (selected !== vault) throw Error('Vault selection changed. Refresh and try again.');
+      return work();
+    });
+    // This orders local requests only. The original native owner still decides admission.
+    const tail = result.then(() => undefined, () => undefined);
+    localVaultWork.set(key, tail);
+    try { return await result; }
+    finally { if (localVaultWork.get(key) === tail) localVaultWork.delete(key); }
+  }
   await schedule().run(clock().now).catch(error => console.error('Scheduled catch-up:', error.message));
   for (const operation of ['enable', 'pause', 'resume', 'disable', 'repair']) ipcMain.handle(`schedule-${operation}`, async () => {
     if (!vault) throw Error('Choose a vault first.'); return schedule().control(operation, clock().now);
   });
   ipcMain.handle('state', async () => {
-    let intake = null, captures = [], vaultError;
-    try { intake = vault ? await new Intake(vault).info() : null; captures = vault ? await vault.list() : []; }
-    catch (error) { vaultError = error.message; }
+    const selected = vault, selectedSchedule = schedule(selected);
+    const { intake, captures, vaultError, warnings } = await orderVaultWork(selected, async () => {
+      let intake = null, captures = [], vaultError;
+      try { if (selected) { intake = await new Intake(selected).info(); captures = await selected.list(); } }
+      catch (error) { vaultError = error.message; }
+      return { intake, captures, vaultError, warnings: [...(selected?.warnings || []), ...(vaultError ? [vaultError] : [])] };
+    });
     const imported = new Map(Object.values(intake?.captures || {}).map(capture => [capture.id, capture]));
-    return { ...clock(), configured: !!vault, location: vault?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings: [...(vault?.warnings || []), ...(vaultError ? [vaultError] : [])], intake, vaultError, schedule: await schedule().info(clock().now) };
+    return { ...clock(), configured: !!selected, location: selected?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings, intake, vaultError, schedule: await selectedSchedule.info(clock().now) };
   });
-  ipcMain.handle('capture', async (_, input) => { if (!vault) throw Error('Choose a vault first.'); return vault.capture(input, clock().now); });
+  ipcMain.handle('capture', async (_, input) => {
+    const selected = vault, now = clock().now;
+    if (!selected) throw Error('Choose a vault first.');
+    return orderVaultWork(selected, () => selected.capture(input, now));
+  });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
-  ipcMain.handle('connect-drafts', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).connect(folder, scan, clock().now)); });
-  ipcMain.handle('connect-reviews', async (_, { folder, scan }) => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).connect(folder, scan, clock().now, 'review')); });
-  ipcMain.handle('check-intake', async () => { if (!vault) throw Error('Choose a vault first.'); return schedule().record(await new Intake(vault).reconcile({ trigger: 'manual', now: clock().now })); });
+  async function intakeRequest(work) {
+    const selected = vault, now = clock().now;
+    if (!selected) throw Error('Choose a vault first.');
+    const selectedSchedule = schedule(selected);
+    const result = await orderVaultWork(selected, () => work(new Intake(selected), now));
+    return selectedSchedule.record(result);
+  }
+  ipcMain.handle('connect-drafts', (_, { folder, scan }) => intakeRequest((intake, now) => intake.connect(folder, scan, now)));
+  ipcMain.handle('connect-reviews', (_, { folder, scan }) => intakeRequest((intake, now) => intake.connect(folder, scan, now, 'review')));
+  ipcMain.handle('check-intake', () => intakeRequest((intake, now) => intake.reconcile({ trigger: 'manual', now })));
   ipcMain.handle('add-annotation', async (_, input) => new Intake(vault).addAnnotation(input, clock().now));
   ipcMain.handle('choose-identity', async (_, input) => new Intake(vault).chooseIdentity(input));
   ipcMain.handle('retry-annotation-link', async (_, input) => new Intake(vault).retryLink(input));
   ipcMain.handle('restore-missing', async (_, input) => new Intake(vault).restoreMissing(input, clock().now));
   ipcMain.handle('remove-missing', async (_, input) => new Intake(vault).removeMissing(input, clock().now));
-  ipcMain.handle('vault-repairs', async () => new Intake(vault).repairs());
+  ipcMain.handle('vault-repairs', () => {
+    const selected = vault;
+    return orderVaultWork(selected, () => new Intake(selected).repairs());
+  });
   ipcMain.handle('resolve-conflict', async (_, input) => new Intake(vault).resolveConflict(input, clock().now));
   ipcMain.handle('inspect-source', async (_, id) => new Intake(vault).inspect(id));
   ipcMain.handle('select-review', async (_, { id, revision }) => new Intake(vault).selectCurrent(id, revision, clock().now));

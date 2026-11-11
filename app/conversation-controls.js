@@ -2,6 +2,8 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
+const { setTimeout: wait } = require('node:timers/promises');
 const { conversation } = require('./archive-format');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -21,20 +23,21 @@ class ConversationControls {
     this.store.safeDirectory(false, parent); this.identity = stat;
     return { directory, stat, parent };
   }
-  async file(file, directory, expected, links = 1, control = false) {
+  async file(file, directory, expected, links = 1, control = false, exactBytes = false) {
     if (control) this.guard(false, directory.stat); else this.store.safeDirectory(false, directory);
     const before = await fs.lstat(file, { bigint: true });
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== BigInt(links)) throw Error('Conversation deletion encountered a linked or nonordinary file. Preserve it for review.');
     const handle = await fs.open(file, 'r');
     try {
       if (!same(before, await handle.stat({ bigint: true }))) throw Error('Conversation deletion file identity changed.');
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(await handle.readFile());
+      const bytes = await handle.readFile();
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
       if (control) this.guard(false, directory.stat); else this.store.safeDirectory(false, directory);
       const after = await fs.lstat(file, { bigint: true });
       if (!same(before, after) || after.nlink !== BigInt(links)) throw Error('Conversation deletion file identity changed.');
       const owned = { name: path.basename(file), sha256: hash(text), dev: String(after.dev), ino: String(after.ino), bytes: Buffer.byteLength(text, 'utf8') };
       if (expected && JSON.stringify(owned) !== JSON.stringify(expected)) throw Error('Conversation deletion target changed. Preserve it and preview again.');
-      return { text, stat: after, owned };
+      return { text, stat: after, owned, rawDigest: exactBytes ? hash(bytes) : undefined };
     } finally { await handle.close(); }
   }
   validate(value, id) {
@@ -128,16 +131,55 @@ class ConversationControls {
     if (JSON.stringify(scope) === JSON.stringify(marker.scope)) return;
     await this.settlePublication(marker); await this.put({ ...marker, scope }, marker);
   }
-  async put(marker, baseline) {
+  async replace(stage, file, directory, staged, current, revalidate) {
+    const guard = () => {
+      this.store.safeDirectory(false, directory.parent);
+      this.guard(false, directory.stat);
+    };
+    const verify = async (file, expected, owned = expected.owned) => {
+      const observed = await this.file(file, directory, owned, 1, true, true);
+      if (observed.rawDigest !== expected.rawDigest) throw Error('Conversation control bytes changed. Preserve the control files for review.');
+    };
+    const deadline = performance.now() + 1000;
+    let delay = 15, lastRefusal;
+    while (true) {
+      guard();
+      if (lastRefusal && performance.now() >= deadline) throw lastRefusal;
+      try { await fs.rename(stage, file); }
+      catch (error) {
+        const remaining = deadline - performance.now();
+        if (error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
+        lastRefusal = error;
+        await wait(Math.min(delay, remaining));
+        if (performance.now() >= deadline) throw error;
+        guard();
+        await revalidate();
+        await verify(stage, staged);
+        await verify(file, current);
+        delay = Math.min(delay * 2, 100);
+        continue;
+      }
+      // Verify the exact publication. Leave any unexpected files for inspection.
+      await verify(file, staged, { ...staged.owned, name: path.basename(file) });
+      guard();
+      return;
+    }
+  }
+  async put(marker, baseline, revalidate) {
     const directory = this.guard(true), file = path.join(directory.directory, `${marker.id}.json`);
     const value = { ...marker, publication: randomUUID() }, text = JSON.stringify(value, null, 2), stage = path.join(directory.directory, `${value.publication}.pending`);
     this.validate(value, value.id);
     this.guard(false, directory.stat); await fs.writeFile(stage, text, { flag: 'wx', flush: true });
     this.guard(false, directory.stat);
     if (baseline) {
-      const current = await this.file(file, directory, null, 1, true);
+      // Retry only where the caller can revalidate the already confirmed transition.
+      const retry = process.platform === 'win32' && typeof revalidate === 'function';
+      const staged = retry ? await this.file(stage, directory, null, 1, true, true) : null;
+      if (staged && staged.rawDigest !== hash(text)) throw Error('Conversation control stage changed. Preserve it for review.');
+      const current = await this.file(file, directory, null, 1, true, retry);
       if (JSON.stringify(JSON.parse(current.text)) !== JSON.stringify(baseline)) throw Error('Conversation authority changed. Preserve the control stage for review.');
-      await fs.rename(stage, file);
+      if (retry) await this.replace(stage, file, directory, staged, current, revalidate);
+      else await fs.rename(stage, file);
     } else {
       await fs.link(stage, file);
       const a = await this.file(stage, directory, null, 2, true), b = await this.file(file, directory, null, 2, true);
@@ -174,11 +216,11 @@ class ConversationControls {
     });
   }
   cancel(token) { this.previews.delete(token); }
-  async recoverySnapshot(id) {
+  async recoverySnapshot(id, expectedParent) {
     const marker = await this.state(id);
     if (!marker || marker.phase !== 'deleting') throw Error('There is no interrupted deletion to resume for this identity.');
     if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve unsaved writing or finish the active request before deletion recovery.');
-    const parent = this.store.safeDirectory(), remaining = [];
+    const parent = this.store.safeDirectory(false, expectedParent), remaining = [];
     for (const target of marker.targets) {
       try { await this.file(path.join(this.store.directory, target.name), parent, target); remaining.push(target.name); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -240,22 +282,27 @@ class ConversationControls {
     if (!same(a.stat, b.stat) || a.text !== b.text || JSON.stringify(JSON.parse(a.text)) !== JSON.stringify(marker)) throw Error('Conversation control publication changed. Unknown peers remain preserved.');
     this.guard(false, directory.stat); await fs.unlink(stage);
   }
-  async restorationSnapshot(id) {
+  async restorationSnapshot(id, { expectedParent, exactBytes = false } = {}) {
     const marker = await this.state(id);
     if (!marker || marker.phase !== 'restoring') throw Error('There is no interrupted history restoration for this identity.');
     if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve unsaved writing or finish the active request before restoration recovery.');
-    const parent = this.store.safeDirectory(), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), destinationTarget = marker.targets.find(target => target.name.endsWith('.json'));
+    const parent = this.store.safeDirectory(false, expectedParent), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), destinationTarget = marker.targets.find(target => target.name.endsWith('.json'));
     const stage = path.join(this.store.directory, stageTarget.name), destination = path.join(this.store.directory, destinationTarget.name);
     const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
     const stageExists = await exists(stage), destinationExists = await exists(destination);
     if (!stageExists && !destinationExists) throw Error('Restoration payload is unavailable. No history will be reconstructed from metadata.');
     const links = stageExists && destinationExists ? 2 : 1;
-    const staged = stageExists ? await this.file(stage, parent, stageTarget, links) : null;
-    const published = destinationExists ? await this.file(destination, parent, destinationTarget, links) : null;
+    const staged = stageExists ? await this.file(stage, parent, stageTarget, links, false, exactBytes) : null;
+    const published = destinationExists ? await this.file(destination, parent, destinationTarget, links, false, exactBytes) : null;
     if (staged && published && (!same(staged.stat, published.stat) || staged.text !== published.text)) throw Error('Restoration has unknown or edited publication peers. Preserve both copies.');
     const text = (staged || published).text, record = conversation(JSON.parse(text));
     if (hash(text) !== marker.restoration.recordDigest || record.id !== id || record.generation !== marker.generation || record.vault.root !== this.store.getVault()?.root || JSON.stringify({ excludedSources: record.scope?.excludedSources, excludedHistory: record.scope?.excludedHistory }) !== JSON.stringify(marker.scope)) throw Error('Restoration ownership or retained exclusion authority changed. Preserve the payload for review.');
+    if (exactBytes && [staged, published].some(file => file && file.rawDigest !== marker.restoration.recordDigest)) throw Error('Restoration payload bytes changed. Preserve the payload for review.');
     return { restoration: true, id, marker, stageExists, destinationExists, text };
+  }
+  async verifyRestorationComplete(marker, parent) {
+    const current = await this.restorationSnapshot(marker.id, { expectedParent: parent, exactBytes: true });
+    if (current.stageExists || !current.destinationExists || JSON.stringify(current.marker) !== JSON.stringify(marker)) throw Error('Restoration publication changed. Preserve the payload for review.');
   }
   async pendingRestorations() {
     const records = [], issues = []; let directory;
@@ -293,7 +340,7 @@ class ConversationControls {
     if (current.stageExists) { this.store.safeDirectory(false, parent); await fs.unlink(stage); }
     await this.store.checkpoint('archive-restore-before-active');
     await this.file(destination, parent, target);
-    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker);
+    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker, () => this.verifyRestorationComplete(marker, parent));
     this.store.tokens.clear(); this.store.durable.set(marker.id, marker.restoration.recordDigest);
     return { id: marker.id, generation: active.generation };
   }
@@ -309,9 +356,12 @@ class ConversationControls {
       await this.store.checkpoint('conversation-delete-after-unlink');
     }
     // Verify no unknown or changed target appeared while completing the exact manifest.
-    const after = await this.recoverySnapshot(marker.id);
-    if (after.remaining.length || JSON.stringify(after.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion targets or authority changed. Recovery remains blocked.');
-    const completed = await this.put({ ...marker, phase: 'deleted' }, marker);
+    const verifyComplete = async () => {
+      const after = await this.recoverySnapshot(marker.id, parent);
+      if (after.remaining.length || JSON.stringify(after.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion targets or authority changed. Recovery remains blocked.');
+    };
+    await verifyComplete();
+    const completed = await this.put({ ...marker, phase: 'deleted' }, marker, verifyComplete);
     this.store.unsaved.delete(marker.id); return { id: marker.id, generation: completed.generation };
   }
   async confirm(token, kind = 'deletion') {
