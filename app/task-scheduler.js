@@ -10,6 +10,7 @@ class TaskScheduler {
   constructor({ testRoot, executable = process.execPath, appPath = path.resolve(__dirname, '..'), packaged = false } = {}) { Object.assign(this, { testRoot, executable, appPath, packaged }); }
   request(operation, state, file) {
     const args = [...(this.packaged ? [] : [this.appPath]), '--intake-worker', '--schedule-file', file];
+    if (state.launchBinding === 1) args.push('--schedule-id', state.id);
     // Task Scheduler truncates subsecond boundaries. Round upward so its
     // launch cannot precede the exact application deadline. Preserve the anchor.
     return { operation, name: `Companion-${state.id}`, owner: `Companion daily intake ${state.id}`, executable: this.executable, arguments: args.map(argv).join(' '), directory: this.appPath, firstDue: new Date(Math.ceil((Date.parse(state.anchor) + 86400000) / 1000) * 1000).toISOString(), interval: 'PT24H', triggerCount: 1, triggerType: 1, triggerEnabled: true, repetitionDuration: '', endBoundary: '', stopAtDurationEnd: false, startWhenAvailable: true, wakeToRun: false, multipleInstances: 2, enabled: state.mode === 'enabled' };

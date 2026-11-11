@@ -54,9 +54,10 @@ $r=[Console]::In.ReadToEnd() | ConvertFrom-Json
 $s=New-Object -ComObject Schedule.Service
 $s.Connect()
 $folder=$s.GetFolder('\\')
+$bound='^{0} "--schedule-id" "[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}"$' -f [regex]::Escape($r.arguments)
 $names=@(foreach($task in $folder.GetTasks(1)){
   foreach($action in $task.Definition.Actions){
-    if($action.Type -eq 0 -and $action.Path -ieq $r.executable -and $action.Arguments -ceq $r.arguments -and $action.WorkingDirectory -ieq $r.directory){$task.Name; break}
+    if($action.Type -eq 0 -and $action.Path -ieq $r.executable -and ($action.Arguments -ceq $r.arguments -or $action.Arguments -cmatch $bound) -and $action.WorkingDirectory -ieq $r.directory){$task.Name; break}
   }
 })
 ConvertTo-Json -InputObject $names -Compress`;

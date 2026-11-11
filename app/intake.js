@@ -46,8 +46,17 @@ class Intake {
     await fs.writeFile(stage, JSON.stringify(value), { flag: 'wx', flush: true });
     await fs.link(stage, file); await fs.unlink(stage);
   }
-  async locked(work) {
-    await this.setup(); return sourceMutation(this.vault.root, async () => { await this.recover(); return work(); });
+  async locked(work, admit) {
+    if (!admit) await this.setup();
+    return sourceMutation(this.vault.root, async () => {
+      if (admit) {
+        // A scheduled worker must still own its slot before touching recovery.
+        if (!await admit()) return { skipped: true };
+        await this.setup();
+      }
+      await this.recover();
+      return work();
+    });
   }
   async info() {
     await this.setup();
@@ -155,9 +164,8 @@ class Intake {
     }
     return keys;
   }
-  async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit = async () => true } = {}) {
+  async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit } = {}) {
     return this.locked(async () => {
-      if (!await admit()) return { skipped: true };
       await this.syncMoves();
       await this.retryPending();
       let ledger = await this.load(); const seen = new Map(), ready = [];
@@ -210,7 +218,7 @@ class Intake {
       ledger.lastCheck = { at: now, trigger, status: ledger.sources.some(x => x.error) ? 'error' : Object.values(ledger.outcomes).some(x => x.status === 'held') ? 'held' : 'complete' };
       if (ledger.lastCheck.status === 'complete') ledger.lastSuccess = { at: now, trigger };
       await this.save(ledger); return ledger;
-    });
+    }, admit);
   }
   async admit(ledger, draft, key, now, guard) {
     const purged = require('./source-inventory').purgedAttempt(ledger, draft);

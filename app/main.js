@@ -21,6 +21,7 @@ const testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
 const workerFile = process.argv[process.argv.indexOf('--schedule-file') + 1];
+const workerBinding = process.argv.indexOf('--schedule-id');
 function scheduleOptions() { return { testRoot, executable: process.execPath, appPath: app.getAppPath(), packaged: app.isPackaged }; }
 async function checkpoint(name) {
   if (!testRoot) return;
@@ -40,11 +41,18 @@ function clock() {
 app.whenReady().then(async () => {
   if (workerMode) {
     try {
-      if (!process.argv.includes('--schedule-file') || !path.isAbsolute(workerFile)) throw Error('Worker requires its absolute daily intake settings path.');
+      if (!process.argv.includes('--schedule-file') || typeof workerFile !== 'string' || !path.isAbsolute(workerFile)) throw Error('Worker requires its absolute daily intake settings path.');
       const state = await new Schedule(workerFile, null, scheduleOptions()).load();
       if (!state) throw Error('Daily intake settings are missing.');
+      // Old registered tasks may omit the ID only while their unbound record is current.
+      const requestedId = workerBinding < 0 ? undefined : process.argv[workerBinding + 1];
+      if ((state.launchBinding === 1 || workerBinding >= 0) && requestedId !== state.id) { app.exit(0); return; }
       const selected = new Vault(state.vault, state.parent, { checkpoint });
-      const result = await new Schedule(workerFile, selected, scheduleOptions()).run(clock().now, 'scheduled');
+      const schedule = new Schedule(workerFile, selected, {
+        ...scheduleOptions(),
+        assertSelected: state.launchBinding === 1 ? () => schedule.assertConfiguration(path.join(path.dirname(workerFile), 'settings.json')) : undefined
+      });
+      const result = await schedule.run(clock().now, 'scheduled', state.id);
       app.exit(result && !result.skipped && result.lastCheck.status !== 'complete' ? 1 : 0);
     } catch (error) { console.error(error.message); app.exit(1); }
     return;
@@ -54,16 +62,36 @@ app.whenReady().then(async () => {
   ipcMain.handle('codex-state', () => codex.snapshot());
   ipcMain.handle('codex-action', (_, input) => codex.action(input, { vault: vault?.root }));
   try { const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8')); vault = new Vault(settings.vault, settings.parent, { checkpoint }); } catch (error) { if (error.code !== 'ENOENT') console.error('Cannot load settings:', error.message); }
+  const schedule = (selected = vault) => {
+    const current = new Schedule(path.join(path.dirname(settingsPath), 'schedule.json'), selected, {
+      ...scheduleOptions(),
+      assertSelected: async () => {
+        if (selected !== vault) throw Error('Vault selection changed. Refresh and try again.');
+        await current.assertConfiguration(settingsPath);
+        if (selected !== vault) throw Error('Vault selection changed. Refresh and try again.');
+      }
+    });
+    return current;
+  };
   ipcMain.handle('choose-vault', async () => testRoot ? path.join(testRoot, 'vault') : (await dialog.showOpenDialog({ properties: ['openDirectory'] })).filePaths[0]);
   ipcMain.handle('configure', async (_, settings) => {
     const next = new Vault(settings.vault, settings.parent, { checkpoint });
-    const existing = await schedule().load();
-    if (existing && existing.mode !== 'disabled' && path.resolve(existing.vault, existing.parent).toLowerCase() !== next.root.toLowerCase()) throw Error('Disable daily intake before changing its vault.');
-    await next.setup();
     await fs.mkdir(path.dirname(settingsPath), { recursive: true });
-    await fs.writeFile(settingsPath, JSON.stringify(settings)); vault = next; codex.invalidate(); return true;
+    const nextSchedule = schedule(next);
+    return nextSchedule.change(async guard => {
+      const existing = await nextSchedule.snapshot(guard);
+      if (existing && !nextSchedule.matches(existing.state)) await nextSchedule.requireDisabled(existing.state);
+      await next.setup();
+      const stored = await fs.lstat(settingsPath).catch(error => {
+        if (error.code === 'ENOENT') return null;
+        throw error;
+      });
+      if (stored && (!stored.isFile() || stored.isSymbolicLink() || stored.nlink !== 1)) throw Error('Vault selection settings are not an ordinary file. Preserve them for repair.');
+      nextSchedule.requireCurrent(existing?.proof || null, guard);
+      await fs.writeFile(settingsPath, JSON.stringify(settings));
+      vault = next; codex.invalidate(); return true;
+    });
   });
-  const schedule = (selected = vault) => new Schedule(path.join(path.dirname(settingsPath), 'schedule.json'), selected, scheduleOptions());
   const localVaultWork = new Map();
   async function orderVaultWork(selected, work) {
     if (!selected) return work();
@@ -150,7 +178,7 @@ app.whenReady().then(async () => {
     const selection = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'transcript-selection.json'), 'utf8')) : await dialog.showSaveDialog({ title: 'Export readable conversation transcript', defaultPath: path.join(selected.vault, 'Conversation transcript.md'), filters: [{ name: 'Markdown transcript', extensions: ['md'] }] });
     return selection.canceled ? null : selection.filePath;
   } });
-  installArchives({ ipcMain, history: conversations, settingsPath, dialog, testRoot, clock, checkpoint, appVersion: app.getVersion(), invalidateContextApprovals: context.clearApprovals, getSchedule: () => new Schedule(path.join(conversations.dataRoot, 'schedule.json'), vault, scheduleOptions()) });
+  installArchives({ ipcMain, history: conversations, settingsPath, dialog, testRoot, clock, checkpoint, appVersion: app.getVersion(), invalidateContextApprovals: context.clearApprovals, getSchedule: schedule });
   ideas = installIdeas({ ipcMain, getVault: () => vault, conversations, clock, checkpoint, open: async uri => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
