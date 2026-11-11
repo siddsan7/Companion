@@ -1,6 +1,6 @@
 const $ = id => document.getElementById(id);
 let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0;
-let checkingIntake = false, connectingIntake = false, savingCapture = false;
+let checkingIntake = false, connectingIntake = false, savingCapture = false, configuringVault = false;
 const status = message => { document.querySelector('[role=status]').textContent = message; };
 function scopeError(error, owned) {
   const earlier = error.canReport;
@@ -67,14 +67,15 @@ for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'pa
   try { await window.companion['schedule-' + operation](); status('Daily intake ' + result + '.'); }
   finally { try { await refresh(); } finally { scheduleControls.forEach(control => { control.disabled = false; }); } }
 });
-function updateCaptureControl() { $('save').disabled = savingCapture || $('configure').disabled; }
+function updateCaptureControl() { $('save').disabled = $('configure').disabled = savingCapture || configuringVault; }
 function updateIntakeControls() {
-  const pending = checkingIntake || connectingIntake || $('configure').disabled;
+  const pending = checkingIntake || connectingIntake || configuringVault;
   for (const id of ['check-intake', 'connect-drafts', 'connect-reviews']) $(id).disabled = pending;
 }
 $('choose').onclick = () => action(async () => { selectedVault = await window.companion['choose-vault'](); $('vault').textContent = selectedVault || 'Selection cancelled.'; });
 $('configure').onclick = () => {
-  const owner = ++configurationEpoch; configurationBusy = true; $('configure').disabled = true; $('vault-repairs').replaceChildren();
+  if ($('configure').disabled) return;
+  const owner = ++configurationEpoch; configurationBusy = true; configuringVault = true; $('vault-repairs').replaceChildren();
   updateCaptureControl(); updateIntakeControls();
   retireCaptureLinks();
   return action(async () => {
@@ -83,7 +84,7 @@ $('configure').onclick = () => {
       if (owner !== configurationEpoch) return;
       configurationBusy = false; await refresh(); if (owner === configurationEpoch) status('Vault ready.');
     } catch (error) { if (owner === configurationEpoch) throw error; }
-    finally { if (owner === configurationEpoch) { configurationBusy = false; $('configure').disabled = false; updateCaptureControl(); updateIntakeControls(); window.dispatchEvent(new Event('companion-vault-configured')); } }
+    finally { if (owner === configurationEpoch) { configurationBusy = false; configuringVault = false; updateCaptureControl(); updateIntakeControls(); window.dispatchEvent(new Event('companion-vault-configured')); } }
   });
 };
 $('add-excerpt').onclick = () => { $('excerpt-label').hidden = false; $('excerpt').focus(); };
