@@ -20,28 +20,46 @@ const identity = async file => {
 async function exitDuringRepair(directory, shared, input, checkpoint = '') {
   const code = String.raw`
     const fs = require('node:fs/promises');
+    const native = require('node:fs');
     const path = require('node:path');
     const { Vault } = require('./app/vault');
     const { Intake } = require('./app/intake');
     const [directory, shared, rawInput, now, stopAt] = process.argv.slice(1);
     const input = JSON.parse(rawInput), link = fs.link, unlink = fs.unlink;
+    const linkSync = native.linkSync, unlinkSync = native.unlinkSync;
+    const intent = path.join(path.dirname(shared), 'repair-intent.json');
+    const selected = tx => tx.sourceHash === input.sourceHash && tx.keptCurrent && tx.resolution;
     let exactStage;
+    const observeLink = (from, to) => {
+      if (to !== shared || !/^journal-[a-f0-9-]{36}\.stage$/.test(path.basename(from))) return;
+      if (!selected(JSON.parse(native.readFileSync(to, 'utf8')))) return;
+      if (stopAt === 'repair-source-first-link') process.exit(77);
+      exactStage = from;
+    };
     fs.link = async (from, to) => {
       await link(from, to);
-      if (to !== shared || !/^journal-[a-f0-9-]{36}\.stage$/.test(path.basename(from))) return;
-      const tx = JSON.parse(await fs.readFile(to, 'utf8'));
-      if (tx.sourceHash === input.sourceHash && tx.keptCurrent && tx.resolution) exactStage = from;
+      observeLink(from, to);
+    };
+    native.linkSync = (from, to) => {
+      linkSync(from, to);
+      observeLink(from, to);
     };
     fs.unlink = async file => {
       await unlink(file);
-      if (file === exactStage) process.exit(77);
+      if (!stopAt && file === exactStage) process.exit(77);
+    };
+    native.unlinkSync = file => {
+      unlinkSync(file);
+      if (!stopAt && file === exactStage) process.exit(77);
     };
     const intake = new Intake(new Vault(directory, 'Companion', { checkpoint: async boundary => {
       if (boundary !== stopAt) return;
-      const tx = JSON.parse(await fs.readFile(shared, 'utf8'));
-      if (tx.sourceHash === input.sourceHash && tx.keptCurrent && tx.resolution) process.exit(77);
+      const tx = boundary === 'repair-intent-published' ? JSON.parse(await fs.readFile(intent, 'utf8')).tx :
+        JSON.parse(await fs.readFile(shared, 'utf8'));
+      if (selected(tx)) process.exit(77);
     } }));
-    const operation = stopAt ? intake.reconcile({ now }) : intake.resolveConflict(input, now);
+    const startRepair = !stopAt || stopAt === 'repair-source-first-link' || stopAt === 'repair-intent-published';
+    const operation = startRepair ? intake.resolveConflict(input, now) : intake.reconcile({ now });
     operation.then(() => process.exit(78), error => {
       console.error(error);
       process.exit(79);
@@ -92,17 +110,31 @@ async function repairConflict(testInfo) {
     writing, input, shared, intentFile };
 }
 
-async function interruptedRepair(testInfo) {
+async function interruptedRepair(testInfo, checkpoint = '') {
   const context = await repairConflict(testInfo);
   const { vault, intake, drafts, sourceHash, current, ledgerFile, block, input, shared, intentFile } = context;
-  await exitDuringRepair(vault.vault, shared, input);
+  await exitDuringRepair(vault.vault, shared, input, checkpoint);
   const intent = await json(intentFile), tx = intent.tx;
   const archive = path.join(intake.dir, `repair-${intent.annotationId}.json`);
   const stage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
   const annotation = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
   expect(tx).toMatchObject({ sourceHash, keptCurrent: { id: current.currentRevision }, revision: { id: block.incomingRevision } });
   expect(await json(shared)).toEqual(tx);
-  expect((await identity(shared)).nlink).toBe(1n);
+  const sourceIdentity = await identity(shared);
+  let sourceStage;
+  if (checkpoint === 'repair-source-first-link') {
+    expect(sourceIdentity.nlink).toBe(2n);
+    const names = (await fs.readdir(intake.dir)).filter(name => /^journal-[a-f0-9-]{36}\.stage$/.test(name));
+    const candidates = await Promise.all(names.map(async name => {
+      const file = path.join(intake.dir, name);
+      return { file, identity: await identity(file) };
+    }));
+    const matching = candidates.filter(item => item.identity.dev === sourceIdentity.dev && item.identity.ino === sourceIdentity.ino);
+    expect(matching).toHaveLength(1);
+    sourceStage = matching[0].file;
+    expect(matching[0].identity).toEqual(sourceIdentity);
+    expect(await fs.readFile(sourceStage)).toEqual(await fs.readFile(shared));
+  } else expect(sourceIdentity.nlink).toBe(1n);
   expect((await identity(intentFile)).nlink).toBe(1n);
   await expect(fs.lstat(archive)).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await fs.readFile(annotation, 'utf8')).toBe(intent.annotation);
@@ -122,7 +154,7 @@ async function interruptedRepair(testInfo) {
   await fs.writeFile(path.join(independent, 'first-pass-target.json'), JSON.stringify(draft.target));
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(independent, 'notes.md'));
 
-  return { ...context, intent, tx, archive, stage, annotation, published };
+  return { ...context, intent, tx, archive, stage, annotation, published, sourceStage };
 }
 
 async function expectFinished(context) {
@@ -148,6 +180,77 @@ async function expectFinished(context) {
 
 test('restart finishes a fresh kept-current repair after publishing its active journal', async ({}, testInfo) => {
   await expectFinished(await interruptedRepair(testInfo));
+});
+
+test('restart retires the exact source stage after a fresh repair first links its journal', async ({}, testInfo) => {
+  const context = await interruptedRepair(testInfo, 'repair-source-first-link');
+  await expectFinished(context);
+  await expect(fs.lstat(context.sourceStage)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('an intent-only restart refuses a fresh repair after its original ledger block is removed', async ({}, testInfo) => {
+  const { vault, intake, sourceHash, ledgerFile, block, older, previous, previousIdentity, destination, local,
+    input, shared, intentFile } = await repairConflict(testInfo);
+  await exitDuringRepair(vault.vault, shared, input, 'repair-intent-published');
+  const originalIntent = await fs.readFile(intentFile), intentIdentity = await identity(intentFile);
+  const intent = JSON.parse(originalIntent);
+  const stage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
+  const annotation = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
+  const sourceArchive = path.join(intake.dir, `conflict-${intent.tx.revision.id}-${intent.tx.resolution}.json`);
+  const ledger = await json(ledgerFile);
+  expect(ledger.blocks[sourceHash]).toEqual(block);
+  expect(ledger.attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect(intentIdentity.nlink).toBe(1n);
+  for (const file of [shared, stage, annotation]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  delete ledger.blocks[sourceHash];
+  const edited = JSON.stringify(ledger, null, 2);
+  await fs.writeFile(ledgerFile, edited);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.locked(() => restarted.load()).catch(() => {});
+  expect.soft(await fs.readFile(ledgerFile, 'utf8')).toBe(edited);
+  expect.soft((await json(ledgerFile)).attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect.soft(await fs.readFile(destination)).toEqual(local);
+  for (const file of [shared, stage, annotation, sourceArchive]) await expect.soft(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect.soft(await fs.readFile(intentFile).catch(error => error.code)).toEqual(originalIntent);
+  expect.soft(await identity(intentFile).catch(error => error.code)).toEqual(intentIdentity);
+  expect(await json(older)).toEqual(previous);
+  expect(await identity(older)).toEqual(previousIdentity);
+});
+
+test('a failed kept-current read does not adopt a separate equal-byte repair archive', async ({}, testInfo) => {
+  const { vault, intake, input, sourceHash, block, ledgerFile, older, previous, previousIdentity, shared, intentFile } =
+    await repairConflict(testInfo);
+  let armed = false, witness;
+  const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async boundary => {
+    if (boundary === 'repair-intent-published') { armed = true; return; }
+    if (!armed || witness || boundary !== 'kept-current-read') return;
+    const bytes = await fs.readFile(intentFile), intent = JSON.parse(bytes), intentIdentity = await identity(intentFile);
+    const archive = path.join(intake.dir, `repair-${intent.annotationId}.json`);
+    const sourceArchive = path.join(intake.dir, `conflict-${intent.tx.revision.id}-${intent.tx.resolution}.json`);
+    await fs.writeFile(archive, bytes, { flag: 'wx' });
+    const archiveIdentity = await identity(archive);
+    expect(intentIdentity.nlink).toBe(1n);
+    expect(archiveIdentity.nlink).toBe(1n);
+    expect(archiveIdentity).not.toEqual(intentIdentity);
+    expect(await fs.readFile(archive)).toEqual(bytes);
+    const ledger = await fs.readFile(ledgerFile);
+    expect(JSON.parse(ledger).blocks[sourceHash]).toEqual(block);
+    witness = { bytes, intentIdentity, archive, archiveIdentity, sourceArchive, ledger };
+    throw Object.assign(Error('Fixture kept-current snapshot is inaccessible.'), { code: 'EACCES' });
+  } }));
+
+  await restarted.resolveConflict(input, later).catch(() => {});
+  expect(witness, 'the equal-byte independent archive was written before the kept-current read failed').toBeDefined();
+  expect.soft(await fs.readFile(ledgerFile)).toEqual(witness.ledger);
+  expect.soft(await fs.readFile(intentFile).catch(error => error.code)).toEqual(witness.bytes);
+  expect.soft(await identity(intentFile).catch(error => error.code)).toEqual(witness.intentIdentity);
+  expect(await fs.readFile(witness.archive)).toEqual(witness.bytes);
+  expect(await identity(witness.archive)).toEqual(witness.archiveIdentity);
+  await expect(fs.lstat(shared)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect.soft(fs.lstat(witness.sourceArchive)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await json(older)).toEqual(previous);
+  expect(await identity(older)).toEqual(previousIdentity);
 });
 
 test('restart does not adopt equal-byte replacements for both repair annotation names', async ({}, testInfo) => {
