@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { installArchives } = require('../app/archives');
+const { Briefs } = require('../app/briefs');
 const { Conversations } = require('../app/conversations');
 const { changeNoteScope } = require('../app/note-scope');
 const { Vault } = require('../app/vault');
@@ -135,21 +136,23 @@ test('title edit keeps the prior note when the final title stage proof closes ov
   expect(await fs.readFile(replacement.parked)).toEqual(replacement.original);
 });
 
-async function archiveExport(root, vault) {
+async function archiveExport(root, vault, { checkpoint = async () => {}, record } = {}) {
   const dataRoot = path.join(root, 'app-data'), destination = path.join(root, 'history.json');
   const settingsPath = path.join(dataRoot, 'settings.json');
   await fs.mkdir(dataRoot);
   await fs.writeFile(settingsPath, JSON.stringify({ vault: vault.vault, parent: 'Companion' }));
-  await fs.writeFile(path.join(dataRoot, 'archive-dialog.json'), JSON.stringify({ save: destination }));
+  await fs.writeFile(path.join(dataRoot, 'archive-dialog.json'), JSON.stringify({ save: destination, open: destination }));
   const clock = () => ({ now });
-  const history = new Conversations({ dataRoot, getVault: () => vault, clock });
+  const history = new Conversations({ dataRoot, getVault: () => vault, clock, checkpoint });
   const handlers = new Map();
   installArchives({
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
-    history, settingsPath, testRoot: dataRoot, clock, checkpoint: async () => {}, appVersion: '0.1.0'
+    history, settingsPath, testRoot: dataRoot, clock, checkpoint, appVersion: '0.1.0'
   });
-  const preview = await handlers.get('archive-preview')(null);
-  return { destination, exportArchive: () => handlers.get('archive-export')(null, { id: preview.id }) };
+  if (record) await history.lock(() => history.write(record));
+  const call = (channel, input) => handlers.get(channel)(null, input);
+  const preview = await call('archive-preview');
+  return { destination, history, call, exportArchive: () => call('archive-export', { id: preview.id }) };
 }
 
 test('archive export keeps a replacement stage out of the destination when its proof handle closes', async ({ localVault }) => {
@@ -279,7 +282,7 @@ async function restoringConversation(root, vault, linked) {
   const preview = await history.controls.resumeRestoration(id), marker = await fs.readFile(control);
   expect(preview).toMatchObject({ id, generation, archiveId, text: payload.toString('utf8') });
   return {
-    stage, destination, control, payload, marker,
+    history, stage, destination, control, payload, marker,
     confirm: () => history.controls.confirm(preview.token, 'restoration')
   };
 }
@@ -302,3 +305,120 @@ for (const linked of [false, true]) {
     expect(await fs.readFile(fixture.control)).toEqual(fixture.marker);
   });
 }
+
+async function activeControlStage(control) {
+  const directory = path.dirname(control);
+  for (const name of await fs.readdir(directory)) {
+    if (!name.endsWith('.pending')) continue;
+    const file = path.join(directory, name), value = JSON.parse(await fs.readFile(file));
+    if (value.phase === 'active' && path.basename(control) === `${value.id}.json`) return file;
+  }
+  return null;
+}
+
+test('restoration recovery keeps a replacement control stage out of the first active rename', async ({ localVault }) => {
+  const { root, vault } = localVault;
+  const fixture = await restoringConversation(root, vault, false);
+  let activeStage, replacement;
+  const result = await afterProofClose(async candidate => {
+    if (candidate !== fixture.control) return false;
+    activeStage = await activeControlStage(fixture.control);
+    return !!activeStage;
+  }, async () => { replacement = await displace(activeStage); }, fixture.confirm);
+
+  expect.soft(result?.message).toMatch(/stag|chang|publication/i);
+  expect.soft(await fs.readFile(fixture.control)).toEqual(fixture.marker);
+  expect.soft(await fs.readFile(activeStage).catch(error => error.code)).toEqual(foreign);
+  expect(JSON.parse(await fs.readFile(replacement.parked))).toMatchObject({ phase: 'active' });
+  expect(await fs.readFile(fixture.destination)).toEqual(fixture.payload);
+});
+
+test('initial archive restoration cannot activate a changed final payload at control publication', async ({ localVault }) => {
+  const { root, vault } = localVault;
+  const readme = path.join(root, 'README.md');
+  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
+  const briefs = new Briefs(vault), { proposed } = await briefs.propose([readme], now);
+  const { approved: [brief] } = await briefs.approve({
+    id: proposed.id, digest: proposed.digest,
+    sections: proposed.sections.map(section => section.text),
+    references: proposed.sections.map(section => section.references.map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+  }, now);
+  const id = randomUUID(), scope = { version: randomUUID(), excludedSources: [], excludedHistory: [] };
+  const record = {
+    schema: 1, id, scope, vault: { root: vault.root }, createdAt: now, requests: [],
+    brief: { id: brief.id, version: brief.version, digest: brief.digest }
+  };
+  let beforeActive = false;
+  const archive = await archiveExport(root, vault, {
+    record,
+    checkpoint: async name => { if (name === 'archive-restore-before-active') beforeActive = true; }
+  });
+  await archive.exportArchive();
+  const deletion = await archive.history.controls.preview(id);
+  await archive.history.controls.confirm(deletion.token);
+  const inspected = await archive.call('archive-inspect');
+  const matched = await archive.call('archive-match', { id: inspected.id, matched: true });
+  expect(matched.newGenerations).toBe(1);
+  const control = path.join(archive.history.directory, '.control', `${id}.json`);
+  const destination = path.join(archive.history.directory, `${id}.json`);
+  let restoring, replacement;
+  const result = await afterProofClose(async candidate => beforeActive && candidate === control && !!await activeControlStage(control),
+    async () => {
+      restoring = await fs.readFile(control);
+      replacement = await displace(destination);
+    },
+    () => archive.call('archive-restore', { token: matched.token }));
+
+  expect.soft(result?.message).toMatch(/restor|stag|chang|publication/i);
+  expect.soft(await fs.readFile(control)).toEqual(restoring);
+  expect(JSON.parse(restoring)).toMatchObject({ phase: 'restoring' });
+  expect(await fs.readFile(destination)).toEqual(foreign);
+  expect(JSON.parse(await fs.readFile(replacement.parked))).toMatchObject({ id, generation: JSON.parse(restoring).generation });
+});
+
+test('linked conversation control cleanup preserves a replaced stage', async ({ localVault }) => {
+  const { root, vault } = localVault;
+  const fixture = await restoringConversation(root, vault, false), marker = JSON.parse(fixture.marker);
+  const stage = path.join(path.dirname(fixture.control), `${marker.publication}.pending`);
+  await fs.link(fixture.control, stage);
+  let replacement;
+  const result = await afterProofClose(candidate => candidate === stage,
+    async () => { replacement = await displace(stage); },
+    () => fixture.history.lock(() => fixture.history.controls.settlePublication(marker)));
+
+  expect.soft(result?.message).toMatch(/stag|chang|publication|peer/i);
+  expect.soft(await fs.readFile(stage).catch(error => error.code)).toEqual(foreign);
+  expect(await fs.readFile(replacement.parked)).toEqual(fixture.marker);
+  expect(await fs.readFile(fixture.control)).toEqual(fixture.marker);
+});
+
+test('capture restart retains a stage-absent lock when the published note was replaced', async ({ localVault }) => {
+  const { vault } = localVault, directory = path.join(vault.root, 'Captures');
+  const unlink = local.unlinkSync;
+  let retained;
+  local.unlinkSync = file => {
+    if (path.dirname(file) === directory && file.endsWith('.md.lock')) {
+      retained = file;
+      throw Object.assign(Error('Controlled refusal to clean the capture lock.'), { code: 'EACCES' });
+    }
+    return unlink(file);
+  };
+  try { await vault.capture({ text: 'A published capture with an interrupted lock cleanup.' }, now); }
+  finally { local.unlinkSync = unlink; }
+  expect(retained).toBeDefined();
+  const destination = retained.slice(0, -'.lock'.length), receipt = await fs.readFile(retained);
+  expect(await absent(`${destination}.pending`)).toBe(true);
+  const replacement = await displace(destination);
+  const restarted = new Vault(vault.vault, 'Companion'), kill = process.kill, { pid } = JSON.parse(receipt);
+  process.kill = (owner, signal) => {
+    if (owner === pid && signal === 0) throw Object.assign(Error('The disposable prior owner exited.'), { code: 'ESRCH' });
+    return kill(owner, signal);
+  };
+  try { await restarted.recover(directory); }
+  finally { process.kill = kill; }
+
+  expect.soft(await fs.readFile(retained).catch(error => error.code)).toEqual(receipt);
+  expect(await fs.readFile(destination)).toEqual(foreign);
+  expect(await fs.readFile(replacement.parked)).toEqual(replacement.original);
+  expect(restarted.warnings.join('\n')).toMatch(/preserv|changed/i);
+});
