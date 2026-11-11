@@ -170,7 +170,8 @@ test('an old worker cannot admit intake or update a replacement schedule record'
   const replacement = JSON.stringify({ schema: 1, id: randomUUID(), anchor, vault: nextVault.vault, parent: 'Companion', mode: 'enabled' });
 
   const originalReconcile = Intake.prototype.reconcile;
-  let replaced = false, result;
+  const originalRecover = Intake.prototype.recover;
+  let replaced = false, recoveryCalls = 0, result;
   Intake.prototype.reconcile = async function (...args) {
     if (this.vault.root === oldVault.root) {
       await fs.writeFile(file, replacement);
@@ -178,11 +179,19 @@ test('an old worker cannot admit intake or update a replacement schedule record'
     }
     return originalReconcile.apply(this, args);
   };
+  Intake.prototype.recover = async function (...args) {
+    if (this.vault.root === oldVault.root) recoveryCalls++;
+    return originalRecover.apply(this, args);
+  };
   try { result = await schedule.run(now, 'scheduled'); }
-  finally { Intake.prototype.reconcile = originalReconcile; }
+  finally {
+    Intake.prototype.reconcile = originalReconcile;
+    Intake.prototype.recover = originalRecover;
+  }
 
   expect(replaced, `record replaced after worker loaded ${initial.id}`).toBe(true);
   expect(result).toEqual({ skipped: true });
+  expect(recoveryCalls).toBe(0);
   expect(await readOptional(file)).toBe(replacement);
   expect(await readOptional(ledger)).toBe(originalLedger);
 });
