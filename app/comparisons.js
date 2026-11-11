@@ -12,12 +12,31 @@ const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 const sameProof = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino && a.digest === b.digest;
 const historyChanged = () => Object.assign(Error('Comparison history changed or is unavailable. Existing history was not replaced. Preserve the retained text.'), { code: 'HISTORY_CONFLICT' });
+const packageHeader = 'Synthetic comparison input. Authored source material is not actual reel evidence.';
+const terminal = slot => ['completed', 'failed', 'interrupted'].includes(slot.status);
+const candidateDigest = slot => hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
+function sharedInput(brief, fixture) {
+  const source = { id: fixture.id, version: fixture.version, synthetic: true, passages: fixture.passages, limitations: fixture.limitations };
+  return JSON.stringify({ source, brief }, null, 2).replace(/\r\n?/g, '\n');
+}
 function makePackage(brief, fixture, method) {
   // Fit labels are inspection metadata, never part of a model request.
-  const source = { id: fixture.id, version: fixture.version, synthetic: true, passages: fixture.passages, limitations: fixture.limitations };
-  const shared = JSON.stringify({ source, brief }, null, 2).replace(/\r\n?/g, '\n');
-  const text = `Synthetic comparison input. Authored source material is not actual reel evidence.\n\n${shared}\n\n${prompts[method].text}`;
+  const shared = sharedInput(brief, fixture);
+  const text = `${packageHeader}\n\n${shared}\n\n${prompts[method].text}`;
   return { text, digest: hash(text), sharedInputDigest: hash(shared), count: [...text].length, limit: 32000 };
+}
+function scoreCase(record, slot) {
+  const fixture = record.fixtures.find(item => item.id === slot.fixtureId);
+  if (!fixture || !fixture.synthetic) throw Error('Synthetic scoring case is unavailable. Preserve the comparison history.');
+  const shared = sharedInput(record.brief, fixture);
+  if (slot.package.sharedInputDigest !== hash(shared) || !slot.package.text.startsWith(`${packageHeader}\n\n${shared}\n\n`)) {
+    throw Error('Scoring evidence differs from the retained comparison input. Preserve the comparison history.');
+  }
+  return {
+    id: fixture.id, version: fixture.version,
+    passages: fixture.passages.map(({ id, text }) => ({ id, text })),
+    limitations: fixture.limitations
+  };
 }
 
 // Main owns packages and the private display mapping. Listing never generates.
@@ -277,28 +296,41 @@ class Comparisons {
     }
   }
   scoreProjection(record) {
-    return { id: record.id, rubric, storageWarning: record.storageWarning || null, canReveal: this.completeFeedback(record), revealedAt: record.revealedAt || null,
-      notice: `Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.${record.revealedAt ? ' Methods were already revealed; subsequent judgments are not blinded.' : ''}`,
-      outputs: record.blindOrder.map((entry, index) => {
-        const slot = record.slots.find(item => item.id === entry.slotId);
-        const candidateDigest = hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
-        return { displayIndex: index, displayId: entry.label, status: slot.status, candidate: slot.candidate || null, candidateDigest, error: slot.error || null, rating: slot.rating || null };
-      }) };
+    const { brief } = record;
+    const scoringBrief = { version: brief.version, sections: brief.snapshot.sections.map(({ title, text, references }) => ({
+      title, text, references: references.map(({ source, start, end }) => ({ source: source + 1, start, end }))
+    })) };
+    const outputs = [];
+    for (const entry of record.blindOrder) {
+      const slot = record.slots.find(item => item.id === entry.slotId);
+      if (!terminal(slot)) continue;
+      const candidate = slot.candidate ? { text: slot.candidate.text, warning: slot.candidate.warning,
+        wordCount: slot.candidate.wordCount, overRequestedLimit: slot.candidate.overRequestedLimit } : null;
+      outputs.push({
+        displayIndex: outputs.length, displayId: entry.label, status: slot.status, candidate, candidateDigest: candidateDigest(slot),
+        error: slot.error ? 'Generation did not finish successfully. Any retained text is shown below.' : null,
+        rating: slot.rating || null, evidence: scoreCase(record, slot)
+      });
+    }
+    const pending = record.slots.filter(slot => slot.status === 'pending').length;
+    return { id: record.id, rubric, brief: scoringBrief, outputs, storageWarning: record.storageWarning || null, canReveal: this.completeFeedback(record), revealedAt: record.revealedAt || null,
+      notice: `Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures.${pending ? ` ${pending} of six slots were never attempted. Only retained outcomes can receive feedback; method reveal requires feedback on all six attempts.` : ''} Three authored cases do not establish statistical reliability or equal consumption.${record.revealedAt ? ' Methods were already revealed; subsequent judgments are not blinded.' : ''}` };
   }
   completeFeedback(record) {
     return !record.storageWarning && record.slots.every(slot => {
       const rating = slot.rating;
-      return ['completed', 'failed', 'interrupted'].includes(slot.status) && slot.candidate && rating && rubric.dimensions.every(dimension => Number.isSafeInteger(rating[dimension.key]) && rating[dimension.key] >= 1 && rating[dimension.key] <= 5) && typeof rating.reason === 'string' && !!rating.reason.trim() && typeof rating.materialError === 'boolean' && rating.rubricVersion === rubric.version && rating.candidateDigest === hash(JSON.stringify({ status: slot.status, candidate: slot.candidate, error: slot.error || null }));
+      return terminal(slot) && slot.candidate && rating && rubric.dimensions.every(dimension => Number.isSafeInteger(rating[dimension.key]) && rating[dimension.key] >= 1 && rating[dimension.key] <= 5) && typeof rating.reason === 'string' && !!rating.reason.trim() && typeof rating.materialError === 'boolean' && rating.rubricVersion === rubric.version && rating.candidateDigest === candidateDigest(slot);
     });
   }
   async scoreView(input) {
     return this.lock(async () => {
       const record = await this.read(input?.id, true);
       if (record.vault.root !== this.getVault()?.root) throw Error('Comparison belongs to another vault.');
-      if (record.slots.some(slot => slot.status === 'pending' || slot.status === 'inProgress')) throw Error('Complete all six explicit attempts before blind scoring. Retained failures remain eligible.');
-      if (!record.blindOrder) {
+      if (record.slots.some(slot => slot.status === 'inProgress') || !record.slots.some(terminal)) throw Error('Blind scoring needs a retained terminal outcome after generation has settled.');
+      const assignLabels = !record.blindOrder;
+      if (assignLabels) {
         if (this.unsaved.has(record.id)) throw Error('Repair unsaved comparison storage before assigning persistent blind labels.');
-        // Independent post-generation shuffle. Never reuse the known preview
+        // Independent scoring shuffle. Never reuse the known preview
         // order or aliases, even if the permutations happen to coincide.
         const order = record.slots.map(slot => slot.id), labels = new Set();
         for (let i = order.length - 1; i > 0; i--) { const j = randomInt(i + 1); [order[i], order[j]] = [order[j], order[i]]; }
@@ -307,9 +339,10 @@ class Comparisons {
           do { label = `Sample ${randomUUID().slice(0, 8)}`; } while (labels.has(label));
           labels.add(label); return { label, slotId };
         });
-        await this.write(record);
       }
-      return this.scoreProjection(record);
+      const projection = this.scoreProjection(record);
+      if (assignLabels) await this.write(record);
+      return projection;
     });
   }
   async rate(input) {
@@ -319,7 +352,7 @@ class Comparisons {
       const record = await this.read(input.id, true);
       if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output. Repair storage before saving feedback.');
       const entry = record.blindOrder?.find(item => item.label === input.displayId), slot = record.slots.find(item => item.id === entry?.slotId);
-      if (!slot || !['completed', 'failed', 'interrupted'].includes(slot.status) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
+      if (!slot || !terminal(slot) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
       const projection = this.scoreProjection(record).outputs.find(item => item.displayId === input.displayId);
       if (projection.candidateDigest !== input.candidateDigest) throw Error('Retained output changed. Inspect it again before saving feedback.');
       const values = { ...rating, reason: rating.reason.trim() };

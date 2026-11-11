@@ -3,7 +3,7 @@
   section.innerHTML = '<h2>Reasoning comparison</h2><p>Inspect three authored synthetic cases against one approved MyTune brief. Creating a comparison makes no model request.</p><label>Comparison brief version<input id="comparison-brief" type="number" min="1" value="1"></label><button id="comparison-create">Create comparison</button><label for="comparison-select">Retained comparison</label><select id="comparison-select"><option value="">Choose comparison</option></select><p id="comparison-error" role="alert"></p><p id="comparison-notice"></p><div id="comparison-cases"></div><label>Reviewed comparison package<textarea id="comparison-package" rows="12" readonly></textarea></label><p id="comparison-preview-summary"></p><button id="comparison-send" disabled>Send reviewed comparison slot</button><div id="comparison-slots"></div>';
   document.querySelector('main').append(section);
   const scoring = document.createElement('div'); scoring.id = 'comparison-score-panel'; scoring.hidden = true;
-  scoring.innerHTML = '<h3>Blind scoring</h3><p id="comparison-score-notice"></p><div id="comparison-rubric"></div><div id="comparison-score"></div><button id="comparison-reveal-button" disabled>Reveal methods and effort</button><div id="comparison-reveal"></div><button id="comparison-inspect">Inspect comparison</button>';
+  scoring.innerHTML = '<h3>Blind scoring</h3><p id="comparison-score-notice"></p><div id="comparison-rubric"></div><div id="comparison-scoring-brief"></div><div id="comparison-score"></div><button id="comparison-reveal-button" disabled>Reveal methods and effort</button><div id="comparison-reveal"></div><button id="comparison-inspect">Inspect comparison</button>';
   section.append(scoring);
   const startScoring = document.createElement('button'); startScoring.id = 'comparison-score-start'; startScoring.textContent = 'Start blind scoring';
   document.getElementById('comparison-notice').after(startScoring);
@@ -75,12 +75,36 @@
       const paragraph = document.createElement('p'); paragraph.textContent = `${dimension.label}: 1 - ${dimension.anchors[0]}; 3 - ${dimension.anchors[1]}; 5 - ${dimension.anchors[2]}. ${dimension.example}`;
       byId('comparison-rubric').append(paragraph);
     }
+    const brief = byId('comparison-scoring-brief'), briefHeading = document.createElement('h4');
+    briefHeading.textContent = `Pinned MyTune brief, version ${result.brief.version}`;
+    brief.replaceChildren(briefHeading);
+    for (const { title, text, references } of result.brief.sections) {
+      const heading = document.createElement('h5'), paragraph = document.createElement('p');
+      heading.textContent = title; paragraph.textContent = text;
+      brief.append(heading, paragraph);
+      if (references.length) {
+        const citations = document.createElement('p');
+        citations.textContent = references.map(({ source, start, end }) => `Source ${source}:L${start}–L${end}`).join(', ');
+        brief.append(citations);
+      }
+    }
     byId('comparison-score').replaceChildren();
     for (const output of result.outputs) {
       const article = document.createElement('article'), heading = document.createElement('h4'), text = document.createElement('pre'), state = document.createElement('p'), feedback = document.createElement('p'), save = document.createElement('button');
       heading.textContent = output.displayId; text.textContent = output.candidate?.text || '';
       state.textContent = `${output.status}. ${output.candidate?.warning || ''} ${output.error || ''}${output.status === 'failed' || output.status === 'interrupted' ? ' Generation failure is not grounded abstention; explain that distinction in the rating reason.' : ''}`;
       article.append(heading, state, text);
+      const caseHeading = document.createElement('h5');
+      caseHeading.textContent = `Synthetic case ${output.evidence.id}, version ${output.evidence.version}`;
+      article.append(caseHeading);
+      for (const { id, text: passage } of output.evidence.passages) {
+        const paragraph = document.createElement('p');
+        paragraph.textContent = `[${id}] ${passage}`;
+        article.append(paragraph);
+      }
+      const limitations = document.createElement('p');
+      limitations.textContent = `Limitations: ${output.evidence.limitations}`;
+      article.append(limitations);
       const key = `${result.id}:${output.displayId}`;
       let draft = drafts.get(key);
       if (!draft || draft.candidateDigest !== output.candidateDigest) { draft = { candidateDigest: output.candidateDigest, values: { ...output.rating } }; drafts.set(key, draft); }
@@ -108,7 +132,8 @@
         try {
           const saved = await window.companion['comparison-rate']({ id: result.id, displayId: output.displayId, candidateDigest: output.candidateDigest, expectedRevision: output.rating?.revision || null, rating });
           if (observedEpoch !== epoch) return;
-          output.rating = saved.outputs[output.displayIndex].rating; draft.values = { ...output.rating }; feedback.textContent = 'Feedback saved'; byId('comparison-reveal-button').disabled = !saved.canReveal;
+          output.rating = saved.outputs.find(item => item.displayId === output.displayId).rating;
+          draft.values = { ...output.rating }; feedback.textContent = 'Feedback saved'; byId('comparison-reveal-button').disabled = !saved.canReveal;
         } finally { if (observedEpoch === epoch) save.disabled = false; }
       });
       article.append(save, feedback); byId('comparison-score').append(article);
