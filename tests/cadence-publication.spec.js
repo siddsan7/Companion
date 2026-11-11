@@ -154,6 +154,39 @@ test('after verified Disable, explicit Enable sets up a fresh schedule for a dif
   expect(await readOptional(file)).toBe(nextBytes);
 });
 
+test('an old worker cannot admit intake or update a replacement schedule record', async () => {
+  const file = path.join(root, 'schedule.json');
+  const oldVault = new Vault(path.join(root, 'vault-A'), 'Companion');
+  const nextVault = new Vault(path.join(root, 'vault-B'), 'Companion');
+  await oldVault.setup();
+  await nextVault.setup();
+  const producer = path.join(root, 'producer-A');
+  await fs.mkdir(producer);
+  await new Intake(oldVault).connect(producer, false, anchor);
+  const schedule = new Schedule(file, oldVault, { testRoot: root });
+  const initial = await schedule.control('enable', anchor);
+  const ledger = path.join(oldVault.root, '.intake', 'ledger.json');
+  const originalLedger = await readOptional(ledger);
+  const replacement = JSON.stringify({ schema: 1, id: randomUUID(), anchor, vault: nextVault.vault, parent: 'Companion', mode: 'enabled' });
+
+  const originalReconcile = Intake.prototype.reconcile;
+  let replaced = false, result;
+  Intake.prototype.reconcile = async function (...args) {
+    if (this.vault.root === oldVault.root) {
+      await fs.writeFile(file, replacement);
+      replaced = true;
+    }
+    return originalReconcile.apply(this, args);
+  };
+  try { result = await schedule.run(now, 'scheduled'); }
+  finally { Intake.prototype.reconcile = originalReconcile; }
+
+  expect(replaced, `record replaced after worker loaded ${initial.id}`).toBe(true);
+  expect(result).toEqual({ skipped: true });
+  expect(await readOptional(file)).toBe(replacement);
+  expect(await readOptional(ledger)).toBe(originalLedger);
+});
+
 test('Configure cannot switch managed parents during native cadence reconnection', async () => {
   const vault = new Vault(path.join(root, 'vault'), 'Companion');
   await vault.setup();
