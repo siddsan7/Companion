@@ -1,5 +1,7 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
+const { ordinaryDirectories, verifyStageSync } = require('./staged-publication');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 function requiredDirectories(intake, targets, preservedWriting = []) {
   const vault = intake.vault, result = new Set();
@@ -36,6 +38,22 @@ async function sourceParents(intake, authority, reviewMissing = false) {
   const result = [];
   for (const name of [...required].sort()) result.push(await directory(intake, name));
   return result;
+}
+function removalParentGuard(vault, directories) {
+  const message = 'Removal folder identity changed. All remaining files were preserved.';
+  return ordinaryDirectories(directories.map(item => path.join(vault.vault, item.file)), message, directories).guard;
+}
+function verifyRemovalTarget(vault, target, survivingPeers, guard, changed) {
+  guard();
+  if (!survivingPeers.includes(target.file)) throw changed();
+  const proof = { dev: target.dev, ino: target.ino, digest: target.sha256 };
+  for (const name of target.peers || [target.file]) {
+    const file = path.join(vault.vault, name);
+    if (survivingPeers.includes(name)) {
+      try { verifyStageSync(file, guard, proof, survivingPeers.length); }
+      catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
+    } else if (local.lstatSync(file, { throwIfNoEntry: false })) throw changed();
+  }
 }
 async function pendingParents(intake, ledger) {
   const pending = Object.values(ledger.sourceAuthority || {}).filter(authority => ['deleting', 'restoring'].includes(authority.phase));
@@ -75,4 +93,4 @@ async function manualLeaf(intake, ledger, id, file, work) {
     throw held(id, authority, `Manual restoration held: ${error.message}`);
   }
 }
-module.exports = { requiredDirectories, directory, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf };
+module.exports = { requiredDirectories, directory, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf, removalParentGuard, verifyRemovalTarget };

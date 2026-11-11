@@ -9,6 +9,7 @@ const { hash } = require('./intake-producer');
 const { uuid } = require('./source-authority');
 const { sourceLink } = require('./repairs');
 const { validateAnnotationRemovals } = require('./annotation-authority');
+const { removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const rel = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 const changed = () => Error('Annotation removal scope changed or contains an unknown copy. Preserve the writing and review again.');
 const strict = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
@@ -189,6 +190,7 @@ class AnnotationRemoval {
   }
   async finish(vault, intake, ledger, id) {
     const authority = ledger.annotationRemovals[id]; validateAnnotationRemovals(ledger);
+    const guard = removalParentGuard(vault, authority.directories);
     const verify = async () => {
       if (await fs.realpath(vault.vault) !== authority.root || !intake.storage.matches(await intake.storage.view())) throw changed();
       for (const expected of authority.directories) if (JSON.stringify(await directory(vault, path.join(vault.vault, expected.file))) !== JSON.stringify(expected)) throw changed();
@@ -216,6 +218,8 @@ class AnnotationRemoval {
       await vault.checkpoint('annotation-removal-before-unlink'); const current = await verify();
       const expected = current.targets.find(item => item.file === target.file), actual = await leaf(vault, path.join(vault.vault, target.file));
       if (!expected || ['sha256', 'dev', 'ino', 'bytes'].some(key => actual[key] !== expected[key]) || actual.links !== expected.peers.length || !intake.storage.matches(await intake.storage.view())) throw changed();
+      intake.storage.guardSync();
+      verifyRemovalTarget(vault, target, expected.peers, guard, changed);
       await fs.unlink(path.join(vault.vault, target.file)); await vault.checkpoint('annotation-removal-unlinked');
     }
     if ((await verify()).targets.length) throw changed();
