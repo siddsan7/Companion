@@ -663,11 +663,13 @@ for (const replaceBackup of [false, true]) {
   });
 }
 
-for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot } of [
+for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot, ordinaryConflict } of [
   { title: 'a new retained-current repair cannot reuse an older deferred conflict witness' },
   { title: 'restart settles a distinct retained-current repair while another restoration is held', restartAtLink: true, withHeldRestoration: true },
   { title: 'a restored snapshot cannot replay a held repair while another restoration is held', restartAtLink: true, withHeldRestoration: true, restoreSnapshot: true },
-  { title: 'a restored snapshot cannot replay a held repair in an ordinary vault', restartAtLink: true, restoreSnapshot: true }
+  { title: 'a restored snapshot cannot replay a held repair in an ordinary vault', restartAtLink: true, restoreSnapshot: true },
+  { title: 'restart settles the first held repair from an ordinary conflict', restartAtLink: true, restoreSnapshot: true, ordinaryConflict: true },
+  { title: 'restart settles the first held repair from an ordinary conflict while another restoration is held', restartAtLink: true, withHeldRestoration: true, restoreSnapshot: true, ordinaryConflict: true }
 ]) test(title, async ({}, testInfo) => {
   const directory = testInfo.outputPath('vault'), reviewRoot = testInfo.outputPath('reviews'), draftRoot = testInfo.outputPath('drafts');
   await fs.mkdir(directory, { recursive: true });
@@ -721,22 +723,32 @@ for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot } of [
   const firstLocal = await fs.readFile(destination);
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(reviewRoot, 'edit'), { recursive: true });
   const firstHold = await intake.reconcile({ now: later });
-  const firstTx = await readJson(path.join(intake.dir, firstHold.blocks[sourceHash].journal));
+  const firstBlock = firstHold.blocks[sourceHash], firstArchive = path.join(intake.dir, firstBlock.journal);
+  const firstTx = await readJson(firstArchive);
   expect(firstTx.retainOnly).toBe(true);
-  const firstWriting = 'Preserve the first local writing.';
-  defer = true;
-  await expect(intake.resolveConflict({ sourceHash, text: firstWriting, localHash: hash(firstLocal) }, later)).rejects.toThrow(/annotation preserved/i);
-  defer = false;
-  const waiting = await readJson(ledgerFile), pending = path.join(intake.dir, waiting.pending[sourceHash].journal);
-  const pendingTx = await readJson(pending), originalPendingIdentity = await identity(pending);
-  expect(pendingTx.keptCurrent.id).toBe(capture.currentRevision);
-  await fs.appendFile(destination, '\nIndependent writing during the deferred repair.\n');
+  let older = firstBlock, priorResolution = firstTx.resolution, olderIdentity = await identity(firstArchive);
+  if (ordinaryConflict) {
+    expect(older.outputHold).toBeUndefined();
+    expect(older.journal).toBe(`conflict-${firstTx.revision.id}.json`);
+  } else {
+    const firstWriting = 'Preserve the first local writing.';
+    defer = true;
+    await expect(intake.resolveConflict({ sourceHash, text: firstWriting, localHash: hash(firstLocal) }, later)).rejects.toThrow(/annotation preserved/i);
+    defer = false;
+    const waiting = await readJson(ledgerFile), pending = path.join(intake.dir, waiting.pending[sourceHash].journal);
+    const pendingTx = await readJson(pending);
+    olderIdentity = await identity(pending);
+    priorResolution = pendingTx.resolution;
+    expect(pendingTx.keptCurrent.id).toBe(capture.currentRevision);
+    await fs.appendFile(destination, '\nIndependent writing during the deferred repair.\n');
+    const deferredHold = await intake.reconcile({ now: later });
+    older = deferredHold.blocks[sourceHash];
+    expect(older.outputHold).toMatchObject({ mode: 'precommit-conflict', committed: false });
+    expect(await readOptional(pending)).toBeNull();
+  }
   const local = await fs.readFile(destination), localIdentity = await identity(destination);
-  const deferredHold = await intake.reconcile({ now: later }), older = deferredHold.blocks[sourceHash];
-  expect(older.outputHold).toMatchObject({ mode: 'precommit-conflict', committed: false });
   const olderArchive = path.join(intake.dir, older.journal), olderBytes = await fs.readFile(olderArchive);
-  expect(await identity(olderArchive)).toEqual(originalPendingIdentity);
-  expect(await readOptional(pending)).toBeNull();
+  expect(await identity(olderArchive)).toEqual(olderIdentity);
   expect(await readOptional(shared)).toBeNull();
 
   const retryWriting = 'Preserve the second local writing.';
@@ -744,7 +756,7 @@ for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot } of [
   const intentFile = path.join(intake.dir, 'repair-intent.json');
   let refusal, activeJournalIdentity;
   if (restartAtLink) {
-    await stopChildIntake(vault.vault, 'held-repair-source-journal', '', shared, { input, snapshot, displaced, priorResolution: pendingTx.resolution });
+    await stopChildIntake(vault.vault, 'held-repair-source-journal', '', shared, { input, snapshot, displaced, priorResolution });
     movedIntent = await readJson(intentFile);
     const retained = path.join(intake.dir, `repair-${movedIntent.annotationId}.json`);
     expect(await fs.readFile(retained)).toEqual(await fs.readFile(intentFile));
@@ -769,7 +781,7 @@ for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot } of [
     expect.soft(await readOptional(intentFile)).toBeNull();
   }
   expect(movedIntent, 'the new repair intent existed before its current reviewed snapshot was removed').toBeDefined();
-  expect(movedIntent.tx.resolution).not.toBe(pendingTx.resolution);
+  expect(movedIntent.tx.resolution).not.toBe(priorResolution);
   await writeDraft(draftRoot, 'independent', '4', 'd');
   const restarted = new Intake(new Vault(vault.vault, 'Companion'));
   const result = await restarted.reconcile({ now: later });
@@ -778,7 +790,7 @@ for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot } of [
   if (restoreSnapshot) {
     const annotations = path.join(vault.root, 'Annotations');
     const names = (await fs.readdir(annotations)).filter(name => name.endsWith('.md'));
-    expect.soft(names).toHaveLength(1);
+    expect.soft(names).toHaveLength(ordinaryConflict ? 0 : 1);
     expect.soft((await Promise.all(names.map(name => fs.readFile(path.join(annotations, name), 'utf8')))).join('\n')).not.toContain(retryWriting);
     expect.soft(await fs.readFile(destination)).toEqual(local);
     expect.soft(result.attempts[movedIntent.tx.revision.identity]).toBeUndefined();
@@ -791,7 +803,7 @@ for (const { title, restartAtLink, withHeldRestoration, restoreSnapshot } of [
   expect(await readOptional(shared)).toBeNull();
   expect(await readOptional(intentFile)).toBeNull();
   expect(await fs.readFile(olderArchive)).toEqual(olderBytes);
-  expect(await identity(olderArchive)).toEqual(originalPendingIdentity);
+  expect(await identity(olderArchive)).toEqual(olderIdentity);
   const intentArchive = await readJson(path.join(intake.dir, `repair-${movedIntent.annotationId}.json`));
   expect(intentArchive).toEqual(movedIntent);
   expect(intentArchive.annotation).toContain(retryWriting);
