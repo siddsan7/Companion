@@ -424,6 +424,18 @@ class Briefs {
     return claims;
   }
   async approvedInventory(index, onlyVersion, lockHeld) {
+    const intake = new (require('./intake').Intake)(this.vault);
+    const reserved = this.vault.reservedRestorationIdentities(await intake.load());
+    const { directories, missing } = intake.storage.expected.parents;
+    const missingLedgerGuard = missing
+      ? ordinaryDirectories(directories.map(directory => directory.file), 'Intake folders changed during brief inspection.', directories).guard
+      : null;
+    const guard = () => {
+      index.guard();
+      if (missingLedgerGuard) verifyAbsentSync(intake.dir, missingLedgerGuard);
+      else intake.storage.guardSync();
+      reserved.verify();
+    };
     const inspected = new Map(), ids = new Set(), canonicalFiles = new Set();
     for (const [version, entry] of index.versions) {
       if (onlyVersion !== undefined && onlyVersion !== version) continue;
@@ -452,7 +464,7 @@ class Briefs {
       if (!inspected.has(version)) inspected.set(version, { error });
     }
     const claims = await this.scanApprovalClaims(ids, canonicalFiles);
-    index.guard();
+    guard();
     const approvals = new Map();
     for (const [version, entry] of inspected) {
       if (entry.error) { approvals.set(version, entry); continue; }
@@ -466,13 +478,16 @@ class Briefs {
       const candidate = canonical || moved[0];
       if (!candidate || !canonical && !receipt) { approvals.set(version, { receipt }); continue; }
       try {
-        verifyStageSync(candidate.file, candidate.guard, candidate.proof);
         const { data, proof, file } = candidate;
+        // A reserved leaf contributes a claim, but cannot supply an approval.
+        const relative = comparable(path.relative(this.vault.vault, file).split(path.sep).join('/'));
+        if (reserved.paths.has(relative)) throw integrityError(path.basename(file));
+        verifyStageSync(file, candidate.guard, proof);
         if (!approvedMetadata(data, version) || receipt && receipt.digest !== proof.digest ||
             data.managed_parent !== undefined && !parentMatches(data.managed_parent, this.managedParent)) {
           throw integrityError(path.basename(file));
         }
-        receipt ||= await this.observeLegacy(version, candidate, index.guard, lockHeld);
+        receipt ||= await this.observeLegacy(version, candidate, guard, lockHeld);
         verifyStageSync(receipt.file, index.guard, receipt.proof);
         verifyStageSync(file, candidate.guard, proof);
         approvals.set(version, { receipt, record: { ...data.record, file: path.relative(this.dir, file), digest: proof.digest } });
@@ -480,6 +495,7 @@ class Briefs {
         approvals.set(version, { error: Error(integrityError(path.basename(candidate.file)).message, { cause: error }) });
       }
     }
+    guard();
     return approvals;
   }
   async readStore({ onlyVersion, lockHeld = false } = {}) {
