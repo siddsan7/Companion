@@ -105,12 +105,14 @@ class Intake {
     await visit(source.folder, guardRoot, 0);
     return found;
   }
-  async scanSource(source, now) {
+  async scanSource(source, now, retained) {
     const guardRoot = producerRootGuard(source);
     const ready = [], outcomes = new Map();
     for (const candidate of await this.candidates(source, guardRoot)) {
       const { folder, guard } = candidate;
       const key = producerOutcomeKey(source, folder);
+      // A local recovery journal owns this slot until its resolution.
+      if (retained.has(key)) continue;
       try {
         if (candidate.error) throw candidate.error;
         const draft = await (source.kind === 'review' ? readReview(folder, guard) : readDraft(folder, guard));
@@ -163,7 +165,7 @@ class Intake {
       ledger.lastCheck = { at: now, trigger, status: 'running' }; await this.save(ledger);
       for (const source of ledger.sources) {
         let scan;
-        try { scan = await this.scanSource(source, now); delete source.error; }
+        try { scan = await this.scanSource(source, now, retained); delete source.error; }
         catch (error) { source.error = error.producerRoot ? error.message : unavailable().message; continue; }
         // Validate all candidates before admitting any: conflicting copies of the
         // same producer attempt are held regardless of directory iteration order.
