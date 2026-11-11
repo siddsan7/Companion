@@ -5,7 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { Intake, noteText } = require('./intake');
 const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
-const { sourceMutation } = require('./source-mutation');
+const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
 const { parse } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf } = require('./source-recovery');
@@ -33,19 +33,20 @@ class CaptureDeletion {
     if (after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size || after.mtimeNs !== stat.mtimeNs) throw changed();
     return { file: relative(vault, file), sha256: hash(bytes), dev: String(stat.dev), ino: String(stat.ino), bytes: String(bytes.length), kind };
   }
-  async inventory(id, retained) {
+  async inventory(id, retained, vault = this.getVault()) {
     if (!uuid(id)) throw Error('Choose a capture to delete.');
-    const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.');
+    if (!vault) throw Error('Choose a vault first.');
+    if (this.getVault() !== vault) throw changed();
     const intake = new Intake(vault), ledger = await intake.load(); validateAuthority(ledger);
     if (ledger.sourceAuthority?.[id] && ledger.sourceAuthority[id].phase !== 'active') throw Error('This capture already has a deletion operation.');
     await globalRecovery(intake, ledger);
     if (ledger.sourceAuthority?.[id]) await sourceParents(intake, ledger.sourceAuthority[id]);
     const entry = Object.entries(ledger.captures).find(([, capture]) => capture.id === id);
-    const notes = (await vault.scan()).filter(note => note.id === id);
-    if (!entry && (notes.length !== 1 || !['thought', 'link'].includes(notes[0].type))) throw changed();
+    const { notes, owned } = await vault.captureInventory({ ledger, id, guardLedger: () => intake.storage.guard() });
+    if (notes.length !== 1 || !owned.has(notes[0]) || !entry && notes[0].type === 'reel_import') throw changed();
     const manual = !entry ? { captureId: id, type: notes[0].type, capturedAt: notes[0].capturedAt, currentHash: hash(notes[0].content), file: path.basename(notes[0].file), relative: relative(vault, notes[0].file) } : undefined;
     const [sourceHash, capture] = entry || [null, { id, title: notes[0].title, currentHash: manual.currentHash, revisions: [] }];
-    if (notes.length !== 1 || manual && hash(notes[0].content) !== capture.currentHash) throw changed();
+    if (manual && hash(notes[0].content) !== capture.currentHash) throw changed();
     const mixed = !manual ? await mixedDeletion.inventory(intake, ledger, capture, sourceHash, notes[0], retained, this.clock?.().now || new Date().toISOString()) : null;
     let targets = mixed ? mixed.targets : [await this.target(vault, notes[0].file, 'capture', !manual)]; const revisions = new Map();
     for (const revisionId of mixed ? [] : capture.revisions) {
@@ -83,11 +84,15 @@ class CaptureDeletion {
     const annotations = (await vault.scan({ annotations: true })).filter(note => note.captureId === id).map(note => ({ id: note.id, file: relative(vault, note.file), text: note.content }));
     await inspectManualPeers(vault, { captureId: id }, new Set([...(imported?.titleProofs || manualTitles?.titleProofs || []).map(proof => proof.before), ...pendingTitle.sidecars(imported?.titleRecovery)]));
     const dependents = await deletionDependents.inventory(vault, this.conversations, id);
-    if (!intake.storage.matches(await intake.storage.view())) throw changed();
-    return { id, root: await fs.realpath(vault.vault), ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
+    const root = await fs.realpath(vault.vault);
+    if (!intake.storage.matches(await intake.storage.view()) || this.getVault() !== vault) throw changed();
+    return { id, root, managedRoot: vault.root, ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
   }
   async preview(id) {
-    const inventory = await this.inventory(id), token = randomUUID(); this.previews.set(token, inventory);
+    const vault = this.getVault();
+    if (!vault) throw Error('Choose a vault first.');
+    const inventory = await sourceInspection(vault.root, () => this.inventory(id, undefined, vault));
+    const token = randomUUID(); this.previews.set(token, inventory);
     return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations, dependents: inventory.dependents.rows, ...(inventory.retainedWriting ? { retainedWriting: inventory.retainedWriting } : {}) };
   }
   cancel(token) { this.previews.delete(token); }
@@ -276,15 +281,16 @@ class CaptureDeletion {
   async confirm(token) {
     const selected = this.previews.get(token); if (!selected) throw Error('Preview capture deletion again.');
     const vault = this.getVault();
+    if (!vault || vault.root !== selected.managedRoot) throw changed();
     return this.conversations.lock(() => sourceMutation(vault.root, async () => {
-      const fresh = await this.inventory(selected.id, selected);
+      const fresh = await this.inventory(selected.id, selected, vault);
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw changed();
       const acquired = [];
       try {
         for (const target of fresh.targets.filter(target => target.kind === 'capture')) { const file = path.join(vault.vault, target.file); await vault.acquire(file); acquired.push(file); }
-        if (JSON.stringify(await this.inventory(selected.id, selected)) !== JSON.stringify(selected)) throw changed();
+        if (JSON.stringify(await this.inventory(selected.id, selected, vault)) !== JSON.stringify(selected)) throw changed();
         const intake = new Intake(vault), ledger = await intake.load();
-        if (JSON.stringify(intake.storage.expected.identity) !== JSON.stringify(fresh.ledgerIdentity)) throw changed();
+        if (JSON.stringify(intake.storage.expected.identity) !== JSON.stringify(fresh.ledgerIdentity) || this.getVault() !== vault) throw changed();
         ledger.sourceAuthority ||= {};
         const operationId = fresh.preservedWriting?.[0]?.publicationOperationId || randomUUID(), purged = new Map((fresh.purgedProducerAttempts || []).map(item => [item.identity, item]));
         for (const item of fresh.observations || []) {

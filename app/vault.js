@@ -5,8 +5,11 @@ const YAML = require('yaml');
 const { sourceMutation } = require('./source-mutation');
 const { assertPublication } = require('./source-authority');
 const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
+const { captureOwners, comparable, ownerWarning, parentOf, storeName } = require('./legacy-capture-ownership');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
+const artifactAreas = ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions'];
+const comparableRelative = value => comparable(process.platform === 'win32' ? value.replace(/\\/g, '/') : value);
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
 const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
@@ -24,15 +27,17 @@ async function noteLock(file, guard) {
   try { process.kill(owner.pid, 0); } catch (error) { if (error.code === 'ESRCH') live = false; }
   return { ...lock, live, legacy: Object.keys(owner).length === 1, publication: owner.publication };
 }
-function markdown(note) {
-  return `---\ncompanion_id: ${JSON.stringify(note.id)}\nartifact_type: "capture"\nschema_version: 1\ncapture_type: ${JSON.stringify(note.type)}\ncaptured_at: ${JSON.stringify(note.capturedAt)}\ntitle: ${JSON.stringify(note.title)}\nsource_url: ${JSON.stringify(note.url || '')}\nprovenance: ${JSON.stringify(note.excerpt ? 'user-supplied excerpt; webpage not verified' : 'user capture')}\n---\n\n# ${note.title.replace(/[\r\n]/g, ' ')}\n\n${note.text}\n${note.excerpt ? `\n## User-supplied excerpt\n\n${note.excerpt}\n\nSource URL (as entered): ${note.url}\n\nThis excerpt was supplied by the user. Companion did not fetch or verify the webpage.\n` : ''}`;
+function markdown(note, parent) {
+  return `---\ncompanion_id: ${JSON.stringify(note.id)}\nartifact_type: "capture"\nschema_version: 1\nmanaged_parent: ${JSON.stringify(parent)}\ncapture_type: ${JSON.stringify(note.type)}\ncaptured_at: ${JSON.stringify(note.capturedAt)}\ntitle: ${JSON.stringify(note.title)}\nsource_url: ${JSON.stringify(note.url || '')}\nprovenance: ${JSON.stringify(note.excerpt ? 'user-supplied excerpt; webpage not verified' : 'user capture')}\n---\n\n# ${note.title.replace(/[\r\n]/g, ' ')}\n\n${note.text}\n${note.excerpt ? `\n## User-supplied excerpt\n\n${note.excerpt}\n\nSource URL (as entered): ${note.url}\n\nThis excerpt was supplied by the user. Companion did not fetch or verify the webpage.\n` : ''}`;
 }
 function parse(text) {
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return null;
   let fields; try { fields = YAML.parse(match[1]); } catch { return null; }
   if (!fields || typeof fields !== 'object' || typeof fields.companion_id !== 'string' || !fields.companion_id.trim() || /[\r\n]/.test(fields.companion_id) || fields.artifact_type !== 'capture' || fields.schema_version !== 1 || !['thought', 'link', 'reel_import'].includes(fields.capture_type) || typeof fields.title !== 'string' || !fields.title.trim() || /[\r\n]/.test(fields.title) || typeof fields.captured_at !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(fields.captured_at) || !Number.isFinite(Date.parse(fields.captured_at))) return null;
-  return { id: fields.companion_id, title: fields.title, type: fields.capture_type, capturedAt: fields.captured_at, content: text };
+  const note = { id: fields.companion_id, title: fields.title, type: fields.capture_type, capturedAt: fields.captured_at, content: text };
+  if (Object.hasOwn(fields, 'managed_parent')) note.managedParent = fields.managed_parent;
+  return note;
 }
 function parseAnnotation(text) {
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
@@ -72,7 +77,7 @@ class Vault {
     await fs.mkdir(this.vault, { recursive: true });
     const relative = path.relative(this.vault, this.root).split(path.sep); let current = this.vault;
     for (const segment of relative) { current = path.join(current, segment); await fs.mkdir(current).catch(error => { if (error.code !== 'EEXIST') throw error; }); await this.contained(current); }
-    for (const area of ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions']) { const target = path.join(this.root, area); await fs.mkdir(target).catch(error => { if (error.code !== 'EEXIST') throw error; }); await this.contained(target); }
+    for (const area of artifactAreas) { const target = path.join(this.root, area); await fs.mkdir(target).catch(error => { if (error.code !== 'EEXIST') throw error; }); await this.contained(target); }
   }
   async writable() { await this.contained(this.root); await this.contained(path.join(this.root, 'Captures')); }
   publicationFolders(directory, expected) {
@@ -109,7 +114,7 @@ class Vault {
     const visit = async dir => {
       await this.contained(dir);
       for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home'].includes(entry.name.toLowerCase())) continue;
+        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home', storeName].includes(entry.name.toLowerCase())) continue;
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
@@ -125,6 +130,30 @@ class Vault {
   async list() {
     return sourceMutation(this.root, () => this.listOwned());
   }
+  matchesManualParent(note) {
+    return note.type !== 'reel_import' && typeof note.managedParent === 'string' &&
+      comparable(note.managedParent) === comparable(parentOf(this.vault, this.root));
+  }
+  async captureInventory({ ledger, guardLedger, id } = {}) {
+    const all = await this.scan();
+    const notes = id ? all.filter(note => note.id === id) : all;
+    if (!ledger) {
+      const intake = new (require('./intake').Intake)(this);
+      ledger = await intake.load();
+      guardLedger = () => intake.storage.guard();
+    }
+    const imported = new Set(Object.values(ledger.captures).map(capture => capture.id));
+    const excluded = new Set(notes.filter(note => {
+      const relative = comparableRelative(path.relative(this.vault, note.file));
+      return ledger.identityChoices?.[note.id]?.copies.some(copy => typeof copy.file === 'string' && comparableRelative(copy.file) === relative);
+    }));
+    const { owned: legacy, held } = await captureOwners(this, notes, imported, excluded, ledger.sourceAuthority, guardLedger);
+    if (!id) this.warnings = this.warnings.filter(warning => warning !== ownerWarning);
+    if (held && !this.warnings.includes(ownerWarning)) this.warnings.push(ownerWarning);
+    const repairable = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
+    const owned = new Set([...repairable].filter(note => !excluded.has(note)));
+    return { notes, owned, repairable, excluded };
+  }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();
     await require('./source-recovery').pendingParents(intake, ledger);
@@ -135,12 +164,13 @@ class Vault {
     await this.writable();
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Invalid capture metadata in '));
     await this.recover(dir);
-    const notes = await this.scan();
-    for (const note of notes) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
+    const { notes, owned } = await this.captureInventory();
     const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
-    const visible = notes.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
+    const eligible = notes.filter(note => owned.has(note));
+    for (const note of eligible) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
+    const visible = eligible.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Duplicate capture identity.'));
-    if (notes.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
+    if (eligible.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
     return visible.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
   }
   async find(id) { const note = (await this.list()).find(note => note.id === id); if (!note) throw Error('Capture is missing. Restore it before editing.'); return note; }
@@ -154,7 +184,7 @@ class Vault {
     if (input.excerpt && type !== 'link') throw Error('An excerpt requires a source URL in Thought or link.');
     const note = { id: randomUUID(), type, capturedAt: new Date(now).toISOString(), title: text.trim().split(/\r?\n/)[0].slice(0, 90), text, excerpt: input.excerpt || '', url: type === 'link' ? text : null };
     const slug = note.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Capture';
-    const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note), stage = `${file}.pending`;
+    const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note, parentOf(this.vault, this.root)), stage = `${file}.pending`;
     const { guard, identities } = this.publicationFolders(path.dirname(file));
     const staged = await writeStage(stage, content, guard);
     const publication = { kind: 'capture', staged, identities };
