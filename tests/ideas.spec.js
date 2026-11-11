@@ -640,6 +640,43 @@ test('an explicitly chosen conflict revision keeps its saved idea dependency and
   await expect(page.getByLabel('Source inspection').getByRole('button', { name: 'Open linked saved idea in Obsidian: Interpret the explicit imported revision', exact: true })).toBeVisible();
 });
 
+test('a conversation from an explicit conflict revision can be archived and its transcript inspected', async () => {
+  await completedConversation({ imported: true, localConflict: true });
+  const history = path.join(root, 'conversations');
+  const [name] = (await fs.readdir(history)).filter(file => file.endsWith('.json'));
+  const original = JSON.parse(await fs.readFile(path.join(history, name), 'utf8'));
+  const dependency = original.requests[0].package.dependencies.find(dep => dep.revisionId);
+  expect(dependency).toMatchObject({ key: expect.stringMatching(/^capture:/), digest: expect.stringMatching(/^[a-f0-9]{64}$/) });
+
+  const archive = path.join(root, 'explicit-conflict-history.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archive }));
+  await page.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  const exportArchive = page.getByRole('button', { name: 'Export reviewed archive', exact: true });
+  await expect.soft(exportArchive).toBeEnabled({ timeout: 5000 });
+  if (await exportArchive.isEnabled()) {
+    await exportArchive.click();
+    await expect(page.locator('#archive-summary')).toContainText('Archive exported');
+    const saved = JSON.parse(await fs.readFile(archive, 'utf8'));
+    expect(saved.payload.conversations).toEqual([original]);
+  }
+
+  const transcript = path.join(root, 'vault', 'Explicit conflict transcript.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: transcript }));
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  const markdown = page.getByLabel('Proposed transcript Markdown', { exact: true });
+  await expect(markdown).toHaveValue(new RegExp(dependency.digest));
+  const text = await markdown.inputValue();
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  expect(await fs.readFile(transcript, 'utf8')).toBe(text);
+  const exports = page.getByLabel('Retained transcript export', { exact: true });
+  const entry = exports.locator('option').filter({ hasText: 'Explicit conflict transcript.md' });
+  await expect(entry).toHaveCount(1, { timeout: 5000 });
+  await exports.selectOption(await entry.getAttribute('value'));
+  await page.getByRole('button', { name: 'Preview transcript removal', exact: true }).click();
+  await expect(page.getByLabel('Transcript removal review')).toContainText('Explicit conflict transcript.md');
+});
+
 test('an explicitly selected imported evidence citation opens its original revision after a reviewed update', async () => {
   test.setTimeout(120000);
   await completedConversation({ imported: true });
