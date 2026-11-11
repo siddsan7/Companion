@@ -7,6 +7,8 @@ const { assertPublication } = require('./source-authority');
 const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
+const portable = relative => relative.split(path.sep).join('/');
+const comparable = value => process.platform === 'win32' ? value.toLowerCase() : value;
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
 const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
@@ -24,15 +26,17 @@ async function noteLock(file, guard) {
   try { process.kill(owner.pid, 0); } catch (error) { if (error.code === 'ESRCH') live = false; }
   return { ...lock, live, legacy: Object.keys(owner).length === 1, publication: owner.publication };
 }
-function markdown(note) {
-  return `---\ncompanion_id: ${JSON.stringify(note.id)}\nartifact_type: "capture"\nschema_version: 1\ncapture_type: ${JSON.stringify(note.type)}\ncaptured_at: ${JSON.stringify(note.capturedAt)}\ntitle: ${JSON.stringify(note.title)}\nsource_url: ${JSON.stringify(note.url || '')}\nprovenance: ${JSON.stringify(note.excerpt ? 'user-supplied excerpt; webpage not verified' : 'user capture')}\n---\n\n# ${note.title.replace(/[\r\n]/g, ' ')}\n\n${note.text}\n${note.excerpt ? `\n## User-supplied excerpt\n\n${note.excerpt}\n\nSource URL (as entered): ${note.url}\n\nThis excerpt was supplied by the user. Companion did not fetch or verify the webpage.\n` : ''}`;
+function markdown(note, parent) {
+  return `---\ncompanion_id: ${JSON.stringify(note.id)}\nartifact_type: "capture"\nschema_version: 1\nmanaged_parent: ${JSON.stringify(parent)}\ncapture_type: ${JSON.stringify(note.type)}\ncaptured_at: ${JSON.stringify(note.capturedAt)}\ntitle: ${JSON.stringify(note.title)}\nsource_url: ${JSON.stringify(note.url || '')}\nprovenance: ${JSON.stringify(note.excerpt ? 'user-supplied excerpt; webpage not verified' : 'user capture')}\n---\n\n# ${note.title.replace(/[\r\n]/g, ' ')}\n\n${note.text}\n${note.excerpt ? `\n## User-supplied excerpt\n\n${note.excerpt}\n\nSource URL (as entered): ${note.url}\n\nThis excerpt was supplied by the user. Companion did not fetch or verify the webpage.\n` : ''}`;
 }
 function parse(text) {
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   if (!match) return null;
   let fields; try { fields = YAML.parse(match[1]); } catch { return null; }
   if (!fields || typeof fields !== 'object' || typeof fields.companion_id !== 'string' || !fields.companion_id.trim() || /[\r\n]/.test(fields.companion_id) || fields.artifact_type !== 'capture' || fields.schema_version !== 1 || !['thought', 'link', 'reel_import'].includes(fields.capture_type) || typeof fields.title !== 'string' || !fields.title.trim() || /[\r\n]/.test(fields.title) || typeof fields.captured_at !== 'string' || !/T.*(?:Z|[+-]\d\d:\d\d)$/.test(fields.captured_at) || !Number.isFinite(Date.parse(fields.captured_at))) return null;
-  return { id: fields.companion_id, title: fields.title, type: fields.capture_type, capturedAt: fields.captured_at, content: text };
+  const note = { id: fields.companion_id, title: fields.title, type: fields.capture_type, capturedAt: fields.captured_at, content: text };
+  if (Object.hasOwn(fields, 'managed_parent')) note.managedParent = fields.managed_parent;
+  return note;
 }
 function parseAnnotation(text) {
   const match = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
@@ -125,6 +129,17 @@ class Vault {
   async list() {
     return sourceMutation(this.root, () => this.listOwned());
   }
+  ownsManual(note, authority) {
+    if (!['thought', 'link'].includes(note.type)) return false;
+    if (Object.hasOwn(note, 'managedParent')) {
+      return typeof note.managedParent === 'string' && comparable(note.managedParent) === comparable(portable(path.relative(this.vault, this.root)));
+    }
+    // Older quick captures carry no parent. Accept their original layout or an
+    // exact manual capture already admitted by this parent's deletion ledger.
+    if (comparable(path.dirname(note.file)) === comparable(path.join(this.root, 'Captures'))) return true;
+    return authority?.phase === 'active' && authority.manual?.captureId === note.id &&
+      authority.manual.relative === portable(path.relative(this.vault, note.file)) && authority.manual.currentHash === hash(note.content);
+  }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();
     await require('./source-recovery').pendingParents(intake, ledger);
@@ -136,11 +151,14 @@ class Vault {
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Invalid capture metadata in '));
     await this.recover(dir);
     const notes = await this.scan();
-    for (const note of notes) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
     const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
-    const visible = notes.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
+    const legacyOutside = notes.some(note => note.type !== 'reel_import' && !Object.hasOwn(note, 'managedParent') && !this.ownsManual(note));
+    const authority = legacyOutside ? (await new (require('./intake').Intake)(this).load()).sourceAuthority : undefined;
+    const owned = notes.filter(note => note.type === 'reel_import' || this.ownsManual(note, authority?.[note.id]));
+    for (const note of owned) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
+    const visible = owned.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Duplicate capture identity.'));
-    if (notes.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
+    if (owned.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
     return visible.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
   }
   async find(id) { const note = (await this.list()).find(note => note.id === id); if (!note) throw Error('Capture is missing. Restore it before editing.'); return note; }
@@ -154,7 +172,7 @@ class Vault {
     if (input.excerpt && type !== 'link') throw Error('An excerpt requires a source URL in Thought or link.');
     const note = { id: randomUUID(), type, capturedAt: new Date(now).toISOString(), title: text.trim().split(/\r?\n/)[0].slice(0, 90), text, excerpt: input.excerpt || '', url: type === 'link' ? text : null };
     const slug = note.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Capture';
-    const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note), stage = `${file}.pending`;
+    const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note, portable(path.relative(this.vault, this.root))), stage = `${file}.pending`;
     const { guard, identities } = this.publicationFolders(path.dirname(file));
     const staged = await writeStage(stage, content, guard);
     const publication = { kind: 'capture', staged, identities };

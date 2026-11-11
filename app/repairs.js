@@ -27,7 +27,9 @@ function install(Intake, { hash, read, noteText }) {
     const notes = await this.vault.scan(), annotations = await this.annotations(), ledger = await this.load();
     ledger.identityIssues = {}; ledger.identityChoices ||= {}; this.vault.identityPaths = new Map();
     const groups = new Map(); for (const note of notes) { if (!groups.has(note.id)) groups.set(note.id, []); groups.get(note.id).push(note); }
+    const importedIds = new Set(Object.values(ledger.captures).map(capture => capture.id));
     for (const [id, matches] of groups) {
+      if (!importedIds.has(id) && !matches.some(note => this.vault.ownsManual(note, ledger.sourceAuthority?.[id]) || note.type === 'reel_import')) continue;
       const choice = ledger.identityChoices[id];
       if (matches.length === 1 && !choice?.copies.some(copy => copy.file === path.relative(this.vault.vault, matches[0].file))) continue;
       const files = matches.map(note => ({ file: path.relative(this.vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
@@ -110,6 +112,10 @@ function install(Intake, { hash, read, noteText }) {
       await this.syncMoves(); const ledger = await this.load(), issue = ledger.identityIssues[id];
       if (!issue || issue.token !== token || !issue.files.some(item => item.file === file)) throw Error('Identity copies changed. Refresh and inspect all copies before choosing.');
       const selected = this.destination({ relative: file }); await this.ownedFile(selected, [], 'Selected identity file');
+      if (!id.startsWith('annotation:') && !Object.values(ledger.captures).some(capture => capture.id === id)) {
+        const note = (await this.vault.scan()).find(candidate => candidate.file === selected && candidate.id === id);
+        if (!note || note.type !== 'reel_import' && !this.vault.ownsManual(note, ledger.sourceAuthority?.[id])) throw Error('Choose a capture that belongs to the selected managed parent. Other copies were preserved.');
+      }
       ledger.identityChoices[id] = { file, copies: issue.files.filter(item => item.file !== file) };
       await this.save(ledger); await this.syncMoves();
     });
