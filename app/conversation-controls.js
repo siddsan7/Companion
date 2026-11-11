@@ -5,10 +5,12 @@ const { createHash, randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { setTimeout: wait } = require('node:timers/promises');
 const { conversation } = require('./archive-format');
+const { writeStage, verifyStage, verifyStageSync, verifyAbsentSync, removeLinkedStage } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const fields = (value, allowed) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key));
+const rawProof = ({ owned, rawDigest }) => ({ dev: owned.dev, ino: owned.ino, digest: rawDigest });
 
 // Local controls are authority, not archived conversation content. Never infer consent from absence.
 class ConversationControls {
@@ -131,65 +133,61 @@ class ConversationControls {
     if (JSON.stringify(scope) === JSON.stringify(marker.scope)) return;
     await this.settlePublication(marker); await this.put({ ...marker, scope }, marker);
   }
-  async replace(stage, file, directory, staged, current, revalidate, assertSelection) {
-    const guard = () => {
-      this.store.safeDirectory(false, directory.parent);
-      this.guard(false, directory.stat);
-    };
-    const verify = async (file, expected, owned = expected.owned) => {
-      const observed = await this.file(file, directory, owned, 1, true, true);
-      if (observed.rawDigest !== expected.rawDigest) throw Error('Conversation control bytes changed. Preserve the control files for review.');
-    };
+  async replace(stage, file, guard, staged, current, revalidate, assertSelection) {
+    const retry = process.platform === 'win32' && typeof revalidate === 'function';
     const deadline = performance.now() + 1000;
     let delay = 15, lastRefusal;
     while (true) {
       guard();
       if (lastRefusal && performance.now() >= deadline) throw lastRefusal;
       assertSelection();
+      verifyStageSync(file, guard, current);
+      verifyStageSync(stage, guard, staged);
       try { await fs.rename(stage, file); }
       catch (error) {
         const remaining = deadline - performance.now();
-        if (error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
+        if (!retry || error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
         lastRefusal = error;
         await wait(Math.min(delay, remaining));
         if (performance.now() >= deadline) throw error;
         guard();
         await revalidate();
-        await verify(stage, staged);
-        await verify(file, current);
+        await verifyStage(stage, guard, staged);
+        await verifyStage(file, guard, current);
         delay = Math.min(delay * 2, 100);
         continue;
       }
       // Verify the exact publication. Leave any unexpected files for inspection.
-      await verify(file, staged, { ...staged.owned, name: path.basename(file) });
-      guard();
+      await verifyStage(file, guard, staged);
+      verifyStageSync(file, guard, staged);
       return;
     }
   }
-  async put(marker, baseline, revalidate, assertSelection = () => {}) {
+  async put(marker, baseline, revalidate, assertSelection = () => {}, publication) {
     assertSelection();
     const directory = this.guard(true), file = path.join(directory.directory, `${marker.id}.json`);
     const value = { ...marker, publication: randomUUID() }, text = JSON.stringify(value, null, 2), stage = path.join(directory.directory, `${value.publication}.pending`);
     this.validate(value, value.id);
-    this.guard(false, directory.stat); await fs.writeFile(stage, text, { flag: 'wx', flush: true });
-    this.guard(false, directory.stat);
+    const guard = () => {
+      this.store.safeDirectory(false, directory.parent);
+      this.guard(false, directory.stat);
+    };
+    const staged = await writeStage(stage, text, guard);
     if (baseline) {
-      // Retry only where the caller can revalidate the already confirmed transition.
-      const retry = process.platform === 'win32' && typeof revalidate === 'function';
-      const staged = retry ? await this.file(stage, directory, null, 1, true, true) : null;
-      if (staged && staged.rawDigest !== hash(text)) throw Error('Conversation control stage changed. Preserve it for review.');
-      const current = await this.file(file, directory, null, 1, true, retry);
+      const current = await this.file(file, directory, null, 1, true, true);
       if (JSON.stringify(JSON.parse(current.text)) !== JSON.stringify(baseline)) throw Error('Conversation authority changed. Preserve the control stage for review.');
-      if (retry) await this.replace(stage, file, directory, staged, current, revalidate, assertSelection);
-      else { assertSelection(); await fs.rename(stage, file); }
+      await this.replace(stage, file, guard, staged, rawProof(current), revalidate, assertSelection);
     } else {
       assertSelection();
-      await fs.link(stage, file);
-      const a = await this.file(stage, directory, null, 2, true), b = await this.file(file, directory, null, 2, true);
-      if (!same(a.stat, b.stat) || a.text !== text || b.text !== text) throw Error('Conversation control publication changed. Preserve both peers.');
-      this.guard(false, directory.stat); await fs.unlink(stage);
+      verifyStageSync(stage, guard, staged);
+      local.linkSync(stage, file);
+      await removeLinkedStage(stage, file, guard, staged, assertSelection);
     }
-    this.guard(false, directory.stat); this.known.add(marker.id); return value;
+    if (publication) await publication.check();
+    verifyStageSync(file, guard, staged);
+    this.known.add(marker.id);
+    publication?.commit();
+    return value;
   }
   async inventory(id) {
     if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve the unsaved reply or finish the active request before deleting this conversation.');
@@ -278,12 +276,21 @@ class ConversationControls {
   }
   async settlePublication(marker, assertSelection = () => {}) {
     const directory = this.guard(), file = path.join(directory.directory, `${marker.id}.json`), stat = await fs.lstat(file);
+    const guard = () => {
+      assertSelection();
+      this.store.safeDirectory(false, directory.parent);
+      this.guard(false, directory.stat);
+    };
+    guard();
     if (stat.nlink === 1) return;
     if (stat.nlink !== 2) throw Error('Conversation control has unknown linked peers. Preserve them before recovery.');
     const stage = path.join(directory.directory, `${marker.publication}.pending`);
-    const a = await this.file(file, directory, null, 2, true), b = await this.file(stage, directory, null, 2, true);
-    if (!same(a.stat, b.stat) || a.text !== b.text || JSON.stringify(JSON.parse(a.text)) !== JSON.stringify(marker)) throw Error('Conversation control publication changed. Unknown peers remain preserved.');
-    this.guard(false, directory.stat); assertSelection(); await fs.unlink(stage);
+    const a = await this.file(file, directory, null, 2, true, true), b = await this.file(stage, directory, null, 2, true, true);
+    if (!same(a.stat, b.stat) || a.rawDigest !== b.rawDigest || JSON.stringify(JSON.parse(a.text)) !== JSON.stringify(marker)) throw Error('Conversation control publication changed. Unknown peers remain preserved.');
+    const proof = rawProof(a);
+    await removeLinkedStage(stage, file, guard, proof);
+    verifyAbsentSync(stage, guard);
+    verifyStageSync(file, guard, proof);
   }
   async restorationSnapshot(id, { expectedParent, exactBytes = false } = {}) {
     const marker = await this.state(id);
@@ -301,7 +308,7 @@ class ConversationControls {
     const text = (staged || published).text, record = conversation(JSON.parse(text));
     if (hash(text) !== marker.restoration.recordDigest || record.id !== id || record.generation !== marker.generation || record.vault.root !== this.store.getVault()?.root || JSON.stringify({ excludedSources: record.scope?.excludedSources, excludedHistory: record.scope?.excludedHistory }) !== JSON.stringify(marker.scope)) throw Error('Restoration ownership or retained exclusion authority changed. Preserve the payload for review.');
     if (exactBytes && [staged, published].some(file => file && file.rawDigest !== marker.restoration.recordDigest)) throw Error('Restoration payload bytes changed. Preserve the payload for review.');
-    return { restoration: true, id, marker, stageExists, destinationExists, text };
+    return { restoration: true, id, marker, stageExists, destinationExists, text, vaultRoot: record.vault.root };
   }
   async verifyRestorationComplete(marker, parent) {
     const current = await this.restorationSnapshot(marker.id, { expectedParent: parent, exactBytes: true });
@@ -329,21 +336,50 @@ class ConversationControls {
       return { token, id, generation: snapshot.marker.generation, archiveId: snapshot.marker.restoration.archiveId, targets: snapshot.marker.targets.map(target => target.name), text: snapshot.text };
     });
   }
+  async restorationMarkerGuard(marker, guard) {
+    guard();
+    const directory = this.guard(), control = path.join(directory.directory, `${marker.id}.json`);
+    const saved = await this.file(control, directory, null, 1, true, true);
+    if (JSON.stringify(JSON.parse(saved.text)) !== JSON.stringify(marker)) throw Error('Restoration authority changed. Preserve the exact payload for review.');
+    const controlProof = rawProof(saved);
+    const controlGuard = () => { guard(); this.guard(false, directory.stat); };
+    return () => { verifyStageSync(control, controlGuard, controlProof); };
+  }
   async finishRestoration(snapshot) {
-    const { marker } = snapshot; await this.settlePublication(marker);
+    const { marker, vaultRoot } = snapshot;
     const parent = this.store.safeDirectory(), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), target = marker.targets.find(target => target.name.endsWith('.json'));
     const stage = path.join(this.store.directory, stageTarget.name), destination = path.join(this.store.directory, target.name);
+    const guard = () => {
+      this.store.safeDirectory(false, parent);
+      if (!vaultRoot || this.store.getVault()?.root !== vaultRoot) throw Error('The restoration vault selection changed. Preserve the payload for review.');
+    };
+    guard();
+    await this.settlePublication(marker, guard);
+    const verifyMarker = await this.restorationMarkerGuard(marker, guard);
+    const proof = { dev: stageTarget.dev, ino: stageTarget.ino, digest: marker.restoration.recordDigest };
     if (!snapshot.destinationExists) {
-      await this.file(stage, parent, stageTarget); this.store.safeDirectory(false, parent);
-      await fs.link(stage, destination); this.store.safeDirectory(false, parent);
+      await this.file(stage, parent, stageTarget);
+      verifyMarker();
+      verifyStageSync(stage, guard, proof);
+      local.linkSync(stage, destination);
+      guard();
       await this.store.checkpoint('archive-restore-after-link');
     }
-    const current = await this.restorationSnapshot(marker.id);
+    const current = await this.restorationSnapshot(marker.id, { expectedParent: parent, exactBytes: true });
     if (JSON.stringify(current.marker) !== JSON.stringify(marker) || current.text !== snapshot.text) throw Error('Restoration authority changed. Preserve the exact payload for review.');
-    if (current.stageExists) { this.store.safeDirectory(false, parent); await fs.unlink(stage); }
+    if (current.stageExists) await removeLinkedStage(stage, destination, guard, proof, verifyMarker);
     await this.store.checkpoint('archive-restore-before-active');
     await this.file(destination, parent, target);
-    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker, () => this.verifyRestorationComplete(marker, parent));
+    const verifyPayload = () => {
+      verifyAbsentSync(stage, guard);
+      verifyStageSync(destination, guard, proof);
+    };
+    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker,
+      () => this.verifyRestorationComplete(marker, parent), () => {
+        verifyMarker();
+        verifyPayload();
+      });
+    verifyPayload();
     this.store.tokens.clear(); this.store.durable.set(marker.id, marker.restoration.recordDigest);
     return { id: marker.id, generation: active.generation };
   }

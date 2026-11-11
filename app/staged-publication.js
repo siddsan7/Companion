@@ -102,24 +102,46 @@ async function verifyPeers(stage, destination, guard, proof) {
   await verifyStage(destination, guard, proof, 2);
 }
 
-async function removeStage(file, guard, proof, links = 1) {
-  await verifyStage(file, guard, proof, links);
-  guard();
-  await fs.unlink(file);
+function verifyPeersSync(stage, destination, guard, proof) {
+  verifyStageSync(stage, guard, proof, 2);
+  verifyStageSync(destination, guard, proof, 2);
 }
 
-async function settlePublishedLink(stage, destination, guard, proof) {
+function verifyAbsentSync(file, guard, error = changed) {
+  guard();
+  try { local.lstatSync(file); }
+  catch (failure) { if (failure.code === 'ENOENT') return; throw failure; }
+  throw error();
+}
+
+async function removeStage(file, guard, proof, links = 1, verifyRelated = () => {}) {
+  await verifyStage(file, guard, proof, links);
+  verifyRelated();
+  verifyStageSync(file, guard, proof, links);
+  local.unlinkSync(file);
+}
+
+async function removeLinkedStage(stage, destination, guard, proof, verifyRelated = () => {}) {
+  await removeStage(stage, guard, proof, 2, () => {
+    verifyRelated();
+    verifyStageSync(destination, guard, proof, 2);
+  });
+}
+
+async function settlePublishedLink(stage, destination, guard, proof, verifyRelated = () => {}) {
   guard();
   const links = (await fs.lstat(destination, { bigint: true })).nlink;
   if (links === 2n) {
     await verifyPeers(stage, destination, guard, proof);
-    await removeStage(stage, guard, proof, 2);
-  } else {
-    await verifyStage(destination, guard, proof);
-    const stagePresent = await fs.lstat(stage).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-    if (stagePresent) throw changed();
+    await removeLinkedStage(stage, destination, guard, proof, verifyRelated);
   }
   await verifyStage(destination, guard, proof);
+  verifyRelated();
+  verifyAbsentSync(stage, guard);
+  verifyStageSync(destination, guard, proof);
 }
 
-module.exports = { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyPeers, removeStage, validProof, settlePublishedLink };
+module.exports = {
+  ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
+  verifyPeers, verifyPeersSync, removeStage, removeLinkedStage, validProof, settlePublishedLink
+};
