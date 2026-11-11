@@ -80,15 +80,16 @@ for (const [boundary, name] of Object.entries(titleRefusals)) test(name, async (
   const observation = path.join(root, 'title-publication-refusal.json');
   if (boundary !== 'substitution') await app.evaluate((_, { root, current, stage, boundary, observation }) => {
     if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Title rollback refusal requires a disposable import fixture.');
-    const io = process.getBuiltinModule('fs').promises;
-    const operation = boundary === 'cleanup' ? 'unlink' : 'link', native = io[operation];
-    io[operation] = async function (file, ...args) {
+    const io = process.getBuiltinModule('fs');
+    const operation = boundary === 'cleanup' ? 'unlink' : 'link';
+    const method = operation + 'Sync', native = io[method];
+    io[method] = function (file, ...args) {
       const expected = boundary === 'active' ? file === stage : file.startsWith(current + '.restore-title-') && file.endsWith('.pending');
       if (!expected || operation === 'link' && args[0] !== current) return native.call(this, file, ...args);
-      const staged = await io.lstat(file, { bigint: true });
-      const output = await io.lstat(current, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-      const bytes = await io.readFile(file);
-      await io.writeFile(observation, JSON.stringify({ file, same: output !== null && staged.dev === output.dev && staged.ino === output.ino, links: String(staged.nlink), bytes: bytes.toString('base64') }));
+      const staged = io.lstatSync(file, { bigint: true });
+      const output = io.lstatSync(current, { bigint: true, throwIfNoEntry: false });
+      const bytes = io.readFileSync(file);
+      io.writeFileSync(observation, JSON.stringify({ file, same: !!output && staged.dev === output.dev && staged.ino === output.ino, links: String(staged.nlink), bytes: bytes.toString('base64') }));
       throw Object.assign(Error('Temporary imported title ' + boundary + ' refusal.'), { code: 'EACCES', syscall: operation });
     };
   }, { root, current, stage, boundary, observation });

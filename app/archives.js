@@ -6,7 +6,7 @@ const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveInte
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { readNoteScope, changeNoteScope } = require('./note-scope');
-const { ordinaryDirectories, writeStage, verifyStage, verifyPeers, removeStage } = require('./staged-publication');
+const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyPeers, verifyPeersSync, removeStage, removeLinkedStage } = require('./staged-publication');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
@@ -532,12 +532,14 @@ class Archives {
     this.history.tokens.clear(); this.history.durable.delete(record.id);
     await this.checkpoint('archive-restore-after-reservation');
     await controls.file(stage, directory, staged.owned);
-    assertSelection(); guard(); await fs.link(stage, destination); guard();
+    const selected = () => { assertSelection(); guard(); };
+    verifyStageSync(stage, selected, proof);
+    local.linkSync(stage, destination);
+    guard();
     await this.checkpoint('archive-restore-after-link');
     const a = await controls.file(stage, directory, staged.owned, 2), b = await controls.file(destination, directory, target, 2);
     if (!same(a.stat, b.stat) || a.text !== text || b.text !== text || canonical(await controls.state(record.id)) !== canonical(marker)) throw Error('Restoration publication changed. Preserve both copies and local authority for explicit recovery.');
-    await verifyStage(stage, guard, proof, 2);
-    assertSelection(); guard(); await fs.unlink(stage);
+    await removeLinkedStage(stage, destination, selected, proof);
     await this.checkpoint('archive-restore-before-active');
     assertSelection();
     await controls.file(destination, directory, target);
@@ -564,11 +566,15 @@ class Archives {
       staged = await writeStage(stage, text, () => { assertSelection(); guard(); });
       if (checkpoint) await this.checkpoint(checkpoint);
       await verifyStage(stage, guard, staged);
-      assertSelection(); guard(); await fs.link(stage, destination); linked = true;
+      verifyStageSync(stage, () => { assertSelection(); guard(); }, staged);
+      local.linkSync(stage, destination);
+      linked = true;
       await verifyPeers(stage, destination, guard, staged);
+      verifyPeersSync(stage, destination, guard, staged);
       committed();
-      await removeStage(stage, guard, staged, 2);
+      await removeLinkedStage(stage, destination, guard, staged);
       await verifyStage(destination, guard, staged);
+      verifyStageSync(destination, guard, staged);
     } finally { if (staged && !linked) await removeStage(stage, guard, staged).catch(() => {}); }
   }
   async publish(destination, text) {

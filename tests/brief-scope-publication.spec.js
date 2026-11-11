@@ -1,5 +1,6 @@
 const { test: base, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
@@ -245,9 +246,9 @@ test('direct note inclusion settles an exact published archive receipt before ch
   const matched = await call('archive-match', { id: inspected.id, matched: true, settingsMode: 'review-note-inclusions' });
   expect(matched.noteCandidates).toEqual([expect.objectContaining({ file: archived })]);
 
-  const unlink = fs.unlink;
+  const unlink = local.unlinkSync;
   let retainedStage;
-  fs.unlink = async target => {
+  local.unlinkSync = target => {
     if (path.dirname(target) === path.dirname(scopeFile) && /^notes-.*\.tmp$/.test(path.basename(target))) {
       retainedStage = target;
       throw Object.assign(Error('Controlled cleanup refusal for the published archive stage.'), { code: 'EACCES' });
@@ -256,7 +257,7 @@ test('direct note inclusion settles an exact published archive receipt before ch
   };
   try {
     await expect(call('archive-restore', { token: matched.token, noteFiles: [archived] })).rejects.toThrow(/restored 1 reviewed note inclusion/i);
-  } finally { fs.unlink = unlink; }
+  } finally { local.unlinkSync = unlink; }
   expect(retainedStage).toBeDefined();
   expect((await fs.lstat(scopeFile)).nlink).toBe(2);
   expect(await fs.readFile(retainedStage)).toEqual(scopeBytes([archived]));

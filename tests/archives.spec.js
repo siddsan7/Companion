@@ -715,14 +715,14 @@ for (const beforeLink of [false, true]) test(beforeLink ?
   if (beforeLink) await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: firstLink }));
   else await app.evaluate((_, { root, scope, scopeDirectory, observation }) => {
     if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Cleanup refusal requires a disposable archive fixture.');
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path');
-    const unlink = io.unlink;
-    io.unlink = async function (file, ...args) {
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path');
+    const unlink = io.unlinkSync;
+    io.unlinkSync = function (file, ...args) {
       if (paths.dirname(file) !== scopeDirectory || !/^notes-[a-f0-9-]+\.tmp$/.test(paths.basename(file))) return unlink.call(this, file, ...args);
-      const stage = await io.lstat(file, { bigint: true });
-      const published = await io.lstat(scope, { bigint: true });
-      const bytes = await io.readFile(file);
-      await io.writeFile(observation, JSON.stringify({ stage: file, same: stage.dev === published.dev && stage.ino === published.ino, links: String(stage.nlink), bytes: bytes.toString('base64') }));
+      const stage = io.lstatSync(file, { bigint: true });
+      const published = io.lstatSync(scope, { bigint: true });
+      const bytes = io.readFileSync(file);
+      io.writeFileSync(observation, JSON.stringify({ stage: file, same: stage.dev === published.dev && stage.ino === published.ino, links: String(stage.nlink), bytes: bytes.toString('base64') }));
       throw Object.assign(Error('Temporary reviewed note stage cleanup refusal.'), { code: 'EACCES', syscall: 'unlink' });
     };
   }, { root, scope, scopeDirectory, observation });

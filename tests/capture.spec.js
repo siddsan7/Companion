@@ -136,11 +136,11 @@ test('interrupted quick capture keeps exact recovery proof through a temporary l
     const refused = path.join(root, 'capture-recovery-link-refusal.json');
     await app.evaluate((_, { root, stage, destination, refused }) => {
       if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Link refusal requires a disposable capture fixture.');
-      const io = process.getBuiltinModule('fs').promises, native = io.link;
-      io.link = async function (from, to) {
+      const io = process.getBuiltinModule('fs'), native = io.linkSync;
+      io.linkSync = function (from, to) {
         if (from !== stage || to !== destination) return native.call(this, from, to);
-        const observed = await io.lstat(from, { bigint: true });
-        await io.writeFile(refused, JSON.stringify({ from, to, ino: String(observed.ino) }));
+        const observed = io.lstatSync(from, { bigint: true });
+        io.writeFileSync(refused, JSON.stringify({ from, to, ino: String(observed.ino) }));
         throw Object.assign(Error('Temporary recovery link refusal.'), { code: 'EACCES', syscall: 'link' });
       };
     }, { root, stage, destination, refused });
@@ -509,14 +509,15 @@ for (const failure of ['link', 'cleanup']) test('active title recovers exactly a
   const observation = path.join(root, 'active-title-io-refusal.json');
   await app.evaluate((_, { root, stage, file, observation, failure }) => {
     if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Title refusal requires a disposable capture fixture.');
-    const io = process.getBuiltinModule('fs').promises;
-    const operation = failure === 'link' ? 'link' : 'unlink', native = io[operation];
-    io[operation] = async function (from, to, ...args) {
+    const io = process.getBuiltinModule('fs');
+    const operation = failure === 'link' ? 'link' : 'unlink';
+    const method = operation + 'Sync', native = io[method];
+    io[method] = function (from, to, ...args) {
       if (from !== stage || operation === 'link' && to !== file) return native.call(this, from, ...(operation === 'link' ? [to, ...args] : []));
-      const staged = await io.lstat(stage, { bigint: true });
-      const current = await io.lstat(file, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-      const bytes = await io.readFile(stage);
-      await io.writeFile(observation, JSON.stringify({ operation, links: String(staged.nlink), same: current !== null && current.dev === staged.dev && current.ino === staged.ino, bytes: bytes.toString('base64') }));
+      const staged = io.lstatSync(stage, { bigint: true });
+      const current = io.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+      const bytes = io.readFileSync(stage);
+      io.writeFileSync(observation, JSON.stringify({ operation, links: String(staged.nlink), same: !!current && current.dev === staged.dev && current.ino === staged.ino, bytes: bytes.toString('base64') }));
       throw Object.assign(Error('Temporary active title ' + failure + ' refusal.'), { code: 'EACCES', syscall: operation });
     };
   }, { root, stage, file, observation, failure });
