@@ -25,7 +25,7 @@ async function launch(configure = true, parent = 'Companion') {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation({ imported = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
+async function completedConversation({ imported = false, localConflict = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario || { reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
   await launch(true, parent);
   if (imported) {
@@ -53,9 +53,20 @@ async function completedConversation({ imported = false, twoCaptures = false, sc
   await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
   const question = imported ? 'What does the synthetic review support for MyTune?' : 'How could retrieval help MyTune?';
+  if (localConflict) {
+    const captures = path.join(root, 'vault', parent || 'Companion', 'Captures');
+    const [file] = (await fs.readdir(captures)).filter(name => name.endsWith('.md'));
+    await fs.appendFile(path.join(captures, file), '\nIndependent local conflict writing.\n');
+  }
   await page.getByLabel('Context question', { exact: true }).fill(question);
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
-  await page.locator('#context-results article').filter({ hasText: imported ? 'Authored synthetic review' : 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  if (localConflict) {
+    await expect(page.locator('#context-results')).not.toContainText('Authored synthetic review');
+    await page.getByLabel('Manual context source', { exact: true }).selectOption({ label: 'Imported revision (conflict): Authored synthetic review' });
+    await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  } else {
+    await page.locator('#context-results article').filter({ hasText: imported ? 'Authored synthetic review' : 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  }
   if (twoCaptures) {
     await page.getByLabel('Manual context source', { exact: true }).selectOption({ label: 'A practice queue makes a delayed revisit visible.' });
     await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
@@ -605,6 +616,28 @@ test('Saved idea completion waits for its source inspection before the next expl
       finally { gate.restore(); delete globalThis.__ideaSaveCompletion; }
     });
   }
+});
+
+test('an explicitly chosen conflict revision keeps its saved idea dependency and exact citation', async () => {
+  await completedConversation({ imported: true, localConflict: true });
+  const revisions = path.join(root, 'vault', 'Companion', 'Revisions');
+  const [name] = (await fs.readdir(revisions)).filter(file => file.endsWith('.json'));
+  const snapshot = JSON.parse(await fs.readFile(path.join(revisions, name), 'utf8'));
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Interpret the explicit imported revision');
+  const citation = page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true });
+  await expect.soft(citation).toBeVisible({ timeout: 5000 });
+  if (await citation.isVisible()) await citation.check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  const preview = page.getByLabel('Proposed idea Markdown', { exact: true });
+  await expect(preview).toHaveValue(/source_dependencies:/);
+  const fields = YAML.parse((await preview.inputValue()).match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect.soft(fields.source_dependencies).toEqual([expect.objectContaining({ capture_id: snapshot.captureId, revision_id: snapshot.id })]);
+  expect.soft(fields.citations).toEqual([expect.objectContaining({ capture_id: snapshot.captureId, revision_id: snapshot.id, evidence_id: 'a1' })]);
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea.');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection').getByRole('button', { name: 'Open linked saved idea in Obsidian: Interpret the explicit imported revision', exact: true })).toBeVisible();
 });
 
 test('an explicitly selected imported evidence citation opens its original revision after a reviewed update', async () => {

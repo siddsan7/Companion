@@ -243,6 +243,30 @@ test('external writing survives restart and transfers to an annotation before in
   await expect.soft(page.locator('#source-details')).toBeEmpty();
 });
 
+test('changing the vault retires an explicit conflict selection and its context preview', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  const captures = path.join(root, 'vault', 'Companion', 'Captures');
+  const [name] = (await fs.readdir(captures)).filter(file => file.endsWith('.md'));
+  await fs.appendFile(path.join(captures, name), '\nPrivate old-vault conflict writing.\n');
+  await page.getByLabel('Context question', { exact: true }).fill('Private old-vault conflict writing');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  const local = manual.locator('option').filter({ hasText: 'Local writing (conflict):' });
+  await manual.selectOption(await local.getAttribute('value'));
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const preview = page.getByLabel('Actual context package', { exact: true });
+  await expect(preview).toHaveValue(/Private old-vault conflict writing/);
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.locator('#parent').fill('Another managed parent');
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect.soft(preview).toHaveValue('', { timeout: 5000 });
+  await expect.soft(page.locator('#context-selected')).toBeEmpty({ timeout: 5000 });
+  await expect.soft(local).toHaveCount(0, { timeout: 5000 });
+  await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeDisabled();
+});
+
 test('independent annotations stay linked and unchanged after a source revision', async () => {
   await artifact(); await launch(); await setup(); await connect(true);
   await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
