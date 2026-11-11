@@ -42,7 +42,7 @@ async function afterProofClose(select, change, operation) {
     const close = handle.close.bind(handle);
     handle.close = async () => {
       await close();
-      if (reached || !await select(file)) return;
+      if (reached || !await select(file, flags)) return;
       reached = true;
       await change(file);
     };
@@ -55,8 +55,8 @@ async function afterProofClose(select, change, operation) {
   } finally { fs.open = open; }
 }
 
-async function displace(file, replacement = foreign) {
-  const original = await fs.readFile(file), parked = `${file}.displaced`;
+async function displace(file, replacement = foreign, parked = `${file}.displaced`) {
+  const original = await fs.readFile(file);
   await fs.rename(file, parked);
   await fs.writeFile(file, replacement, { flag: 'wx' });
   return { file, parked, original };
@@ -333,8 +333,7 @@ test('restoration recovery keeps a replacement control stage out of the first ac
   expect(await fs.readFile(fixture.destination)).toEqual(fixture.payload);
 });
 
-test('initial archive restoration cannot activate a changed final payload at control publication', async ({ localVault }) => {
-  const { root, vault } = localVault;
+async function matchedGenerationArchive({ root, vault }) {
   const readme = path.join(root, 'README.md');
   await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
   const briefs = new Briefs(vault), { proposed } = await briefs.propose([readme], now);
@@ -361,19 +360,54 @@ test('initial archive restoration cannot activate a changed final payload at con
   expect(matched.newGenerations).toBe(1);
   const control = path.join(archive.history.directory, '.control', `${id}.json`);
   const destination = path.join(archive.history.directory, `${id}.json`);
+  return {
+    id, control, destination, history: archive.history, beforeActive: () => beforeActive,
+    confirm: () => archive.call('archive-restore', { token: matched.token })
+  };
+}
+
+test('initial archive restoration cannot activate a changed final payload at control publication', async ({ localVault }) => {
+  const { id, control, destination, beforeActive, confirm } = await matchedGenerationArchive(localVault);
   let restoring, replacement;
-  const result = await afterProofClose(async candidate => beforeActive && candidate === control && !!await activeControlStage(control),
+  const result = await afterProofClose(async candidate => beforeActive() && candidate === control && !!await activeControlStage(control),
     async () => {
       restoring = await fs.readFile(control);
       replacement = await displace(destination);
     },
-    () => archive.call('archive-restore', { token: matched.token }));
+    confirm);
 
   expect.soft(result?.message).toMatch(/restor|stag|chang|publication/i);
   expect.soft(await fs.readFile(control)).toEqual(restoring);
   expect(JSON.parse(restoring)).toMatchObject({ phase: 'restoring' });
   expect(await fs.readFile(destination)).toEqual(foreign);
   expect(JSON.parse(await fs.readFile(replacement.parked))).toMatchObject({ id, generation: JSON.parse(restoring).generation });
+});
+
+test('initial archive restoration reports when the active marker changes during its final control read', async ({ localVault }) => {
+  const { id, control, destination, history, beforeActive, confirm } = await matchedGenerationArchive(localVault);
+  const check = history.controls.check;
+  let checking = false, replacement, payload;
+  history.controls.check = async function (...args) {
+    checking = true;
+    try { return await check.apply(this, args); }
+    finally { checking = false; }
+  };
+  let result;
+  try {
+    result = await afterProofClose((candidate, flags) => beforeActive() && checking && candidate === control && flags === 'r',
+      async () => {
+        payload = await fs.readFile(destination);
+        replacement = await displace(control, foreign, path.join(localVault.root, 'original-active-control.json'));
+      }, confirm);
+  } finally { history.controls.check = check; }
+
+  expect.soft(result?.message).toMatch(/Restored 0 conversations/);
+  expect(await fs.readFile(control)).toEqual(foreign);
+  expect(await fs.readFile(replacement.parked)).toEqual(replacement.original);
+  const active = JSON.parse(replacement.original);
+  expect(active).toMatchObject({ id, phase: 'active' });
+  expect(active.restoration.recordDigest).toBe(createHash('sha256').update(payload).digest('hex'));
+  expect(await fs.readFile(destination)).toEqual(payload);
 });
 
 test('linked conversation control cleanup preserves a replaced stage', async ({ localVault }) => {
