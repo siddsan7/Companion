@@ -79,6 +79,8 @@ const integrityError = name => Error(`Approved brief integrity check failed: ${n
 const duplicateError = () => Error('Duplicate approved brief version. Preserve the files and resolve their identity before pinning.');
 const comparable = value => process.platform === 'win32' ? value.toLowerCase() : value;
 const parentMatches = (recorded, expected) => typeof recorded === 'string' && comparable(recorded) === comparable(expected);
+const validParent = value => typeof value === 'string' && !/[\\<>:"|?*\0]/.test(value) &&
+  value.split('/').every(part => part && part !== '.' && part !== '..');
 
 function metadata(bytes) {
   const match = bytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
@@ -149,14 +151,19 @@ class Briefs {
     try {
       const { bytes, proof } = await readExact(file, guard);
       const data = metadata(bytes);
-      if (!checksumName.test(name) && data?.record?.version !== version &&
-          approvedMetadata(data, data?.record?.version)) return null;
+      const recordedVersion = data?.record?.version;
+      const valid = approvedMetadata(data, recordedVersion);
+      const checksumClaim = checksumName.test(name);
       const checksumMatches = name === `approved-${version}-${proof.digest}.md`;
-      const readableRename = !checksumName.test(name) && receipt &&
+      if (!checksumClaim && valid && recordedVersion !== version) return null;
+      const owner = data?.managed_parent;
+      const foreign = valid && validParent(owner) && !parentMatches(owner, this.managedParent) &&
+        receipt?.id !== data.record.id && (!checksumClaim || checksumMatches);
+      if (foreign) return null;
+      const readableRename = !checksumClaim && receipt &&
         receipt.id === data?.record?.id && receipt.digest === proof.digest;
-      if ((!checksumMatches && !readableRename) || !approvedMetadata(data, version) ||
-          !receipt && data.managed_parent !== undefined ||
-          data.managed_parent !== undefined && !parentMatches(data.managed_parent, this.managedParent)) throw integrityError(name);
+      if ((!checksumMatches && !readableRename) || !valid || recordedVersion !== version ||
+          owner !== undefined && (!receipt || !parentMatches(owner, this.managedParent))) throw integrityError(name);
       return { file, proof, data, guard };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
@@ -226,6 +233,7 @@ class Briefs {
           if (canonical) throw duplicateError();
           canonical = claim;
         }
+        if (!receipt && !canonical) continue;
         const id = receipt?.id || canonical?.data.record.id;
         if (id) ids.add(id);
         if (receipt && canonical && (receipt.id !== canonical.data.record.id || receipt.digest !== canonical.proof.digest)) {
