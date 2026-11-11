@@ -5,7 +5,7 @@ const YAML = require('yaml');
 const { Intake } = require('./intake');
 const { sourceInspection } = require('./source-mutation');
 const { Briefs } = require('./briefs');
-const { withBriefMutation } = require('./briefs-lock');
+const { readNoteScope, changeNoteScope } = require('./note-scope');
 const { scanIdeas } = require('./idea-inventory');
 const { createHash, randomUUID } = require('node:crypto');
 const { revisionAdmission } = require('./source-authority');
@@ -51,10 +51,11 @@ function passages(text, terms) {
   return found.sort((a, b) => b.matched.length - a.matched.length || a.start - b.start);
 }
 class Context {
-  constructor(vault, { scopeFile, dependencyValidator = validateDependencies, verifiedInputBound = null, capacityBinding = null, approvals = new Map(), ideaEligibility = rawIdeaEligibility } = {}) { this.vault = vault; this.scopeFile = scopeFile; this.dependencyValidator = dependencyValidator; this.verifiedInputBound = verifiedInputBound; this.capacityBinding = capacityBinding; this.approvals = approvals; this.ideaEligibility = ideaEligibility; }
+  constructor(vault, { scopeFile, dependencyValidator = validateDependencies, verifiedInputBound = null, capacityBinding = null, approvals = new Map(), ideaEligibility = rawIdeaEligibility, assertSelection = () => {} } = {}) {
+    Object.assign(this, { vault, scopeFile, dependencyValidator, verifiedInputBound, capacityBinding, approvals, ideaEligibility, assertSelection });
+  }
   async scope() {
-    try { const scope = JSON.parse(await fs.readFile(this.scopeFile, 'utf8')); if (scope.schema !== 1 || !Array.isArray(scope.files) || scope.files.some(file => typeof file !== 'string')) throw Error('Invalid explicit note scope. Preserve settings for repair.'); return scope.files; }
-    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+    return (await readNoteScope(this.scopeFile, { assertSelection: this.assertSelection }))?.value.files || [];
   }
   async note(file) {
     if (!path.isAbsolute(file) || !/\.(md|txt)$/i.test(file)) throw Error('Choose a Markdown or text note in the selected vault.');
@@ -68,16 +69,16 @@ class Context {
     if (metadata && typeof metadata === 'object' && (Object.hasOwn(metadata, 'companion_id') || ['capture', 'annotation', 'saved_idea', 'project_brief', 'conversation_transcript'].includes(metadata.artifact_type))) throw Error('Managed artifact metadata cannot bypass context eligibility through note inclusion.');
     return { key: `note:${digest(file)}`, title: path.basename(file), text, provenance: `Explicit vault note ${path.basename(file)}; sha256 ${digest(text)}; user selected; not independently verified`, digest: digest(text) };
   }
-  async changeScope(update) {
-    const directory = path.dirname(this.scopeFile); await fs.mkdir(directory, { recursive: true });
+  async changeScope(update, revalidate = async () => {}) {
     try {
-      return await withBriefMutation(directory, async () => {
-        const files = update(await this.scope()), stage = path.join(directory, `notes-${randomUUID()}.tmp`);
-        try {
-          await fs.writeFile(stage, JSON.stringify({ schema: 1, files }, null, 2), { flag: 'wx', flush: true });
+      return await changeNoteScope(this.scopeFile, {
+        update,
+        assertSelection: this.assertSelection,
+        beforePublish: async () => {
           await this.vault.checkpoint('context-before-scope-publish');
-          await fs.rename(stage, this.scopeFile);
-        } finally { await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+          this.assertSelection();
+          await revalidate();
+        }
       });
     } catch (error) {
       if (error.message.startsWith('Project Brief store is busy')) throw Error('Explicit note scope is busy in another Companion window. Keep the selection and retry after that operation finishes.');
@@ -86,8 +87,12 @@ class Context {
   }
   async include(files) {
     if (!Array.isArray(files)) throw Error('Choose explicit vault notes.');
-    for (const file of files) await this.note(file);
-    await this.changeScope(current => [...new Set([...current, ...files])]);
+    const validate = async () => {
+      this.assertSelection();
+      for (const file of files) await this.note(file);
+    };
+    await validate();
+    await this.changeScope(current => [...new Set([...current, ...files])], validate);
   }
   async exclude(key) { await this.changeScope(current => current.filter(file => `note:${digest(file)}` !== key)); }
   async corpus() {
@@ -301,23 +306,34 @@ class Context {
 function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvidence, getVerifiedInputBound = async () => null, ideaEligibility = rawIdeaEligibility }) {
   let chain = Promise.resolve(); const approvals = new Map();
   const serial = work => { const next = chain.then(work); chain = next.catch(() => {}); return next; };
-  const store = async () => {
-    const vault = getVault(); if (!vault) throw Error('Choose a vault first.');
+  const selectedVault = () => { const selected = getVault(); if (!selected) throw Error('Choose a vault first.'); return selected; };
+  const store = async (vault = selectedVault()) => {
+    const assertSelection = () => { if (getVault() !== vault) throw Error('Vault selection changed. Select the reviewed vault and try again.'); };
+    assertSelection();
     const evidence = getEvidence ? await getEvidence() : null;
     let verifiedInputBound = evidence ? evidence.capacity : await getVerifiedInputBound();
     // Controlled OS/provider-boundary evidence only; never accepted from renderer input.
     if (testRoot && !getEvidence) try { verifiedInputBound = JSON.parse(await fs.readFile(path.join(testRoot, 'context-bound.json'), 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
-    return new Context(vault, { scopeFile: path.join(dataRoot, `context-settings-${digest(vault.root)}`, 'notes.json'), verifiedInputBound, capacityBinding: evidence?.binding || null, approvals, ideaEligibility });
+    assertSelection();
+    return new Context(vault, { scopeFile: path.join(dataRoot, `context-settings-${digest(vault.root)}`, 'notes.json'), verifiedInputBound, capacityBinding: evidence?.binding || null, approvals, ideaEligibility, assertSelection });
   };
   ipcMain.handle('context-find', async (_, input) => (await store()).discover(input));
   ipcMain.handle('context-passage', async (_, input) => (await store()).approvePassage(input));
   ipcMain.handle('context-shorten', async (_, input) => (await store()).approveShortening(input));
   ipcMain.handle('context-preview', async (_, input) => (await store()).preview(input));
-  ipcMain.handle('context-include', () => serial(async () => {
-    const files = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'context-selection.json'), 'utf8')) : (await dialog.showOpenDialog({ title: 'Explicitly include vault notes', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Vault notes', extensions: ['md', 'txt'] }] })).filePaths;
-    await (await store()).include(files); return true;
-  }));
-  ipcMain.handle('context-exclude', (_, key) => serial(async () => (await store()).exclude(key)));
+  ipcMain.handle('context-include', () => {
+    const vault = selectedVault();
+    return serial(async () => {
+      const context = await store(vault);
+      const files = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'context-selection.json'), 'utf8')) : (await dialog.showOpenDialog({ title: 'Explicitly include vault notes', properties: ['openFile', 'multiSelections'], filters: [{ name: 'Vault notes', extensions: ['md', 'txt'] }] })).filePaths;
+      await context.include(files);
+      return true;
+    });
+  });
+  ipcMain.handle('context-exclude', (_, key) => {
+    const vault = selectedVault();
+    return serial(async () => (await store(vault)).exclude(key));
+  });
   return { store, clearApprovals: () => approvals.clear() };
 }
 module.exports = { Context, installContext, validateDependencies };

@@ -1,9 +1,12 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const YAML = require('yaml');
 const { withBriefMutation } = require('./briefs-lock');
+const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyPeers, removeStage } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
+const sourceByteLimit = 128000;
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 const instant = value => typeof value === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
 const titles = ['Project purpose', 'Current behavior', 'Constraints', 'Known limitations', 'Questions worth exploring'];
@@ -39,8 +42,37 @@ function markdown(record) {
   const metadata = YAML.stringify({ artifact_type: 'project_brief', schema_version: 1, record });
   return `---\n${metadata}---\n\n# MyTune brief — ${record.kind}${record.version ? ` version ${record.version}` : ''}\n\nOffline source extraction; edited statements are user writing, not model verification.\n\n${record.sections.map(s => `## ${s.title}\n\n${s.text}\n\n${s.references.map(r => `[${path.basename(record.sources[r.source].path)}:L${r.start}-L${r.end}](#source-${r.source + 1}) (source ${r.source + 1}, sha256 ${record.sources[r.source].sha256})`).join('\n')}`).join('\n\n')}\n\n# Selected source snapshots\n\n${record.sources.map((s, i) => `## Source ${i + 1}\n\n${s.path}\n\nsha256: ${s.sha256}\n\n${s.text}`).join('\n\n')}\n`;
 }
+
+function finalSourceDigest(file) {
+  if (!local.statSync(file).isFile()) return null;
+  const descriptor = local.openSync(file, 'r');
+  try {
+    const before = local.fstatSync(descriptor, { bigint: true });
+    if (!before.isFile() || before.size > BigInt(sourceByteLimit)) return null;
+    const bytes = Buffer.alloc(Number(before.size) + 1);
+    let used = 0;
+    while (used < bytes.length) {
+      const count = local.readSync(descriptor, bytes, used, bytes.length - used, used);
+      if (!count) break;
+      used += count;
+    }
+    const after = local.fstatSync(descriptor, { bigint: true }), leaf = local.statSync(file, { bigint: true });
+    const same = stat => stat.isFile() && stat.dev === before.dev && stat.ino === before.ino && stat.size === before.size &&
+      stat.mtimeNs === before.mtimeNs && stat.ctimeNs === before.ctimeNs;
+    return BigInt(used) === before.size && same(after) && same(leaf) ? hash(bytes.subarray(0, used)) : null;
+  } finally { local.closeSync(descriptor); }
+}
+
+function blockStaleApproval(issues) {
+  if (issues.length) throw Error(`Refresh approval blocked. ${issues.join(' ')} Restore or explicitly replace the source, then propose again.`);
+}
+
 class Briefs {
-  constructor(vault) { this.vault = vault; this.dir = path.join(vault.root, 'Briefs'); }
+  constructor(vault, { assertSelection = () => {} } = {}) {
+    this.vault = vault;
+    this.dir = path.join(vault.root, 'Briefs');
+    this.assertSelection = assertSelection;
+  }
   async safe() { await this.vault.contained(this.vault.root); await this.vault.contained(this.dir); if ((await fs.lstat(this.dir)).isSymbolicLink()) throw Error('Briefs folder is a link. Choose an ordinary folder inside the vault.'); }
   async records(onlyVersion) {
     await this.safe(); const records = [];
@@ -62,16 +94,46 @@ class Briefs {
     return records;
   }
   async write(record, name) {
-    await this.safe(); const stage = path.join(this.dir, `.brief-stage-${randomUUID()}`);
-    try { await fs.writeFile(stage, markdown(record), { flag: 'wx', flush: true }); await this.safe(); if (record.kind === 'approved') await this.vault.checkpoint('brief-before-approval-publish'); await fs.link(stage, path.join(this.dir, name)); }
-    finally { await fs.unlink(stage).catch(() => { /* A leftover stage is ignored; publication success stays success. */ }); }
+    this.assertSelection();
+    await this.safe();
+    const stage = path.join(this.dir, `.brief-stage-${randomUUID()}`), destination = path.join(this.dir, name);
+    const { guard } = ordinaryDirectories([this.vault.vault, this.dir], 'The Briefs folder changed or is an alias. Files were preserved for inspection.');
+    const selected = () => { this.assertSelection(); guard(); };
+    let staged, linked = false;
+    try {
+      staged = await writeStage(stage, markdown(record), selected);
+      if (record.kind === 'approved') {
+        await this.vault.checkpoint('brief-before-approval-publish');
+        selected();
+        await this.requireCurrentSources(record);
+      }
+      await verifyStage(stage, selected, staged);
+      verifyStageSync(stage, selected, staged);
+      if (record.kind === 'approved') {
+        const issues = [];
+        for (const source of record.sources) {
+          try { if (finalSourceDigest(source.path) !== source.sha256) issues.push(`Changed source: ${source.path}`); }
+          catch { issues.push(`Missing or unreadable source: ${source.path}`); }
+        }
+        blockStaleApproval(issues);
+      }
+      selected();
+      local.linkSync(stage, destination);
+      linked = true;
+      await verifyPeers(stage, destination, guard, staged);
+      try { await removeStage(stage, guard, staged, 2); }
+      catch (error) { throw Error(`The Project Brief was published, but stage cleanup could not be verified. Inspect the saved version before retrying. ${error.message}`); }
+      await verifyStage(destination, guard, staged);
+    } finally {
+      if (staged && !linked) await removeStage(stage, guard, staged).catch(() => {});
+    }
   }
   async readSources(paths) {
     if (!Array.isArray(paths) || !paths.length || paths.some(p => typeof p !== 'string' || !path.isAbsolute(p))) throw Error('Select the current MyTune README first.');
     const sources = []; let size = 0;
     for (const file of paths) {
       const stat = await fs.stat(file); if (!stat.isFile()) throw Error(`Source is not a document: ${file}`);
-      if (stat.size > 128000) throw Error(`Source exceeds local brief limit: ${file}. Nothing was shortened. Select a smaller document explicitly.`);
+      if (stat.size > sourceByteLimit) throw Error(`Source exceeds local brief limit: ${file}. Nothing was shortened. Select a smaller document explicitly.`);
       const bytes = await fs.readFile(file); const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       const front = text.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
       if (front && YAML.parse(front[1])?.artifact_type === 'conversation_transcript') throw Error('Conversation transcripts are historical dialogue and cannot be used as opaque project brief inputs.');
@@ -101,6 +163,9 @@ class Briefs {
     }
     return issues;
   }
+  async requireCurrentSources(record) {
+    blockStaleApproval(await this.outdated(record));
+  }
   async state() {
     const records = await this.records(); const approved = records.filter(r => r.kind === 'approved').sort((a, b) => b.version - a.version);
     const proposed = records.filter(r => r.kind === 'proposal').sort((a, b) => b.ordinal - a.ordinal)[0];
@@ -111,7 +176,7 @@ class Briefs {
     return withBriefMutation(this.vault.root, async () => {
       const records = await this.records(), proposed = records.find(r => r.kind === 'proposal' && r.id === id);
       if (!proposed || proposed.digest !== digest) throw Error('Proposal changed. Inspect it again.');
-      const issues = await this.outdated(proposed); if (issues.length) throw Error(`Refresh approval blocked. ${issues.join(' ')} Restore or explicitly replace the source, then propose again.`);
+      await this.requireCurrentSources(proposed);
       const latestAttempt = records.filter(r => r.kind !== 'approved').sort((a, b) => b.ordinal - a.ordinal)[0];
       if (latestAttempt?.kind === 'failure') throw Error('Refresh approval blocked. Resolve the failed refresh and propose again.');
       if (records.some(r => r.kind === 'approved' && r.id === id)) return this.state();
