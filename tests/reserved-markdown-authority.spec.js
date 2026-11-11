@@ -107,7 +107,7 @@ test('reserved restoration direct reads cannot offer an exact foreign capture ci
   expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
 });
 
-for (const claim of ['reserved claim', 'new ordinary duplicate']) test(`idea confirmation holds a selected citation changed by a ${claim} after preview`, async ({}, testInfo) => {
+for (const claim of ['reserved claim', 'new ordinary duplicate', 'new ordinary duplicate with a YAML document marker']) test(`idea confirmation holds a selected citation changed by a ${claim} after preview`, async ({}, testInfo) => {
   const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures', { independent: true });
   const replacement = 'An ordinary restoration replacement before citation review.\n';
   const initial = await replaceRestoration(testInfo, reserved, replacement);
@@ -125,6 +125,9 @@ for (const claim of ['reserved claim', 'new ordinary duplicate']) test(`idea con
   const ledger = await intake.load(), cited = ledger.captures['c'.repeat(64)], unaffected = ledger.captures['d'.repeat(64)];
   const citedFile = intake.destination(cited), citedBytes = await fs.readFile(citedFile);
   const citedIdentity = await identity(citedFile), duplicate = path.join(vault.vault, 'New capture claim.md');
+  const duplicateBytes = claim.endsWith('YAML document marker')
+    ? Buffer.concat([Buffer.from('---\n'), citedBytes])
+    : citedBytes;
   const originalCited = testInfo.outputPath('original-cited-before-confirm.md'), displacedReplacement = testInfo.outputPath('prior-reserved-replacement.md');
   const source = (await context.corpus()).all.find(item => item.captureId === cited.id && item.revisionId === cited.currentRevision);
   expect(source).toBeDefined();
@@ -169,9 +172,11 @@ for (const claim of ['reserved claim', 'new ordinary duplicate']) test(`idea con
         await fs.rename(reserved, displacedReplacement);
         await fs.writeFile(reserved, citedBytes, { flag: 'wx' });
       } else {
-        await fs.writeFile(duplicate, citedBytes, { flag: 'wx' });
+        await fs.writeFile(duplicate, duplicateBytes, { flag: 'wx' });
         duplicateIdentity = await identity(duplicate);
         expect(duplicateIdentity).not.toEqual(citedIdentity);
+        const recognized = (await vault.scan()).filter(note => note.id === cited.id).map(note => note.file).sort();
+        expect(recognized).toEqual([citedFile, duplicate].sort());
       }
       changed = true;
     }
@@ -192,7 +197,7 @@ for (const claim of ['reserved claim', 'new ordinary duplicate']) test(`idea con
   } else {
     expect(await fs.readFile(citedFile)).toEqual(citedBytes);
     expect(await identity(citedFile)).toEqual(citedIdentity);
-    expect(await fs.readFile(duplicate)).toEqual(citedBytes);
+    expect(await fs.readFile(duplicate)).toEqual(duplicateBytes);
     expect(await identity(duplicate)).toEqual(duplicateIdentity);
     expect(await fs.readFile(reserved, 'utf8')).toBe(replacement);
     expect(await identity(reserved)).toEqual(initial.replacementIdentity);
