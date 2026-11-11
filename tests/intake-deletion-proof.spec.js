@@ -1,6 +1,8 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
 const { Vault } = require('../app/vault');
 const { Intake } = require('../app/intake');
@@ -113,6 +115,94 @@ test('an edited ledger stage cannot replace the only committed intake ledger', a
   expect.soft(await readOptional(ledgerFile)).toBe(original);
   expect.soft(await readOptional(stage)).toBe(replacement);
   expect(outcome).toMatch(/ledger.*changed/i);
+});
+
+for (const changedStage of [false, true]) test(`Windows intake ledger sharing refusal ${changedStage ? 'holds an edited stage' : 'publishes the exact original stage after release'}`, async ({}, testInfo) => {
+  test.skip(process.platform !== 'win32', 'Requires a native Windows FileShare.Read refusal.');
+  const { intake, ledgerFile } = await setup(testInfo);
+  const producer = testInfo.outputPath('producer');
+  await writeDraft(producer);
+  await intake.connect(producer, false, now);
+  const ledger = await intake.load(), baseline = await fs.readFile(ledgerFile, 'utf8');
+  ledger.lastCheck = { at: later, trigger: 'manual', status: 'complete' };
+  const exact = JSON.stringify(ledger, null, 2), independent = exact + '\n';
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$stream = [IO.File]::Open($env:COMPANION_LEDGER_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)',
+    'try { [Console]::WriteLine("READY:" + $PID); [void][Console]::ReadLine() } finally { $stream.Dispose(); [Console]::WriteLine("RELEASED:" + $PID) }'
+  ].join('; ');
+  const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true, env: { ...process.env, COMPANION_LEDGER_FIXTURE: ledgerFile }, stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const proof = { pid: child.pid, access: 'FileAccess.Read', share: 'FileShare.Read', stdout: '', stderr: '', attempts: [] };
+  child.stdout.on('data', chunk => { proof.stdout += chunk.toString(); });
+  child.stderr.on('data', chunk => { proof.stderr += chunk.toString(); });
+  child.stdin.on('error', error => { proof.inputError = error.message; });
+  child.on('error', error => { proof.error = error.message; });
+  const closed = new Promise(resolve => child.once('close', (code, signal) => {
+    proof.exit = { code, signal };
+    resolve();
+  }));
+  const rename = local.renameSync, sharing = ['EPERM', 'EBUSY', 'EACCES'];
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    child.stdin.end('\n');
+  };
+  let outcome;
+  try {
+    await expect.poll(() => {
+      if (proof.error || proof.exit) throw Error(JSON.stringify(proof));
+      return proof.stdout;
+    }).toContain(`READY:${child.pid}`);
+    local.renameSync = (source, destination) => {
+      if (destination !== ledgerFile || path.dirname(source) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(source))) {
+        return rename(source, destination);
+      }
+      const stat = local.lstatSync(source, { bigint: true });
+      const attempt = { source, dev: String(stat.dev), ino: String(stat.ino), sha256: hash(local.readFileSync(source)) };
+      proof.attempts.push(attempt);
+      try { rename(source, destination); attempt.code = null; }
+      catch (error) {
+        attempt.code = error.code;
+        attempt.syscall = error.syscall;
+        if (proof.attempts.length === 1 && sharing.includes(error.code)) {
+          if (changedStage) local.writeFileSync(source, independent);
+          release();
+        }
+        throw error;
+      }
+    };
+    outcome = await intake.save(ledger).then(() => null, error => ({ code: error.code, message: error.message }));
+  } finally {
+    local.renameSync = rename;
+    release();
+    await closed;
+  }
+
+  await fs.writeFile(testInfo.outputPath('native-ledger-publication.json'), JSON.stringify({ ...proof, outcome }, null, 2));
+  expect(proof.exit).toEqual({ code: 0, signal: null });
+  expect(proof.stdout).toContain(`RELEASED:${child.pid}`);
+  const [first] = proof.attempts;
+  expect(first?.syscall).toBe('rename');
+  expect(sharing).toContain(first.code);
+  expect(first.sha256).toBe(hash(exact));
+  if (changedStage) {
+    expect(proof.attempts).toHaveLength(1);
+    expect(await readOptional(ledgerFile)).toBe(baseline);
+    expect(await readOptional(first.source)).toBe(independent);
+    expect(outcome?.message).toMatch(/ledger.*changed/i);
+  } else {
+    expect(outcome).toBeNull();
+    expect(proof.attempts.length).toBeGreaterThan(1);
+    expect(proof.attempts.every(attempt => ['source', 'dev', 'ino', 'sha256'].every(key => attempt[key] === first[key]))).toBe(true);
+    expect(proof.attempts.at(-1).code).toBeNull();
+    expect(await readOptional(ledgerFile)).toBe(exact);
+    const current = await fs.lstat(ledgerFile, { bigint: true });
+    expect({ dev: String(current.dev), ino: String(current.ino) }).toEqual({ dev: first.dev, ino: first.ino });
+    expect(await readOptional(first.source)).toBeNull();
+  }
 });
 
 test('annotation removal holds a note changed during its final ledger check', async ({}, testInfo) => {
