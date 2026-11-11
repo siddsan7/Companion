@@ -9,6 +9,7 @@ const { hash } = require('./intake-producer');
 const { uuid } = require('./source-authority');
 const { sourceLink } = require('./repairs');
 const { validateAnnotationRemovals } = require('./annotation-authority');
+const { validProof } = require('./staged-publication');
 const { removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const { comparable } = require('./legacy-capture-ownership');
 const rel = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
@@ -115,7 +116,11 @@ async function inventory(vault, intake, ledger, id, captureId) {
     }
     if (name === 'link-intent.json' || /^link-[a-f0-9-]{36}\.json$/.test(name)) {
       let object; try { object = JSON.parse(value.text); } catch {}
-      if (!strict(object, ['schema', 'id', 'file', 'before', 'content', 'relative']) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      const fields = ['schema', 'id', 'file', 'before', 'content', 'relative'];
+      if (object && Object.hasOwn(object, 'stageProof')) fields.push('stageProof');
+      if (!strict(object, fields) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      if (fields.includes('stageProof') && (!validProof(object.stageProof) || Object.keys(object.stageProof).length !== 3 ||
+          object.stageProof.digest !== hash(object.content))) throw changed();
       if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
       // Journals retain their native serialized path. Only manifest paths use
       // canonical separators; the normal destination boundary validates both.
@@ -151,6 +156,7 @@ async function inventory(vault, intake, ledger, id, captureId) {
     if (!match || !value.text.includes(id) && !links.has(match[1])) continue;
     const intent = links.get(match[1]), note = parseAnnotation(value.text);
     if (!intent || !note) throw changed(); bind(note);
+    if (match[2] === 'stage' && intent.stageProof && !matchesPublication(value, intent.stageProof)) throw changed();
     candidates.push({ ...value, kind: match[2] === 'before.md' ? 'relationship-before' : match[2] === 'stage' ? 'relationship-stage' : 'relationship-held' });
   }
   if (!uuid(captureId)) throw changed();

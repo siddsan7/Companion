@@ -561,10 +561,15 @@ class Intake {
       for (const authority of restorations) verifyImportedRestorationHold(this, authority, journal.verify);
     });
   }
-  async finish(tx, ledger, journalProof, verifyRelated) {
+  async finish(tx, ledger, journalProof, transfer) {
     const publication = {};
-    try { return await this.publishTransaction(tx, ledger, journalProof, publication, verifyRelated); }
+    try { return await this.publishTransaction(tx, ledger, journalProof, publication, transfer); }
     catch (error) {
+      if (!publication.committed && publication.transferFailure === error) {
+        try { publication.restoreTransfer?.(); }
+        catch (cause) { this.vault.warnings.push(`Prior capture recovery files were preserved: ${cause.message}`); }
+        throw error;
+      }
       if (error.intakeConflict && publication.rollback && !publication.committed && !tx.restoreOperation) {
         error.intakeConflictProof = { mode: precommitConflict, journalProof: publication.journalProof, rollback: publication.rollback };
       }
@@ -575,11 +580,18 @@ class Intake {
       throw Object.assign(Error(reason, { cause: error }), { intakeOutputHeld: true });
     }
   }
-  async publishTransaction(tx, ledger, journalProof, publication, verifyRelated) {
+  async publishTransaction(tx, ledger, journalProof, publication, transfer) {
     this.validateTransaction(tx);
     const verifyRestorationControls = this.ordinaryPublicationControls(tx, ledger, journalProof);
     const verifyIndependentJournal = validProof(journalProof) && this.isIndependentNewSource(tx, ledger) ? verifyRestorationControls : undefined;
-    const checkPublication = () => this.publicationAuthority(tx, ledger, { verifyRestorationControls, verifyIndependentJournal });
+    const verifyTransfer = () => {
+      try { transfer?.verify(); }
+      catch (error) { publication.transferFailure = error; throw error; }
+    };
+    const checkPublication = async () => {
+      await this.publicationAuthority(tx, ledger, { verifyRestorationControls, verifyIndependentJournal });
+      verifyTransfer();
+    };
     await checkPublication();
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
@@ -654,9 +666,48 @@ class Intake {
     if (await read(snapshot) !== snapshotBytes) throw conflict('Immutable revision snapshot changed during publication. All versions were preserved.');
     await this.vault.checkpoint('intake-snapshot');
     const currentProof = await this.ownedFile(destination, [stage, backup], 'Capture destination');
-    await this.ownedFile(backup, destination, 'Previous capture backup');
+    const backupInfo = await this.ownedFile(backup, destination, 'Previous capture backup');
     let captureOutput = currentProof, captureStageProof;
     let current = await read(destination), old = await read(backup);
+    if (transfer) publication.restoreTransfer = () => {
+      const prior = transfer.previous || publication.rollback?.proof;
+      if (!prior) return;
+      this.storage.guardSync();
+      verifyRestorationControls?.();
+      exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
+      const present = local.lstatSync(destination, { bigint: true, throwIfNoEntry: false });
+      if (present && String(present.dev) === prior.dev && String(present.ino) === prior.ino) {
+        verifyStageSync(destination, guard, prior, Number(present.nlink));
+        return;
+      }
+      verifyStageSync(backup, guard, prior);
+      if (present) {
+        if (!captureOutput) throw Error('The incoming capture identity changed. Recovery files were preserved.');
+        const incoming = fileProof(captureOutput, tx.content);
+        verifyStageSync(stage, guard, incoming, 2);
+        verifyStageSync(destination, guard, incoming, 2);
+        local.unlinkSync(destination);
+        verifyStageSync(stage, guard, incoming);
+      }
+      verifyAbsentSync(destination, guard);
+      local.linkSync(backup, destination);
+      verifyStageSync(backup, guard, prior, 2);
+      verifyStageSync(destination, guard, prior, 2);
+      local.unlinkSync(backup);
+      verifyStageSync(destination, guard, prior);
+    };
+    if (transfer?.previous && old !== null) {
+      if (backupInfo?.nlink === 2n && current === tx.previous) {
+        this.storage.guardSync();
+        verifyTransfer();
+        verifyStageSync(backup, guard, transfer.previous, 2);
+        verifyStageSync(destination, guard, transfer.previous, 2);
+        local.unlinkSync(backup);
+        verifyStageSync(destination, guard, transfer.previous);
+        captureOutput = publicationIdentity(currentProof, 1n);
+        old = null;
+      } else verifyStageSync(backup, guard, transfer.previous);
+    }
     if (current !== tx.content) {
       if (tx.previousHash !== null) {
         if (old === null) {
@@ -665,12 +716,13 @@ class Intake {
             await this.vault.checkpoint('intake-before-move');
             await checkPublication();
             this.storage.guardSync();
-            exact(destination, currentProof, tx.previous, 'Capture destination');
+            exact(destination, captureOutput, tx.previous, 'Capture destination');
+            if (transfer?.previous) verifyStageSync(destination, guard, transfer.previous);
             guard();
             const occupied = local.lstatSync(backup, { throwIfNoEntry: false });
             if (occupied) throw conflict('Previous capture backup appeared during publication. Both files were preserved.');
             await fs.rename(destination, backup);
-            publication.rollback = { proof: fileProof(currentProof, tx.previous), directories };
+            publication.rollback = { proof: fileProof(captureOutput, tx.previous), directories };
           }
           catch (error) { if (['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw deferred('Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.'); throw error; }
           await this.vault.checkpoint('intake-moved'); old = await read(backup); current = await read(destination);
@@ -712,7 +764,7 @@ class Intake {
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
     let committed = false;
     const verifyPublished = () => {
-      if (!committed) verifyRelated?.();
+      if (!committed) verifyTransfer();
       if (!committed && journalProof?.freshRepair) journalProof.verify();
       if (!committed || tx.restoreOperation) {
         verifyRestorationControls?.();
@@ -734,7 +786,7 @@ class Intake {
         outcomes: { ...ledger.outcomes }, attempts: { ...ledger.attempts }, pending: { ...ledger.pending },
         ...(ledger.admissions || tx.sourceGeneration ? { admissions: { ...ledger.admissions } } : {})
       };
-      if (journalProof?.freshRepair) {
+      if (journalProof?.freshRepair || transfer) {
         next.blocks = { ...ledger.blocks };
         delete next.blocks[tx.sourceHash];
       }
