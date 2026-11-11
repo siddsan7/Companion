@@ -173,6 +173,53 @@ test('restoration hold allows independent import after a published output change
   expect(await readOptional(shared)).toBeNull();
 });
 
+async function withRestorationReadRefusal(locked, work) {
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$stream = [IO.File]::Open($env:COMPANION_RESTORATION_LOCK_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)',
+    'try { [Console]::WriteLine("READY:" + $PID); [void][Console]::ReadLine() } finally { $stream.Dispose(); [Console]::WriteLine("RELEASED:" + $PID) }'
+  ].join('; ');
+  const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true, env: { ...process.env, COMPANION_RESTORATION_LOCK_FIXTURE: locked }, stdio: ['pipe', 'pipe', 'pipe']
+  });
+  const helper = { pid: child.pid, stdout: '', stderr: '' };
+  child.stdout.on('data', chunk => { helper.stdout += chunk.toString(); });
+  child.stderr.on('data', chunk => { helper.stderr += chunk.toString(); });
+  child.stdin.on('error', error => { helper.inputError = error.message; });
+  child.on('error', error => { helper.error = error.message; });
+  const closed = new Promise(resolve => child.once('close', (code, signal) => {
+    helper.exit = { code, signal };
+    resolve();
+  }));
+  try {
+    await expect.poll(() => {
+      if (helper.error || helper.exit) throw Error(JSON.stringify(helper));
+      return helper.stdout;
+    }).toContain('READY:' + child.pid);
+    let refusal;
+    try { native.readFileSync(locked); }
+    catch (error) { refusal = error.code; }
+    expect(['EPERM', 'EBUSY', 'EACCES']).toContain(refusal);
+    return await work();
+  } finally {
+    child.stdin.end('\n');
+    await closed;
+    expect(helper.exit).toEqual({ code: 0, signal: null });
+    expect(helper.stdout).toContain('RELEASED:' + child.pid);
+  }
+}
+
+async function observeLedgerStageWrites(intake, count, work) {
+  const open = fs.open;
+  let writes = 0;
+  fs.open = async (file, ...args) => {
+    if (count() && args[0] === 'wx' && path.dirname(String(file)) === intake.dir && /^ledger-.*\.tmp$/.test(path.basename(String(file)))) writes++;
+    return open(file, ...args);
+  };
+  try { return { outcome: await work().catch(error => error), writes }; }
+  finally { fs.open = open; }
+}
+
 for (const target of ['capture', 'snapshot', 'shared ledger']) {
   test(`Windows published restoration read refusal at the ${target}`, async ({}, testInfo) => {
     test.skip(process.platform !== 'win32', 'Requires an actual Windows FileShare.None handle.');
@@ -198,44 +245,14 @@ for (const target of ['capture', 'snapshot', 'shared ledger']) {
     await writeDraft(producer, 'new-independent', '4', 'd');
 
     const locked = { capture, snapshot, 'shared ledger': ledgerFile }[target];
-    const script = [
-      '$ErrorActionPreference = "Stop"',
-      '$stream = [IO.File]::Open($env:COMPANION_RESTORATION_LOCK_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)',
-      'try { [Console]::WriteLine("READY:" + $PID); [void][Console]::ReadLine() } finally { $stream.Dispose(); [Console]::WriteLine("RELEASED:" + $PID) }'
-    ].join('; ');
-    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-      windowsHide: true, env: { ...process.env, COMPANION_RESTORATION_LOCK_FIXTURE: locked }, stdio: ['pipe', 'pipe', 'pipe']
-    });
-    const helper = { pid: child.pid, stdout: '', stderr: '' };
-    child.stdout.on('data', chunk => { helper.stdout += chunk.toString(); });
-    child.stderr.on('data', chunk => { helper.stderr += chunk.toString(); });
-    child.stdin.on('error', error => { helper.inputError = error.message; });
-    child.on('error', error => { helper.error = error.message; });
-    const closed = new Promise(resolve => child.once('close', (code, signal) => {
-      helper.exit = { code, signal };
-      resolve();
-    }));
-    const sharing = ['EPERM', 'EBUSY', 'EACCES'];
-    let outcome, refusal;
-    try {
-      await expect.poll(() => {
-        if (helper.error || helper.exit) throw Error(JSON.stringify(helper));
-        return helper.stdout;
-      }).toContain('READY:' + child.pid);
-      try { native.readFileSync(locked); }
-      catch (error) { refusal = error.code; }
-      expect(sharing).toContain(refusal);
+    const outcome = await withRestorationReadRefusal(locked, async () => {
       const restarted = new Intake(new Vault(vault.vault, 'Companion'));
-      outcome = await restarted.reconcile({ now: later }).catch(error => error);
-      if (target === 'capture' && !(outcome instanceof Error)) {
+      const result = await restarted.reconcile({ now: later }).catch(error => error);
+      if (target === 'capture' && !(result instanceof Error)) {
         await expect(restarted.vault.list()).rejects.toThrow();
       }
-    } finally {
-      child.stdin.end('\n');
-      await closed;
-    }
-    expect(helper.exit).toEqual({ code: 0, signal: null });
-    expect(helper.stdout).toContain('RELEASED:' + child.pid);
+      return result;
+    });
     for (const { file, bytes, stat } of files) {
       expect(await fs.readFile(file)).toEqual(bytes);
       const after = await fs.lstat(file, { bigint: true });
@@ -257,6 +274,83 @@ for (const target of ['capture', 'snapshot', 'shared ledger']) {
       expect(outcome.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
       expect(outcome.attempts[`${'b'.repeat(64)}:${'3'.repeat(32)}`]).toBeUndefined();
     }
+  });
+}
+
+for (const target of ['active intake journal', 'selected restoration journal']) {
+  test(`Windows held restoration stops before ledger writes when the ${target} is replaced`, async ({}, testInfo) => {
+    test.skip(process.platform !== 'win32', 'Requires an actual Windows FileShare.None handle.');
+    const interruption = Error('Stopped after restoration publication.');
+    const { vault, intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
+      if (name === 'capture-restoration-published') throw interruption;
+    });
+    await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+    const authority = (await readJson(ledgerFile)).sourceAuthority[id];
+    const capture = intake.destination((await readJson(ledgerFile)).captures[sourceHash]);
+    const snapshot = path.join(vault.root, 'Revisions', authority.restoration.revision + '.json');
+    const selected = path.join(intake.dir, authority.restoration.journal), shared = path.join(intake.dir, 'transaction.json');
+    const locked = target === 'active intake journal' ? capture : snapshot;
+    const captureBytes = await fs.readFile(capture), captureIdentity = await identity(capture);
+    const snapshotBytes = await fs.readFile(snapshot), snapshotIdentity = await identity(snapshot);
+    const selectedBytes = await fs.readFile(selected), selectedIdentity = await identity(selected);
+    const firstHash = 'c'.repeat(64), secondHash = 'd'.repeat(64);
+    await writeDraft(producer, 'independent-first', '3', 'c');
+    let fault;
+    const replace = async (file, tx) => {
+      const before = await fs.readFile(ledgerFile), bytes = await fs.readFile(file), originalIdentity = await identity(file);
+      const displaced = testInfo.outputPath('original-controlled-journal.json');
+      await fs.rename(file, displaced);
+      await fs.writeFile(file, bytes, { flag: 'wx' });
+      const foreignIdentity = await identity(file);
+      expect(foreignIdentity).not.toEqual(originalIdentity);
+      fault = { before, bytes, originalIdentity, foreignIdentity, file, displaced, tx };
+    };
+    const { outcome, writes } = await withRestorationReadRefusal(locked, async () => {
+      if (target === 'active intake journal') {
+        await writeDraft(producer, 'independent-second', '4', 'd');
+        const checkpoint = async name => {
+          if (name !== 'intake-journaled' || fault) return;
+          const tx = await readJson(shared);
+          expect(tx.sourceHash).toBe(firstHash);
+          await replace(shared, tx);
+        };
+        const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint }));
+        return observeLedgerStageWrites(intake, () => !!fault, () => restarted.reconcile({ now: later }));
+      }
+      await stopChildIntake(vault.vault, 'intake-journaled');
+      const tx = await readJson(shared);
+      expect(tx.sourceHash).toBe(firstHash);
+      expect((await fs.lstat(shared, { bigint: true })).nlink).toBe(1n);
+      await replace(selected, tx);
+      await writeDraft(producer, 'independent-second', '4', 'd');
+      const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+      return observeLedgerStageWrites(intake, () => true, () => restarted.reconcile({ now: later }));
+    });
+    expect(fault, 'the replacement occurred after the first draft owned its exact shared journal').toBeDefined();
+    expect.soft(outcome).toBeInstanceOf(Error);
+    expect.soft(writes).toBe(0);
+    expect.soft(await fs.readFile(ledgerFile)).toEqual(fault.before);
+    const ledger = await readJson(ledgerFile);
+    expect.soft(ledger.captures[firstHash]).toBeUndefined();
+    expect.soft(ledger.captures[secondHash]).toBeUndefined();
+    expect.soft(ledger.attempts[fault.tx.revision.identity]).toBeUndefined();
+    expect.soft(ledger.outcomes[fault.tx.key]).toEqual(JSON.parse(fault.before).outcomes[fault.tx.key]);
+    expect(ledger.sourceAuthority[id]).toEqual(authority);
+    expect(ledger.suppressed).toContain(sourceHash);
+    expect.soft(await readOptional(intake.destination(fault.tx.capture))).toBeNull();
+    expect.soft(await readOptional(path.join(vault.root, 'Revisions', fault.tx.revision.id + '.json'))).toBeNull();
+    expect.soft(await readOptional(shared)).not.toBeNull();
+    const foreign = await readOptional(fault.file);
+    expect.soft(foreign).toEqual(fault.bytes);
+    if (foreign) expect(await identity(fault.file)).toEqual(fault.foreignIdentity);
+    expect(await fs.readFile(fault.displaced)).toEqual(fault.bytes);
+    expect(await identity(fault.displaced)).toEqual(fault.originalIdentity);
+    expect(await fs.readFile(capture)).toEqual(captureBytes);
+    expect(await identity(capture)).toEqual(captureIdentity);
+    expect(await fs.readFile(snapshot)).toEqual(snapshotBytes);
+    expect(await identity(snapshot)).toEqual(snapshotIdentity);
+    expect(await fs.readFile(selected)).toEqual(selectedBytes);
+    if (target === 'active intake journal') expect(await identity(selected)).toEqual(selectedIdentity);
   });
 }
 
