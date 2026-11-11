@@ -166,16 +166,65 @@ class Briefs {
       return { ...index, errors };
     }
   }
-  async receipt(version, name, guard) {
+  async publishMarker(file, value, guard, linkedMarker = () => {}) {
+    const stage = `${file}.stage-${randomUUID()}`;
+    const proof = await writeStage(stage, JSON.stringify({ ...value, markerStage: path.basename(stage) }), guard);
+    let linked = false;
+    try {
+      verifyStageSync(stage, guard, proof);
+      verifyAbsentSync(file, guard);
+      local.linkSync(stage, file);
+      linked = true;
+      linkedMarker(proof);
+      await settlePublishedLink(stage, file, guard, proof);
+      return proof;
+    } finally {
+      if (!linked) await removeStage(stage, guard, proof).catch(() => {});
+    }
+  }
+  async readMarker(file, guard, { validate, lockHeld = false, stagedFor = path.basename(file), retiring = false }) {
+    const name = path.basename(file);
+    const read = async owned => {
+      guard();
+      const stat = await fs.lstat(file, { bigint: true });
+      if (stat.nlink !== 1n && (stat.nlink !== 2n || retiring)) throw integrityError(name);
+      if (stat.nlink === 2n && !owned) return withBriefMutation(this.vault.root, () => read(true));
+      const { bytes, proof } = await readExact(file, guard, Number(stat.nlink));
+      const value = JSON.parse(bytes.toString('utf8'));
+      validate(value, bytes);
+      const stageName = value.markerStage;
+      let stage;
+      if (stageName !== undefined) {
+        const prefix = `${stagedFor}.stage-`;
+        if (typeof stageName !== 'string' || !stageName.startsWith(prefix) ||
+            !uuid(stageName.slice(prefix.length)) || !bytes.equals(Buffer.from(JSON.stringify(value)))) {
+          throw integrityError(name);
+        }
+        stage = path.join(this.dir, stageName);
+      }
+      if (stat.nlink === 2n) {
+        if (!stage) throw integrityError(name);
+        await settlePublishedLink(stage, file, guard, proof);
+      }
+      if (stage) verifyAbsentSync(stage, guard);
+      verifyStageSync(file, guard, proof);
+      return { value, proof };
+    };
+    return read(lockHeld);
+  }
+  async receipt(version, name, guard, lockHeld) {
     if (!name) return null;
     const file = path.join(this.dir, name);
     try {
-      const { bytes, proof } = await readExact(file, guard);
-      const entry = JSON.parse(bytes.toString('utf8'));
-      if (entry?.schema !== 1 || entry.version !== version || !uuid(entry.id) ||
-          typeof entry.digest !== 'string' || !/^[a-f0-9]{64}$/.test(entry.digest) ||
-          !parentMatches(entry.parent, this.managedParent)) throw integrityError(name);
-      return { ...entry, file, proof };
+      const { value, proof } = await this.readMarker(file, guard, {
+        lockHeld,
+        validate: entry => {
+          if (entry?.schema !== 1 || entry.version !== version || !uuid(entry.id) ||
+              typeof entry.digest !== 'string' || !/^[a-f0-9]{64}$/.test(entry.digest) ||
+              !parentMatches(entry.parent, this.managedParent)) throw integrityError(name);
+        }
+      });
+      return { ...value, file, proof };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
   async managedClaim(version, name, guard, receipt) {
@@ -199,25 +248,28 @@ class Briefs {
       return { file, proof, data, guard };
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
-  receiptBytes(version, id, digest) {
-    return JSON.stringify({ schema: 1, parent: this.managedParent, id, version, digest });
+  receiptValue(version, id, digest) {
+    return { schema: 1, parent: this.managedParent, id, version, digest };
   }
   async readPending(version, name, guard) {
     const file = path.join(this.dir, name);
-    const { bytes, proof } = await readExact(file, guard);
-    const pending = JSON.parse(bytes.toString('utf8'));
-    if (pending?.schema !== 1 || pending.version !== version || !uuid(pending.id) ||
-        !parentMatches(pending.parent, this.managedParent) || !validProof(pending.staged) ||
-        typeof pending.stage !== 'string' || !pending.stage.startsWith('.brief-stage-') ||
-        !uuid(pending.stage.slice('.brief-stage-'.length)) || !Array.isArray(pending.identities) ||
-        !bytes.equals(Buffer.from(JSON.stringify(pending)))) {
-      throw integrityError(name);
-    }
-    const parents = ordinaryDirectories([this.vault.vault, this.vault.root, this.dir],
-      'The pending approval folders changed. Files were preserved for inspection.', pending.identities);
+    const retiring = name === pendingName(version, 'retiring');
+    let parents;
+    const { value: pending, proof } = await this.readMarker(file, guard, {
+      lockHeld: true, stagedFor: pendingName(version), retiring,
+      validate: (entry, bytes) => {
+        if (entry?.schema !== 1 || entry.version !== version || !uuid(entry.id) ||
+            !parentMatches(entry.parent, this.managedParent) || !validProof(entry.staged) ||
+            typeof entry.stage !== 'string' || !entry.stage.startsWith('.brief-stage-') ||
+            !uuid(entry.stage.slice('.brief-stage-'.length)) || !Array.isArray(entry.identities) ||
+            !bytes.equals(Buffer.from(JSON.stringify(entry)))) throw integrityError(name);
+        parents = ordinaryDirectories([this.vault.vault, this.vault.root, this.dir],
+          'The pending approval folders changed. Files were preserved for inspection.', entry.identities);
+      }
+    });
     const pinned = () => { guard(); parents.guard(); };
     verifyStageSync(file, pinned, proof);
-    return { ...pending, file, proof, guard: pinned, retiring: name === pendingName(version, 'retiring') };
+    return { ...pending, file, proof, guard: pinned, retiring };
   }
   async finishPublishedApproval(pending, destination, guard) {
     const { version, id, staged } = pending;
@@ -242,11 +294,11 @@ class Briefs {
     const existing = await fs.lstat(file).catch(missing);
     let proof;
     if (existing) {
-      const receipt = await this.receipt(version, name, pending.guard);
+      const receipt = await this.receipt(version, name, pending.guard, true);
       if (receipt.id !== id || receipt.digest !== staged.digest) throw integrityError(name);
       proof = receipt.proof;
     } else {
-      proof = await writeStage(file, this.receiptBytes(version, id, staged.digest), verifyPublication);
+      proof = await this.publishMarker(file, this.receiptValue(version, id, staged.digest), verifyPublication);
     }
     const verifyReceipts = () => {
       verifyPending();
@@ -330,13 +382,15 @@ class Briefs {
       try { present = local.lstatSync(file); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (present) {
-        const receipt = await this.receipt(version, name, guard);
+        const receipt = await this.receipt(version, name, guard, true);
         if (receipt.id !== data.record.id || receipt.digest !== proof.digest) throw integrityError(name);
         verifyStageSync(file, guard, receipt.proof);
         verifyStageSync(candidate.file, candidate.guard, proof);
         return receipt;
       }
-      const receiptProof = await writeStage(file, this.receiptBytes(version, data.record.id, proof.digest), guard);
+      const canonical = () => verifyStageSync(candidate.file, candidate.guard, proof);
+      const receiptGuard = () => { guard(); canonical(); };
+      const receiptProof = await this.publishMarker(file, this.receiptValue(version, data.record.id, proof.digest), receiptGuard);
       verifyStageSync(file, guard, receiptProof);
       verifyStageSync(candidate.file, candidate.guard, proof);
       return { id: data.record.id, digest: proof.digest, file, proof: receiptProof };
@@ -376,7 +430,7 @@ class Briefs {
       const recoveryError = index.errors?.get(version);
       if (recoveryError) { inspected.set(version, { error: recoveryError }); continue; }
       try {
-        const receipt = await this.receipt(version, entry.receipt, index.guard);
+        const receipt = await this.receipt(version, entry.receipt, index.guard, lockHeld);
         let canonical;
         for (const name of entry.canonical) {
           const claim = await this.managedClaim(version, name, index.guard, receipt);
@@ -475,8 +529,9 @@ class Briefs {
           schema: 1, parent: this.managedParent, id: record.id, version: record.version,
           stage: path.basename(stage), staged, identities
         };
-        const proof = await writeStage(file, JSON.stringify(value), selected);
-        pending = { ...value, file, proof, guard: selected };
+        const proof = await this.publishMarker(file, value, selected, markerProof => {
+          pending = { ...value, file, proof: markerProof, guard: selected };
+        });
         verifyStageSync(file, selected, proof);
         this.requireCurrentSourcesSync(record);
         verifyAbsentSync(path.join(this.dir, receiptName(record.version)), selected);
