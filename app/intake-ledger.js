@@ -67,7 +67,7 @@ class IntakeLedger {
       throw error;
     }
   }
-  async publish(stage, proof, expected, guard) {
+  async publish(stage, proof, expected, guard, verifyRelated) {
     const deadline = performance.now() + 1000;
     let delay = 15, refusal;
     for (;;) {
@@ -75,6 +75,7 @@ class IntakeLedger {
       this.guardSync(expected, guard);
       try { verifyStageSync(stage, guard, proof); }
       catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
+      verifyRelated();
       try { local.renameSync(stage, this.file); return; }
       catch (error) {
         const remaining = deadline - performance.now();
@@ -85,12 +86,16 @@ class IntakeLedger {
       }
     }
   }
-  async replace(text) {
+  async replace(text, verifyRelated = () => {}) {
     if (!this.matches(await this.view()) || this.expected.parents.missing) throw changed();
     const stage = path.join(this.directory, `ledger-${randomUUID()}.tmp`), bytes = Buffer.from(text, 'utf8');
     const expected = this.expected, digest = hash(bytes);
-    if (digest === expected.identity?.digest) return;
     const guard = this.parentGuard(expected);
+    if (digest === expected.identity?.digest) {
+      this.guardSync(expected, guard);
+      verifyRelated();
+      return;
+    }
     let proof;
     try {
       const handle = await fs.open(stage, 'wx');
@@ -104,7 +109,7 @@ class IntakeLedger {
       const prepared = await this.view(stage);
       if (!this.matches(prepared, { parents: expected.parents, identity: proof })) throw changed();
       if (!this.matches(await this.view(), expected)) throw changed();
-      await this.publish(stage, proof, expected, guard);
+      await this.publish(stage, proof, expected, guard, verifyRelated);
       const published = await this.view();
       if (!this.matches(published, { parents: expected.parents, identity: proof })) throw changed();
       this.guardSync(published, guard);
