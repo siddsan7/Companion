@@ -64,6 +64,82 @@ for (const kind of ['snapshot', 'capture']) test(`intake holds changed ${kind} s
   expect(Object.values(result.attempts)).toHaveLength(0);
 });
 
+for (const phase of ['before ledger replacement', 'after ledger commit']) {
+  for (const kind of ['snapshot', 'capture']) test(`intake holds an independently replaced ${kind} ${phase}`, async ({}, testInfo) => {
+    const producer = testInfo.outputPath('producer');
+    const foreign = `Independent file at the published ${kind} path.\n`;
+    let armed = false, mutation;
+    const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
+      if (boundary === 'intake-published') armed = true;
+      if (boundary === 'intake-ledger' && phase === 'after ledger commit') await replaceOutput();
+    });
+    const journal = path.join(intake.dir, 'transaction.json');
+    async function replaceOutput() {
+      expect(mutation).toBeUndefined();
+      const journalBytes = await fs.readFile(journal, 'utf8'), tx = JSON.parse(journalBytes);
+      const captureStage = path.join(intake.dir, tx.revision.id + '.stage');
+      const snapshotStage = path.join(intake.dir, tx.revision.id + '.snapshot.stage');
+      const stage = kind === 'snapshot' ? snapshotStage : captureStage;
+      const destination = kind === 'snapshot' ? path.join(vault.root, 'Revisions', tx.revision.id + '.json') : intake.destination(tx.capture);
+      const stageBefore = await fs.lstat(stage, { bigint: true }), destinationBefore = await fs.lstat(destination, { bigint: true });
+      expect(stageBefore.nlink).toBe(2n);
+      expect([stageBefore.dev, stageBefore.ino]).toEqual([destinationBefore.dev, destinationBefore.ino]);
+      const retained = new Map(await Promise.all([captureStage, snapshotStage, journal].map(async file => [file, await fs.readFile(file, 'utf8')])));
+      const before = await readJson(ledgerFile);
+      if (phase === 'after ledger commit') {
+        expect(before.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id, captureId: tx.capture.id });
+      } else expect(before.attempts[tx.revision.identity]).toBeUndefined();
+      // Detach the actual published name while retaining its exact original stage.
+      await fs.unlink(destination);
+      await fs.writeFile(destination, foreign, { flag: 'wx' });
+      const foreignIdentity = await fs.lstat(destination, { bigint: true });
+      expect([foreignIdentity.dev, foreignIdentity.ino]).not.toEqual([stageBefore.dev, stageBefore.ino]);
+      mutation = { tx, retained, destination, stage, stageBefore, foreignIdentity };
+    }
+    await writeDraft(producer);
+    await intake.connect(producer, false, now);
+    const open = fs.open;
+    fs.open = async (file, ...args) => {
+      const handle = await open(file, ...args);
+      if (phase !== 'before ledger replacement' || !armed || mutation || args[0] !== 'wx' ||
+        typeof file !== 'string' || path.dirname(file) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(file))) return handle;
+      const close = handle.close.bind(handle);
+      handle.close = async () => {
+        await close();
+        const prepared = await readJson(file), tx = await readJson(journal);
+        expect(prepared.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+        await replaceOutput();
+      };
+      return handle;
+    };
+    let result, error;
+    try { result = await intake.reconcile({ now: later }); }
+    catch (caught) { error = caught; }
+    finally { fs.open = open; }
+
+    expect(mutation, 'the real output pair and ledger boundary were reached').toBeDefined();
+    const { tx, retained, destination, stage, stageBefore, foreignIdentity } = mutation;
+    const committed = await readJson(ledgerFile);
+    expect.soft(committed.lastCheck?.status).not.toBe('complete');
+    expect.soft(result?.lastCheck?.status || error?.message).toMatch(/held|error|changed|preserv/i);
+    if (phase === 'after ledger commit') {
+      expect.soft(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id, captureId: tx.capture.id });
+    } else {
+      expect.soft(committed.attempts[tx.revision.identity]).toBeUndefined();
+      expect.soft(committed.captures[tx.sourceHash]).toBeUndefined();
+    }
+    for (const [file, bytes] of retained) expect.soft(await readOptional(file), path.basename(file)).toBe(bytes);
+    expect.soft(await readOptional(destination)).toBe(foreign);
+    const actualForeign = await fs.lstat(destination, { bigint: true });
+    expect([actualForeign.dev, actualForeign.ino]).toEqual([foreignIdentity.dev, foreignIdentity.ino]);
+    const actualStage = await fs.lstat(stage, { bigint: true }).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    expect.soft(actualStage && [actualStage.dev, actualStage.ino, actualStage.nlink]).toEqual([stageBefore.dev, stageBefore.ino, 1n]);
+  });
+}
+
 test('intake preserves a newly occupied backup path and its current capture', async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   const independent = 'Independent writing that arrived at the unused backup path.\n';
