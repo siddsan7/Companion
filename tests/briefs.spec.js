@@ -225,10 +225,14 @@ test('reviewed passage references navigate retained snapshots, approvals are ide
   await page.getByRole('button', { name: 'Propose brief' }).click();
   await page.getByLabel('Questions worth exploring', { exact: true }).fill('Can the tutor support another practice pattern? (Question, not an established outcome.)');
   await page.getByLabel('Questions worth exploring references', { exact: true }).fill('1:3-3');
-  await page.getByRole('button', { name: 'Approve proposed brief' }).click();
+  const approve = page.getByRole('button', { name: 'Approve proposed brief' });
+  await approve.click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
-  await page.getByRole('button', { name: 'Approve proposed brief' }).click();
-  await expect(page.locator('#brief-view')).not.toContainText('Approved version 2');
+  await approve.click();
+  await expect(approve).toBeEnabled();
+  await expect(page.locator('#brief-error')).toBeEmpty();
+  const repeated = await page.evaluate(() => window.companion['brief-state']());
+  expect(repeated.approved.map(record => record.version)).toEqual([1]);
   await page.locator('#brief-proposal').getByRole('link', { name: 'README.md:L3-L3', exact: true }).first().click();
   await expect(page.locator('#brief-proposal').getByText('1 | # MyTune', { exact: false })).toBeVisible();
   const approved = await page.evaluate(() => window.companion['brief-pin'](1));
