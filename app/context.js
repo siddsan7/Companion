@@ -14,6 +14,10 @@ const { ordinaryDirectories, readExactSync, verifyAbsentSync, verifyStageSync } 
 const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance } = require('./source-generations');
 const digest = text => createHash('sha256').update(text).digest('hex');
 const body = content => content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '').trim();
+function importedProvenance(id, revision, snapshotHash) {
+  const uncertainty = revision.uncertainty || {};
+  return `Imported capture ${id}; exact imported revision ${revision.id}; snapshot sha256 ${snapshotHash}; Processing: ${revision.processing || revision.run?.state || 'unknown'}; Extraction: ${revision.extraction || 'unknown'}; Human review: ${revision.humanReview}; Uncertainty: ${Array.isArray(uncertainty.uncertainEvidence) ? uncertainty.uncertainEvidence.length : 'unknown'} flagged extracts; sampling capped: ${uncertainty.truncated === true ? 'yes' : uncertainty.truncated === false ? 'no' : 'unknown'}. Claims are not independently verified.${revision.synthetic === true || revision.run?.input_kind === 'synthetic_fixture' ? ' Authored synthetic fixture; not real source evidence.' : ''}`;
+}
 // Direct Context callers still honor durable removal. The desktop supplies the
 // Ideas store's stronger guard, including its observed directory identity.
 function rawIdeaEligibility(vault, id) {
@@ -131,10 +135,50 @@ class Context {
     const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned());
     return this.corpusFromSources(sources);
   }
+  conflictChoices(note, capture, sourceHash, ledger, intake, observed, sourceGenerations) {
+    const block = ledger.blocks[sourceHash], localHash = digest(note.content);
+    if (note.type !== 'reel_import' || capture.rejected || capture.supportEligible === false || capture.reviewChoices?.length ||
+        capture.removed || capture.identityIssue || ledger.suppressed.includes(sourceHash) || ledger.pending[sourceHash] ||
+        ledger.acceptedCleanup?.sourceHash === sourceHash || comparable(path.resolve(note.file)) !== comparable(path.resolve(intake.destination(capture))) ||
+        (block ? block.outputHold !== undefined || !capture.conflict || block.reason !== capture.conflict : !!capture.conflict || localHash === capture.currentHash)) return [];
+    const choices = [];
+    const exact = (file, work) => {
+      const parent = this.vault.publicationFolders(path.dirname(file)).guard;
+      const guard = () => { intake.storage.guardSync(observed); parent(); };
+      const { bytes, proof } = readExactSync(file, guard);
+      const source = work(bytes, proof.digest);
+      if (!source) return;
+      Object.assign(source, { captureId: capture.id, ...generationFields(sourceGenerations) });
+      source.provenance += generationProvenance(source);
+      choices.push({ source, verify: () => verifyStageSync(file, guard, proof) });
+    };
+    try {
+      exact(note.file, (bytes, hash) => {
+        if (hash !== localHash || hash === capture.currentHash) return null;
+        const text = body(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
+        if (!text) return null;
+        return { key: `conflict-local:${capture.id}`, conflictChoice: 'local', title: `Local writing (conflict): ${note.title}`, text,
+          provenance: `Conflicted capture ${capture.id}; exact local content sha256 ${hash}; user-selected unverified local writing, not producer evidence.`, digest: hash };
+      });
+    } catch { /* An unproved local copy never becomes a selection. */ }
+    const revisionId = capture.currentRevision, admission = revisionAdmission(ledger, revisionId);
+    if (!/^[a-f0-9-]{36}$/.test(revisionId) || admission?.captureId !== capture.id || admission.sourceHash !== sourceHash) return choices;
+    try {
+      exact(path.join(this.vault.root, 'Revisions', `${revisionId}.json`), (bytes, hash) => {
+        const revision = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+        if (hash !== admission.snapshotHash || revision.id !== revisionId || revision.captureId !== capture.id || revision.sourceHash !== sourceHash ||
+            revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') return null;
+        const provenance = `${importedProvenance(capture.id, revision, hash)} Explicitly selected retained revision; unresolved local conflict. Local changes were not included.`;
+        return { key: `conflict-imported:${capture.id}`, conflictChoice: 'imported', revisionId, title: `Imported revision (conflict): ${note.title}`, text: revision.text,
+          provenance, digest: digest(provenance + revision.text) };
+      });
+    } catch { /* A missing or changed snapshot never becomes a selection. */ }
+    return choices;
+  }
   async sourceCorpusOwned() {
     const intake = new Intake(this.vault), ledger = await intake.info();
     const observed = intake.storage.expected;
-    const notes = await this.vault.list(), issues = [], all = [], eligible = new Map(), histories = new Map();
+    const notes = await this.vault.list(), issues = [], all = [], manualChoices = [], eligible = new Map(), histories = new Map();
     for (const note of notes) {
       const authority = ledger.sourceAuthority?.[note.id];
       if (authority && authority.phase !== 'active') { issues.push(`Evidence unavailable: ${note.title}; deliberately deleted source.`); continue; }
@@ -151,6 +195,7 @@ class Context {
       try {
         if (!entry) throw Error('not admitted by intake');
         const [sourceHash, capture] = entry;
+        if (capture.conflict || digest(note.content) !== capture.currentHash) manualChoices.push(...this.conflictChoices(note, capture, sourceHash, ledger, intake, observed, sourceGenerations));
         if (capture.rejected || capture.supportEligible === false || capture.reviewChoices?.length || capture.conflict || capture.identityIssue || capture.removed || ledger.suppressed.includes(sourceHash) || ledger.blocks[sourceHash] || ledger.pending[sourceHash]) throw Error(capture.rejected ? 'rejected support' : 'current source eligibility is unresolved');
         if (digest(note.content) !== capture.currentHash) throw Error('local changes conflict with the retained imported revision');
         // Guard every snapshot before the existing immutable-history validator reads it.
@@ -162,17 +207,16 @@ class Context {
         }
         const inspected = await intake.inspect(note.id, { annotations: false }), revision = inspected.revisions.find(item => item.id === capture.currentRevision);
         if (!revision || revision.captureId !== capture.id || revision.sourceHash !== sourceHash || revision.supportEligible === false || revision.humanReview === 'reject' || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') throw Error('current revision is unavailable or rejected');
-        const uncertainty = revision.uncertainty || {};
-        const provenance = `Imported capture ${note.id}; exact imported revision ${revision.id}; snapshot sha256 ${revisionAdmission(ledger, revision.id)?.snapshotHash}; Processing: ${revision.processing || revision.run?.state || 'unknown'}; Extraction: ${revision.extraction || 'unknown'}; Human review: ${revision.humanReview}; Uncertainty: ${Array.isArray(uncertainty.uncertainEvidence) ? uncertainty.uncertainEvidence.length : 'unknown'} flagged extracts; sampling capped: ${uncertainty.truncated === true ? 'yes' : uncertainty.truncated === false ? 'no' : 'unknown'}. Claims are not independently verified.${revision.synthetic === true || revision.run?.input_kind === 'synthetic_fixture' ? ' Authored synthetic fixture; not real source evidence.' : ''}`;
+        const provenance = importedProvenance(note.id, revision, revisionAdmission(ledger, revision.id)?.snapshotHash);
         const source = { key: `capture:${note.id}`, captureId: note.id, revisionId: revision.id, title: note.title, text: revision.text, provenance, digest: digest(provenance + revision.text), linked: inspected.links.map(link => link.related?.id).filter(Boolean) };
         Object.assign(source, generationFields(sourceGenerations)); source.provenance += generationProvenance(source);
         all.push(source); eligible.set(note.id, source); histories.set(note.id, inspected.revisions);
       } catch (error) { issues.push(`Evidence unavailable: ${note.title}; ${error.message}`); }
     }
     if (!intake.storage.matches(await intake.storage.view(), observed)) throw Error('Intake ledger changed during context discovery. Retry against the current authority.');
-    return { intake, ledger, observed, issues, all, eligible, histories };
+    return { intake, ledger, observed, issues, all, manualChoices, eligible, histories };
   }
-  async corpusFromSources({ intake, ledger, observed, issues, all, eligible, histories }) {
+  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories }) {
     const included = [];
     const annotationGroups = new Map();
     for (const annotation of await intake.annotations()) {
@@ -273,7 +317,13 @@ class Context {
     });
     const keys = available.map(source => source.key), duplicates = new Set(keys.filter((key, i) => keys.indexOf(key) !== i));
     for (const key of duplicates) issues.push(`Evidence unavailable: duplicate source identity ${key}.`);
-    return { all: available.filter(source => !duplicates.has(source.key)).map(source => ({ ...source, text: source.text.replace(/\r\n?/g, '\n') })), issues, included };
+    const manual = [], normalized = source => ({ ...source, text: source.text.replace(/\r\n?/g, '\n') });
+    for (const { source, verify } of manualChoices) {
+      try { verify(); manual.push(normalized(source)); }
+      catch { issues.push(`Unavailable manual choice ${source.title}; its exact file changed.`); }
+    }
+    intake.storage.guardSync(observed);
+    return { all: available.filter(source => !duplicates.has(source.key)).map(normalized), manual, issues, included };
   }
   async discover({ question }) {
     const state = await this.corpus(), terms = [...new Set(question.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [])];
@@ -284,10 +334,10 @@ class Context {
       if (associated && !matches.some(item => item.key === source.key)) matches.push({ ...source, reason: `Source association with ${associated}; relevance requires inspection` });
     }
     for (const source of state.all) if (!matches.some(item => item.key === source.key) && projects.has(source.projectVersion)) matches.push({ ...source, reason: `Project association with approved brief version ${source.projectVersion}; relevance requires inspection` });
-    return { ...state, matches };
+    return { ...state, all: [...state.all, ...state.manual], matches };
   }
   async approveShortening({ key, digest: expected, sourceGenerations, text }) {
-    const source = (await this.corpus()).all.find(item => item.key === key);
+    const { all, manual } = await this.corpus(), source = [...all, ...manual].find(item => item.key === key);
     if (!sameEvidence(source, { key, digest: expected, sourceGenerations })) throw Error('Selected evidence changed or is unavailable. Inspect it again before shortening.');
     if (typeof text !== 'string' || !text.trim() || !source.text.includes(text) || [...text].length >= [...source.text].length) throw Error('Choose a shorter exact passage from the inspected source. Rewriting is not source evidence.');
     const approval = randomUUID();
@@ -295,7 +345,7 @@ class Context {
     return { approval, text };
   }
   async approvePassage({ key, digest: expected, sourceGenerations, start, end }) {
-    const source = (await this.corpus()).all.find(item => item.key === key);
+    const { all, manual } = await this.corpus(), source = [...all, ...manual].find(item => item.key === key);
     if (!sameEvidence(source, { key, digest: expected, sourceGenerations })) throw Error('Selected evidence changed or is unavailable. Inspect its passages again.');
     const lines = source.text.split('\n');
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start || end > lines.length) throw Error('Passage line range is unavailable.');
@@ -307,8 +357,8 @@ class Context {
   async preview({ question, selections, excludedSources = [] }) {
     await this.vault.checkpoint('context-before-preview-read');
     if (!Array.isArray(excludedSources) || excludedSources.some(key => typeof key !== 'string')) throw Error('Invalid explicit package exclusions.');
-    const { all } = await this.corpus(), excluded = new Set(excludedSources), omissions = [];
-    const dependencies = source => [...[source.associated, ...(source.associatedIds || [])].filter(Boolean).map(id => `capture:${id}`), ...(source.projectVersion === undefined ? [] : [`brief:${source.projectVersion}`])];
+    const { all: eligible, manual } = await this.corpus(), all = [...eligible, ...manual], excluded = new Set(excludedSources), omissions = [];
+    const dependencies = source => [...[source.associated, ...(source.associatedIds || []), source.conflictChoice && source.captureId].filter(Boolean).map(id => `capture:${id}`), ...(source.projectVersion === undefined ? [] : [`brief:${source.projectVersion}`])];
     for (const [token, approval] of this.approvals) {
       const source = all.find(item => item.key === approval.key);
       if (approval.root === this.vault.root && source && (excluded.has(source.key) || dependencies(source).some(key => excluded.has(key)))) this.approvals.delete(token);
@@ -325,6 +375,8 @@ class Context {
       }
       return source;
     }).filter(Boolean);
+    const conflicting = chosen.filter(source => source.conflictChoice).map(source => source.captureId);
+    if (new Set(conflicting).size !== conflicting.length) throw Error('Choose one exact local or imported version of each conflicted capture.');
     const text = `Question:\n${question}\n\nSources:\n${chosen.map(source => `${source.provenance}\n${source.text}`).join('\n\n')}`;
     const serialized = text.replace(/\r\n?/g, '\n');
     const bound = this.verifiedInputBound;

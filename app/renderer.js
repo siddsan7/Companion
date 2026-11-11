@@ -10,7 +10,7 @@ function scopeError(error, owned) {
 async function action(work) { try { await work(); } catch (error) { if (typeof error.canReport === 'function' && !error.canReport()) return; status(error.message.replace(/^Error invoking remote method '[^']+': Error: /, '')); } }
 function day(instant, timezone) { return new Intl.DateTimeFormat('en-CA', { timeZone: timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(instant)); }
 function retireCaptureLinks() {
-  for (const open of $('captures').querySelectorAll('[data-open-capture]')) open.disabled = true;
+  for (const control of $('captures').querySelectorAll('[data-open-capture], [data-inspect-capture]')) control.disabled = true;
 }
 async function refresh() {
   const owner = configurationEpoch; if (configurationBusy) return;
@@ -64,7 +64,7 @@ async function refresh() {
         const remove = document.createElement('button'); remove.textContent = 'Delete capture';
         remove.onclick = () => action(() => window.captureDeletionView.preview(note.id)); article.append(remove);
       }
-      if (note.type === 'reel_import') { const inspect = document.createElement('button'); inspect.textContent = 'Inspect source'; inspect.onclick = () => action(() => window.intakeView.inspect(note.id)); article.append(inspect); }
+      if (note.type === 'reel_import') { const inspect = document.createElement('button'); inspect.textContent = 'Inspect source'; inspect.dataset.inspectCapture = ''; inspect.onclick = () => action(() => { if (owned() && inspect.isConnected && !inspect.disabled) return window.intakeView.inspect(note.id); }); article.append(inspect); }
     }
     window.dispatchEvent(new CustomEvent('companion-base-refreshed', { detail: { configurationEpoch: owner, location: state.location } }));
   } catch (error) { if (owned()) throw scopeError(error, owned); }
@@ -103,6 +103,7 @@ $('choose').onclick = () => action(async () => { selectedVault = await window.co
 $('configure').onclick = () => {
   if ($('configure').disabled) return;
   const owner = ++configurationEpoch; configurationBusy = true; configuringVault = true; $('vault-repairs').replaceChildren();
+  window.intakeView.retireInspection();
   scheduleView = null;
   updateCaptureControl(); updateIntakeControls(); updateScheduleControls();
   retireCaptureLinks();

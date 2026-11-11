@@ -1632,7 +1632,7 @@ class Intake {
     capture.title = intent.title; capture.currentHash = hash(note.content); this.vault.expected.set(intent.id, capture.currentHash);
     await this.save(ledger); await fs.unlink(file); return true;
   }
-  async inspect(id) {
+  async inspect(id, { verifyCurrentNote = false } = {}) {
     const ledger = await this.info(), entry = Object.entries(ledger.captures).find(([, item]) => item.id === id);
     if (!entry) throw Error('Imported capture is missing from intake history.');
     const [sourceHash, capture] = entry;
@@ -1647,13 +1647,21 @@ class Intake {
     }
     const related = Object.entries(ledger.captures).filter(([, item]) => item.id !== id).map(([sourceHash, item]) => ({ id: item.id, title: item.title, sourceHash }));
     const links = (ledger.links || []).filter(link => link.captureIds.includes(id)).map(link => ({ ...link, related: related.find(item => link.captureIds.includes(item.id)) }));
-    const supportReason = capture.rejected ? 'excluded by rejection. Historical material remains inspectable.'
+    let supportReason = capture.rejected ? 'excluded by rejection. Historical material remains inspectable.'
       : capture.removed || ledger.suppressed.includes(sourceHash) ? 'unavailable because this source is removed or suppressed.'
       : capture.conflict || ledger.blocks[sourceHash] ? 'paused because the imported source has an unresolved conflict or publication hold.'
       : capture.reviewChoices?.length ? 'paused pending an explicit current reviewed revision choice.'
       : capture.identityIssue || ledger.identityIssues?.[id] ? 'paused until the capture identity is resolved.'
       : ledger.pending[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash ? 'paused while intake recovery is pending.'
       : capture.supportEligible === false ? 'excluded by the recorded source eligibility.' : null;
+    if (verifyCurrentNote && !supportReason) {
+      const observed = this.storage.expected;
+      let note;
+      try { note = await this.vault.find(id); }
+      catch { supportReason = 'unavailable because the current capture cannot be verified.'; }
+      if (!this.storage.matches(await this.storage.view(), observed)) throw Error('Intake authority changed. Inspect the source again.');
+      if (note && hash(note.content) !== capture.currentHash) supportReason = 'paused because local changes do not match the retained imported revision.';
+    }
     return { capture, revisions, related, links, supportReason };
   }
 }

@@ -261,7 +261,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
   };
   const inspect = Intake.prototype.inspect;
   Intake.prototype.inspect = async function (id, options) {
-    const info = await inspect.call(this, id);
+    const info = await inspect.call(this, id, options);
     if (options?.annotations === false) return info;
     return { ...info, annotations: await this.annotations(id) };
   };

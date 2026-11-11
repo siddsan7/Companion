@@ -229,10 +229,11 @@ class Conversations {
     if (prior && JSON.stringify(prior.brief) !== JSON.stringify(brief)) throw Error('Pinned approved brief changed or is unavailable.');
     if (typeof input.question !== 'string' || !input.question.trim() || typeof input.speculation !== 'boolean') throw Error('Enter a question and review speculation permission.');
     const corpus = await context.corpus(), all = corpus.all;
+    const selectable = [...all, ...(corpus.manual || [])];
     const selections = structuredClone(input.selections || []), baseline = scopeOf(prior);
     const sourceRemovals = input.excludedSources || [], sourceRestores = input.restoreSources || [];
-    const knownSources = new Set([...baseline.excludedSources, ...all.map(source => source.key), ...(prior?.requests || []).flatMap(request => request.package?.dependencies || []).map(dep => dep?.key)]);
-    if (!Array.isArray(sourceRemovals) || sourceRemovals.some(key => typeof key !== 'string' || !knownSources.has(key)) || !Array.isArray(sourceRestores) || sourceRestores.some(key => !all.some(source => source.key === key && selections.some(selection => sameEvidence(selection, source))))) throw Error('Selected evidence changed or is unavailable. Inspect and explicitly select the source again, then preview.');
+    const knownSources = new Set([...baseline.excludedSources, ...selectable.map(source => source.key), ...(prior?.requests || []).flatMap(request => request.package?.dependencies || []).map(dep => dep?.key)]);
+    if (!Array.isArray(sourceRemovals) || sourceRemovals.some(key => typeof key !== 'string' || !knownSources.has(key)) || !Array.isArray(sourceRestores) || sourceRestores.some(key => !selectable.some(source => source.key === key && selections.some(selection => sameEvidence(selection, source))))) throw Error('Selected evidence changed or is unavailable. Inspect and explicitly select the source again, then preview.');
     const excluded = new Set([...baseline.excludedSources, ...sourceRemovals]);
     for (const key of sourceRestores) excluded.delete(key);
     if (selections.some(source => source.key.startsWith('brief:') && source.key !== `brief:${version}`)) throw Error('Use only the conversation’s pinned brief version.');

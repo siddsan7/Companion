@@ -148,7 +148,16 @@
   const dependentOn = (item, key) => [item.associated, ...(item.associatedIds || [])].some(id => `capture:${id}` === key) || item.projectVersion !== undefined && `brief:${item.projectVersion}` === key;
   function revoke(item) { delete item.approval; delete item.approvedText; delete item.approvalLabel; }
   function add(source) {
-    if (source) { restoredSources.add(source.key); if (excluded.delete(source.key)) for (const item of selections) if (dependentOn(item, source.key)) revoke(item); selections = selections.filter(item => item.key !== source.key); selections.push({ ...source }); }
+    if (source) {
+      restoredSources.add(source.key);
+      if (excluded.delete(source.key)) for (const item of selections) if (dependentOn(item, source.key)) revoke(item);
+      selections = selections.filter(item => {
+        const keep = item.key !== source.key && !(source.conflictChoice && item.conflictChoice && item.captureId === source.captureId);
+        if (!keep && item.key !== source.key) restoredSources.delete(item.key);
+        return keep;
+      });
+      selections.push({ ...source });
+    }
     selected(); clearPreview();
   }
   function selected() {

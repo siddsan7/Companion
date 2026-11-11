@@ -78,10 +78,21 @@ window.intakeView = {
       article.append(reason, local, incoming, label, apply); section.append(article);
     }
   },
+  retireInspection() {
+    this.inspectionEpoch = (this.inspectionEpoch || 0) + 1;
+    document.getElementById('source-inspection').hidden = true;
+    document.getElementById('source-details').replaceChildren();
+  },
   async inspect(id) {
     const request = this.inspectionEpoch = (this.inspectionEpoch || 0) + 1, location = state.location, configuration = configurationEpoch;
-    const current = () => request === this.inspectionEpoch && location === state.location && configuration === configurationEpoch;
-    const info = await window.companion['inspect-source'](id);
+    const current = () => request === this.inspectionEpoch && location === state.location && configuration === configurationEpoch && !configurationBusy;
+    const run = work => action(async () => {
+      if (!current()) return;
+      try { await work(); } catch (error) { if (current()) throw scopeError(error, current); }
+    });
+    let info;
+    try { info = await window.companion['inspect-source'](id); }
+    catch (error) { if (current()) throw scopeError(error, current); return; }
     if (!current()) return;
     const section = document.getElementById('source-inspection'), details = document.getElementById('source-details'); details.replaceChildren(); section.hidden = false;
     const eligibility = document.createElement('p');
@@ -93,7 +104,7 @@ window.intakeView = {
       if (info.linkedIdeasWarning) { const warning = document.createElement('p'); warning.textContent = info.linkedIdeasWarning; linked.append(warning); }
       for (const idea of info.linkedIdeas || []) {
         const open = document.createElement('button'); open.textContent = `Open linked saved idea in Obsidian: ${idea.title}`;
-        open.onclick = () => action(async () => { if (current()) await window.companion['idea-open'](idea.id); }); linked.append(open);
+        open.onclick = () => run(() => window.companion['idea-open'](idea.id)); linked.append(open);
       }
       details.append(linked);
     }
@@ -105,7 +116,7 @@ window.intakeView = {
       label.textContent = 'Related changed-byte capture'; placeholder.value = ''; placeholder.textContent = 'Choose a separate capture'; select.append(placeholder);
       for (const candidate of info.related) { const option = document.createElement('option'); option.value = candidate.id; option.textContent = `${candidate.title} · ${candidate.sourceHash}`; select.append(option); }
       label.append(select); link.textContent = 'Link sources';
-      link.onclick = () => action(async () => { await window.companion['link-sources']({ id, related: select.value }); await refresh(); await window.intakeView.inspect(id); status('Sources linked. Captures and revision histories remain separate.'); });
+      link.onclick = () => run(async () => { await window.companion['link-sources']({ id, related: select.value }); if (!current()) return; await refresh(); if (!current()) return; status('Sources linked. Captures and revision histories remain separate.'); await this.inspect(id); });
       details.append(label, link);
     }
     for (const revision of info.revisions) {
@@ -115,7 +126,7 @@ window.intakeView = {
       provenance.textContent = `Source bytes: ${revision.sourceHash}\nAttempt: ${revision.run.attempt_id}\nInput: ${revision.run.input_kind}\nSource time: ${revision.run.started_utc}\nImported: ${revision.importedAt}\nFirst captured: ${info.capture.capturedAt}\nLocator: ${revision.locator}\nNo source URL supplied. Source hashes group equal bytes, not semantic identities.`;
       if (revision.review) {
         const choose = document.createElement('button'); choose.textContent = 'Make current';
-        choose.onclick = () => action(async () => { await window.companion['select-review']({ id, revision: revision.id }); await refresh(); await window.intakeView.inspect(id); status('Current revision selected.'); }); article.append(choose);
+        choose.onclick = () => run(async () => { await window.companion['select-review']({ id, revision: revision.id }); if (!current()) return; await refresh(); if (!current()) return; status('Current revision selected.'); await this.inspect(id); }); article.append(choose);
       }
       text.textContent = revision.text;
       evidence.textContent = JSON.stringify({ uncertainty: revision.uncertainty, evidence: revision.evidence, review: revision.review, metrics: revision.metrics }, null, 2); if (revision.review) { const warning = document.createElement('p'); warning.textContent = 'Acceptance does not verify every claim. Findings refer to the original output; edits are retained separately. Synthetic fixtures are not real reviewed source evidence.'; article.append(warning); } article.append(heading, reviewState, provenance, text, evidence); details.append(article);
@@ -124,7 +135,7 @@ window.intakeView = {
     for (const annotation of info.annotations) { const text = document.createElement('pre'); text.textContent = annotation.content; annotations.append(text); }
     const label = document.createElement('label'), input = document.createElement('textarea'), save = document.createElement('button'), annotationId = crypto.randomUUID();
     label.textContent = 'New annotation'; label.append(input); save.textContent = 'Save annotation';
-    save.onclick = () => action(async () => { await window.companion['add-annotation']({ id: annotationId, captureId: id, text: input.value }); await window.intakeView.inspect(id); status('Annotation saved. Source content remains managed separately.'); });
+    save.onclick = () => run(async () => { await window.companion['add-annotation']({ id: annotationId, captureId: id, text: input.value }); if (!current()) return; status('Annotation saved. Source content remains managed separately.'); await this.inspect(id); });
     details.append(annotations, label, save);
     section.scrollIntoView();
   }
