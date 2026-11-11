@@ -1085,7 +1085,7 @@ class Intake {
     this.validateTransaction(tx);
     await this.setup();
     const preservePublication = message.startsWith(outputHold);
-    const priorWitness = ledger.blocks[tx.sourceHash]?.outputHold;
+    const priorWitness = this.hasHeldJournal(ledger, tx) ? ledger.blocks[tx.sourceHash].outputHold : undefined;
     const exactJournal = preservePublication || retained?.mode === precommitConflict || priorWitness?.mode === precommitConflict;
     const reason = exactJournal && message.endsWith(conflictPause) ? message : message + conflictPause;
     const archive = heldName(tx), journal = path.join(this.dir, 'transaction.json');
@@ -1161,6 +1161,9 @@ class Intake {
       try { await fs.link(journal, held); } catch (error) { if (error.code !== 'EEXIST' || await read(journal) !== await read(held)) throw Error('Conflict archive already exists with different content. All files were preserved for repair.'); }
       await fs.unlink(journal);
     }
+  }
+  async archivePrecommitConflict(tx, ledger, message, journalProof, guard) {
+    await this.archiveConflict(tx, ledger, message, { mode: precommitConflict, journalProof, guard });
   }
   restoreConflictBackup(tx, ledger, rollback, verifyJournal) {
     const destination = this.destination(tx.capture), backup = path.join(this.dir, tx.backup);

@@ -5,7 +5,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { parseAnnotation } = require('./vault');
 const { revisionAdmission, activeAdmission, validateAuthority } = require('./source-authority');
-const { verifyAbsentSync, verifyStageSync } = require('./staged-publication');
+const { readExactSync, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 
 async function annotationAuthority(intake) {
   // A caller can still hold the ledger it loaded before an awaited publication.
@@ -401,14 +401,22 @@ function install(Intake, { hash, read, noteText }) {
       catch (archiveError) { if (archiveError.code !== 'EEXIST' || await read(archivedIntent) !== bytes) throw Error('Repair evidence archive conflicts. All active files were preserved.'); }
       const journal = path.join(this.dir, 'transaction.json');
       const sourceArchive = path.join(this.dir, `conflict-${tx.revision.id}-${tx.resolution}.json`);
-      await this.ownedFile(journal, sourceArchive, 'Repair source journal');
+      let journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
       await this.ownedFile(sourceArchive, journal, 'Repair source archive');
-      if (await read(journal) === null) await this.publishJournal(journal, tx);
-      else if (await read(journal) !== JSON.stringify(tx)) throw Error('Another source publication needs recovery before this repair.');
+      if (!journalInfo) {
+        await this.publishJournal(journal, tx);
+        journalInfo = await this.ownedFile(journal, sourceArchive, 'Repair source journal');
+      }
+      if (!journalInfo) throw Error('The exact repair source journal is missing. Files were preserved.');
+      const guard = this.vault.publicationFolders(this.dir).guard;
+      const links = Number(journalInfo.nlink);
+      const expected = { dev: String(journalInfo.dev), ino: String(journalInfo.ino), digest: hash(JSON.stringify(tx)) };
+      const { proof } = readExactSync(journal, guard, links, expected);
+      if (links === 2) verifyStageSync(sourceArchive, guard, proof, 2);
       const ledger = await this.load();
       // A kept-snapshot failure can occur before any annotation exists. Require
       // fresh explicit transfer; a pending retry must never publish this tx.
-      await this.archiveConflict(tx, ledger, error.message);
+      await this.archivePrecommitConflict(tx, ledger, error.message, proof, guard);
       if (await this.ownedFile(stage, file, 'Annotation staging file')) await fs.unlink(stage);
       await fs.unlink(intentFile);
       throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for repair.'), { intakeRepairHeld: true });
