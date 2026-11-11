@@ -229,25 +229,7 @@ test('restoration hold lets an exact interrupted independent intake settle befor
   const bHash = 'c'.repeat(64), cHash = 'd'.repeat(64), shared = path.join(intake.dir, 'transaction.json');
   await writeDraft(producer, 'interrupted-independent', '2', 'c');
 
-  const code = `
-    const { Vault } = require('./app/vault');
-    const { Intake } = require('./app/intake');
-    const [directory, now] = process.argv.slice(1);
-    const checkpoint = async name => { if (name === 'intake-journaled') process.exit(77); };
-    const intake = new Intake(new Vault(directory, 'Companion', { checkpoint }));
-    intake.reconcile({ now }).then(() => process.exit(78), error => { console.error(error); process.exit(79); });
-  `;
-  const child = spawn(process.execPath, ['-e', code, vault.vault, later], {
-    cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
-  });
-  let stderr = '';
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', part => { stderr += part; });
-  const exit = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
-  expect(exit, stderr).toEqual({ code: 77, signal: null });
+  await stopChildIntake(vault.vault, 'intake-journaled');
   const interrupted = await readJson(shared);
   const proof = await fs.lstat(shared, { bigint: true });
   expect(proof.isFile() && !proof.isSymbolicLink() && proof.nlink === 1n).toBe(true);
@@ -267,6 +249,141 @@ test('restoration hold lets an exact interrupted independent intake settle befor
   expect(result.suppressed).toContain(sourceHash);
   expect(await fs.readFile(destination)).toEqual(replacement);
   expect(await identity(destination)).toEqual(replacementIdentity);
+  expect(await fs.readFile(selected)).toEqual(selectedBytes);
+  expect(await identity(selected)).toEqual(selectedIdentity);
+});
+
+async function stopChildIntake(directory, boundary, pending = '', shared = '') {
+  const code = `
+    const fs = require('node:fs/promises');
+    const { Vault } = require('./app/vault');
+    const { Intake } = require('./app/intake');
+    const [directory, now, boundary, pending, shared] = process.argv.slice(1);
+    const checkpoint = async name => { if (name === boundary) process.exit(77); };
+    if (boundary === 'pending-retry-link') {
+      const link = fs.link;
+      fs.link = async (from, to) => {
+        await link(from, to);
+        if (from === pending && to === shared) process.exit(77);
+      };
+    }
+    const intake = new Intake(new Vault(directory, 'Companion', { checkpoint }));
+    intake.reconcile({ now }).then(() => process.exit(78), error => { console.error(error); process.exit(79); });
+  `;
+  const child = spawn(process.execPath, ['-e', code, directory, later, boundary, pending, shared], {
+    cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', part => { stderr += part; });
+  const exit = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  expect(exit, stderr).toEqual({ code: 77, signal: null });
+}
+
+for (const boundary of ['intake-ledger', 'pending-retry-link']) {
+  test(`restoration hold settles an interrupted deferred retry at ${boundary} before independent intake`, async ({}, testInfo) => {
+    const interruption = Error('Stopped after restoration publication.');
+    const { vault, intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
+      if (name === 'capture-restoration-published') throw interruption;
+    }, { existing: true });
+    await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+    const before = await readJson(ledgerFile), authority = before.sourceAuthority[id], bHash = 'c'.repeat(64), cHash = 'd'.repeat(64);
+    const destination = intake.destination(before.captures[sourceHash]);
+    const replacement = Buffer.from('Independent writing at the reserved restoration path.\n');
+    await fs.rename(destination, testInfo.outputPath('original-reserved-capture.md'));
+    await fs.writeFile(destination, replacement, { flag: 'wx' });
+    const replacementIdentity = await identity(destination);
+    const selected = path.join(intake.dir, authority.restoration.journal);
+    const selectedBytes = await fs.readFile(selected), selectedIdentity = await identity(selected);
+    await writeDraft(producer, 'existing-update', '3', 'c');
+    const deferring = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async name => {
+      if (name === 'intake-before-move') throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+    } }));
+    const deferred = await deferring.reconcile({ now: later });
+    expect(deferred.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+    const pending = path.join(intake.dir, deferred.pending[bHash].journal), shared = path.join(intake.dir, 'transaction.json');
+    const pendingBytes = await fs.readFile(pending), pendingIdentity = await identity(pending);
+    const tx = JSON.parse(pendingBytes);
+    expect(tx.sourceHash).toBe(bHash);
+    expect(await readOptional(shared)).toBeNull();
+    await stopChildIntake(vault.vault, boundary, pending, shared);
+
+    const committed = await readJson(ledgerFile);
+    expect(committed.captures[bHash].currentRevision).toBe(boundary === 'intake-ledger' ? tx.revision.id : before.captures[bHash].currentRevision);
+    expect(await fs.readFile(shared)).toEqual(pendingBytes);
+    expect(await fs.readFile(pending)).toEqual(pendingBytes);
+    expect(await identity(shared)).toEqual(pendingIdentity);
+    expect(await identity(pending)).toEqual(pendingIdentity);
+    expect((await fs.lstat(shared, { bigint: true })).nlink).toBe(2n);
+    expect((await fs.lstat(pending, { bigint: true })).nlink).toBe(2n);
+    await writeDraft(producer, 'new-independent', '4', 'd');
+
+    const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+    const result = await restarted.reconcile({ now: later });
+    expect(result.captures[bHash].currentRevision).toBe(tx.revision.id);
+    expect(result.captures[bHash].revisions).toEqual([...before.captures[bHash].revisions, tx.revision.id]);
+    expect(result.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+    expect(await readOptional(restarted.destination(result.captures[cHash]))).not.toBeNull();
+    expect(await readOptional(shared)).toBeNull();
+    expect(await readOptional(pending)).toBeNull();
+    expect(result.sourceAuthority[id]).toEqual(authority);
+    expect(result.suppressed).toContain(sourceHash);
+    expect(await fs.readFile(destination)).toEqual(replacement);
+    expect(await identity(destination)).toEqual(replacementIdentity);
+    expect(await fs.readFile(selected)).toEqual(selectedBytes);
+    expect(await identity(selected)).toEqual(selectedIdentity);
+  });
+}
+
+test('a late reserved restoration identity claim holds only its exact journaled import', async ({}, testInfo) => {
+  const interruption = Error('Stopped after restoration publication.');
+  const { vault, intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
+    if (name === 'capture-restoration-published') throw interruption;
+  }, { existing: true });
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+  const before = await readJson(ledgerFile), authority = before.sourceAuthority[id], bHash = 'c'.repeat(64), cHash = 'd'.repeat(64);
+  const reserved = intake.destination(before.captures[sourceHash]), existing = intake.destination(before.captures[bHash]);
+  const initialReplacement = Buffer.from('Independent writing at the held restoration path.\n');
+  await fs.rename(reserved, testInfo.outputPath('original-reserved-capture.md'));
+  await fs.writeFile(reserved, initialReplacement, { flag: 'wx' });
+  const existingBytes = await fs.readFile(existing), existingIdentity = await identity(existing);
+  const selected = path.join(intake.dir, authority.restoration.journal);
+  const selectedBytes = await fs.readFile(selected), selectedIdentity = await identity(selected);
+  const shared = path.join(intake.dir, 'transaction.json');
+  await writeDraft(producer, 'existing-update', '3', 'c');
+  await writeDraft(producer, 'new-independent', '4', 'd');
+  let observed;
+  const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async name => {
+    if (name !== 'intake-journaled' || observed) return;
+    const bytes = await fs.readFile(shared), tx = JSON.parse(bytes);
+    expect(tx.sourceHash).toBe(bHash);
+    const prior = await readJson(ledgerFile);
+    expect(prior.captures[bHash].identityIssue).toBeUndefined();
+    const journalIdentity = await identity(shared);
+    await fs.rename(reserved, testInfo.outputPath('first-foreign-reserved-file.md'));
+    await fs.writeFile(reserved, existingBytes, { flag: 'wx' });
+    observed = { bytes, tx, journalIdentity, replacementIdentity: await identity(reserved) };
+  } }));
+  const result = await restarted.reconcile({ now: later });
+  expect(observed, 'the distinct claim appeared after the actual import journal was published').toBeDefined();
+  expect.soft(result.attempts[observed.tx.revision.identity]).toBeUndefined();
+  expect.soft(result.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+  expect.soft(result.captures[cHash]).toBeDefined();
+  expect.soft(await readOptional(shared)).toBeNull();
+  const hold = result.blocks[bHash];
+  expect(hold).toMatchObject({ incomingRevision: observed.tx.revision.id, reason: expect.stringMatching(/restoration path.*identity/i) });
+  const archive = path.join(intake.dir, hold.journal);
+  expect(await fs.readFile(archive)).toEqual(observed.bytes);
+  expect(await identity(archive)).toEqual(observed.journalIdentity);
+  expect(await identity(existing)).toEqual(existingIdentity);
+  expect(await fs.readFile(existing)).toEqual(existingBytes);
+  expect(await fs.readFile(reserved)).toEqual(existingBytes);
+  expect(await identity(reserved)).toEqual(observed.replacementIdentity);
+  expect(result.sourceAuthority[id]).toEqual(authority);
+  expect(result.suppressed).toContain(sourceHash);
   expect(await fs.readFile(selected)).toEqual(selectedBytes);
   expect(await identity(selected)).toEqual(selectedIdentity);
 });
