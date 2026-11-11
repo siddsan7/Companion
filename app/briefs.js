@@ -482,12 +482,15 @@ class Briefs {
     }
     return approvals;
   }
-  async readStore({ onlyVersion, lockHeld = false } = {}) {
+  async readStore({ onlyVersion, lockHeld = false, inspectRecoveryHolds = false } = {}) {
     const index = await this.recoveredIndex(onlyVersion, lockHeld);
     const approvals = await this.approvedInventory(index, onlyVersion, lockHeld);
-    const records = [];
-    for (const { record, error } of approvals.values()) {
-      if (error) throw error;
+    const records = [], recoveryHolds = [];
+    for (const [version, { record, error }] of approvals) {
+      if (error) {
+        if (!inspectRecoveryHolds || index.errors?.get(version) !== error) throw error;
+        recoveryHolds.push(error.message);
+      }
       if (record) records.push(record);
     }
     if (onlyVersion === undefined) {
@@ -500,7 +503,7 @@ class Briefs {
         records.push({ ...data.record, file: name, digest: proof.digest });
       }
     }
-    return { records, approvals };
+    return { records, approvals, recoveryHolds };
   }
   async records(onlyVersion) {
     return (await this.readStore({ onlyVersion })).records;
@@ -598,11 +601,14 @@ class Briefs {
     blockStaleApproval(issues);
   }
   async state(lockHeld = false) {
-    const { records } = await this.readStore({ lockHeld });
+    // The desktop can inspect valid approvals while a pending publication is held.
+    // Propose and approve still require the strict store read before any mutation.
+    const { records, recoveryHolds } = await this.readStore({ lockHeld, inspectRecoveryHolds: true });
     const approved = records.filter(r => r.kind === 'approved').sort((a, b) => b.version - a.version);
     const proposed = records.filter(r => r.kind === 'proposal').sort((a, b) => b.ordinal - a.ordinal)[0];
     const latestAttempt = records.filter(r => r.kind !== 'approved').sort((a, b) => b.ordinal - a.ordinal)[0];
-    return { approved, proposed, failure: latestAttempt?.kind === 'failure' ? latestAttempt.error : null, issues: await this.outdated(approved[0]), proposalIssues: await this.outdated(proposed) };
+    const failure = recoveryHolds.join(' ') || (latestAttempt?.kind === 'failure' ? latestAttempt.error : null);
+    return { approved, proposed, failure, issues: await this.outdated(approved[0]), proposalIssues: await this.outdated(proposed) };
   }
   async approve({ id, digest, sections, references }, now) {
     return withBriefMutation(this.vault.root, async () => {
