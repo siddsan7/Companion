@@ -154,7 +154,11 @@ for (const phase of ['before ledger replacement', 'after ledger commit']) {
   });
 }
 
-for (const boundary of ['held ledger rename', 'held journal link']) test(`deferred intake hold resumes after interruption at the ${boundary}`, async ({}, testInfo) => {
+for (const boundary of ['held ledger rename', 'held journal link', 'edited journal']) test(
+  boundary === 'edited journal'
+    ? 'deferred intake restart refuses a same-ID held journal edited in place'
+    : `deferred intake hold resumes after interruption at the ${boundary}`,
+  async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   const interruption = Error('Stopped after the real held-journal transition.');
   let deferMove = false, changeOutput = false, changed;
@@ -190,7 +194,7 @@ for (const boundary of ['held ledger rename', 'held journal link']) test(`deferr
   let stopped = false;
   const rename = local.renameSync, link = local.linkSync;
   local.renameSync = (from, to) => {
-    const transition = boundary === 'held ledger rename' && to === ledgerFile && /^ledger-.*\.tmp$/.test(path.basename(from)) &&
+    const transition = boundary !== 'held journal link' && to === ledgerFile && /^ledger-.*\.tmp$/.test(path.basename(from)) &&
       JSON.parse(local.readFileSync(from, 'utf8')).blocks[sourceHash]?.journal === path.basename(held);
     rename(from, to);
     if (transition) { stopped = true; throw interruption; }
@@ -210,8 +214,31 @@ for (const boundary of ['held ledger rename', 'held journal link']) test(`deferr
   expect(paused.blocks[sourceHash]?.journal).toBe(path.basename(held));
   expect(paused.attempts).toEqual(original.attempts);
 
-  await writeDraft(producer, 'z-independent', '3', 'c');
   const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  if (boundary === 'edited journal') {
+    const originalLedger = await fs.readFile(ledgerFile);
+    const edited = structuredClone(pendingTx);
+    edited.revision.locator += '-independently-edited';
+    const bytes = JSON.stringify(edited);
+    expect(() => restarted.validateTransaction(edited)).not.toThrow();
+    expect(bytes).not.toBe(pendingBytes);
+    await fs.writeFile(changed.journal, bytes);
+    for (const file of [changed.journal, pending]) {
+      const observed = await fs.lstat(file, { bigint: true });
+      expect([observed.dev, observed.ino, observed.nlink]).toEqual([pendingIdentity.dev, pendingIdentity.ino, 2n]);
+      expect(await readOptional(file)).toBe(bytes);
+    }
+    await expect.soft(restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' })).rejects.toThrow(/changed|preserv|proof/i);
+    expect.soft(await fs.readFile(ledgerFile)).toEqual(originalLedger);
+    expect.soft(await readOptional(held)).toBeNull();
+    expect.soft(await readOptional(changed.journal)).toBe(bytes);
+    expect.soft(await readOptional(pending)).toBe(bytes);
+    expect(await readOptional(changed.destination)).toBe(changed.foreign);
+    for (const [file, originalBytes] of changed.retained) if (file !== changed.journal) expect(await readOptional(file)).toBe(originalBytes);
+    return;
+  }
+
+  await writeDraft(producer, 'z-independent', '3', 'c');
   const recovered = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
   expect(recovered.lastCheck.status).toBe('held');
   expect(recovered.attempts[pendingTx.revision.identity]).toBeUndefined();
@@ -222,6 +249,54 @@ for (const boundary of ['held ledger rename', 'held journal link']) test(`deferr
   expect([completed.dev, completed.ino, completed.nlink]).toEqual([pendingIdentity.dev, pendingIdentity.ino, 1n]);
   expect(await readOptional(changed.journal)).toBeNull();
   expect(await readOptional(pending)).toBeNull();
+});
+
+test('accepted deferred intake restart settles its unchanged journal pair without replay', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), interruption = Error('Stopped after successful deferred admission.');
+  let deferMove = false, stop = false;
+  const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (boundary === 'intake-before-move' && deferMove) throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+    if (boundary === 'intake-ledger' && stop) throw interruption;
+  });
+  await writeDraft(producer);
+  const first = await intake.connect(producer, true, now);
+  expect(first.lastCheck.status).toBe('complete');
+  const [sourceHash] = Object.keys(first.captures);
+  await writeDraft(producer, 'second', '2');
+  deferMove = true;
+  const deferred = await intake.reconcile({ now: later });
+  deferMove = false;
+  expect(deferred.lastCheck.status).toBe('held');
+  const pending = path.join(intake.dir, deferred.pending[sourceHash].journal), journal = path.join(intake.dir, 'transaction.json');
+  const raw = await fs.readFile(pending, 'utf8'), tx = JSON.parse(raw);
+  stop = true;
+  await expect(intake.reconcile({ now: later })).rejects.toThrow(interruption.message);
+  const committed = await readJson(ledgerFile);
+  expect(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+  expect(committed.captures[sourceHash].currentRevision).toBe(tx.revision.id);
+  const active = await fs.lstat(journal, { bigint: true }), deferredAlias = await fs.lstat(pending, { bigint: true });
+  expect([active.dev, active.ino, active.nlink]).toEqual([deferredAlias.dev, deferredAlias.ino, 2n]);
+  expect(await readOptional(journal)).toBe(raw);
+  expect(await readOptional(pending)).toBe(raw);
+  const destination = intake.destination(tx.capture), snapshot = path.join(vault.root, 'Revisions', tx.revision.id + '.json');
+  const captureBefore = await fs.lstat(destination, { bigint: true }), snapshotBefore = await fs.lstat(snapshot, { bigint: true });
+  await writeDraft(producer, 'z-independent', '3', 'c');
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const completed = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
+  expect(completed.lastCheck.status).toBe('complete');
+  expect(completed.attempts[tx.revision.identity]).toEqual(committed.attempts[tx.revision.identity]);
+  expect(Object.values(completed.attempts)).toHaveLength(3);
+  expect(completed.captures[sourceHash].revisions).toEqual(committed.captures[sourceHash].revisions);
+  expect(await readOptional(journal)).toBeNull();
+  expect(await readOptional(pending)).toBeNull();
+  expect(completed.pending[sourceHash]).toBeUndefined();
+  expect(await readOptional(path.join(intake.dir, tx.revision.id + '.stage'))).toBeNull();
+  expect(await readOptional(path.join(intake.dir, tx.revision.id + '.snapshot.stage'))).toBeNull();
+  expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
+  expect(await fs.readFile(snapshot, 'utf8')).toBe(JSON.stringify(tx.revision, null, 2));
+  const captureAfter = await fs.lstat(destination, { bigint: true }), snapshotAfter = await fs.lstat(snapshot, { bigint: true });
+  expect([captureAfter.dev, captureAfter.ino, captureAfter.nlink]).toEqual([captureBefore.dev, captureBefore.ino, 1n]);
+  expect([snapshotAfter.dev, snapshotAfter.ino, snapshotAfter.nlink]).toEqual([snapshotBefore.dev, snapshotBefore.ino, 1n]);
 });
 
 test('held explicit conflict repair does not adopt a byte-identical replacement on restart', async ({}, testInfo) => {
