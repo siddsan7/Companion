@@ -32,7 +32,7 @@
   Object.assign(editorControls.style, { border: '0', padding: '0', margin: '0', minWidth: '0' });
   editorControls.append(...byId('idea-editor').childNodes); byId('idea-editor').append(editorControls);
   let origin = null, operation = null, epoch = 0, listEpoch = 0, vaultEpoch = 0, initialSupportPending = true;
-  let editorLoad = null;
+  let editorLoad = null, confirmation = null;
   let removalOperation = null, removalEpoch = 0;
   function closeRemoval() { removalEpoch++; removalOperation = null; removalPreview.hidden = true; }
   function showRemoval(preview) {
@@ -94,7 +94,8 @@
       removalRecovery.append(article);
     }
   }
-  const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; };
+  function updateConfirm() { byId('idea-confirm').disabled = !!confirmation || !operation; }
+  const invalidate = () => { epoch++; operation = null; byId('idea-preview').hidden = true; updateConfirm(); };
   function beginEditorLoad() {
     invalidate(); editorLoad = { epoch, vaultEpoch }; editorControls.disabled = true; editorControls.setAttribute('aria-busy', 'true'); return editorLoad;
   }
@@ -120,9 +121,9 @@
   }
   function showPreview(preview) {
     operation = preview.blocked ? null : preview.operation; byId('idea-destination').value = preview.destination; byId('idea-markdown').value = preview.text;
-    byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false; byId('idea-confirm').disabled = !!preview.blocked;
+    byId('idea-warnings').textContent = preview.warnings.join('\n'); byId('idea-preview').hidden = false; updateConfirm();
   }
-  async function list() {
+  async function list({ reportError = true } = {}) {
     const request = ++listEpoch, owner = vaultEpoch, view = epoch;
     const current = () => request === listEpoch && owner === vaultEpoch && view === epoch;
     supportStatus.textContent = 'Checking current saved idea support…';
@@ -183,7 +184,7 @@
     } catch (error) {
       if (current()) {
         supportStatus.textContent = `Support inspection unavailable: ${error.message}`;
-        byId('idea-status').textContent = error.message;
+        if (reportError) byId('idea-status').textContent = error.message;
       }
     }
   }
@@ -208,14 +209,17 @@
   };
   byId('idea-cancel').onclick = invalidate;
   byId('idea-confirm').onclick = async () => {
-    const current = epoch, approved = operation; if (!approved) return;
-    byId('idea-confirm').disabled = true;
+    const approved = operation; if (!approved || confirmation) return;
+    const request = { editor: epoch, vault: vaultEpoch }, owns = () => request.editor === epoch && request.vault === vaultEpoch;
+    confirmation = request; updateConfirm(); byId('idea-status').textContent = '';
     try {
       await window.companion['idea-confirm']({ operation: approved });
-      if (current !== epoch) return;
-      invalidate(); byId('idea-status').textContent = 'Saved idea. The independent Markdown note is available in the vault.'; await list();
-    } catch (error) { if (current === epoch) byId('idea-status').textContent = `Save failed. Proposed content is retained. Retry confirmation explicitly. ${error.message}`; }
-    finally { byId('idea-confirm').disabled = false; }
+      if (!owns()) return;
+      invalidate(); const completion = epoch;
+      await list({ reportError: false });
+      if (completion === epoch && request.vault === vaultEpoch) byId('idea-status').textContent = 'Saved idea. The independent Markdown note is available in the vault.';
+    } catch (error) { if (owns()) byId('idea-status').textContent = `Save failed. Proposed content is retained. Retry confirmation explicitly. ${error.message}`; }
+    finally { if (confirmation === request) { confirmation = null; updateConfirm(); } }
   };
   refreshSupport.onclick = () => list();
   document.getElementById('configure').addEventListener('click', () => { vaultEpoch++; listEpoch++; invalidate(); closeRemoval(); removalRecovery.replaceChildren(); editorLoad = null; editorControls.disabled = false; editorControls.removeAttribute('aria-busy'); initialSupportPending = true; refreshSupport.disabled = true; byId('saved-ideas').replaceChildren(); pendingView.replaceChildren(); supportStatus.textContent = ''; });

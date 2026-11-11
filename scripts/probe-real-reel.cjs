@@ -2,13 +2,15 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const os = require('node:os');
 const { createRequire } = require('node:module');
 const { createHash } = require('node:crypto');
 const repository = process.cwd(), local = createRequire(path.join(repository, 'package.json'));
 const { _electron: electron, expect } = local('@playwright/test');
 const YAML = local('yaml');
-const [root, producer, readme] = process.argv.slice(2).map(file => path.resolve(file));
-assert.ok(process.platform === 'win32' && process.argv.length === 5, 'Supply fresh evidence directory, actual producer attempt, and MyTune README.');
+const inputs = process.argv.slice(2);
+assert.ok(process.platform === 'win32' && inputs.length === 3 && inputs.every(file => path.isAbsolute(file)), 'Supply absolute paths for a fresh Temp evidence directory, actual producer attempt, and MyTune README.');
+const [root, producer, readme] = inputs.map(file => path.resolve(file));
 const names = ['evidence.json', 'first-pass-target.json', 'frames.json', 'notes.md', 'run.json'];
 const copied = path.join(root, 'producer', 'actual-attempt'), project = path.join(root, 'project-input', 'README.md');
 const vault = path.join(root, 'vault', 'Companion'), ideas = path.join(vault, 'Ideas');
@@ -58,8 +60,16 @@ const button = (page, name) => page.getByRole('button', { name, exact: true });
 const field = (page, name) => page.getByLabel(name, { exact: true });
 async function close() { if (desktop) { await desktop.close(); desktop = null; } }
 
+function contains(directory, file) {
+  const relative = path.relative(directory, file);
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
 async function main() {
-  assert.equal(await fs.realpath(producer), producer);
+  const parent = path.dirname(root), resolvedParent = await fs.realpath(parent), temp = await fs.realpath(os.tmpdir());
+  assert.ok(resolvedParent.toLowerCase() === parent.toLowerCase() && resolvedParent.toLowerCase() === temp.toLowerCase(), 'Evidence must be a fresh directory directly under the canonical Windows Temp folder.');
+  const actualProducer = await fs.realpath(producer), actualProject = path.dirname(await fs.realpath(readme));
+  assert.equal(actualProducer, producer);
+  assert.ok(!contains(actualProducer, root) && !contains(actualProject, root), 'Evidence must stay outside both selected input folders.');
   const before = await inputHashes(producer, readme);
   const run = await json(producer, 'run.json'), target = await json(producer, 'first-pass-target.json'), packet = await json(producer, 'evidence.json');
   assert.equal(run.input_kind, 'local_video');

@@ -509,12 +509,17 @@ class Archives {
     const baseline = await controls.state(record.id);
     if (canonical(baseline) !== canonical(transition.baseline)) throw Error('Local generation or exclusion authority changed. Inspect the archive again.');
     if (baseline) await controls.settlePublication(baseline);
-    const stage = path.join(this.history.directory, `${randomUUID()}.pending`), text = JSON.stringify(record, null, 2);
+    const stage = path.join(this.history.directory, `${randomUUID()}.pending`), text = JSON.stringify(record, null, 2), digest = hash(text);
     // This source-bearing stage is preserved on failure; only its exact published peer can finish it.
     this.history.safeDirectory(false, directory); await fs.writeFile(stage, text, { flag: 'wx', flush: true });
     const staged = await controls.file(stage, directory), target = { ...staged.owned, name: `${record.id}.json` };
     if (staged.text !== text) throw Error('Restoration stage changed. Preserve the retained writing.');
-    let marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: hash(text) } }, baseline);
+    const recheckReservation = async () => {
+      const exact = await controls.file(stage, directory, staged.owned, 1, false, true);
+      const destinationExists = await fs.lstat(destination).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
+      if (exact.rawDigest !== digest || destinationExists || record.vault.root !== this.history.getVault()?.root) throw Error('Restoration stage or destination changed. Preserve the retained writing.');
+    };
+    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation);
     this.history.tokens.clear(); this.history.durable.delete(record.id);
     await this.checkpoint('archive-restore-after-reservation');
     await controls.file(stage, directory, staged.owned); this.history.safeDirectory(false, directory);
@@ -525,8 +530,8 @@ class Archives {
     this.history.safeDirectory(false, directory); await fs.unlink(stage);
     await this.checkpoint('archive-restore-before-active');
     await controls.file(destination, directory, target);
-    marker = await controls.put({ ...marker, phase: 'active', targets: [] }, marker);
-    await controls.check(record); this.history.durable.set(record.id, hash(text));
+    await controls.put({ ...marker, phase: 'active', targets: [] }, marker, () => controls.verifyRestorationComplete(marker, directory));
+    await controls.check(record); this.history.durable.set(record.id, digest);
   }
   async publishAddition(record, transition) {
     if (transition) return this.publishGenerationAddition(record, transition);

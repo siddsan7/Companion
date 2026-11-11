@@ -166,6 +166,234 @@ test('Today follows DST midnight rather than an elapsed 24 hour window', async (
   await page.getByRole('button', { name: 'All captures', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Fall-back day thought', exact: true })).toBeVisible();
 });
+
+async function holdBrowseRepairs(contender) {
+  const base = path.join(root, 'vault', 'My Companion');
+  await app.evaluate(({ app: mainApp, ipcMain }, { root, base, contender }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Held Browse repairs require the disposable fixture.');
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Intake } = load('./intake');
+    const originalRepairs = Intake.prototype.repairs;
+    const channels = contender === 'state' ? ['state', 'vault-repairs'] : ['capture'];
+    const handlers = new Map(channels.map(channel => [channel, ipcMain._invokeHandlers.get(channel)]));
+    const gate = globalThis.__browseAdmission = { claimed: false, held: false, requests: [] };
+    let resume, finish;
+    const delivery = new Promise(resolve => { resume = resolve; });
+    gate.finished = new Promise(resolve => { finish = resolve; });
+    gate.release = reason => {
+      if (gate.releaseReason) return;
+      clearTimeout(gate.timer);
+      gate.releaseReason = reason;
+      try {
+        if (contender === 'capture') {
+          const dir = process.getBuiltinModule('path').join(base, 'Captures');
+          gate.filesBeforeRelease = process.getBuiltinModule('fs').readdirSync(dir);
+        }
+      } finally { resume(); }
+    };
+    Intake.prototype.repairs = async function (...args) {
+      if (gate.claimed || this.vault.root !== base) return Reflect.apply(originalRepairs, this, args);
+      gate.claimed = true;
+      const ownLocked = Object.getOwnPropertyDescriptor(this, 'locked'), nativeLocked = this.locked;
+      this.locked = function (work, ...lockedArgs) {
+        return Reflect.apply(nativeLocked, this, [async function (...workArgs) {
+          // The original locked method has acquired the real owner and recovered.
+          gate.held = true;
+          await delivery;
+          return Reflect.apply(work, this, workArgs);
+        }, ...lockedArgs]);
+      };
+      try { return await Reflect.apply(originalRepairs, this, args); }
+      finally {
+        if (ownLocked) Object.defineProperty(this, 'locked', ownLocked); else delete this.locked;
+        finish();
+      }
+    };
+    for (const [channel, original] of handlers) {
+      ipcMain._invokeHandlers.set(channel, async function (...args) {
+        if (!gate.held) return Reflect.apply(original, this, args);
+        const request = { channel, duringHold: !gate.releaseReason };
+        if (channel === 'capture') request.input = args[1];
+        gate.requests.push(request);
+        if (channel === contender && request.duringHold && !gate.timer) {
+          // Let a waiting contender finish after a bounded fixture hold.
+          gate.timer = setTimeout(() => gate.release('fixture boundary'), 1500);
+        }
+        try {
+          const result = await Reflect.apply(original, this, args);
+          if (channel === 'state') {
+            request.outcome = { now: result.now, error: result.vaultError ?? null };
+            if (result.vaultError) gate.release('state failed');
+          } else {
+            request.outcome = channel === 'capture' ? { id: result } : { count: result.length };
+          }
+          return result;
+        } catch (error) {
+          request.outcome = { error: error.message };
+          if (channel === 'state') gate.release('state failed');
+          throw error;
+        } finally {
+          if (channel !== 'state') gate.release(`${channel} settled`);
+        }
+      });
+    }
+    gate.restore = () => {
+      Intake.prototype.repairs = originalRepairs;
+      for (const [channel, original] of handlers) ipcMain._invokeHandlers.set(channel, original);
+    };
+  }, { root, base, contender });
+}
+
+async function restoreBrowseRepairs() {
+  await app.evaluate(async () => {
+    const gate = globalThis.__browseAdmission;
+    try {
+      gate.release('cleanup');
+      if (gate.claimed) await gate.finished;
+    } finally {
+      gate.restore();
+      delete globalThis.__browseAdmission;
+    }
+  });
+}
+
+test('a newer Browse Refresh shows Today after DST midnight while earlier repairs own the vault', async () => {
+  const timezone = 'America/New_York', title = 'Thought from the fall-back day';
+  await launch('2026-11-01T04:30:00Z', timezone); await setup();
+  await page.getByLabel('Thought or link').fill(title);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  const note = page.getByRole('heading', { name: title, exact: true });
+  await expect(note).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  const [file] = await fs.readdir(dir), original = await fs.readFile(path.join(dir, file));
+  const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+  const open = page.getByRole('button', { name: 'Open in Obsidian', exact: true });
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-02T04:59:00Z', timezone }));
+  await holdBrowseRepairs('state');
+  try {
+    await refresh.click();
+    await expect.poll(() => app.evaluate(() => globalThis.__browseAdmission.held)).toBe(true);
+    await expect(open).toBeDisabled();
+    const now = '2026-11-02T05:01:00Z';
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now, timezone }));
+    await refresh.click();
+    const observation = () => app.evaluate(() => {
+      const { requests, releaseReason } = globalThis.__browseAdmission;
+      return { requests, releaseReason };
+    });
+    await expect.poll(async () => (await observation()).requests[0]?.outcome).toBeDefined();
+    const { requests, releaseReason } = await observation();
+    expect({ request: requests[0], releaseReason }).toEqual({
+      request: { channel: 'state', duringHold: true, outcome: { now, error: null } },
+      releaseReason: 'fixture boundary'
+    });
+    await expect.poll(async () => (await observation()).requests.find(request => request.channel === 'vault-repairs')?.outcome).toEqual({ count: 0 });
+    await expect(page.locator('#timezone')).toHaveText('Today · America/New_York · 2026-11-02');
+    await expect(note).toHaveCount(0);
+    await expect(page.locator('#warnings')).toBeEmpty();
+    await page.getByRole('button', { name: 'All captures', exact: true }).click();
+    await expect(note).toBeVisible();
+    await expect(open).toBeEnabled();
+    expect(await fs.readdir(dir)).toEqual([file]);
+    expect(await fs.readFile(path.join(dir, file))).toEqual(original);
+  } finally { await restoreBrowseRepairs(); }
+});
+
+test('one explicit Save capture publishes once after earlier Browse repairs release the vault', async () => {
+  await launch(); await setup();
+  const text = 'Save this thought once after Browse.';
+  const draft = page.getByLabel('Thought or link');
+  await draft.fill(text);
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  await holdBrowseRepairs('capture');
+  try {
+    const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+    await refresh.click();
+    await expect.poll(() => app.evaluate(() => globalThis.__browseAdmission.held)).toBe(true);
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    expect.soft(await page.getByRole('button', { name: 'Use this folder', exact: true }).isDisabled(), 'The selected vault cannot change during an admitted Save').toBe(true);
+    const observation = () => app.evaluate(() => {
+      const { requests, releaseReason, filesBeforeRelease } = globalThis.__browseAdmission;
+      return { requests, releaseReason, filesBeforeRelease };
+    });
+    await expect.poll(async () => (await observation()).requests[0]?.outcome).toBeDefined();
+    expect(await observation()).toEqual({
+      requests: [{ channel: 'capture', duringHold: true, input: { text, excerpt: '' }, outcome: { id: expect.any(String) } }],
+      releaseReason: 'fixture boundary',
+      filesBeforeRelease: []
+    });
+    await expect(page.getByRole('status')).toHaveText('Capture saved.');
+    await expect(draft).toHaveValue('');
+    const heading = page.getByRole('heading', { name: text, exact: true });
+    await expect(heading).toBeVisible();
+    const saved = await heading.elementHandle();
+    try {
+      await refresh.click();
+      await expect.poll(() => saved.evaluate(node => node.isConnected)).toBe(false);
+      await expect(heading).toHaveCount(1);
+    } finally { await saved.dispose(); }
+    expect((await observation()).requests).toHaveLength(1);
+    const files = await fs.readdir(dir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/\.md$/);
+    expect(await fs.readFile(path.join(dir, files[0]), 'utf8')).toContain(text);
+  } finally { await restoreBrowseRepairs(); }
+});
+
+test('Save capture waits for vault setup and an explicit click persists one note', async () => {
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByLabel('Parent folder').fill('My Companion');
+  const base = path.join(root, 'vault', 'My Companion');
+  await app.evaluate(({ app: mainApp }, { root, base }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Held vault setup requires the disposable fixture.');
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Vault } = load('./vault');
+    const original = Vault.prototype.setup;
+    const gate = globalThis.__captureSetup = { held: false };
+    const delivery = new Promise(resolve => { gate.release = resolve; });
+    Vault.prototype.setup = async function (...args) {
+      const result = await Reflect.apply(original, this, args);
+      if (this.root === base) {
+        gate.held = true;
+        await delivery;
+      }
+      return result;
+    };
+    gate.restore = () => { Vault.prototype.setup = original; };
+  }, { root, base });
+  const text = 'Keep this draft during vault setup.';
+  const draft = page.getByLabel('Thought or link');
+  const save = page.getByRole('button', { name: 'Save capture', exact: true });
+  const dir = path.join(base, 'Captures');
+  try {
+    await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+    await expect.poll(() => app.evaluate(() => globalThis.__captureSetup.held)).toBe(true);
+    await draft.fill(text);
+    await expect(fs.access(path.join(root, 'settings.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect.soft(await save.isDisabled(), 'Save is disabled before the selected vault is published').toBe(true);
+  } finally {
+    await app.evaluate(() => {
+      const gate = globalThis.__captureSetup;
+      gate.restore();
+      gate.release();
+      delete globalThis.__captureSetup;
+    });
+  }
+  await expect(page.getByRole('status')).toHaveText('Vault ready.');
+  await expect(save).toBeEnabled();
+  await expect(draft).toHaveValue(text);
+  expect(await fs.readdir(dir)).toEqual([]);
+  await save.click();
+  await expect(page.getByRole('status')).toHaveText('Capture saved.');
+  await app.close(); app = null; await launch();
+  await expect(page.getByRole('heading', { name: text, exact: true })).toHaveCount(1);
+  const files = await fs.readdir(dir);
+  expect(files).toHaveLength(1);
+  expect(files[0]).toMatch(/\.md$/);
+  expect(await fs.readFile(path.join(dir, files[0]), 'utf8')).toContain(text);
+});
+
 test('failed capture retains the draft and explicit retry creates one note', async () => {
   await launch(); await setup();
   const dir = path.join(root, 'vault', 'My Companion', 'Captures'); await fs.rmdir(dir);
