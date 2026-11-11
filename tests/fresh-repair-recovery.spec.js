@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const native = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
@@ -59,9 +60,8 @@ async function exitDuringRepair(directory, shared, input, checkpoint = '') {
   expect(result, stderr).toEqual({ code: 77, signal: null });
 }
 
-async function interruptedRepair(testInfo) {
+async function repairConflict(testInfo) {
   const directory = testInfo.outputPath('vault'), reviews = testInfo.outputPath('reviews'), drafts = testInfo.outputPath('drafts');
-  const independent = path.join(drafts, 'independent');
   await fs.mkdir(directory, { recursive: true });
   await fs.mkdir(drafts, { recursive: true });
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(reviews, 'accept'), { recursive: true });
@@ -88,6 +88,13 @@ async function interruptedRepair(testInfo) {
   const writing = 'Preserve the selected local writing.';
   const input = { sourceHash, text: writing, localHash: createHash('sha256').update(local).digest('hex') };
   const shared = path.join(intake.dir, 'transaction.json'), intentFile = path.join(intake.dir, 'repair-intent.json');
+  return { vault, intake, drafts, sourceHash, current, destination, local, ledgerFile, block, older, previous, previousIdentity,
+    writing, input, shared, intentFile };
+}
+
+async function interruptedRepair(testInfo) {
+  const context = await repairConflict(testInfo);
+  const { vault, intake, drafts, sourceHash, current, ledgerFile, block, input, shared, intentFile } = context;
   await exitDuringRepair(vault.vault, shared, input);
   const intent = await json(intentFile), tx = intent.tx;
   const archive = path.join(intake.dir, `repair-${intent.annotationId}.json`);
@@ -104,6 +111,7 @@ async function interruptedRepair(testInfo) {
   expect(await identity(stage)).toEqual(published);
   expect((await json(ledgerFile)).blocks[sourceHash]).toEqual(block);
 
+  const independent = path.join(drafts, 'independent');
   await fs.mkdir(independent);
   const clip = 'b'.repeat(64);
   await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify({
@@ -114,8 +122,7 @@ async function interruptedRepair(testInfo) {
   await fs.writeFile(path.join(independent, 'first-pass-target.json'), JSON.stringify(draft.target));
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(independent, 'notes.md'));
 
-  return { vault, sourceHash, current, destination, local, ledgerFile, block, older, previous, previousIdentity,
-    writing, input, shared, intentFile, intent, tx, archive, stage, annotation, published };
+  return { ...context, intent, tx, archive, stage, annotation, published };
 }
 
 async function expectFinished(context) {
@@ -214,4 +221,100 @@ test('fresh repair retains its conflict proof across a second process exit befor
   expect(await identity(annotation)).toEqual(published);
 
   await expectFinished(context);
+});
+
+test('fresh repair does not adopt an equal-byte replacement of the exclusive annotation stage', async ({}, testInfo) => {
+  const { vault, intake, sourceHash, input, ledgerFile, block, local, destination, shared, intentFile } = await repairConflict(testInfo);
+  const displaced = testInfo.outputPath('original-exclusive-annotation.stage');
+  const writeFile = fs.writeFile, open = fs.open;
+  const isStage = file => typeof file === 'string' && path.dirname(file) === intake.dir &&
+    /^annotation-[a-f0-9-]{36}\.stage$/.test(path.basename(file));
+  let witness;
+  const replaceStage = async file => {
+    if (witness) return;
+    const intent = await json(intentFile), original = await identity(file);
+    expect(path.basename(file)).toBe(`annotation-${intent.annotationId}.stage`);
+    expect(original.nlink).toBe(1n);
+    const bytes = await fs.readFile(file);
+    expect(bytes.toString('utf8')).toBe(intent.annotation);
+    await fs.rename(file, displaced);
+    await writeFile(file, bytes, { flag: 'wx' });
+    const replacement = await identity(file);
+    expect(replacement).not.toEqual(original);
+    witness = { file, intent, bytes, original, replacement };
+  };
+  fs.writeFile = async (file, bytes, options) => {
+    await writeFile(file, bytes, options);
+    if (isStage(file) && options?.flag === 'wx') await replaceStage(file);
+  };
+  fs.open = async (file, flags, mode) => {
+    const handle = await open(file, flags, mode);
+    if (isStage(file) && flags === 'wx') {
+      const close = handle.close.bind(handle);
+      handle.close = async () => { await close(); await replaceStage(file); };
+    }
+    return handle;
+  };
+  try { await intake.resolveConflict(input, later).catch(() => {}); }
+  finally { fs.writeFile = writeFile; fs.open = open; }
+  expect(witness, 'the genuine stage was replaced immediately after its exclusive write').toBeDefined();
+  const { file, intent, bytes, original, replacement } = witness;
+  const annotation = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
+  const ledger = await json(ledgerFile);
+  expect.soft(ledger.attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect.soft(ledger.blocks[sourceHash]).toEqual(block);
+  expect.soft(await fs.readFile(destination)).toEqual(local);
+  await expect(fs.lstat(shared)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect.soft(fs.lstat(annotation)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect.soft(await identity(file).catch(error => error.code)).toEqual(replacement);
+  expect.soft(await fs.readFile(file).catch(error => error.code)).toEqual(bytes);
+  expect(await identity(displaced)).toEqual(original);
+  expect(await fs.readFile(displaced)).toEqual(bytes);
+});
+
+test('accepted repair restart settles its annotation without reading the kept snapshot again', async ({}, testInfo) => {
+  const { vault, sourceHash, ledgerFile, shared, input, tx, intentFile, intent, archive, stage, annotation, published } =
+    await interruptedRepair(testInfo);
+  await exitDuringRepair(vault.vault, shared, input, 'intake-ledger');
+  const accepted = await json(ledgerFile);
+  expect(accepted.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+  expect(accepted.outcomes[tx.key]).toEqual(accepted.attempts[tx.revision.identity]);
+  expect(accepted.acceptedCleanup).toMatchObject({ sourceHash, revision: tx.revision.id, resolution: tx.resolution });
+  expect(accepted.blocks[sourceHash]).toBeUndefined();
+  expect(await json(shared)).toEqual(tx);
+  const keptSnapshot = path.join(vault.root, 'Revisions', `${tx.keptCurrent.id}.json`);
+  const displaced = testInfo.outputPath('original-kept-snapshot.json');
+  const snapshot = await fs.readFile(keptSnapshot), snapshotIdentity = await identity(keptSnapshot);
+  await fs.rename(keptSnapshot, displaced);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const link = fs.link, linkSync = native.linkSync;
+  const recreated = [];
+  fs.link = async (from, to) => {
+    await link(from, to);
+    if (to === shared) recreated.push(from);
+  };
+  native.linkSync = (from, to) => {
+    linkSync(from, to);
+    if (to === shared) recreated.push(from);
+  };
+  let recoveryError;
+  try { await restarted.locked(() => restarted.load()); }
+  catch (error) { recoveryError = error; }
+  finally { fs.link = link; native.linkSync = linkSync; }
+  const settled = await json(ledgerFile);
+  expect.soft(recoveryError).toBeUndefined();
+  expect.soft(recreated).toEqual([]);
+  expect.soft(settled.blocks[sourceHash]).toBeUndefined();
+  expect.soft(settled.captures[sourceHash]).toEqual(accepted.captures[sourceHash]);
+  expect.soft(settled.attempts).toEqual(accepted.attempts);
+  expect.soft(settled.outcomes[tx.key]).toEqual(accepted.outcomes[tx.key]);
+  expect(settled.acceptedCleanup).toBeUndefined();
+  for (const file of [shared, intentFile, stage, archive, keptSnapshot]) {
+    await expect.soft(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  }
+  expect(await fs.readFile(annotation, 'utf8')).toBe(intent.annotation);
+  expect.soft(await identity(annotation)).toEqual({ ...published, nlink: 1n });
+  expect(await fs.readFile(displaced)).toEqual(snapshot);
+  expect(await identity(displaced)).toEqual(snapshotIdentity);
 });
