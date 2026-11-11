@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { Transcripts } = require('../app/transcripts');
@@ -172,6 +173,115 @@ for (const state of ['missing', 'replaced', 'exact']) {
       expect(await read(retained)).toBe(preview.text);
       expect(identity(await fs.lstat(retained, { bigint: true }))).toEqual(identity(original));
     }
+  });
+}
+
+for (const mode of ['fresh export', 'receipt-backed resume']) {
+  test(`transcript confirmation verifies its output after exact stage unlink: ${mode}`, async ({}, testInfo) => {
+    const fixture = mode === 'fresh export'
+      ? await transcriptFixture(testInfo)
+      : await interruptedTranscript(testInfo, 'transcript-after-receipt');
+    const { destination, directory, vault, preview } = fixture;
+    let { store } = fixture;
+    let token = preview.token;
+    if (mode === 'receipt-backed resume') {
+      store = fixture.createStore();
+      token = (await store.resume(fixture.intent.operation)).token;
+    }
+    const retained = path.join(vault.vault, 'Retained exact transcript.md');
+    const unlink = local.unlinkSync;
+    let swap;
+    local.unlinkSync = file => {
+      unlink(file);
+      if (path.dirname(file) !== directory || !file.endsWith('.md.pending')) return;
+      const operation = path.basename(file, '.md.pending');
+      const journal = path.join(directory, `${operation}.intent.json`);
+      const receipt = path.join(directory, `${operation}.published.json`);
+      const journalBytes = local.readFileSync(journal, 'utf8'), receiptBytes = local.readFileSync(receipt, 'utf8');
+      const original = local.lstatSync(destination, { bigint: true });
+      expect(original.nlink).toBe(1n);
+      const bytes = local.readFileSync(destination);
+      expect(bytes.toString('utf8')).toBe(preview.text);
+      local.renameSync(destination, retained);
+      local.writeFileSync(destination, bytes, { flag: 'wx' });
+      const replacement = local.lstatSync(destination, { bigint: true });
+      expect(identity(replacement)).not.toEqual(identity(original));
+      swap = { stage: file, original, replacement, journal, receipt, journalBytes, receiptBytes };
+    };
+    let outcome;
+    try {
+      outcome = await store.confirm(token).then(result => ({ result }), error => ({ error: error.message }));
+    } finally { local.unlinkSync = unlink; }
+
+    expect(swap, 'exact cleanup completed before the destination was replaced').toBeDefined();
+    expect.soft(outcome).toMatchObject({ error: expect.stringMatching(/identity|changed|preserve|missing/i) });
+    expect(await absent(swap.stage)).toBe('ENOENT');
+    expect(await read(destination)).toBe(preview.text);
+    expect(await read(retained)).toBe(preview.text);
+    expect(identity(await fs.lstat(destination, { bigint: true }))).toEqual(identity(swap.replacement));
+    expect(identity(await fs.lstat(retained, { bigint: true }))).toEqual(identity(swap.original));
+    expect(await read(swap.journal)).toBe(swap.journalBytes);
+    expect(await read(swap.receipt)).toBe(swap.receiptBytes);
+  });
+}
+
+for (const state of ['independent replacement', 'unchanged pair']) {
+  test(`transcript legacy resume binds the reviewed receipt-backed pair: ${state}`, async ({}, testInfo) => {
+    const fixture = await interruptedTranscript(testInfo, 'transcript-after-receipt');
+    const { vault, destination, intent, stage, receipt, original, journal, preview } = fixture;
+    delete intent.stageProof;
+    const legacy = JSON.stringify(intent, null, 2), originalReceiptBytes = await read(receipt);
+    await fs.writeFile(journal, legacy);
+    const restarted = fixture.createStore();
+    const resumed = await restarted.resume(intent.operation);
+    expect(resumed.text).toBe(preview.text);
+    const confirmation = () => restarted.confirm(resumed.token);
+    if (state === 'unchanged pair') {
+      await expect(confirmation()).resolves.toEqual({ destination, completed: true });
+      expect(await absent(stage)).toBe('ENOENT');
+      const output = await fs.lstat(destination, { bigint: true });
+      expect(identity(output)).toEqual(identity(original));
+      expect(output.nlink).toBe(1n);
+      expect(await read(destination)).toBe(preview.text);
+      expect(await read(journal)).toBe(legacy);
+      expect(await read(receipt)).toBe(originalReceiptBytes);
+      return;
+    }
+
+    const retainedStage = path.join(vault.vault, 'Retained exact stage.md');
+    const retainedOutput = path.join(vault.vault, 'Retained exact output.md');
+    const retainedReceipt = path.join(vault.vault, 'Retained exact receipt.json');
+    const receiptIdentity = await fs.lstat(receipt, { bigint: true });
+    await fs.rename(stage, retainedStage);
+    await fs.rename(destination, retainedOutput);
+    await fs.rename(receipt, retainedReceipt);
+    await fs.writeFile(stage, preview.text, { flag: 'wx' });
+    await fs.link(stage, destination);
+    const independent = await fs.lstat(stage, { bigint: true });
+    expect(identity(independent)).not.toEqual(identity(original));
+    const replacementReceipt = JSON.stringify({
+      ...JSON.parse(originalReceiptBytes), dev: String(independent.dev), ino: String(independent.ino)
+    }, null, 2);
+    await fs.writeFile(receipt, replacementReceipt, { flag: 'wx' });
+    const independentReceipt = await fs.lstat(receipt, { bigint: true });
+    expect(identity(independentReceipt)).not.toEqual(identity(receiptIdentity));
+
+    await expect.soft(confirmation()).rejects.toThrow(/identity|changed|preserve|receipt/i);
+    expect.soft(await read(stage).catch(error => error.code)).toBe(preview.text);
+    const staged = await fs.lstat(stage, { bigint: true }).catch(error => error.code);
+    expect.soft(identity(staged)).toEqual(identity(independent));
+    expect.soft(staged.nlink).toBe(2n);
+    expect(await read(destination)).toBe(preview.text);
+    expect(identity(await fs.lstat(destination, { bigint: true }))).toEqual(identity(independent));
+    for (const file of [retainedStage, retainedOutput]) {
+      expect(await read(file)).toBe(preview.text);
+      expect(identity(await fs.lstat(file, { bigint: true }))).toEqual(identity(original));
+    }
+    expect(await read(receipt)).toBe(replacementReceipt);
+    expect(await read(retainedReceipt)).toBe(originalReceiptBytes);
+    expect(identity(await fs.lstat(receipt, { bigint: true }))).toEqual(identity(independentReceipt));
+    expect(identity(await fs.lstat(retainedReceipt, { bigint: true }))).toEqual(identity(receiptIdentity));
+    expect(await read(journal)).toBe(legacy);
   });
 }
 
