@@ -34,7 +34,7 @@ function parseHeader(header) {
 // retained. Positional reads leave the file position at the start for owned notes.
 async function readHeader(handle, size) {
   const buffer = Buffer.alloc(4096), close = /(?:^|\n)---(?:\r?\n|$)/g;
-  let header = '', offset = 0, searchFrom = 0, bom = false;
+  let header = '', offset = 0, searchFrom = 0;
   while (BigInt(offset) < size) {
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
     if (!bytesRead) break;
@@ -42,14 +42,13 @@ async function readHeader(handle, size) {
     if (!offset) {
       const opening = /^(?:\xef\xbb\xbf)?---\r?\n/.exec(fragment);
       if (!opening) return null;
-      bom = opening[0].startsWith('\xef\xbb\xbf');
       fragment = fragment.slice(opening[0].length);
     }
     offset += bytesRead;
     header += fragment;
     close.lastIndex = searchFrom;
     const closing = close.exec(header);
-    if (closing && (closing[0].endsWith('\n') || BigInt(offset) >= size)) return { header: header.slice(0, closing.index), complete: true, bom };
+    if (closing && (closing[0].endsWith('\n') || BigInt(offset) >= size)) return { header: header.slice(0, closing.index), complete: true };
     searchFrom = Math.max(0, header.length - 6);
   }
   return { header, complete: false };
@@ -148,16 +147,17 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
     const localIdea = inside(ideas, file), retainedIds = publishedIds.get(inode(stat)) || [];
     const isReserved = reserved.paths.has(comparable(relative(file).split(path.sep).join('/')));
     await inspect(file, stat, async handle => {
-      const front = await readHeader(handle, stat.size);
-      const header = front?.complete && Buffer.from(front.header, 'latin1');
-      if (scanCapture && header && !front.bom) {
-        const capture = parseCapture(`---\n${header.toString('utf8')}\n---\n`);
+      const captureBytes = scanCapture ? await readBytes(file, stat, handle) : null;
+      if (captureBytes) {
+        const capture = parseCapture(captureBytes.toString('utf8'));
         if (captureIds.has(capture?.id)) {
           if (!captureClaims.has(capture.id)) captureClaims.set(capture.id, []);
           captureClaims.get(capture.id).push(file);
         }
       }
       if (!scanIdea) return;
+      const front = await readHeader(handle, stat.size);
+      const header = front?.complete && Buffer.from(front.header, 'latin1');
       let metadata;
       if (header) {
         try { metadata = parseHeader(decode.decode(header)); }
@@ -184,7 +184,7 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
       const recordedDestination = publications.get(id)?.destination === file;
       const owned = !isReserved && (retainedIds.includes(id) || recordedDestination || localIdea && isIdea && !publications.has(id));
       const savedIdea = owned && isIdea && metadata.schema_version === 1 && rawId === id;
-      const content = savedIdea ? decode.decode(await readBytes(file, stat, handle)) : undefined;
+      const content = savedIdea ? decode.decode(captureBytes ?? await readBytes(file, stat, handle)) : undefined;
       record(id, { file, stat, relevant: owned || localIdea && isReserved && isIdea || publications.has(id), savedIdea, ...(savedIdea ? { content, metadata } : {}) });
     });
   }
