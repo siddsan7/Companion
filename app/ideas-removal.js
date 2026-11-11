@@ -4,6 +4,7 @@ const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
 const { generations } = require('./source-generations');
+const { scanIdeas } = require('./idea-inventory');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -98,10 +99,13 @@ class IdeasRemoval {
       return { bytes, stat, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
     } finally { fs.closeSync(handle); }
   }
-  scope(vault, id, writing = null) {
+  async scope(vault, id, { writing, confirmed = false } = {}) {
     if (!uuid(id)) held();
     const parents = this.ideas.guard(vault), directory = path.join(vault.root, '.ideas');
     if (!parents.has(directory)) throw Error('Saved idea removal requires the existing .ideas folder. No folder was created.');
+    const inventory = await scanIdeas(vault).catch(error => { throw Error(`Saved idea removal is held. ${error.message}`); });
+    this.ideas.guard(vault, parents);
+    if (this.ideas.getVault() !== vault) held();
     const found = new Map(), intents = new Map(), receipts = [];
     const add = (file, kind, operation, loaded) => found.set(file, { file, kind, operation, loaded: loaded || this.read(vault, file, parents) });
     for (const name of fs.readdirSync(directory).sort()) {
@@ -120,13 +124,16 @@ class IdeasRemoval {
       if (value.vault !== vault.root || typeof value.text !== 'string' || digest(value.text) !== value.digest || !fields || fields.artifact_type !== 'saved_idea' || fields.schema_version !== 1 || fields.companion_id !== id || path.dirname(value.destination || '') !== path.join(vault.root, 'Ideas') || !path.basename(value.destination).endsWith(`--${id}.md`) || value.input?.conversationId !== fields.origin?.conversation_id || value.input?.requestId !== fields.origin?.request_id) held();
       intents.set(value.operation, value); add(file, 'intent', value.operation, loaded);
     }
-    for (const name of fs.readdirSync(path.join(vault.root, 'Ideas')).sort()) {
-      if (!name.endsWith('.md')) continue;
-      const file = path.join(vault.root, 'Ideas', name), loaded = this.read(vault, file, parents);
-      let data; try { data = metadata(loaded.text); } catch { if (name.includes(id)) held(); continue; }
-      if (data?.companion_id !== id && !name.includes(id)) continue;
-      if (data?.artifact_type !== 'saved_idea' || data.schema_version !== 1 || data.companion_id !== id || !name.endsWith(`--${id}.md`)) held();
-      add(file, 'note', null, loaded);
+    const claims = inventory.claims.get(id) || [], [claim] = claims;
+    if (intents.size > 1) held();
+    if (claims.length > 1) throw Error('Saved idea removal is held. Preserve the files and resolve the duplicate identity before removal.');
+    const [intent] = intents.values();
+    if (claim && (!claim.savedIdea || claim.file !== intent?.destination)) throw Error('Saved idea removal is held. The vault copy does not match the recorded publication path. Preserve the file and review its ownership.');
+    if (intent && this.exists(intent.destination) && !claim) held();
+    if (claim) {
+      const loaded = this.read(vault, claim.file, parents);
+      if (!same(loaded.stat, claim.stat) || loaded.text !== claim.content) held();
+      add(claim.file, 'note', null, loaded);
     }
     for (const value of intents.values()) {
       const stage = path.join(directory, `${value.operation}.md.pending`);
@@ -150,7 +157,14 @@ class IdeasRemoval {
       this.ideas.checkReceipt(receipt.value, value);
       const note = found.get(value.destination);
       if (note && (note.loaded.stat.dev.toString() !== receipt.value.dev || note.loaded.stat.ino.toString() !== receipt.value.ino)) held();
+      if (!note && !confirmed) held();
       add(receipt.file, 'receipt', value.operation, receipt.loaded);
+    }
+    // Before a first confirmation, a note must be the recorded publication or
+    // the exact peer of its retained stage. Recovery uses the confirmed scope.
+    if (claim && !receipts.length && !confirmed) {
+      const stage = found.get(path.join(directory, `${intent.operation}.md.pending`));
+      if (!stage || !same(claim.stat, stage.loaded.stat)) held();
     }
     const files = [...found.values()].map(item => {
       const peers = [...found.values()].filter(peer => same(peer.loaded.stat, item.loaded.stat));
@@ -171,6 +185,7 @@ class IdeasRemoval {
       if (item.kind === 'receipt') continue;
       writing.push({ path: item.file, kind: item.kind, text: item.kind === 'intent' ? intents.get(item.operation).text : item.loaded.text });
     }
+    inventory.check();
     return { parents: parentRecords, files };
   }
   validate(vault, value, id) {
@@ -211,15 +226,16 @@ class IdeasRemoval {
     return { value, copies, parents, locations };
   }
   checkAuthority(vault, authority) {
+    if (this.ideas.getVault() !== vault) held();
     this.validate(vault, authority.value, authority.value.ideaId);
     for (const copy of authority.copies) {
       const current = this.read(vault, copy.file, authority.parents);
       if (!same(current.stat, copy.stat) || current.text !== copy.text || current.stat.nlink !== BigInt(authority.copies.length)) held();
     }
   }
-  checkScope(vault, value) {
+  async checkScope(vault, value) {
     this.validate(vault, value, value.ideaId);
-    const current = this.scope(vault, value.ideaId);
+    const current = await this.scope(vault, value.ideaId, { confirmed: true });
     if (JSON.stringify(current.parents) !== JSON.stringify(value.parents)) held();
     for (const expected of value.files) if (this.exists(this.absolute(vault, expected.path)) && !current.files.some(file => file.path === expected.path)) held();
     for (const file of current.files) {
@@ -237,7 +253,8 @@ class IdeasRemoval {
     if (!parents.has(directory)) throw Error('Saved idea removal requires the existing .ideas folder. No folder was created.');
     return withBriefMutation(directory, async () => {
       this.ideas.guard(vault, parents); this.allow(vault, id);
-      const writing = [], scope = this.scope(vault, id, writing); if (!scope.files.length) held();
+      const writing = [], scope = await this.scope(vault, id, { writing }); if (!scope.files.length) held();
+      if (this.ideas.getVault() !== vault) held();
       const value = { schema: 1, kind: 'saved-idea-removal', ideaId: id, operation: randomUUID(), vault: vault.root, ...scope };
       this.validate(vault, value, id); this.previews.set(value.operation, value);
       return { ...this.describe(vault, value), writing };
@@ -259,19 +276,20 @@ class IdeasRemoval {
     } finally { fs.closeSync(handle); }
   }
   async finish(vault, authority) {
-    this.checkAuthority(vault, authority); this.checkScope(vault, authority.value);
+    this.checkAuthority(vault, authority); await this.checkScope(vault, authority.value);
     if (!authority.copies.some(copy => copy.file === authority.locations.final)) {
+      this.checkAuthority(vault, authority);
       fs.linkSync(authority.locations.stage, authority.locations.final);
       const next = this.load(vault, authority.value.ideaId);
       if (!same(next.copies[0].stat, authority.copies[0].stat)) held();
       authority = next;
     }
     await this.ideas.checkpoint('idea-removal-after-marker');
-    this.checkAuthority(vault, authority); this.checkScope(vault, authority.value);
+    this.checkAuthority(vault, authority); await this.checkScope(vault, authority.value);
     const priority = { stage: 0, note: 1, receipt: 2, intent: 3 };
     for (const target of [...authority.value.files].sort((a, b) => priority[a.kind] - priority[b.kind])) {
       this.checkAuthority(vault, authority);
-      const remaining = this.checkScope(vault, authority.value);
+      const remaining = await this.checkScope(vault, authority.value);
       if (!remaining.files.some(file => file.path === target.path)) continue;
       const file = this.absolute(vault, target.path), current = this.read(vault, file, authority.parents);
       const peers = target.peers.filter(peer => this.exists(this.absolute(vault, peer)));
@@ -280,11 +298,11 @@ class IdeasRemoval {
       await this.ideas.checkpoint('idea-removal-after-unlink');
     }
     this.checkAuthority(vault, authority);
-    if (this.checkScope(vault, authority.value).files.length) held();
+    if ((await this.checkScope(vault, authority.value)).files.length) held();
     const staged = authority.copies.find(copy => copy.file === authority.locations.stage);
     if (staged) { this.checkAuthority(vault, authority); fs.unlinkSync(staged.file); authority = this.load(vault, authority.value.ideaId); }
     this.checkAuthority(vault, authority);
-    if (this.checkScope(vault, authority.value).files.length) held();
+    if ((await this.checkScope(vault, authority.value)).files.length) held();
     for (const [operation, preview] of this.ideas.previews) if (preview.id === authority.value.ideaId) this.ideas.previews.delete(operation);
     return { id: authority.value.ideaId, complete: true };
   }
@@ -293,7 +311,8 @@ class IdeasRemoval {
     if (!value || !vault || value.vault !== vault.root) throw Error('Preview saved idea removal again before confirmation.');
     return withBriefMutation(path.join(vault.root, '.ideas'), async () => {
       this.allow(vault, value.ideaId);
-      if (JSON.stringify(this.scope(vault, value.ideaId)) !== JSON.stringify({ parents: value.parents, files: value.files })) held();
+      if (JSON.stringify(await this.scope(vault, value.ideaId)) !== JSON.stringify({ parents: value.parents, files: value.files })) held();
+      if (this.ideas.getVault() !== vault) held();
       const authority = this.commit(vault, value); this.previews.delete(operation);
       return this.finish(vault, authority);
     });
@@ -304,7 +323,7 @@ class IdeasRemoval {
     const ids = [...new Set(fs.readdirSync(directory).map(name => name.match(/^([a-f0-9-]{36})\.removed\.json(?:\.pending)?$/)?.[1]).filter(Boolean))].sort(), pending = [];
     for (const id of ids) {
       try {
-        const authority = this.load(vault, id), current = this.checkScope(vault, authority.value);
+        const authority = this.load(vault, id), current = await this.checkScope(vault, authority.value);
         if (current.files.length || authority.copies.length !== 1 || authority.copies[0].file !== authority.locations.final) pending.push({ ...this.describe(vault, authority.value), held: false });
       } catch (error) { pending.push({ id, held: true, warnings: [`Saved idea removal held: ${error.message}`], files: [] }); }
     }

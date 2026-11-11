@@ -15,18 +15,19 @@ test.afterEach(async () => {
   app = null;
   await fs.rm(root, { recursive: true, force: true });
 });
-async function launch(configure = true) {
+async function launch(configure = true, parent = 'Companion') {
   app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   page = await app.firstWindow();
   if (configure) {
     await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+    await page.getByLabel('Parent folder', { exact: true }).fill(parent);
     await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation({ imported = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation' } = {}) {
+async function completedConversation({ imported = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario || { reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
-  await launch();
+  await launch(true, parent);
   if (imported) {
     await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
     await page.getByLabel('Finalized review folder', { exact: true }).fill(path.join(root, 'producer'));
@@ -79,6 +80,342 @@ async function dispatchedUri() {
   try { return await fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8'); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
+
+async function saveCitedExperimentProposal(title, signal, parent = 'Companion') {
+  await completedConversation({ imported: true, parent });
+  const vault = path.join(root, 'vault', parent);
+  const revisions = path.join(vault, 'Revisions');
+  const revisionNames = (await fs.readdir(revisions)).filter(name => name.endsWith('.json'));
+  expect(revisionNames).toHaveLength(1);
+  const snapshotBytes = await fs.readFile(path.join(revisions, revisionNames[0]));
+  const snapshot = JSON.parse(snapshotBytes.toString('utf8'));
+
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill(`${signal}: compare two practice queues.`);
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic source; no experiment was run.');
+  await page.getByLabel('Saved idea kind', { exact: true }).selectOption({ label: 'Experiment Proposal' });
+  for (const [label, value] of [
+    ['Hypothesis', 'A delayed revisit may improve next-day chord changes.'],
+    ['Borrowed mechanism', 'Retrieve a learned chord after a delay.'],
+    ['Project application', 'Offer a delayed revisit in the MyTune practice queue.'],
+    ['Smallest test', 'Compare two practice sessions with and without a delayed revisit.'],
+    ['Observable result', 'Count next-day clean chord changes out of ten attempts.']
+  ]) await page.getByLabel(label, { exact: true }).fill(value);
+  await page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  const preview = page.getByLabel('Proposed idea Markdown', { exact: true });
+  await expect(preview).toHaveValue(/evidence_id: a1/);
+  const text = await preview.inputValue();
+  const fields = YAML.parse(text.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect(fields.idea_kind).toBe('experiment_proposal');
+  expect(fields.citations).toHaveLength(1);
+  expect(fields.citations[0]).toMatchObject({
+    kind: 'imported_evidence', capture_id: snapshot.captureId, revision_id: snapshot.id,
+    snapshot_sha256: createHash('sha256').update(snapshotBytes).digest('hex'),
+    evidence_id: 'a1', excerpt: 'Authored synthetic review fixture only.'
+  });
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea.');
+  const bytes = await fs.readFile(destination);
+  expect(bytes.toString('utf8')).toBe(text);
+  return { vault, destination, bytes, id: fields.companion_id, snapshot };
+}
+
+test('a moved and renamed Experiment Proposal keeps its saved idea identity and exact citation after restart', async () => {
+  test.setTimeout(120000);
+  const title = 'Try a delayed practice queue';
+  const signal = 'movedproposalidentity';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  const directory = path.join(proposal.vault, 'Practice Notes', 'Proposed Tests');
+  await fs.mkdir(directory, { recursive: true });
+  const moved = path.join(directory, 'A delayed revisit.md');
+  await fs.rename(proposal.destination, moved);
+
+  await app.close(); app = null; await launch(false);
+  const idea = page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  await expect(idea).toHaveCount(1);
+  await idea.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(moved)}`);
+  await idea.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  await expect(page.locator('#idea-evidence')).toContainText(`Cited revision ${proposal.snapshot.id}; evidence a1`);
+  await expect(page.locator('#idea-evidence')).toContainText('Authored synthetic review fixture only.');
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(proposal.snapshot.text.replace(/\r\n?/g, '\n'));
+
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await manual.selectOption({ label: title });
+  await expect(manual).toHaveValue(`idea:${proposal.id}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  await expect(packageText).toHaveValue(new RegExp(`Saved idea ${proposal.id};`));
+  await expect(packageText).toHaveValue(new RegExp(`${signal}: compare two practice queues`));
+  expect(await fs.readFile(moved)).toEqual(proposal.bytes);
+  await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('a duplicate saved idea in an ordinary nested folder blocks discovery and previously selected use', async () => {
+  test.setTimeout(120000);
+  const title = 'A proposal with an independent copy';
+  const signal = 'duplicateproposalidentity';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const results = page.locator('#context-results');
+  const result = results.getByRole('heading', { name: title, exact: true });
+  await expect(result).toBeVisible();
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await manual.selectOption({ label: title });
+  await expect(manual).toHaveValue(`idea:${proposal.id}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+
+  const directory = path.join(proposal.vault, 'Practice Notes', 'Independent Copies');
+  await fs.mkdir(directory, { recursive: true });
+  const duplicate = path.join(directory, 'A different file.md');
+  // This copy claims the same identity but could not qualify as supporting context.
+  const copyText = proposal.bytes.toString('utf8').replace('support_attribution_unavailable: false', 'support_attribution_unavailable: true');
+  expect(copyText).toContain('support_attribution_unavailable: true');
+  const duplicateBytes = Buffer.from(`${copyText}\nIndependent writing in the duplicate.\n`, 'utf8');
+  await fs.writeFile(duplicate, duplicateBytes, { flag: 'wx' });
+
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const contextError = page.locator('#context-error');
+  await expect.poll(async () => !!(await contextError.textContent()) || !!(await packageText.inputValue())).toBe(true);
+  await expect.soft(packageText).toHaveValue('', { timeout: 1000 });
+  await expect.soft(contextError).toContainText(/unavailable|changed|duplicat|ambigu/i, { timeout: 1000 });
+
+  const idea = page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  const ideaStatus = page.locator('#idea-status');
+  await idea.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(async () => !!await dispatchedUri() || /before opening/i.test(await ideaStatus.textContent())).toBe(true);
+  expect.soft(await dispatchedUri()).toBeNull();
+  await idea.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  const evidence = page.getByLabel('Cited revision snapshot', { exact: true });
+  await expect.poll(async () => await evidence.isVisible() || /identity is missing or ambiguous/i.test(await ideaStatus.textContent())).toBe(true);
+  await expect.soft(evidence).toBeHidden({ timeout: 1000 });
+
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
+  await expect.soft(result).toHaveCount(0, { timeout: 1000 });
+  await expect.soft(manual.getByRole('option', { name: title, exact: true })).toHaveCount(0, { timeout: 1000 });
+  await expect.soft(contextError).toContainText(/duplicat|ambigu/i, { timeout: 1000 });
+  expect(await fs.readFile(proposal.destination)).toEqual(proposal.bytes);
+  expect(await fs.readFile(duplicate)).toEqual(duplicateBytes);
+});
+
+test('a selected dot-prefixed parent retains its saved idea while private vault stores stay excluded', async () => {
+  test.setTimeout(120000);
+  const title = 'A proposal in the selected dot-prefixed parent';
+  const signal = 'dotparentproposalsignal';
+  const proposal = await saveCitedExperimentProposal(title, signal, '.Companion');
+  const privateFolder = path.join(root, 'vault', '.obsidian');
+  await fs.mkdir(privateFolder);
+  const privateNote = path.join(privateFolder, 'Private copy.md');
+  const privateBytes = Buffer.from(`${proposal.bytes.toString('utf8')}\nPRIVATE_IDEA_STORE_17\n`);
+  await fs.writeFile(privateNote, privateBytes, { flag: 'wx' });
+
+  await app.close(); app = null; await launch(false);
+  const idea = page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  await expect(idea).toHaveCount(1);
+  await idea.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(proposal.destination)}`);
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toHaveCount(1);
+  await page.getByLabel('Manual context source', { exact: true }).selectOption(`idea:${proposal.id}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  await expect(packageText).toHaveValue(new RegExp(`Saved idea ${proposal.id};`));
+  await expect(packageText).not.toHaveValue(/PRIVATE_IDEA_STORE_17/);
+  expect(await fs.readFile(proposal.destination)).toEqual(proposal.bytes);
+  expect(await fs.readFile(privateNote)).toEqual(privateBytes);
+});
+
+test('unrelated malformed Markdown permits browsing and confirming saved ideas', async () => {
+  test.setTimeout(120000);
+  const title = 'Browse a proposal beside ordinary Markdown';
+  const signal = 'unrelatedmalformedsignal';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  const note = path.join(root, 'vault', 'Unrelated writing.md');
+  const noteBytes = Buffer.from('---\ntags: [unclosed\n---\n\nKeep this independent draft exactly as written.\n');
+  await fs.writeFile(note, noteBytes, { flag: 'wx' });
+
+  await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+  const supportStatus = page.locator('#idea-support-status');
+  await expect(supportStatus).toContainText(/Current support inspected|Support inspection unavailable/);
+  await expect.soft(supportStatus).toContainText('Current support inspected', { timeout: 1000 });
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
+  await expect.soft(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toBeVisible({ timeout: 1000 });
+
+  const nextTitle = 'Confirm another idea beside ordinary Markdown';
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(nextTitle);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('An independent synthetic interpretation of the retained reply.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic fixture; no observed outcome.');
+  await page.getByLabel('Saved idea kind', { exact: true }).selectOption({ label: 'Observation' });
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  const preview = page.getByLabel('Proposed idea Markdown', { exact: true });
+  await expect(preview).toHaveValue(new RegExp(nextTitle));
+  const text = await preview.inputValue();
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText(/^(Saved idea\.|Save failed\.)/);
+  await expect.soft(page.locator('#idea-status')).toContainText('Saved idea.', { timeout: 1000 });
+  const published = await fs.readFile(destination, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  expect.soft(published).toBe(text);
+  expect(await fs.readFile(proposal.destination)).toEqual(proposal.bytes);
+  expect(await fs.readFile(note)).toEqual(noteBytes);
+});
+
+test('two managed parents in the same vault keep their saved ideas and Context scope separate', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const oldTitle = 'A published proposal in the first parent';
+  const signal = 'managedparentideascope';
+  const proposal = await saveCitedExperimentProposal(oldTitle, signal);
+  const other = path.join(root, 'vault', 'Other Companion');
+  const firstLegacy = 'First parent independent idea';
+  const secondLegacy = 'Second parent independent idea';
+  const firstId = '77000000-0000-4000-8000-000000000001';
+  const secondId = '77000000-0000-4000-8000-000000000002';
+  const legacy = (id, title) => `---\nartifact_type: saved_idea\nschema_version: 1\ncompanion_id: ${id}\ntitle: ${title}\nsource_dependencies: []\n---\n\n${signal}: ${title}.\n`;
+  const firstFile = path.join(proposal.vault, 'Ideas', 'First independent note.md');
+  const secondFolder = path.join(other, 'Ideas', 'Independent Notes');
+  await fs.mkdir(secondFolder, { recursive: true });
+  const secondFile = path.join(secondFolder, 'Second independent note.md');
+  await fs.writeFile(firstFile, legacy(firstId, firstLegacy), { flag: 'wx' });
+  await fs.writeFile(secondFile, legacy(secondId, secondLegacy), { flag: 'wx' });
+
+  await page.getByLabel('Parent folder', { exact: true }).fill(path.basename(other));
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.locator('#location')).toHaveText(other);
+  const saved = page.locator('#saved-ideas');
+  await expect(saved.getByRole('heading', { name: secondLegacy, exact: true })).toBeVisible();
+  await expect.soft(saved.getByRole('heading', { name: oldTitle, exact: true })).toHaveCount(0, { timeout: 1000 });
+  await expect.soft(saved.getByRole('heading', { name: firstLegacy, exact: true })).toHaveCount(0, { timeout: 1000 });
+
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
+  const results = page.locator('#context-results');
+  await expect(results.getByRole('heading', { name: secondLegacy, exact: true })).toBeVisible();
+  await expect.soft(results.getByRole('heading', { name: firstLegacy, exact: true })).toHaveCount(0, { timeout: 1000 });
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await manual.selectOption(`idea:${secondId}`);
+  await expect.soft(manual.getByRole('option', { name: firstLegacy, exact: true })).toHaveCount(0, { timeout: 1000 });
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  // The prior draft still contains a source from the first parent. It must
+  // fail closed; an explicit new conversation starts from the current parent.
+  await expect(page.locator('#context-error')).toContainText('Selected evidence changed or is unavailable.');
+  await expect(packageText).toHaveValue('');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
+  await manual.selectOption(`idea:${secondId}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  try {
+    await expect(packageText).toHaveValue(new RegExp(`Saved idea ${secondId};`));
+  } catch (error) {
+    const [contextError, contextSummary, selected, currentLocation, selectedOption] = await Promise.all([
+      page.locator('#context-error').textContent(), page.locator('#context-summary').textContent(),
+      page.locator('#context-selected').innerHTML(), page.locator('#location').textContent(), manual.inputValue()
+    ]);
+    await fs.writeFile(testInfo.outputPath('two-parent-context-preview.json'),
+      JSON.stringify({ failure: error.message, contextError, contextSummary, selected, currentLocation, selectedOption }, null, 2));
+    throw error;
+  }
+  await expect(packageText).not.toHaveValue(new RegExp(firstId));
+  expect(await fs.readFile(proposal.destination)).toEqual(proposal.bytes);
+  expect(await fs.readFile(firstFile, 'utf8')).toBe(legacy(firstId, firstLegacy));
+  expect(await fs.readFile(secondFile, 'utf8')).toBe(legacy(secondId, secondLegacy));
+});
+
+async function inspectSavedProposal(proposal, title, signal, file) {
+  const idea = page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  await expect(idea).toHaveCount(1);
+  await idea.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(file)}`);
+  await idea.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  await expect(page.locator('#idea-evidence')).toContainText(`Cited revision ${proposal.snapshot.id}; evidence a1`);
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(proposal.snapshot.text.replace(/\r\n?/g, '\n'));
+
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toHaveCount(1);
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await manual.selectOption({ label: title });
+  await expect(manual).toHaveValue(`idea:${proposal.id}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(new RegExp(`Saved idea ${proposal.id};`));
+  return idea;
+}
+
+test('replacing a confirmed note at its recorded path preserves saved idea reads and holds removal', async () => {
+  test.setTimeout(120000);
+  const title = 'A proposal saved by an atomic editor';
+  const signal = 'replacementproposalidentity';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  const parked = path.join(root, 'Original proposal outside the vault.md');
+  const temporary = `${proposal.destination}.replacement`;
+  const edit = 'An editor replaced the file and retained this additional independent writing.';
+  const replacement = Buffer.from(`${proposal.bytes.toString('utf8')}\n${edit}\n`);
+  await fs.writeFile(temporary, replacement, { flag: 'wx' });
+  await fs.rename(proposal.destination, parked);
+  await fs.rename(temporary, proposal.destination);
+  const originalIdentity = await fs.stat(parked, { bigint: true });
+  const replacementIdentity = await fs.stat(proposal.destination, { bigint: true });
+  expect([replacementIdentity.dev, replacementIdentity.ino]).not.toEqual([originalIdentity.dev, originalIdentity.ino]);
+
+  await app.close(); app = null; await launch(false);
+  const idea = await inspectSavedProposal(proposal, title, signal, proposal.destination);
+  await expect(page.getByLabel('Actual context package', { exact: true })).toHaveValue(new RegExp(edit));
+  const journals = path.join(proposal.vault, '.ideas');
+  const before = (await fs.readdir(journals)).sort();
+  const remove = idea.getByRole('button', { name: 'Preview saved idea removal', exact: true });
+  if (await remove.isEnabled()) {
+    await remove.click();
+    await expect(page.locator('#idea-status')).toContainText(/removal.*held/i);
+  }
+  await expect(page.getByLabel('Saved idea removal preview', { exact: true })).toBeHidden();
+  expect((await fs.readdir(journals)).sort()).toEqual(before);
+  expect(await fs.readFile(parked)).toEqual(proposal.bytes);
+  expect(await fs.readFile(proposal.destination)).toEqual(replacement);
+});
+
+test('a confirmed note moved to an ordinary dot folder and filename keeps its identity', async () => {
+  test.setTimeout(120000);
+  const title = 'A proposal moved to a dot folder';
+  const signal = 'dotfolderproposalidentity';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  const directory = path.join(proposal.vault, 'Ideas', '.Archive');
+  const privateStore = path.join(root, 'vault', 'managed-home');
+  await fs.mkdir(directory);
+  await fs.mkdir(privateStore);
+  const moved = path.join(directory, '.proposal.md');
+  const privateCopy = path.join(privateStore, 'Private proposal.md');
+  const privateBytes = Buffer.from(`${proposal.bytes.toString('utf8')}\nPRIVATE_HOME_PROPOSAL_17\n`);
+  await fs.rename(proposal.destination, moved);
+  await fs.writeFile(privateCopy, privateBytes, { flag: 'wx' });
+
+  await app.close(); app = null; await launch(false);
+  await inspectSavedProposal(proposal, title, signal, moved);
+  await expect(page.getByLabel('Actual context package', { exact: true })).not.toHaveValue(/PRIVATE_HOME_PROPOSAL_17/);
+  expect(await fs.readFile(moved)).toEqual(proposal.bytes);
+  expect(await fs.readFile(privateCopy)).toEqual(privateBytes);
+  await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
+});
 
 test('a completed conversation result becomes a standalone saved idea only after visible preview and confirmation', async () => {
   test.setTimeout(90000);

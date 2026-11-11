@@ -6,6 +6,7 @@ const { Intake } = require('./intake');
 const { sourceInspection } = require('./source-mutation');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
+const { scanIdeas } = require('./idea-inventory');
 const { createHash, randomUUID } = require('node:crypto');
 const { revisionAdmission } = require('./source-authority');
 const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance } = require('./source-generations');
@@ -186,14 +187,17 @@ class Context {
       } catch (error) { issues.push(`Approved brief version ${version} unavailable: ${error.message}`); }
     }
     this.ideaEligibility(this.vault);
-    const ideaDir = path.join(this.vault.root, 'Ideas'); await this.vault.contained(ideaDir);
-    for (const entry of await fs.readdir(ideaDir, { withFileTypes: true })) if (entry.isFile() && entry.name.endsWith('.md')) {
+    let ideas;
+    try { ideas = await scanIdeas(this.vault); }
+    catch (error) { issues.push(error.message); }
+    for (const [id, claims] of ideas?.claims || []) {
+      const claim = claims.find(item => item.relevant);
+      if (!claim) continue;
       try {
-        const file = path.join(ideaDir, entry.name); await this.vault.contained(file); const stat = await fs.lstat(file);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('unsupported saved-idea file');
-        const content = await fs.readFile(file, 'utf8'), match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/), metadata = match && YAML.parse(match[1]);
-        if (metadata?.artifact_type !== 'saved_idea' || metadata.schema_version !== 1 || !/^[a-f0-9-]{36}$/.test(metadata.companion_id)) throw Error('unsupported saved-idea record');
-        this.ideaEligibility(this.vault, metadata.companion_id);
+        if (claims.length !== 1) throw Error(`duplicate identity ${id}; preserve and resolve these copies: ${claims.map(item => ideas.relative(item.file)).join(', ')}`);
+        if (!claim.savedIdea || claim.stat.nlink !== 1n) throw Error('unsupported saved-idea record or linked file');
+        const { content, metadata } = claim;
+        this.ideaEligibility(this.vault, id);
         if (metadata.support_attribution_unavailable === true) throw Error('additional source dependency attribution is unavailable');
         const associatedIds = await this.dependencyValidator(metadata.source_dependencies, async dependency => {
           const source = eligible.get(dependency.capture_id); if (!source) return false;
@@ -216,7 +220,7 @@ class Context {
         const dependencyText = metadata.source_dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact imported revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}`).join('; ');
         all.push({ key: `idea:${metadata.companion_id}`, title: metadata.title || `Saved idea ${metadata.companion_id}`, text: body(content), provenance: `Saved idea ${metadata.companion_id}; user interpretation, not independently verified; content sha256 ${digest(content)}; dependencies: ${dependencyText || 'explicitly independent user writing'}${project === undefined ? '' : `; approved project brief version ${project}`}`, digest: digest(content + associatedIds.map(id => eligible.get(id).digest).join('') + (project === undefined ? '' : all.find(item => item.key === `brief:${project}`).digest)), associatedIds, projectVersion: project, ...generationFields(unionGenerations(associatedIds.map(id => eligible.get(id)))) });
         all.at(-1).provenance += generationProvenance(all.at(-1));
-      } catch (error) { issues.push(`Saved idea unavailable: ${entry.name}; ${error.message}`); }
+      } catch (error) { issues.push(`Saved idea unavailable: ${ideas.relative(claim.file)}; ${error.message}`); }
     }
     for (const file of await this.scope()) {
       const key = `note:${digest(file)}`; included.push({ key, file });
@@ -224,8 +228,11 @@ class Context {
     }
     if (!intake.storage.matches(await intake.storage.view(), observed)) throw Error('Intake ledger changed during context discovery. Retry against the current authority.');
     this.ideaEligibility(this.vault);
+    try { ideas?.check(); }
+    catch (error) { issues.push(error.message); ideas = null; }
     const available = all.filter(source => {
       if (!source.key.startsWith('idea:')) return true;
+      if (!ideas) return false;
       try { this.ideaEligibility(this.vault, source.key.slice(5)); return true; }
       catch (error) { issues.push(`Saved idea unavailable: ${source.title}; ${error.message}`); return false; }
     });

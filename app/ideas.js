@@ -7,6 +7,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
 const { IdeasRemoval } = require('./ideas-removal');
+const { scanIdeas } = require('./idea-inventory');
 const { generations, sameEvidence, sameGenerations } = require('./source-generations');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -81,32 +82,31 @@ class Ideas {
   async list() {
     const vault = this.getVault(); if (!vault) return [];
     const parents = this.guard(vault), notes = [];
-    // A known published stage pair remains pending until explicit acknowledgement
-    // or cleanup. It is not an ordinary saved note yet, and general linked files
-    // remain rejected by the reader below.
-    const held = new Set((await this.pending()).filter(item => item.hasPublication).map(item => item.destination));
-    for (const name of await fs.readdir(path.join(vault.root, 'Ideas'))) {
-      if (!name.endsWith('.md')) continue;
-      try {
-        const file = path.join(vault.root, 'Ideas', name); if (held.has(file)) continue;
-        const { text } = await this.readFile(vault, file, parents);
-        const data = metadata(text);
-        if (data?.artifact_type === 'saved_idea' && data.schema_version === 1 && uuid(data.companion_id) && !this.removal.fenced(vault, data.companion_id)) notes.push({ id: data.companion_id, title: data.title, file, citationCount: Array.isArray(data.citations) ? data.citations.length : 0, supportMetadata: data });
-      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const inventory = await scanIdeas(vault);
+    this.guard(vault, parents);
+    for (const [id, claims] of inventory.claims) {
+      if (!claims.some(claim => claim.savedIdea && claim.stat.nlink === 1n)) continue;
+      if (this.removal.fenced(vault, id)) continue;
+      for (const { file, metadata: data, stat } of claims) {
+        // A published stage pair stays pending until the exact peer is cleaned up.
+        if (!data || stat.nlink !== 1n) continue;
+        const unavailable = claims.length !== 1;
+        notes.push({ id, title: data.title || `Saved idea ${id}`, file, unavailable, citationCount: !unavailable && Array.isArray(data.citations) ? data.citations.length : 0, supportMetadata: data, identityWarning: unavailable ? `Duplicate saved idea identity. Preserve and resolve these copies: ${claims.map(claim => inventory.relative(claim.file)).join(', ')}.` : null });
+      }
     }
-    const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
     let corpus, supportError;
     if (notes.length) try {
       // Context reads saved metadata directly; it never calls Ideas.list. One
       // corpus provides the same current eligibility used for outgoing context.
       const context = await this.conversations.getContext();
-      if (context.vault.root !== vault.root) throw Error('Selected vault changed during support inspection.');
+      if (context.vault !== vault) throw Error('Selected vault changed during support inspection.');
       corpus = await context.corpus();
     } catch (error) { supportError = error.message; }
-    this.guard(vault, parents);
-    if (this.getVault()?.root !== vault.root) throw Error('Selected vault changed. Inspect saved ideas again.');
-    return notes.map(({ supportMetadata: data, ...note }) => {
+    this.guard(vault, parents); inventory.check();
+    if (this.getVault() !== vault) throw Error('Selected vault changed. Inspect saved ideas again.');
+    return notes.filter(note => !this.removal.fenced(vault, note.id)).map(({ supportMetadata: data, identityWarning, ...note }) => {
       const warnings = [], dependencies = data.source_dependencies, ids = new Set();
+      if (identityWarning) warnings.push(identityWarning);
       if (data.support_attribution_unavailable !== false) warnings.push('Source attribution is unknown or unavailable; retained writing is not verified support.');
       if (!Array.isArray(dependencies)) warnings.push('Recorded source dependency attribution is unavailable.');
       else for (const dep of dependencies) {
@@ -119,10 +119,10 @@ class Ideas {
       if (!data.project_brief || !uuid(data.project_brief.id) || !Number.isSafeInteger(data.project_brief.version) || data.project_brief.version < 1 || data.project_brief.version !== data.project_brief_version || typeof data.project_brief.digest !== 'string' || !/^[a-f0-9]{64}$/.test(data.project_brief.digest)) warnings.push('Exact project brief attribution is unknown or unavailable.');
       if (supportError) warnings.push(`Current support inspection unavailable: ${supportError}`);
       else if (!corpus?.all.some(source => source.key === `idea:${note.id}`)) {
-        warnings.push(...(corpus?.issues || []).filter(issue => issue.startsWith(`Saved idea unavailable: ${path.basename(note.file)};`)));
+        warnings.push(...(corpus?.issues || []).filter(issue => issue.startsWith(`Saved idea unavailable: ${inventory.relative(note.file)};`)));
         warnings.push('Recorded dependency or brief support is currently unavailable. Retained writing remains independent and was not rewritten.');
       }
-      return { ...note, unavailable: counts.get(note.id) !== 1, reviewSupport: warnings.length > 0, supportWarnings: [...new Set(warnings)] };
+      return { ...note, reviewSupport: warnings.length > 0, supportWarnings: [...new Set(warnings)] };
     });
   }
   async origin(input) {
@@ -417,19 +417,21 @@ class Ideas {
       this.removal.allow(vault, preview.id);
       const currentPreview = await this.preview(preview.input, { ...preview, createdAt: metadata(preview.text).created_at });
       if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
+      const inventory = await scanIdeas(vault), claims = inventory.claims.get(preview.id) || [];
       const freshLinks = local.lstatSync(stage).nlink;
       if (![1, 2].includes(freshLinks)) throw Error('Saved idea stage has unknown linked copies. No destination was created.');
       const freshStage = await this.readFile(vault, stage, parents, freshLinks);
       if (!same(staged.stat, freshStage.stat) || freshStage.text !== preview.text) throw Error('Saved idea stage changed. The proposal and existing files were preserved.');
-      this.guard(vault, parents);
+      this.guard(vault, parents); inventory.check();
       // Check exact peers after every asynchronous checkpoint, immediately before
       // exclusive publication. Two links are valid only for our known destination.
       const finalStage = local.lstatSync(stage, { bigint: true });
       let finalDestination;
       try { finalDestination = local.lstatSync(preview.destination, { bigint: true }); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
-      if (!finalStage.isFile() || finalStage.isSymbolicLink() || !same(freshStage.stat, finalStage)) throw Error('Saved idea stage identity changed. No destination was created.');
+      if (!finalStage.isFile() || finalStage.isSymbolicLink() || !same(freshStage.stat, finalStage) || finalStage.size !== freshStage.stat.size || finalStage.mtimeNs !== freshStage.stat.mtimeNs || finalStage.ctimeNs !== freshStage.stat.ctimeNs || finalStage.nlink !== freshStage.stat.nlink) throw Error('Saved idea stage identity changed. No destination was created.');
       this.removal.allow(vault, preview.id);
+      if (claims.length && (claims.length !== 1 || claims[0].file !== preview.destination || !same(claims[0].stat, finalStage))) throw Error('The saved idea identity already has a vault copy. Existing files were preserved.');
       if (finalStage.nlink === 1n && !finalDestination) local.linkSync(stage, preview.destination);
       else if (finalStage.nlink !== 2n || !finalDestination?.isFile() || finalDestination.isSymbolicLink() || finalDestination.nlink !== 2n || !same(finalStage, finalDestination)) throw Error('Saved idea stage has an unknown peer or the destination exists. Existing files were preserved; no destination peer was created.');
       this.guard(vault, parents);
@@ -441,25 +443,39 @@ class Ideas {
       return { id: preview.id, destination: preview.destination };
     });
   }
+  async locate(id) {
+    const vault = this.getVault(); if (!vault) return null;
+    const parents = this.guard(vault), inventory = await scanIdeas(vault);
+    this.guard(vault, parents);
+    if (this.getVault() !== vault) throw Error('Selected vault changed. Inspect saved ideas again.');
+    const claims = inventory.claims.get(id);
+    if (this.removal.fenced(vault, id) || claims?.length !== 1 || !claims[0].savedIdea || claims[0].stat.nlink !== 1n) return null;
+    return { vault, parents, inventory, note: claims[0] };
+  }
   async openNote(id) {
     if (!uuid(id)) throw Error('Saved idea identity is invalid.');
-    const matches = (await this.list()).filter(note => note.id === id);
-    if (matches.length !== 1 || matches[0].unavailable) throw Error('Saved idea is missing or has duplicate identities. Preserve the notes and resolve them before opening.');
-    await this.open(`obsidian://open?path=${encodeURIComponent(matches[0].file)}`);
+    const found = await this.locate(id);
+    if (!found) throw Error('Saved idea is missing or has duplicate identities. Preserve the notes and resolve them before opening.');
+    if (this.getVault() !== found.vault) throw Error('Selected vault changed. Inspect saved ideas again.');
+    found.inventory.check(); this.removal.allow(found.vault, id);
+    await this.open(`obsidian://open?path=${encodeURIComponent(found.note.file)}`);
   }
   async inspectEvidence({ id, index }) {
     if (!uuid(id) || !Number.isSafeInteger(index) || index < 0) throw Error('Choose a saved citation.');
-    const matches = (await this.list()).filter(note => note.id === id);
-    if (matches.length !== 1 || matches[0].unavailable) throw Error('Saved idea identity is missing or ambiguous.');
-    const vault = this.getVault(), { text } = await this.readFile(vault, matches[0].file, this.guard(vault));
-    const anchor = metadata(text).citations?.[index];
+    const found = await this.locate(id);
+    if (!found) throw Error('Saved idea identity is missing or ambiguous.');
+    const { vault, parents, inventory, note } = found, anchor = note.metadata.citations?.[index];
     if (anchor?.kind !== 'imported_evidence') throw Error('Saved citation attribution is unavailable.');
+    let result;
     try {
       const resolved = await this.revision(vault, anchor.capture_id, anchor.revision_id);
       const evidence = resolved.revision.evidence?.evidence?.find(item => item.id === anchor.evidence_id);
       if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor)) throw Error('Exact cited evidence is damaged or changed.');
-      return { available: true, anchor, text: resolved.revision.text, warnings: resolved.warnings, humanReview: resolved.revision.humanReview, extraction: resolved.revision.extraction, processing: resolved.revision.processing || resolved.revision.run?.state || 'unknown', uncertainty: resolved.revision.uncertainty };
-    } catch (error) { return { available: false, anchor, warnings: [`Cited evidence unavailable: ${error.message} No newer revision was substituted.`] }; }
+      result = { available: true, anchor, text: resolved.revision.text, warnings: resolved.warnings, humanReview: resolved.revision.humanReview, extraction: resolved.revision.extraction, processing: resolved.revision.processing || resolved.revision.run?.state || 'unknown', uncertainty: resolved.revision.uncertainty };
+    } catch (error) { result = { available: false, anchor, warnings: [`Cited evidence unavailable: ${error.message} No newer revision was substituted.`] }; }
+    this.guard(vault, parents); inventory.check(); this.removal.allow(vault, id);
+    if (this.getVault() !== vault) throw Error('Selected vault changed. Inspect saved ideas again.');
+    return result;
   }
 }
 function installIdeas({ ipcMain, ...options }) {
