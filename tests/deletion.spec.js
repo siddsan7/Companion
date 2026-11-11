@@ -2609,7 +2609,12 @@ for (const boundary of ['capture-restoration-authorized', 'intake-ledger', 'capt
   }
   if (boundary === 'capture-restoration-published') {
     expect(authority.restoration.published).toBe(true);
-    expect(await fs.access(path.join(base, '.intake', authority.restoration.journal)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+    const journal = path.join(base, '.intake', authority.restoration.journal);
+    const stat = await fs.lstat(journal, { bigint: true });
+    const digest = createHash('sha256').update(await fs.readFile(journal)).digest('hex');
+    expect(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1n).toBe(true);
+    expect(digest).toBe(authority.restoration.sha256);
+    expect(authority.restoration.importedPublication.journal).toEqual({ dev: String(stat.dev), ino: String(stat.ino), digest });
   }
   await exitMain(boundary, testInfo);
   await fs.writeFile(path.join(root, 'faults.json'), '{}'); await launch();
