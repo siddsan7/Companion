@@ -15,8 +15,7 @@ async function fixture(testInfo) {
   const readme = path.join(root, 'README.md');
   await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
   const restart = () => new Briefs(new Vault(vault.vault, 'Companion'));
-  async function approve() {
-    const briefs = restart();
+  async function approve(briefs = restart()) {
     const { proposed } = await briefs.propose([readme], now);
     const request = {
       id: proposed.id,
@@ -147,4 +146,46 @@ test('retrying an already reserved approval cannot give the same proposal a new 
   if (attempt instanceof Error) expect(attempt.message).toMatch(/unavailable|missing|already approved/i);
   await expect(restart().pinned(2)).rejects.toThrow(/unavailable/i);
   expect(await fs.readFile(retained)).toEqual(bytes);
+});
+
+test('a moved approval in a sibling Briefs folder leaves both parents on their own exact pins', async ({}, testInfo) => {
+  const { root, vault, restart, approve } = await fixture(testInfo);
+  const sibling = new Vault(vault.vault, 'Other managed parent');
+  await sibling.setup();
+  const other = new Briefs(sibling);
+  const first = await approve();
+  const second = await approve(other);
+  const moved = path.join(other.dir, first.record.file);
+  const bytes = await fs.readFile(first.file);
+  await fs.rename(first.file, moved);
+
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject({
+    id: first.record.id, digest: first.record.digest
+  });
+  await expect.soft(other.pinned(1)).resolves.toMatchObject({
+    id: second.record.id, digest: second.record.digest
+  });
+  for (const [selected, approval] of [[vault, first], [sibling, second]]) {
+    const scopeFile = path.join(root, path.basename(selected.root), 'notes.json');
+    const { all } = await new Context(selected, { scopeFile }).corpus();
+    expect.soft(all.filter(source => source.key.startsWith('brief:'))).toMatchObject([
+      { key: 'brief:1', digest: approval.record.digest }
+    ]);
+  }
+  expect(await fs.readFile(moved)).toEqual(bytes);
+});
+
+test('a sibling move into an empty Briefs folder does not reserve a local approval number', async ({}, testInfo) => {
+  const { vault, restart, approve } = await fixture(testInfo);
+  const sibling = new Vault(vault.vault, 'Other managed parent');
+  await sibling.setup();
+  const other = new Briefs(sibling);
+  const first = await approve();
+  const moved = path.join(other.dir, first.record.file);
+  await fs.rename(first.file, moved);
+
+  const second = await approve(other);
+  expect(second.record.version).toBe(1);
+  await expect(other.pinned(1)).resolves.toMatchObject({ id: second.record.id, digest: second.record.digest });
+  await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest: first.record.digest });
 });
