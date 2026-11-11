@@ -299,6 +299,75 @@ test('accepted deferred intake restart settles its unchanged journal pair withou
   expect([snapshotAfter.dev, snapshotAfter.ino, snapshotAfter.nlink]).toEqual([snapshotBefore.dev, snapshotBefore.ino, 1n]);
 });
 
+for (const restartBeforeCleanup of [false, true]) test(`accepted deferred output change stays held ${restartBeforeCleanup ? 'on restart' : 'before and after restart'}`, async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), interruption = Error('Stopped after deferred output replacement.');
+  let deferMove = false, retry = false, replacement, committed;
+  const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (boundary === 'intake-before-move' && deferMove) throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+    if (boundary !== 'intake-ledger' || !retry || replacement) return;
+    committed = await readJson(ledgerFile);
+    const original = await fs.lstat(destination, { bigint: true });
+    expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
+    await fs.unlink(destination);
+    await fs.writeFile(destination, tx.content, { flag: 'wx' });
+    replacement = await fs.lstat(destination, { bigint: true });
+    expect([replacement.dev, replacement.ino]).not.toEqual([original.dev, original.ino]);
+    if (restartBeforeCleanup) throw interruption;
+  });
+  await writeDraft(producer);
+  const first = await intake.connect(producer, true, now);
+  expect(first.lastCheck.status).toBe('complete');
+  const [sourceHash] = Object.keys(first.captures);
+  await writeDraft(producer, 'second', '2');
+  deferMove = true;
+  const deferred = await intake.reconcile({ now: later });
+  deferMove = false;
+  expect(deferred.lastCheck.status).toBe('held');
+  const pending = path.join(intake.dir, deferred.pending[sourceHash].journal), journal = path.join(intake.dir, 'transaction.json');
+  const raw = await fs.readFile(pending, 'utf8'), tx = JSON.parse(raw);
+  const journalIdentity = await fs.lstat(pending, { bigint: true });
+  const held = path.join(intake.dir, `conflict-${tx.revision.id}.json`), destination = intake.destination(tx.capture);
+  const captureStage = path.join(intake.dir, tx.revision.id + '.stage');
+  const snapshotStage = path.join(intake.dir, tx.revision.id + '.snapshot.stage');
+  await writeDraft(producer, 'z-independent', '3', 'c');
+  retry = true;
+  const outcome = await intake.reconcile({ now: later }).catch(error => error);
+  expect(replacement, 'the accepted capture was replaced at the real ledger checkpoint').toBeDefined();
+  expect(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+  expect(committed.captures[sourceHash].currentRevision).toBe(tx.revision.id);
+
+  async function expectHeld(result, attemptCount) {
+    expect(result.lastCheck.status).toBe('held');
+    expect(result.attempts[tx.revision.identity]).toEqual(committed.attempts[tx.revision.identity]);
+    expect(result.captures[sourceHash]).toEqual({ ...committed.captures[sourceHash], conflict: result.blocks[sourceHash]?.reason });
+    expect(Object.values(result.attempts)).toHaveLength(attemptCount);
+    expect(result.blocks[sourceHash]?.journal).toBe(path.basename(held));
+    expect(result.pending[sourceHash]).toBeUndefined();
+    expect(await readOptional(journal)).toBeNull();
+    expect(await readOptional(pending)).toBeNull();
+    expect(await fs.readFile(held, 'utf8')).toBe(raw);
+    const retained = await fs.lstat(held, { bigint: true });
+    expect([retained.dev, retained.ino, retained.nlink]).toEqual([journalIdentity.dev, journalIdentity.ino, 1n]);
+    expect(await fs.readFile(captureStage, 'utf8')).toBe(tx.content);
+    expect(await fs.readFile(snapshotStage, 'utf8')).toBe(JSON.stringify(tx.revision, null, 2));
+    expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
+    const current = await fs.lstat(destination, { bigint: true });
+    expect([current.dev, current.ino]).toEqual([replacement.dev, replacement.ino]);
+  }
+
+  if (restartBeforeCleanup) {
+    expect(outcome).toBe(interruption);
+    expect(await readOptional(journal)).toBe(raw);
+    expect(await readOptional(pending)).toBe(raw);
+  } else {
+    expect.soft(outcome instanceof Error ? outcome.message : null).toBeNull();
+    if (!(outcome instanceof Error)) await expectHeld(outcome, 3);
+    await writeDraft(producer, 'zz-next-independent', '4', 'd');
+  }
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await expectHeld(await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' }), restartBeforeCleanup ? 3 : 4);
+});
+
 test('held explicit conflict repair does not adopt a byte-identical replacement on restart', async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   let repairing = false, replacement;
