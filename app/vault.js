@@ -8,6 +8,8 @@ const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, re
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
+const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
+const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
 async function noteLock(file, guard) {
   const lock = await readExact(`${file}.lock`, guard).catch(missing);
   if (!lock) return null;
@@ -16,7 +18,7 @@ async function noteLock(file, guard) {
   if (!Number.isInteger(owner?.pid) || owner.pid < 1) return { ...lock, unknown: true };
   let live = true;
   try { process.kill(owner.pid, 0); } catch (error) { if (error.code === 'ESRCH') live = false; }
-  return { ...lock, live, publication: owner.publication };
+  return { ...lock, live, legacy: Object.keys(owner).length === 1, publication: owner.publication };
 }
 function markdown(note) {
   return `---\ncompanion_id: ${JSON.stringify(note.id)}\nartifact_type: "capture"\nschema_version: 1\ncapture_type: ${JSON.stringify(note.type)}\ncaptured_at: ${JSON.stringify(note.capturedAt)}\ntitle: ${JSON.stringify(note.title)}\nsource_url: ${JSON.stringify(note.url || '')}\nprovenance: ${JSON.stringify(note.excerpt ? 'user-supplied excerpt; webpage not verified' : 'user capture')}\n---\n\n# ${note.title.replace(/[\r\n]/g, ' ')}\n\n${note.text}\n${note.excerpt ? `\n## User-supplied excerpt\n\n${note.excerpt}\n\nSource URL (as entered): ${note.url}\n\nThis excerpt was supplied by the user. Companion did not fetch or verify the webpage.\n` : ''}`;
@@ -56,7 +58,7 @@ class Vault {
   constructor(vault, parent, { checkpoint = async () => {} } = {}) {
     if (typeof vault !== 'string' || !path.isAbsolute(vault)) throw Error('Choose an absolute vault folder.');
     if (typeof parent !== 'string' || !parent.trim() || /[<>:"|?*]/.test(parent) || parent.split(/[\\/]/).some(part => !part || part === '.' || part === '..')) throw Error('Use a relative parent folder without reserved characters.');
-    this.vault = vault; this.root = path.join(vault, parent); this.expected = new Map(); this.checkpoint = checkpoint; this.warnings = [];
+    this.vault = vault; this.root = path.join(vault, parent); this.expected = new Map(); this.checkpoint = checkpoint; this.warnings = []; this.titleRecoveryErrors = new Map();
   }
   async contained(target) {
     const anchor = await fs.realpath(this.vault), actual = await fs.realpath(target), relative = path.relative(anchor, actual);
@@ -177,6 +179,13 @@ class Vault {
   async title(id, title) {
     return sourceMutation(this.root, () => this.titleOwned(id, title));
   }
+  async titleHasStage(file) {
+    const exists = await fs.lstat(`${file}.title-transaction.json`).catch(missing) || await fs.lstat(`${file}.pending`).catch(missing);
+    if (!exists) return false;
+    const recoveryError = this.titleRecoveryErrors.get(file);
+    if (recoveryError) throw recoveryError;
+    return true;
+  }
   async titleOwned(id, title) {
     if (typeof title !== 'string' || !title.trim() || /[\r\n]/.test(title)) throw Error('Enter a title on one line.');
     const note = await this.find(id);
@@ -184,24 +193,25 @@ class Vault {
     const content = withTitle(note.content, title.trim());
     const authority = (await new (require('./intake').Intake)(this).load()).sourceAuthority?.[id];
     const { guard, identities } = this.publicationFolders(path.dirname(note.file));
+    const stage = `${note.file}.pending`, journal = `${note.file}.title-transaction.json`;
+    if (await this.titleHasStage(note.file)) throw titleHeld();
+    if (await fs.lstat(`${note.file}.lock`).catch(missing)) throw Error('A save or recovery still holds this note. Inspect the note lock before retrying.');
     const original = await readExact(note.file, guard);
     if (!original.bytes.equals(Buffer.from(note.content))) throw Error('The note changed. Your file was preserved.');
-    const stage = `${note.file}.pending`, journal = `${note.file}.title-transaction.json`;
-    if (await fs.lstat(journal).catch(missing) || await fs.lstat(`${note.file}.lock`).catch(missing)) throw stagingHeld();
     const transaction = { expectedHash: hash(note.content), content, backup: `${path.basename(note.file)}.before-title-${randomUUID()}.bak`, ...(authority?.phase === 'active' ? { sourceGeneration: authority.generation } : {}) };
     let lock;
     try {
-      const staged = await writeStage(stage, content, guard);
-      const journalProof = await writeStage(journal, JSON.stringify(transaction), guard);
+      const create = (file, bytes) => writeStage(file, bytes, guard).catch(error => { if (error.code === 'EEXIST') throw titleHeld(); throw error; });
+      const staged = await create(stage, content);
+      const journalProof = await create(journal, JSON.stringify(transaction));
       const publication = { kind: 'title', staged, journal: journalProof, previous: original.proof, identities };
       lock = await this.acquire(note.file, publication, guard);
       await this.checkpoint('title-staged');
       await this.finishTitleOwned(note.file, transaction, publication, guard);
       this.expected.set(id, hash(content));
-    } catch (error) { if (error.code === 'EEXIST') throw stagingHeld(); throw error; }
-    finally { if (lock) await this.release(note.file, lock, guard); }
+    } finally { if (lock) await this.release(note.file, lock, guard); }
   }
-  async finishTitleOwned(file, transaction, publication, guard) {
+  async finishTitleOwned(file, transaction, publication, guard, legacyJournal) {
     const backup = path.join(path.dirname(file), transaction.backup), stage = `${file}.pending`, journal = `${file}.title-transaction.json`;
     guard();
     let old = await readExact(backup, guard).catch(missing);
@@ -209,9 +219,13 @@ class Vault {
     const before = source && parse(source.bytes.toString('utf8')), after = parse(transaction.content);
     if (source && source.proof.digest !== transaction.expectedHash) throw Error('External edit conflict. The note and previous version were preserved.');
     if (!before || !after || before.id !== after.id || before.capturedAt !== after.capturedAt || before.type !== after.type || withTitle(source.bytes.toString('utf8'), after.title) !== transaction.content) throw Error('Invalid title recovery journal. Only a verified capture title can be recovered; all files were preserved.');
+    if (!publication && legacyJournal?.digest === hash(JSON.stringify(transaction)) && old) {
+      // Older note locks never identified the title stage. Only the verified prior note can be restored.
+      await this.restoreTitleBackup(file, backup, after.id, transaction, guard, old, legacyJournal);
+    }
     if (publication?.kind !== 'title' || publication.previous?.digest !== source.proof.digest ||
         publication.previous.dev !== source.proof.dev || publication.previous.ino !== source.proof.ino ||
-        publication.staged?.digest !== hash(transaction.content) || !publication.journal) throw stagingHeld();
+        publication.staged?.digest !== hash(transaction.content) || !publication.journal) throw titleHeld();
     await verifyStage(journal, guard, publication.journal);
     await this.publication(after.id, transaction);
     try {
@@ -248,20 +262,34 @@ class Vault {
       await verifyStage(backup, guard, publication.previous);
       await removeStage(journal, guard, publication.journal);
     } catch (error) {
-      if (error.code !== 'SOURCE_AUTHORITY_DENIED') await this.restoreTitleBackup(file, backup, after.id, transaction, publication, guard).catch(() => {});
+      if (error.code !== 'SOURCE_AUTHORITY_DENIED') {
+        try {
+          const retained = await readExact(backup, guard).catch(missing);
+          // An open editor can change the old inode after the move. Keep those bytes, too.
+          if (retained && retained.proof.dev === publication.previous.dev && retained.proof.ino === publication.previous.ino) {
+            await this.restoreTitleBackup(file, backup, after.id, transaction, guard, retained, publication.journal);
+          }
+        } catch (recoveryError) { this.warnings.push(`Prior title recovery held: ${recoveryError.message}`); }
+      }
       throw error;
     }
   }
-  async restoreTitleBackup(file, backup, id, transaction, publication, guard) {
+  async restoreTitleBackup(file, backup, id, transaction, guard, retained, journalProof) {
     guard();
     if (await fs.lstat(file).catch(missing)) return;
-    const retained = await readExact(backup, guard).catch(missing);
-    // An open editor can change the old inode after the move. Keep those bytes, too.
-    if (!retained || retained.proof.dev !== publication.previous.dev || retained.proof.ino !== publication.previous.ino) return;
     await this.publication(id, transaction);
-    await verifyStage(backup, guard, retained.proof);
-    guard(); await fs.link(backup, file);
-    await verifyPeers(backup, file, guard, retained.proof);
+    const stage = `${file}.restore-title-${randomUUID()}.pending`;
+    const staged = await writeStage(stage, retained.bytes, guard);
+    let linked = false;
+    try {
+      await verifyStage(`${file}.title-transaction.json`, guard, journalProof);
+      await verifyStage(backup, guard, retained.proof);
+      await verifyStage(stage, guard, staged);
+      guard(); await fs.link(stage, file); linked = true;
+      await verifyPeers(stage, file, guard, staged);
+      await removeStage(stage, guard, staged, 2);
+      await verifyStage(file, guard, staged);
+    } finally { if (!linked) await removeStage(stage, guard, staged).catch(() => {}); }
   }
   async recover(dir) {
     return sourceMutation(this.root, () => this.recoverOwned(dir));
@@ -269,20 +297,30 @@ class Vault {
   async recoverOwned(dir) {
     const { guard } = this.publicationFolders(dir);
     const entries = await fs.readdir(dir);
+    const recoveryLocks = new Set();
+    this.titleRecoveryErrors.clear();
     for (const entry of entries.filter(name => name.endsWith('.md.title-transaction.json'))) {
       const journal = path.join(dir, entry), file = journal.slice(0, -'.title-transaction.json'.length);
+      recoveryLocks.add(file);
       let lock;
       try {
         lock = await noteLock(file, guard);
         if (lock?.live) continue;
         const publication = lock?.publication;
         const pinned = this.publicationFolders(dir, publication?.identities);
-        const transaction = JSON.parse((await readExact(journal, pinned.guard)).bytes);
-        if (typeof transaction.content !== 'string' || typeof transaction.expectedHash !== 'string' || typeof transaction.backup !== 'string' || path.basename(transaction.backup) !== transaction.backup || !transaction.backup.startsWith(path.basename(file) + '.before-title-')) throw Error('Invalid title recovery journal; preserve it for repair.');
-        await this.finishTitleOwned(file, transaction, publication, pinned.guard);
+        const stored = await readExact(journal, pinned.guard);
+        const transaction = JSON.parse(stored.bytes);
+        const backupPrefix = path.basename(file) + '.before-title-';
+        if (typeof transaction.content !== 'string' || typeof transaction.expectedHash !== 'string' || typeof transaction.backup !== 'string' ||
+            !transaction.backup.startsWith(backupPrefix) || !/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.bak$/.test(transaction.backup.slice(backupPrefix.length))) throw Error('Invalid title recovery journal; preserve it for repair.');
+        await this.finishTitleOwned(file, transaction, publication, pinned.guard, lock?.legacy ? stored.proof : undefined);
         this.warnings.push('Recovered an interrupted title save. The previous version remains in an adjacent backup.');
-      } catch (error) { this.warnings.push(error.message); }
-      finally { if (lock && !lock.live && !lock.unknown) await this.release(file, lock.proof, guard); }
+        await this.release(file, lock.proof, pinned.guard);
+      } catch (error) {
+        this.warnings.push(error.message);
+        if (temporaryFileError(error) || error.code === 'SOURCE_AUTHORITY_DENIED') this.titleRecoveryErrors.set(file, error);
+        if (lock?.legacy && !lock.live && !temporaryFileError(error)) await this.release(file, lock.proof, guard);
+      }
     }
     // Only exact quick-capture stages can finish here. Other writers keep their own recovery records.
     for (const entry of entries.filter(name => name.endsWith('.md.pending'))) {
@@ -291,6 +329,7 @@ class Vault {
       try {
         if (!await fs.lstat(stage).catch(missing)) continue;
         if (await fs.lstat(`${file}.title-transaction.json`).catch(missing)) continue;
+        recoveryLocks.add(file);
         lock = await noteLock(file, guard);
         if (lock?.live) continue;
         const publication = lock?.publication;
@@ -310,11 +349,15 @@ class Vault {
         await removeStage(stage, pinned, publication.staged, 2);
         await verifyStage(file, pinned, publication.staged);
         this.warnings.push('Recovered an interrupted capture save.');
-      } catch (error) { this.warnings.push(`${entry}: ${error.message}`); }
-      finally { if (lock && !lock.live && !lock.unknown) await this.release(file, lock.proof, guard); }
+        await this.release(file, lock.proof, pinned);
+      } catch (error) {
+        this.warnings.push(`${entry}: ${error.message}`);
+        if (lock?.legacy && !lock.live && !temporaryFileError(error)) await this.release(file, lock.proof, guard);
+      }
     }
     for (const entry of entries.filter(name => name.endsWith('.md.lock'))) {
       const file = path.join(dir, entry.slice(0, -'.lock'.length));
+      if (recoveryLocks.has(file)) continue;
       try {
         const lock = await noteLock(file, guard);
         if (lock?.unknown) this.warnings.push(`Unrecognized lock ${entry}. Its bytes were preserved for inspection.`);

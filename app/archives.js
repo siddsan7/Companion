@@ -232,7 +232,7 @@ class Archives {
           await this.publishAddition(record, plan.transitions.find(transition => transition.id === record.id), assertSelection, () => restored++);
         }
         assertSelection();
-        if (noteFiles.length) restoredNotes = await this.includeReviewedNotes(noteFiles, matched);
+        if (noteFiles.length) await this.includeReviewedNotes(noteFiles, matched, count => { restoredNotes = count; });
         const inactiveIntents = (await this.inactiveIntents()).length;
         assertSelection();
         return { restored, restoredNotes, preservedMetadata, equal: plan.equal.length, inactiveIntents };
@@ -289,7 +289,7 @@ class Archives {
     }
     return candidates;
   }
-  async includeReviewedNotes(files, matched) {
+  async includeReviewedNotes(files, matched, committed) {
     const { vault, root, assertSelection } = matched;
     const directory = path.join(this.history.dataRoot, `context-settings-${hash(root)}`), file = path.join(directory, 'notes.json');
     assertSelection(); this.guard();
@@ -307,7 +307,12 @@ class Archives {
         if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.');
       }
       const next = [...new Set([...existing, ...files])], stage = path.join(directory, `notes-${randomUUID()}.tmp`);
-      let staged, published = false;
+      let staged, published = false, verified = false;
+      const commit = () => {
+        verified = true;
+        committed(next.length - existing.length);
+        this.history.tokens.clear(); this.invalidateContextApprovals();
+      };
       try {
         assertSelection();
         staged = await writeStage(stage, JSON.stringify({ schema: 1, files: next }, null, 2), () => { assertSelection(); guard(); });
@@ -315,15 +320,21 @@ class Archives {
         if ((latest?.digest || null) !== (current?.digest || null)) throw Error('Note inclusion settings changed before publication. Existing scope was preserved.');
         await verifyStage(stage, guard, staged);
         assertSelection(); guard();
-        if (current) { await fs.rename(stage, file); published = true; }
-        else {
+        if (current) {
+          await fs.rename(stage, file); published = true;
+          await verifyStage(file, guard, staged);
+          commit();
+        } else {
           await fs.link(stage, file); published = true;
           await verifyPeers(stage, file, guard, staged);
+          commit();
           await removeStage(stage, guard, staged, 2);
+          await verifyStage(file, guard, staged);
         }
-        await verifyStage(file, guard, staged);
-        this.history.tokens.clear(); this.invalidateContextApprovals();
-        return next.length - existing.length;
+      } catch (error) {
+        if (!published) throw error;
+        if (!verified) throw Error(`Note inclusion publication could not be verified. Inspect the current scope and any staging file before retrying. ${error.message}`);
+        throw Error(`The reviewed note scope was published, but cleanup could not be verified. Inspect the current scope and any retained staging file before retrying. ${error.message}`);
       } finally { if (staged && !published) await removeStage(stage, guard, staged).catch(() => {}); }
     });
   }
