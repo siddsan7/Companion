@@ -38,6 +38,11 @@ window.intakeView = {
     // A transient busy/error response must not erase the last successful same-vault view.
     section.replaceChildren();
     for (const item of repairs) {
+      if (item.kind === 'intake-output-hold') {
+        const article = document.createElement('article'), reason = document.createElement('p');
+        reason.textContent = `${item.title || item.id} · Publication held. ${item.reason}`;
+        article.append(reason); section.append(article); continue;
+      }
       if (item.kind === 'annotation-link') {
         const article = document.createElement('article'), reason = document.createElement('p'), retry = document.createElement('button');
         reason.textContent = 'Annotation relationship paused: ' + item.file + ' — ' + item.reason + ' Current writing and relationship recovery versions are preserved. Retry changes only the current generated link; independent source intake can continue.';

@@ -17,6 +17,12 @@ async function annotationAuthority(intake) {
 }
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
+function admittedOutputHold(ledger, sourceHash) {
+  const block = ledger.blocks[sourceHash];
+  if (!block?.outputHold) return false;
+  const admission = revisionAdmission(ledger, block.incomingRevision);
+  return !!admission && admission.sourceHash === sourceHash && admission.captureId === ledger.captures[sourceHash]?.id;
+}
 function sourceLink(content, relative) {
   const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
   if (!frontmatter) return content;
@@ -264,9 +270,13 @@ function install(Intake, { hash, read, noteText }) {
       for (const [id, hold] of Object.entries(ledger.linkHolds || {})) items.push({ kind: 'annotation-link', id, ...hold });
       for (const [sourceHash, block] of Object.entries(ledger.blocks)) {
         if (!/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) continue;
+        const current = ledger.captures[sourceHash];
+        if (admittedOutputHold(ledger, sourceHash)) {
+          items.push({ kind: 'intake-output-hold', sourceHash, id: current.id, title: current.title, reason: block.reason });
+          continue;
+        }
         const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
         this.verifyHeldTransaction(ledger, tx);
-        const current = ledger.captures[sourceHash];
         if (current?.identityIssue || current?.removed) continue;
         if (tx.sourceHash !== sourceHash || current && current.id !== tx.capture.id) throw Error('Conflict identity does not match current intake history. All files were preserved.');
         const file = this.destination(current || tx.capture);
@@ -280,8 +290,13 @@ function install(Intake, { hash, read, noteText }) {
   Intake.prototype.resolveConflict = async function ({ sourceHash, text, localHash }, now) {
     return this.locked(async () => {
       if (typeof text !== 'string' || !text.trim()) throw Error('Choose local writing to preserve in an annotation before applying the incoming revision.');
+      const checkHold = ledger => {
+        if (admittedOutputHold(ledger, sourceHash)) throw Error('This source has a publication hold. Keep its current and recovery files for inspection.');
+      };
+      checkHold(await this.load());
       await this.syncMoves();
       const ledger = await this.load(), block = ledger.blocks[sourceHash];
+      checkHold(ledger);
       if (!block || !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) throw Error('This source has no resolvable incoming conflict.');
       const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
       this.verifyHeldTransaction(ledger, tx);
