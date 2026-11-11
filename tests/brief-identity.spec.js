@@ -1,0 +1,191 @@
+const { test, expect } = require('@playwright/test');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
+const { Briefs } = require('../app/briefs');
+const { Context } = require('../app/context');
+const { Vault } = require('../app/vault');
+
+const now = '2026-11-08T12:00:00Z';
+
+async function fixture(testInfo) {
+  const root = testInfo.outputPath('brief-fixture');
+  const vault = new Vault(path.join(root, 'vault'), 'Companion');
+  await vault.setup();
+  const readme = path.join(root, 'README.md');
+  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
+  const restart = () => new Briefs(new Vault(vault.vault, 'Companion'));
+  async function approve(briefs = restart()) {
+    const { proposed } = await briefs.propose([readme], now);
+    const request = {
+      id: proposed.id,
+      digest: proposed.digest,
+      sections: proposed.sections.map(section => section.text),
+      references: proposed.sections.map(section => section.references
+        .map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+    };
+    const { approved } = await briefs.approve(request, now);
+    const record = approved.find(brief => brief.id === proposed.id);
+    expect(record).toBeDefined();
+    return { record, file: path.join(briefs.dir, record.file), request };
+  }
+  async function archiveFile(name) {
+    const directory = path.join(vault.vault, 'Project writing', 'History');
+    await fs.mkdir(directory, { recursive: true });
+    return path.join(directory, name);
+  }
+  return { root, vault, restart, approve, archiveFile };
+}
+
+test('an approved brief keeps its exact pin and discovery entry after a vault move', async ({}, testInfo) => {
+  const { root, vault, restart, approve, archiveFile } = await fixture(testInfo);
+  const { record, file } = await approve();
+  const bytes = await fs.readFile(file);
+  const moved = await archiveFile('Early MyTune plan.md');
+  await fs.rename(file, moved);
+
+  const pin = { id: record.id, version: record.version, digest: record.digest };
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject({
+    ...pin, sources: record.sources, sections: record.sections
+  });
+  const discovered = await new Context(vault, { scopeFile: path.join(root, 'app', 'notes.json') }).corpus();
+  expect.soft(discovered.all).toEqual(expect.arrayContaining([
+    expect.objectContaining({ key: 'brief:1', briefVersion: 1, digest: record.digest })
+  ]));
+  expect(await fs.readFile(moved)).toEqual(bytes);
+  await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('a missing approved brief keeps its version reserved for historical pins', async ({}, testInfo) => {
+  const { root, restart, approve } = await fixture(testInfo);
+  const { record, file } = await approve();
+  const bytes = await fs.readFile(file);
+  const backup = path.join(root, 'Retained original outside vault.md');
+  await fs.rename(file, backup);
+
+  const newer = await approve();
+  expect.soft(newer.record).toMatchObject({ version: 2 });
+  expect.soft(newer.record.id).not.toBe(record.id);
+  await expect.soft(restart().pinned(1)).rejects.toThrow(/unavailable/i);
+  await expect.soft(restart().pinned(2)).resolves.toMatchObject({ id: newer.record.id, digest: newer.record.digest });
+  expect(await fs.readFile(backup)).toEqual(bytes);
+});
+
+test('a renamed duplicate holds its own approved version and preserves other pins', async ({}, testInfo) => {
+  const { restart, approve, archiveFile } = await fixture(testInfo);
+  const first = await approve();
+  const second = await approve();
+  const duplicate = await archiveFile('Copy of the early MyTune plan.md');
+  const bytes = await fs.readFile(first.file);
+  await fs.copyFile(first.file, duplicate, require('node:fs').constants.COPYFILE_EXCL);
+
+  await expect.soft(restart().pinned(1)).rejects.toThrow(/duplicate|ambiguous/i);
+  await expect.soft(restart().pinned(2)).resolves.toMatchObject({ id: second.record.id, digest: second.record.digest });
+  expect(await fs.readFile(first.file)).toEqual(bytes);
+  expect(await fs.readFile(duplicate)).toEqual(bytes);
+});
+
+test('editing a moved approval holds its own pin without affecting another version', async ({}, testInfo) => {
+  const { restart, approve, archiveFile } = await fixture(testInfo);
+  const first = await approve();
+  const second = await approve();
+  const moved = await archiveFile('Changed early MyTune plan.md');
+  await fs.rename(first.file, moved);
+  await fs.appendFile(moved, '\nUnreviewed changes after the move.\n');
+  const edited = await fs.readFile(moved);
+
+  await expect.soft(restart().pinned(1)).rejects.toThrow(/integrity|changed/i);
+  await expect.soft(restart().pinned(2)).resolves.toMatchObject({ id: second.record.id, digest: second.record.digest });
+  expect(await fs.readFile(moved)).toEqual(edited);
+});
+
+test('a legacy canonical approval observed before moving keeps its pin and version', async ({}, testInfo) => {
+  const { restart, approve, archiveFile } = await fixture(testInfo);
+  const first = await approve();
+  const receipt = path.join(restart().dir, '.brief-approval-1.json');
+  const modern = await fs.readFile(first.file, 'utf8');
+  const legacy = modern.replace(/^managed_parent: .*\r?\n/m, '');
+  expect(legacy).not.toBe(modern);
+  const digest = createHash('sha256').update(legacy).digest('hex');
+  const canonical = path.join(restart().dir, `approved-1-${digest}.md`);
+  await fs.unlink(receipt);
+  await fs.unlink(first.file);
+  await fs.writeFile(canonical, legacy, { flag: 'wx' });
+
+  const pin = { id: first.record.id, version: 1, digest };
+  await expect(restart().pinned(1)).resolves.toMatchObject(pin);
+  const moved = await archiveFile('Legacy MyTune brief.md');
+  await fs.rename(canonical, moved);
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject(pin);
+  const next = await approve();
+  expect.soft(next.record.version).toBe(2);
+  expect(await fs.readFile(moved, 'utf8')).toBe(legacy);
+});
+
+test('a readable approval rename inside Briefs resolves the original receipt', async ({}, testInfo) => {
+  const { restart, approve } = await fixture(testInfo);
+  const first = await approve();
+  const moved = path.join(restart().dir, 'approved-1-MyTune.md');
+  const bytes = await fs.readFile(first.file);
+  await fs.rename(first.file, moved);
+
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject({
+    id: first.record.id, version: 1, digest: first.record.digest
+  });
+  expect(await fs.readFile(moved)).toEqual(bytes);
+});
+
+test('retrying an already reserved approval cannot give the same proposal a new version', async ({}, testInfo) => {
+  const { root, restart, approve } = await fixture(testInfo);
+  const first = await approve();
+  const retained = path.join(root, 'Missing approved original.md');
+  const bytes = await fs.readFile(first.file);
+  await fs.rename(first.file, retained);
+
+  const attempt = await restart().approve(first.request, now).catch(error => error);
+  if (attempt instanceof Error) expect(attempt.message).toMatch(/unavailable|missing|already approved/i);
+  await expect(restart().pinned(2)).rejects.toThrow(/unavailable/i);
+  expect(await fs.readFile(retained)).toEqual(bytes);
+});
+
+test('a moved approval in a sibling Briefs folder leaves both parents on their own exact pins', async ({}, testInfo) => {
+  const { root, vault, restart, approve } = await fixture(testInfo);
+  const sibling = new Vault(vault.vault, 'Other managed parent');
+  await sibling.setup();
+  const other = new Briefs(sibling);
+  const first = await approve();
+  const second = await approve(other);
+  const moved = path.join(other.dir, first.record.file);
+  const bytes = await fs.readFile(first.file);
+  await fs.rename(first.file, moved);
+
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject({
+    id: first.record.id, digest: first.record.digest
+  });
+  await expect.soft(other.pinned(1)).resolves.toMatchObject({
+    id: second.record.id, digest: second.record.digest
+  });
+  for (const [selected, approval] of [[vault, first], [sibling, second]]) {
+    const scopeFile = path.join(root, path.basename(selected.root), 'notes.json');
+    const { all } = await new Context(selected, { scopeFile }).corpus();
+    expect.soft(all.filter(source => source.key.startsWith('brief:'))).toMatchObject([
+      { key: 'brief:1', digest: approval.record.digest }
+    ]);
+  }
+  expect(await fs.readFile(moved)).toEqual(bytes);
+});
+
+test('a sibling move into an empty Briefs folder does not reserve a local approval number', async ({}, testInfo) => {
+  const { vault, restart, approve } = await fixture(testInfo);
+  const sibling = new Vault(vault.vault, 'Other managed parent');
+  await sibling.setup();
+  const other = new Briefs(sibling);
+  const first = await approve();
+  const moved = path.join(other.dir, first.record.file);
+  await fs.rename(first.file, moved);
+
+  const second = await approve(other);
+  expect(second.record.version).toBe(1);
+  await expect(other.pinned(1)).resolves.toMatchObject({ id: second.record.id, digest: second.record.digest });
+  await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest: first.record.digest });
+});

@@ -172,12 +172,10 @@ class Context {
         all.at(-1).provenance += generationProvenance(all.at(-1));
       } catch (error) { issues.push(`Annotation unavailable: ${id}; ${error.message}`); }
     }
-    const briefDir = path.join(this.vault.root, 'Briefs'); await this.vault.contained(briefDir);
-    const versions = new Set((await fs.readdir(briefDir)).map(name => name.match(/^approved-([1-9][0-9]*)(?:-|\.md$)/)?.[1]).filter(Boolean).map(Number));
     const approvedVersions = new Set();
-    for (const version of [...versions].sort((a, b) => a - b)) {
+    for (const { version, pin, error } of await new Briefs(this.vault).pins()) {
       try {
-        const pin = await new Briefs(this.vault).pinned(version);
+        if (error) throw error;
         // Managed captures used as project documents must not re-enter as opaque quotations.
         for (const snapshot of pin.sources) {
           const match = snapshot.text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/), metadata = match && YAML.parse(match[1]);
