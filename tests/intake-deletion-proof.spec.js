@@ -299,18 +299,23 @@ test('accepted deferred intake restart settles its unchanged journal pair withou
   expect([snapshotAfter.dev, snapshotAfter.ino, snapshotAfter.nlink]).toEqual([snapshotBefore.dev, snapshotBefore.ino, 1n]);
 });
 
-for (const restartBeforeCleanup of [false, true]) test(`accepted deferred output change stays held ${restartBeforeCleanup ? 'on restart' : 'before and after restart'}`, async ({}, testInfo) => {
+const deferredOutputChanges = [
+  { kind: 'capture', restartBeforeCleanup: false, title: 'before and after restart' },
+  { kind: 'capture', restartBeforeCleanup: true, title: 'on restart' },
+  { kind: 'snapshot', restartBeforeCleanup: false, title: 'for a replaced snapshot before and after restart' }
+];
+for (const { kind, restartBeforeCleanup, title } of deferredOutputChanges) test(`accepted deferred output change stays held ${title}`, async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer'), interruption = Error('Stopped after deferred output replacement.');
   let deferMove = false, retry = false, replacement, committed;
   const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
     if (boundary === 'intake-before-move' && deferMove) throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
     if (boundary !== 'intake-ledger' || !retry || replacement) return;
     committed = await readJson(ledgerFile);
-    const original = await fs.lstat(destination, { bigint: true });
-    expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
-    await fs.unlink(destination);
-    await fs.writeFile(destination, tx.content, { flag: 'wx' });
-    replacement = await fs.lstat(destination, { bigint: true });
+    const original = await fs.lstat(output, { bigint: true });
+    expect(await fs.readFile(output, 'utf8')).toBe(outputBytes);
+    await fs.unlink(output);
+    await fs.writeFile(output, outputBytes, { flag: 'wx' });
+    replacement = await fs.lstat(output, { bigint: true });
     expect([replacement.dev, replacement.ino]).not.toEqual([original.dev, original.ino]);
     if (restartBeforeCleanup) throw interruption;
   });
@@ -327,12 +332,14 @@ for (const restartBeforeCleanup of [false, true]) test(`accepted deferred output
   const raw = await fs.readFile(pending, 'utf8'), tx = JSON.parse(raw);
   const journalIdentity = await fs.lstat(pending, { bigint: true });
   const held = path.join(intake.dir, `conflict-${tx.revision.id}.json`), destination = intake.destination(tx.capture);
+  const snapshot = path.join(vault.root, 'Revisions', tx.revision.id + '.json'), snapshotBytes = JSON.stringify(tx.revision, null, 2);
+  const [output, outputBytes] = kind === 'capture' ? [destination, tx.content] : [snapshot, snapshotBytes];
   const captureStage = path.join(intake.dir, tx.revision.id + '.stage');
   const snapshotStage = path.join(intake.dir, tx.revision.id + '.snapshot.stage');
   await writeDraft(producer, 'z-independent', '3', 'c');
   retry = true;
   const outcome = await intake.reconcile({ now: later }).catch(error => error);
-  expect(replacement, 'the accepted capture was replaced at the real ledger checkpoint').toBeDefined();
+  expect(replacement, 'the accepted output was replaced at the real ledger checkpoint').toBeDefined();
   expect(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
   expect(committed.captures[sourceHash].currentRevision).toBe(tx.revision.id);
 
@@ -349,10 +356,14 @@ for (const restartBeforeCleanup of [false, true]) test(`accepted deferred output
     const retained = await fs.lstat(held, { bigint: true });
     expect([retained.dev, retained.ino, retained.nlink]).toEqual([journalIdentity.dev, journalIdentity.ino, 1n]);
     expect(await fs.readFile(captureStage, 'utf8')).toBe(tx.content);
-    expect(await fs.readFile(snapshotStage, 'utf8')).toBe(JSON.stringify(tx.revision, null, 2));
-    expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
-    const current = await fs.lstat(destination, { bigint: true });
+    expect(await fs.readFile(snapshotStage, 'utf8')).toBe(snapshotBytes);
+    expect(await fs.readFile(output, 'utf8')).toBe(outputBytes);
+    const current = await fs.lstat(output, { bigint: true });
     expect([current.dev, current.ino]).toEqual([replacement.dev, replacement.ino]);
+    if (kind === 'snapshot') {
+      const capturePeer = await fs.lstat(captureStage, { bigint: true }), capture = await fs.lstat(destination, { bigint: true });
+      expect([capture.dev, capture.ino, capture.nlink]).toEqual([capturePeer.dev, capturePeer.ino, 2n]);
+    }
   }
 
   if (restartBeforeCleanup) {
