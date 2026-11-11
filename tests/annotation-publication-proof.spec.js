@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const native = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
@@ -202,6 +203,77 @@ test('ordinary conflict transfer preserves its only-copy writing when the publis
   for (const file of [witness.note, path.join(intake.dir, 'transaction.json')]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
 });
 
+for (const altered of [true, false]) test(altered ?
+  'ordinary conflict transfer preserves the prior conflict and capture when its annotation changes before admission' :
+  'ordinary conflict transfer admits the incoming capture with the unchanged exact annotation', async ({}, testInfo) => {
+  const transfer = 'Only-copy annotation text selected for final conflict admission.';
+  const displaced = testInfo.outputPath('annotation-moved-at-final-admission.md');
+  let context, witness;
+  context = await fixture(testInfo, async boundary => {
+    if (boundary !== 'intake-published' || !context) return;
+    const { intake, vault } = context;
+    const shared = path.join(intake.dir, 'transaction.json');
+    const tx = JSON.parse(await fs.readFile(shared));
+    if (!tx.resolution || tx.keptCurrent) return;
+    const journal = path.join(intake.dir, 'repair-intent.json');
+    const bytes = await fs.readFile(journal), intent = JSON.parse(bytes), journalIdentity = await identity(journal);
+    expect(intent.tx).toEqual(tx);
+    expect(intent.annotation).toContain(transfer);
+    const note = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
+    const stage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
+    const original = await identity(note);
+    expect(original.nlink).toBe(2n);
+    expect(await identity(stage)).toEqual(original);
+    expect(await fs.readFile(note, 'utf8')).toBe(intent.annotation);
+    const ledger = JSON.parse(await fs.readFile(path.join(intake.dir, 'ledger.json')));
+    expect(ledger.attempts[tx.revision.identity]).toBeUndefined();
+    if (altered) await fs.rename(note, displaced);
+    witness = { tx, journal, bytes, journalIdentity, intent, note, stage, original, shared };
+  }, 'draft');
+  const { intake, producer, sourceHash, capture } = context;
+  const destination = intake.destination(capture);
+  await fs.appendFile(destination, '\nLocal capture writing before final conflict admission.\n');
+  const local = await fs.readFile(destination), localIdentity = await identity(destination);
+  await writeDraft(producer, '2', later);
+  const before = await intake.reconcile({ now: later }), block = before.blocks[sourceHash];
+  expect(block).toBeDefined();
+  const older = path.join(intake.dir, block.journal), olderBytes = await fs.readFile(older), olderIdentity = await identity(older);
+
+  let refusal;
+  try { await intake.resolveConflict({ sourceHash, text: transfer, localHash: createHash('sha256').update(local).digest('hex') }, later); }
+  catch (error) { refusal = error; }
+  expect(witness, 'the ordinary source reached its actual pre-admission publication checkpoint').toBeDefined();
+  const ledger = JSON.parse(await fs.readFile(path.join(intake.dir, 'ledger.json')));
+  const { tx, journal, bytes, journalIdentity, intent, note, stage, original, shared } = witness;
+  expect(await fs.readFile(older)).toEqual(olderBytes);
+  expect(await identity(older)).toEqual(olderIdentity);
+  if (altered) {
+    expect(refusal).toBeInstanceOf(Error);
+    expect.soft(ledger.blocks[sourceHash]).toEqual(block);
+    expect.soft(ledger.captures[sourceHash]).toEqual(before.captures[sourceHash]);
+    expect(ledger.attempts[tx.revision.identity]).toBeUndefined();
+    expect.soft(await readOptional(destination)).toEqual(local);
+    const restored = await identity(destination).catch(error => ({ code: error.code }));
+    expect.soft(restored).toMatchObject({ dev: localIdentity.dev, ino: localIdentity.ino });
+    expect(await readOptional(note)).toBeNull();
+    expect(await fs.readFile(displaced, 'utf8')).toBe(intent.annotation);
+    expect(await identity(displaced)).toEqual(original);
+    expect(await fs.readFile(stage, 'utf8')).toBe(intent.annotation);
+    expect(await identity(stage)).toEqual(original);
+    expect(await fs.readFile(journal)).toEqual(bytes);
+    expect(await identity(journal)).toEqual(journalIdentity);
+  } else {
+    expect(refusal).toBeUndefined();
+    expect(ledger.blocks[sourceHash]).toBeUndefined();
+    expect(ledger.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+    expect(ledger.captures[sourceHash].currentRevision).toBe(tx.revision.id);
+    expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
+    expect(await fs.readFile(note, 'utf8')).toBe(intent.annotation);
+    expect(await identity(note)).toEqual({ ...original, nlink: 1n });
+    for (const file of [journal, stage, shared]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  }
+});
+
 test('relationship repair preserves an independent backup created during authority verification', async ({}, testInfo) => {
   const foreignText = 'Independent backup writing created after the backup was observed absent.\n';
   let armed = false, views = 0, context, witness;
@@ -241,4 +313,53 @@ test('relationship repair preserves an independent backup created during authori
   const evidence = await readOptional(witness.journal) ? witness.journal : archive;
   expect.soft(await readOptional(evidence)).toEqual(witness.bytes);
   expect.soft(await identity(evidence).catch(error => error.code)).toEqual(witness.journalIdentity);
+});
+
+test('relationship repair refuses an independent equal-byte stage at its exclusive open', async ({}, testInfo) => {
+  let armed = false, witness;
+  const { intake, input, note } = await fixture(testInfo, boundary => { if (boundary === 'link-intent-published') armed = true; });
+  await intake.addAnnotation(input, now);
+  const original = await fs.readFile(note), originalIdentity = await identity(note);
+  const moved = path.join(path.dirname(note), 'Nested', path.basename(note));
+  await fs.mkdir(path.dirname(moved));
+  await fs.rename(note, moved);
+  const open = fs.open;
+  fs.open = async (file, flags, ...args) => {
+    if (armed && !witness && flags === 'wx' && path.dirname(file) === intake.dir && /^link-[a-f0-9-]{36}\.stage$/.test(path.basename(file))) {
+      const journal = path.join(intake.dir, 'link-intent.json');
+      const bytes = await fs.readFile(journal), intent = JSON.parse(bytes), journalIdentity = await identity(journal);
+      const stage = path.join(intake.dir, `link-${intent.id}.stage`);
+      const backup = path.join(intake.dir, `link-${intent.id}.before.md`);
+      expect(file).toBe(stage);
+      expect(intent.before).toBe(original.toString('utf8'));
+      expect(intent.content).not.toBe(intent.before);
+      const originalLocation = await readOptional(moved) ? moved : backup;
+      expect(await fs.readFile(originalLocation)).toEqual(original);
+      expect(await identity(originalLocation)).toMatchObject({ dev: originalIdentity.dev, ino: originalIdentity.ino });
+      await expect(fs.lstat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
+      native.writeFileSync(stage, intent.content, { flag: 'wx' });
+      const foreign = await identity(stage);
+      expect(foreign.nlink).toBe(1n);
+      witness = { journal, bytes, journalIdentity, intent, stage, backup, foreign };
+    }
+    return open(file, flags, ...args);
+  };
+  try { await intake.info().catch(() => {}); }
+  finally { fs.open = open; }
+  expect(witness, 'the independent inode existed when the real exclusive open was attempted').toBeDefined();
+  expect.soft(await identity(witness.stage).catch(error => error.code)).toEqual(witness.foreign);
+  expect.soft((await readOptional(witness.stage))?.toString('utf8')).toBe(witness.intent.content);
+  const destination = await readOptional(moved);
+  expect.soft(destination === null || destination.equals(original)).toBe(true);
+  const locations = [moved, witness.backup];
+  const surviving = (await Promise.all(locations.map(async file => {
+    const bytes = await readOptional(file);
+    return bytes?.equals(original) ? identity(file) : null;
+  }))).filter(Boolean);
+  expect(surviving).not.toHaveLength(0);
+  for (const actual of surviving) expect(actual).toMatchObject({ dev: originalIdentity.dev, ino: originalIdentity.ino });
+  const archive = path.join(intake.dir, `link-${witness.intent.id}.json`);
+  const evidence = await readOptional(witness.journal) ? witness.journal : archive;
+  expect.soft(await readOptional(evidence)).toEqual(witness.bytes);
+  expect.soft(await identity(evidence).catch(error => error.code)).toMatchObject({ dev: witness.journalIdentity.dev, ino: witness.journalIdentity.ino });
 });
