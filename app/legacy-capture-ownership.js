@@ -12,8 +12,9 @@ const ownerWarning = 'Legacy capture ownership could not be verified. Preserve t
 const badStore = 'Legacy capture ownership requires ordinary, unchanged folders.';
 
 function validReceipt(receipt, id) {
-  return receipt && Object.keys(receipt).sort().join(',') === 'capturedAt,id,owner,schema,type' &&
-    receipt.schema === 1 && receipt.id === id && ['thought', 'link'].includes(receipt.type) &&
+  return receipt && Object.keys(receipt).sort().join(',') === 'baselineHash,capturedAt,generation,id,owner,schema,type' &&
+    receipt.schema === 2 && receipt.id === id && uuid(receipt.generation) &&
+    typeof receipt.baselineHash === 'string' && /^[a-f0-9]{64}$/.test(receipt.baselineHash) && ['thought', 'link'].includes(receipt.type) &&
     typeof receipt.capturedAt === 'string' && Number.isFinite(Date.parse(receipt.capturedAt)) &&
     typeof receipt.owner === 'string' && !/[\\<>:"|?*\x00\r\n]/.test(receipt.owner) &&
     receipt.owner.split('/').every(part => part && part !== '.' && part !== '..');
@@ -23,7 +24,7 @@ function sameCapture(note, record) {
   return note.type === record.type && note.capturedAt === record.capturedAt;
 }
 
-async function captureOwners(vault, notes, managedRoots, importedIds, authority = {}) {
+async function captureOwners(vault, notes, importedIds, excluded, authority = {}, guardLedger) {
   const groups = new Map();
   for (const note of notes) {
     if (importedIds.has(note.id)) continue;
@@ -36,8 +37,6 @@ async function captureOwners(vault, notes, managedRoots, importedIds, authority 
 
   const root = path.resolve(vault.vault), directory = path.join(root, storeName);
   const selected = comparable(parentOf(root, vault.root));
-  const captureArea = comparable(path.join(vault.root, 'Captures'));
-  const here = note => comparable(path.dirname(note.file)) === captureArea;
   let held = false;
   await intakeLock(root, async () => {
     const rootGuard = ordinaryDirectories([root], badStore).guard;
@@ -61,7 +60,7 @@ async function captureOwners(vault, notes, managedRoots, importedIds, authority 
       const candidates = copies.filter(legacy);
       const history = authority[id];
       const prior = history?.phase === 'active' && history.manual?.captureId === id ? history.manual : null;
-      if (!uuid(id)) { held ||= candidates.some(here); continue; }
+      if (!uuid(id)) { held = true; continue; }
       const file = path.join(directory, `${id}.json`);
       try {
         const reader = await store(false);
@@ -78,25 +77,29 @@ async function captureOwners(vault, notes, managedRoots, importedIds, authority 
           continue;
         }
 
-        const eligible = candidates.filter(note => prior ? sameCapture(note, prior) : managedRoots.size === 1 && here(note));
-        if (!eligible.length) { held ||= candidates.some(here) || !!prior; continue; }
-        if (copies.length > 1) {
-          // Reserve every claim for duplicate repair without recording an owner
-          // from an ambiguous observation.
-          for (const note of eligible) owned.add(note);
+        const [note] = candidates;
+        if (copies.length !== 1 || excluded.has(note) || !prior || !sameCapture(note, prior) || comparable(history.root) !== comparable(root)) {
+          held = true;
           continue;
         }
-        const [note] = eligible;
-        const receipt = { schema: 1, id, owner: parentOf(root, vault.root), type: note.type, capturedAt: note.capturedAt };
-        const writer = await store(true);
+        const intake = path.join(vault.root, '.intake');
+        const relativeIntake = comparable(parentOf(root, intake));
+        const knownIntake = history.directories.find(item => comparable(item.file) === relativeIntake);
+        const intakeGuard = vault.publicationFolders(intake).guard;
+        const currentIntake = await fs.lstat(intake, { bigint: true });
+        if (!knownIntake || knownIntake.dev !== String(currentIntake.dev) || knownIntake.ino !== String(currentIntake.ino)) throw Error(ownerWarning);
         const parentGuard = vault.publicationFolders(path.dirname(note.file)).guard;
         const observation = await readExact(note.file, parentGuard);
-        if (!observation.bytes.equals(Buffer.from(note.content))) throw Error(ownerWarning);
+        if (observation.proof.digest !== prior.currentHash || !observation.bytes.equals(Buffer.from(note.content))) throw Error(ownerWarning);
+        const receipt = { schema: 2, id, owner: parentOf(root, vault.root), type: note.type, capturedAt: note.capturedAt, generation: history.generation, baselineHash: prior.currentHash };
+        const writer = await store(true);
+        const publishGuard = () => { writer(); parentGuard(); intakeGuard(); };
+        await guardLedger();
         // Readers hold the same native lock. Exclusive creation reserves the
         // identity without replacing an existing receipt. A partial file stays
         // in place and fails validation after an interrupted write.
-        const proof = await writeStage(file, JSON.stringify(receipt), writer);
-        await verifyStage(file, writer, proof);
+        const proof = await writeStage(file, JSON.stringify(receipt), publishGuard);
+        await verifyStage(file, publishGuard, proof);
         owned.add(note);
       } catch {
         held = true;

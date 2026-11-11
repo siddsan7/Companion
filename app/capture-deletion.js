@@ -5,7 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { Intake, noteText } = require('./intake');
 const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
-const { sourceMutation } = require('./source-mutation');
+const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
 const { parse } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf } = require('./source-recovery');
@@ -42,12 +42,11 @@ class CaptureDeletion {
     await globalRecovery(intake, ledger);
     if (ledger.sourceAuthority?.[id]) await sourceParents(intake, ledger.sourceAuthority[id]);
     const entry = Object.entries(ledger.captures).find(([, capture]) => capture.id === id);
-    const { notes: claims, owned } = await vault.captureInventory(ledger);
-    const notes = claims.filter(note => note.id === id);
-    if (!entry && (notes.length !== 1 || !owned.has(notes[0]) || notes[0].type === 'reel_import')) throw changed();
+    const { notes, owned } = await vault.captureInventory({ ledger, id, guardLedger: () => intake.storage.guard() });
+    if (notes.length !== 1 || !owned.has(notes[0]) || !entry && notes[0].type === 'reel_import') throw changed();
     const manual = !entry ? { captureId: id, type: notes[0].type, capturedAt: notes[0].capturedAt, currentHash: hash(notes[0].content), file: path.basename(notes[0].file), relative: relative(vault, notes[0].file) } : undefined;
     const [sourceHash, capture] = entry || [null, { id, title: notes[0].title, currentHash: manual.currentHash, revisions: [] }];
-    if (notes.length !== 1 || manual && hash(notes[0].content) !== capture.currentHash) throw changed();
+    if (manual && hash(notes[0].content) !== capture.currentHash) throw changed();
     const mixed = !manual ? await mixedDeletion.inventory(intake, ledger, capture, sourceHash, notes[0], retained, this.clock?.().now || new Date().toISOString()) : null;
     let targets = mixed ? mixed.targets : [await this.target(vault, notes[0].file, 'capture', !manual)]; const revisions = new Map();
     for (const revisionId of mixed ? [] : capture.revisions) {
@@ -90,7 +89,10 @@ class CaptureDeletion {
     return { id, root, managedRoot: vault.root, ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
   }
   async preview(id) {
-    const inventory = await this.inventory(id), token = randomUUID(); this.previews.set(token, inventory);
+    const vault = this.getVault();
+    if (!vault) throw Error('Choose a vault first.');
+    const inventory = await sourceInspection(vault.root, () => this.inventory(id, undefined, vault));
+    const token = randomUUID(); this.previews.set(token, inventory);
     return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations, dependents: inventory.dependents.rows, ...(inventory.retainedWriting ? { retainedWriting: inventory.retainedWriting } : {}) };
   }
   cancel(token) { this.previews.delete(token); }

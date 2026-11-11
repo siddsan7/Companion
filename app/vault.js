@@ -9,6 +9,7 @@ const { captureOwners, comparable, ownerWarning, parentOf, storeName } = require
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
 const artifactAreas = ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions'];
+const comparableRelative = value => comparable(process.platform === 'win32' ? value.replace(/\\/g, '/') : value);
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
 const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
@@ -107,17 +108,12 @@ class Vault {
     const remove = proof ? removeStage(lock, guard, proof) : fs.unlink(lock);
     await remove.catch(error => { if (error.code !== 'ENOENT') this.warnings.push('A saved-note lock could not be removed. Inspect it before continuing.'); });
   }
-  async scan({ annotations = false, managedRoots } = {}) {
+  async scan({ annotations = false } = {}) {
     await this.writable();
     const notes = [];
     const visit = async dir => {
       await this.contained(dir);
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      if (managedRoots) {
-        const folders = new Set(entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink()).map(entry => comparable(entry.name)));
-        if (folders.has('.intake') && artifactAreas.some(area => folders.has(comparable(area))) || artifactAreas.every(area => folders.has(comparable(area)))) managedRoots.add(comparable(dir));
-      }
-      for (const entry of entries) {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
         if (['.intake', '.obsidian', '.git', '.codex', 'managed-home', storeName].includes(entry.name.toLowerCase())) continue;
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
@@ -138,18 +134,25 @@ class Vault {
     return note.type !== 'reel_import' && typeof note.managedParent === 'string' &&
       comparable(note.managedParent) === comparable(parentOf(this.vault, this.root));
   }
-  async captureInventory(ledger) {
-    const managedRoots = new Set([comparable(path.resolve(this.root))]);
-    const notes = await this.scan({ managedRoots });
-    if (!ledger && notes.some(note => note.type !== 'reel_import' && !this.matchesManualParent(note))) {
-      ledger = await new (require('./intake').Intake)(this).load();
+  async captureInventory({ ledger, guardLedger, id } = {}) {
+    const all = await this.scan();
+    const notes = id ? all.filter(note => note.id === id) : all;
+    if (!ledger) {
+      const intake = new (require('./intake').Intake)(this);
+      ledger = await intake.load();
+      guardLedger = () => intake.storage.guard();
     }
-    const imported = new Set(Object.values(ledger?.captures || {}).map(capture => capture.id));
-    const { owned: legacy, held } = await captureOwners(this, notes, managedRoots, imported, ledger?.sourceAuthority);
-    this.warnings = this.warnings.filter(warning => warning !== ownerWarning);
-    if (held) this.warnings.push(ownerWarning);
-    const owned = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
-    return { notes, owned };
+    const imported = new Set(Object.values(ledger.captures).map(capture => capture.id));
+    const excluded = new Set(notes.filter(note => {
+      const relative = comparableRelative(path.relative(this.vault, note.file));
+      return ledger.identityChoices?.[note.id]?.copies.some(copy => typeof copy.file === 'string' && comparableRelative(copy.file) === relative);
+    }));
+    const { owned: legacy, held } = await captureOwners(this, notes, imported, excluded, ledger.sourceAuthority, guardLedger);
+    if (!id) this.warnings = this.warnings.filter(warning => warning !== ownerWarning);
+    if (held && !this.warnings.includes(ownerWarning)) this.warnings.push(ownerWarning);
+    const repairable = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
+    const owned = new Set([...repairable].filter(note => !excluded.has(note)));
+    return { notes, owned, repairable, excluded };
   }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();
