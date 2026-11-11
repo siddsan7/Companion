@@ -30,11 +30,11 @@ async function setup(testInfo, checkpoint) {
   return { vault, intake, ledgerFile: path.join(intake.dir, 'ledger.json') };
 }
 
-async function writeDraft(root, name = 'first', attempt = '1') {
+async function writeDraft(root, name = 'first', attempt = '1', input = 'a') {
   const directory = path.join(root, name), clip = 'b'.repeat(64);
   await fs.mkdir(directory, { recursive: true });
   await fs.writeFile(path.join(directory, 'run.json'), JSON.stringify({
-    job_id: clip, attempt_id: attempt.repeat(32), started_utc: now, input_sha256: 'a'.repeat(64),
+    job_id: clip, attempt_id: attempt.repeat(32), started_utc: now, input_sha256: input.repeat(64),
     input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
   }));
   await fs.writeFile(path.join(directory, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
@@ -68,10 +68,11 @@ for (const phase of ['before ledger replacement', 'after ledger commit']) {
   for (const kind of ['snapshot', 'capture']) test(`intake holds an independently replaced ${kind} ${phase}`, async ({}, testInfo) => {
     const producer = testInfo.outputPath('producer');
     const foreign = `Independent file at the published ${kind} path.\n`;
+    const checkIndependent = kind === 'capture' && phase === 'after ledger commit';
     let armed = false, mutation;
     const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
       if (boundary === 'intake-published') armed = true;
-      if (boundary === 'intake-ledger' && phase === 'after ledger commit') await replaceOutput();
+      if (boundary === 'intake-ledger' && phase === 'after ledger commit' && !mutation) await replaceOutput();
     });
     const journal = path.join(intake.dir, 'transaction.json');
     async function replaceOutput() {
@@ -97,6 +98,7 @@ for (const phase of ['before ledger replacement', 'after ledger commit']) {
       mutation = { tx, retained, destination, stage, stageBefore, foreignIdentity };
     }
     await writeDraft(producer);
+    if (checkIndependent) await writeDraft(producer, 'z-independent', '2', 'c');
     await intake.connect(producer, false, now);
     const open = fs.open;
     fs.open = async (file, ...args) => {
@@ -128,7 +130,9 @@ for (const phase of ['before ledger replacement', 'after ledger commit']) {
       expect.soft(committed.attempts[tx.revision.identity]).toBeUndefined();
       expect.soft(committed.captures[tx.sourceHash]).toBeUndefined();
     }
-    for (const [file, bytes] of retained) expect.soft(await readOptional(file), path.basename(file)).toBe(bytes);
+    const heldName = committed.blocks[tx.sourceHash]?.journal;
+    const heldJournal = heldName ? path.join(intake.dir, heldName) : journal;
+    for (const [file, bytes] of retained) expect.soft(await readOptional(file === journal ? heldJournal : file), path.basename(file)).toBe(bytes);
     expect.soft(await readOptional(destination)).toBe(foreign);
     const actualForeign = await fs.lstat(destination, { bigint: true });
     expect([actualForeign.dev, actualForeign.ino]).toEqual([foreignIdentity.dev, foreignIdentity.ino]);
@@ -137,6 +141,16 @@ for (const phase of ['before ledger replacement', 'after ledger commit']) {
       throw error;
     });
     expect.soft(actualStage && [actualStage.dev, actualStage.ino, actualStage.nlink]).toEqual([stageBefore.dev, stageBefore.ino, 1n]);
+    if (checkIndependent) {
+      expect.soft(Object.values(committed.attempts)).toHaveLength(2);
+      expect.soft(Object.values(committed.captures)).toHaveLength(2);
+      const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+      const recovered = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
+      expect(recovered.lastCheck.status).toBe('held');
+      expect(recovered.attempts).toEqual(committed.attempts);
+      for (const [file, bytes] of retained) expect.soft(await readOptional(file === journal ? heldJournal : file)).toBe(bytes);
+      expect(await fs.readFile(destination, 'utf8')).toBe(foreign);
+    }
   });
 }
 
