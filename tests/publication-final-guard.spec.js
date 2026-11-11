@@ -1,7 +1,9 @@
 const { test: base, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { createHash, randomUUID } = require('node:crypto');
 const { installArchives } = require('../app/archives');
 const { Conversations } = require('../app/conversations');
 const { changeNoteScope } = require('../app/note-scope');
@@ -35,7 +37,7 @@ async function afterProofClose(select, change, operation) {
   let reached = false;
   fs.open = async (file, flags, ...args) => {
     const handle = await open(file, flags, ...args);
-    if (typeof file !== 'string' || typeof flags !== 'number') return handle;
+    if (typeof file !== 'string' || typeof flags !== 'number' && flags !== 'r') return handle;
     const close = handle.close.bind(handle);
     handle.close = async () => {
       await close();
@@ -196,3 +198,107 @@ test('note scope retains its receipt if the destination changes during receipt c
   expect(await fs.readFile(file)).toEqual(external);
   expect(await fs.readFile(replacement.parked)).toEqual(Buffer.from(JSON.stringify({ schema: 1, files: [selected] }, null, 2)));
 });
+
+for (const changed of ['destination', 'stage']) {
+  test(`capture keeps its recovery lock when the ${changed} changes during lock cleanup`, async ({ localVault }) => {
+    const { vault } = localVault, directory = path.join(vault.root, 'Captures');
+    let file, stage, receipt, receiptBytes, replacement;
+    const result = await afterProofClose(async candidate => {
+      if (path.dirname(candidate) !== directory || !candidate.endsWith('.md.lock')) return false;
+      file = candidate.slice(0, -'.lock'.length);
+      stage = `${file}.pending`;
+      return !await absent(file) && await absent(stage);
+    }, async candidate => {
+      receipt = candidate;
+      receiptBytes = await fs.readFile(receipt);
+      if (changed === 'destination') replacement = await displace(file);
+      else await fs.writeFile(stage, foreign, { flag: 'wx' });
+    }, () => vault.capture({ text: 'A capture with a recovery lock.' }, now));
+
+    expect.soft(result?.code).toBe('STAGING_CHANGED');
+    expect.soft(await fs.readFile(receipt).catch(error => error.code)).toEqual(receiptBytes);
+    if (changed === 'destination') {
+      expect(await fs.readFile(file)).toEqual(foreign);
+      expect(await fs.readFile(replacement.parked)).toEqual(replacement.original);
+    } else {
+      expect(await fs.readFile(stage)).toEqual(foreign);
+      expect(await fs.readFile(file, 'utf8')).toContain('A capture with a recovery lock.');
+    }
+  });
+}
+
+test('capture cannot report recoverable cleanup when its recovery lock changes during peer verification', async ({ localVault }) => {
+  const { vault } = localVault, directory = path.join(vault.root, 'Captures');
+  const unlink = local.unlinkSync;
+  let refused, file, replacement;
+  local.unlinkSync = candidate => {
+    if (path.dirname(candidate) === directory && candidate.endsWith('.md.pending')) {
+      refused = candidate;
+      file = candidate.slice(0, -'.pending'.length);
+      throw Object.assign(Error('Controlled refusal to clean the capture stage.'), { code: 'EACCES' });
+    }
+    return unlink(candidate);
+  };
+  let result;
+  try {
+    result = await afterProofClose(candidate => !!refused && candidate === file,
+      async () => { replacement = await displace(`${file}.lock`); },
+      () => vault.capture({ text: 'This capture has a refused cleanup.' }, now));
+  } finally { local.unlinkSync = unlink; }
+
+  expect.soft(result?.code).toBe('STAGING_CHANGED');
+  expect(await fs.readFile(replacement.file)).toEqual(foreign);
+  expect(await fs.readFile(replacement.parked)).toEqual(replacement.original);
+  expect(await fs.readFile(refused)).toEqual(await fs.readFile(file));
+  expect((await fs.lstat(file)).nlink).toBe(2);
+});
+
+async function restoringConversation(root, vault, linked) {
+  const history = new Conversations({ dataRoot: root, getVault: () => vault, clock: () => ({ now }), checkpoint: async () => {} });
+  const id = randomUUID(), generation = randomUUID(), archiveId = randomUUID();
+  const stage = path.join(history.directory, `${randomUUID()}.pending`);
+  const destination = path.join(history.directory, `${id}.json`);
+  const control = path.join(history.directory, '.control', `${id}.json`);
+  const scope = { version: randomUUID(), excludedSources: [], excludedHistory: [] };
+  const record = {
+    schema: 1, id, generation, scope, vault: { root: vault.root },
+    brief: { id: randomUUID(), version: 1, digest: 'a'.repeat(64) }, createdAt: now, requests: []
+  };
+  const payload = Buffer.from(JSON.stringify(record));
+  await history.lock(async () => {
+    await fs.writeFile(stage, payload, { flag: 'wx', flush: true });
+    const staged = await history.controls.file(stage, history.safeDirectory());
+    await history.controls.put({
+      schema: 1, id, generation, phase: 'restoring',
+      scope: { excludedSources: scope.excludedSources, excludedHistory: scope.excludedHistory },
+      targets: [staged.owned, { ...staged.owned, name: path.basename(destination) }],
+      restoration: { archiveId, recordDigest: createHash('sha256').update(payload).digest('hex') }
+    });
+    if (linked) await fs.link(stage, destination);
+  });
+  const preview = await history.controls.resumeRestoration(id), marker = await fs.readFile(control);
+  expect(preview).toMatchObject({ id, generation, archiveId, text: payload.toString('utf8') });
+  return {
+    stage, destination, control, payload, marker,
+    confirm: () => history.controls.confirm(preview.token, 'restoration')
+  };
+}
+
+for (const linked of [false, true]) {
+  test(`restoration retry preserves a replacement stage before ${linked ? 'linked cleanup' : 'exclusive publication'}`, async ({ localVault }) => {
+    const { root, vault } = localVault;
+    const fixture = await restoringConversation(root, vault, linked);
+    let reads = 0, replacement;
+    const proofFile = linked ? fixture.destination : fixture.stage;
+    const result = await afterProofClose(candidate => candidate === proofFile && ++reads === 2,
+      async () => { replacement = await displace(fixture.stage); },
+      fixture.confirm);
+
+    expect.soft(result?.message).toMatch(/stag|chang|publication|peer/i);
+    expect.soft(await fs.readFile(fixture.stage).catch(error => error.code)).toEqual(foreign);
+    if (linked) expect(await fs.readFile(fixture.destination)).toEqual(fixture.payload);
+    else expect.soft(await absent(fixture.destination)).toBe(true);
+    expect(await fs.readFile(replacement.parked)).toEqual(fixture.payload);
+    expect(await fs.readFile(fixture.control)).toEqual(fixture.marker);
+  });
+}
