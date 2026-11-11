@@ -511,9 +511,15 @@ test('explicit reviewed note settings restore keeps current defaults and convers
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(before.calls);
 });
 
-async function createSafetyArchive() {
+async function createSafetyArchive(noteFile) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic ARCHIVE_SAFETY_HISTORY 🎸.' }), 'utf8');
   await launch();
+  if (noteFile) {
+    await fs.writeFile(noteFile, '# Practice\n\nAn authored note for restore scope review.\n', 'utf8');
+    await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([noteFile]), 'utf8');
+    await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+    await expect(page.locator('#context-notes')).toContainText(noteFile);
+  }
   await page.getByLabel('Thought or link', { exact: true }).fill('Spaced retrieval revisits a learned chord.');
   await page.getByRole('button', { name: 'Save capture', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Capture saved.');
@@ -548,6 +554,91 @@ async function archiveSafetyState() {
   for (const directory of (await fs.readdir(root)).filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) scopes[directory] = await optional(path.join(directory, 'notes.json'));
   return { history: await tree(path.join(root, 'conversations')), vault: await tree(path.join(root, 'vault')), settings: await optional('settings.json'), scopes, schedule: await optional('schedule.json'), task: await optional('scheduler-task.json'), calls: await optional('conversation-submissions.jsonl') };
 }
+test('archive export holds an actual stage replaced before publication', async () => {
+  const valid = await createSafetyArchive(), before = await archiveSafetyState();
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-archive-stage-destination-'));
+  try {
+    const destination = path.join(directory, 'reviewed-history.json');
+    await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: destination }));
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'archive-before-publish' }));
+    const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+    await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+    await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('archive-before-publish');
+    const names = await fs.readdir(directory);
+    expect(names).toHaveLength(1);
+    expect(names[0]).toMatch(/^\.companion-archive-.*\.pending$/);
+    const stage = path.join(directory, names[0]), movedStage = path.join(directory, 'original-archive-stage');
+    const reviewed = await fs.readFile(stage);
+    expect(JSON.parse(reviewed).payload).toEqual(valid.archive.payload);
+    const foreign = Buffer.from('Independent destination writing 🎸.\n');
+    await fs.rename(stage, movedStage);
+    await fs.writeFile(stage, foreign, { flag: 'wx' });
+    await fs.writeFile(path.join(root, 'release.txt'), 'resume');
+    const summary = region.locator('#archive-summary');
+    await expect(summary).toContainText(/staging.*preserv|Archive exported/i);
+    expect.soft(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+    expect.soft(await fs.readFile(stage).catch(error => error.code)).toEqual(foreign);
+    expect(await fs.readFile(movedStage)).toEqual(reviewed);
+    expect(await archiveSafetyState()).toEqual(before);
+    await expect(summary).toContainText(/staging.*preserv/i);
+  } finally {
+    await fs.writeFile(path.join(root, 'release.txt'), 'resume');
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('matched archive restore stops when the selected managed parent changes inside the same vault', async () => {
+  test.setTimeout(120000);
+  const vault = path.join(root, 'vault'), noteFile = path.join(vault, 'practice.md');
+  const valid = await createSafetyArchive(noteFile);
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  const source = path.join(vault, 'Companion'), other = path.join(vault, 'Other parent');
+  const { createHash } = require('node:crypto');
+  const scopeFile = managed => path.join(root, `context-settings-${createHash('sha256').update(managed).digest('hex')}`, 'notes.json');
+  const historyFile = path.join(root, 'conversations', `${valid.record.id}.json`);
+  const control = path.join(root, 'conversations', '.control', `${valid.record.id}.json`);
+  const noteBytes = await fs.readFile(noteFile);
+  await page.locator('#context-notes').getByRole('button', { name: 'Exclude note', exact: true }).click();
+  await expect(page.locator('#context-notes')).not.toContainText(noteFile);
+  const emptyScope = await fs.readFile(scopeFile(source));
+  expect(JSON.parse(emptyScope).files).toEqual([]);
+  await page.getByRole('button', { name: 'Preview conversation deletion', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Conversation deletion review', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Confirm conversation deletion', exact: true }).click();
+  await expect(page.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(region).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByLabel('Application settings restoration', { exact: true }).selectOption('review-note-inclusions');
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await region.getByLabel(`Restore note inclusion ${noteFile}`, { exact: true }).check();
+  const confirm = region.getByRole('button', { name: 'Restore reviewed additions', exact: true });
+  await expect(confirm).toBeEnabled();
+  const boundary = 'archive-restore-before-active';
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }));
+  await confirm.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(boundary);
+  const reservedControl = await fs.readFile(control), reservedHistory = await fs.readFile(historyFile);
+  expect(JSON.parse(reservedControl).phase).toBe('restoring');
+  expect(JSON.parse(reservedHistory).vault.root).toBe(source);
+  try {
+    await page.evaluate(settings => window.companion.configure(settings), { vault, parent: 'Other parent' });
+    expect(JSON.parse(await fs.readFile(path.join(root, 'settings.json')))).toEqual({ vault, parent: 'Other parent' });
+    expect(await fs.stat(scopeFile(other)).catch(error => error.code)).toBe('ENOENT');
+  } finally {
+    await fs.writeFile(path.join(root, 'release.txt'), 'resume');
+  }
+  const summary = region.locator('#archive-restore-summary');
+  await expect(summary).toContainText(/restore stopped|Restored 1 conversation/i);
+  expect.soft(await fs.stat(scopeFile(other)).catch(error => error.code)).toBe('ENOENT');
+  expect.soft(await fs.readFile(control)).toEqual(reservedControl);
+  expect(await fs.readFile(scopeFile(source))).toEqual(emptyScope);
+  expect(await fs.readFile(historyFile)).toEqual(reservedHistory);
+  expect(await fs.readFile(noteFile)).toEqual(noteBytes);
+  await expect(summary).toContainText(/Restored 0 conversations.*selection changed.*Inspect again/i);
+});
+
 test('invalid archive inputs and a file changed after matched preview preserve current history and authority', async () => {
   test.setTimeout(150000);
   const valid = await createSafetyArchive();
