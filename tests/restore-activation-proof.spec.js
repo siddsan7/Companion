@@ -322,7 +322,12 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '', c
     const { Vault } = require('./app/vault');
     const { Intake } = require('./app/intake');
     const [directory, now, boundary, pending, shared, rawClaim] = process.argv.slice(1);
+    const repair = boundary === 'held-repair-source-journal' ? JSON.parse(rawClaim) : null;
     const checkpoint = async name => {
+      if (repair && name === 'repair-intent-published') {
+        await fs.rename(repair.snapshot, repair.displaced);
+        return;
+      }
       if (name !== boundary) return;
       const claim = JSON.parse(rawClaim);
       if (claim) {
@@ -352,8 +357,23 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '', c
         return rename(from, to);
       };
     }
+    if (repair) {
+      const link = fs.link, unlink = fs.unlink;
+      let exactStage;
+      fs.link = async (from, to) => {
+        await link(from, to);
+        if (to !== shared) return;
+        const tx = JSON.parse(await fs.readFile(to, 'utf8'));
+        if (tx.sourceHash === repair.input.sourceHash && tx.resolution && tx.resolution !== repair.priorResolution) exactStage = from;
+      };
+      fs.unlink = async file => {
+        await unlink(file);
+        if (file === exactStage) process.exit(77);
+      };
+    }
     const intake = new Intake(new Vault(directory, 'Companion', { checkpoint }));
-    intake.reconcile({ now }).then(() => process.exit(78), error => { console.error(error); process.exit(79); });
+    const operation = repair ? intake.resolveConflict(repair.input, now) : intake.reconcile({ now });
+    operation.then(() => process.exit(78), error => { console.error(error); process.exit(79); });
   `;
   const child = spawn(process.execPath, ['-e', code, directory, later, boundary, pending, shared, JSON.stringify(claim)], {
     cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
@@ -643,16 +663,20 @@ for (const replaceBackup of [false, true]) {
   });
 }
 
-test('a new retained-current repair cannot reuse an older deferred conflict witness', async ({}, testInfo) => {
+for (const restartAtLink of [false, true]) test(restartAtLink
+  ? 'restart settles a distinct retained-current repair while another restoration is held'
+  : 'a new retained-current repair cannot reuse an older deferred conflict witness', async ({}, testInfo) => {
   const directory = testInfo.outputPath('vault'), reviewRoot = testInfo.outputPath('reviews'), draftRoot = testInfo.outputPath('drafts');
   await fs.mkdir(directory, { recursive: true });
   await fs.mkdir(draftRoot, { recursive: true });
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(reviewRoot, 'accept'), { recursive: true });
   const hash = bytes => createHash('sha256').update(bytes).digest('hex');
   let defer = false, interruptRepair = false, snapshot, movedIntent;
+  const restorationInterruption = Error('Stopped after independent restoration publication.');
   const displaced = testInfo.outputPath('original-current-snapshot.json');
   const vault = new Vault(await fs.realpath(directory), 'Companion', { checkpoint: async boundary => {
     if (defer && boundary === 'intake-before-move') throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+    if (restartAtLink && boundary === 'capture-restoration-published') throw restorationInterruption;
     if (interruptRepair && boundary === 'repair-intent-published') {
       movedIntent = await readJson(path.join(intake.dir, 'repair-intent.json'));
       await fs.rename(snapshot, displaced);
@@ -668,6 +692,28 @@ test('a new retained-current repair cannot reuse an older deferred conflict witn
   snapshot = path.join(vault.root, 'Revisions', capture.currentRevision + '.json');
   const snapshotBytes = await fs.readFile(snapshot), snapshotIdentity = await identity(snapshot);
   await intake.connect(draftRoot, false, now);
+  let heldRestoration;
+  if (restartAtLink) {
+    const aHash = 'e'.repeat(64), folder = await writeDraft(draftRoot, 'held-restoration-source', '8', 'e');
+    const accepted = await intake.reconcile({ now: later }), a = accepted.captures[aHash];
+    const getVault = () => vault, clock = () => ({ now: later });
+    const conversations = new Conversations({ dataRoot: testInfo.outputPath('history'), getVault, clock });
+    await conversations.lock(async () => {});
+    const deletion = new CaptureDeletion({ getVault, conversations, clock, clearApprovals() {} });
+    const preview = await deletion.preview(a.id);
+    await deletion.confirm(preview.token);
+    const selected = await deletion.previewRestoration({ id: a.id, kind: 'draft', folder });
+    await expect(deletion.confirmRestoration(selected.token)).rejects.toThrow(restorationInterruption.message);
+    const ledger = await readJson(ledgerFile), authority = ledger.sourceAuthority[a.id];
+    const file = intake.destination(ledger.captures[aHash]), journal = path.join(intake.dir, authority.restoration.journal);
+    await fs.rename(file, testInfo.outputPath('original-held-restoration.md'));
+    const replacement = Buffer.from('Independent writing at the held restoration path.\n');
+    await fs.writeFile(file, replacement, { flag: 'wx' });
+    heldRestoration = {
+      aHash, id: a.id, authority, file, replacement, fileIdentity: await identity(file),
+      journal, journalBytes: await fs.readFile(journal), journalIdentity: await identity(journal)
+    };
+  }
   await fs.appendFile(destination, '\nIndependent writing before the first transfer.\n');
   const firstLocal = await fs.readFile(destination);
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(reviewRoot, 'edit'), { recursive: true });
@@ -690,16 +736,31 @@ test('a new retained-current repair cannot reuse an older deferred conflict witn
   expect(await readOptional(pending)).toBeNull();
   expect(await readOptional(shared)).toBeNull();
 
-  interruptRepair = true;
   const retryWriting = 'Preserve the second local writing.';
-  let refusal;
-  try { await intake.resolveConflict({ sourceHash, text: retryWriting, localHash: hash(local) }, later); }
-  catch (error) { refusal = error; }
+  const input = { sourceHash, text: retryWriting, localHash: hash(local) };
+  const intentFile = path.join(intake.dir, 'repair-intent.json');
+  let refusal, activeJournalIdentity;
+  if (restartAtLink) {
+    await stopChildIntake(vault.vault, 'held-repair-source-journal', '', shared, { input, snapshot, displaced, priorResolution: pendingTx.resolution });
+    movedIntent = await readJson(intentFile);
+    const retained = path.join(intake.dir, `repair-${movedIntent.annotationId}.json`);
+    expect(await fs.readFile(retained)).toEqual(await fs.readFile(intentFile));
+    expect(await identity(retained)).toEqual(await identity(intentFile));
+    expect((await fs.lstat(intentFile, { bigint: true })).nlink).toBe(2n);
+    expect(await readJson(shared)).toEqual(movedIntent.tx);
+    expect((await fs.lstat(shared, { bigint: true })).nlink).toBe(1n);
+    activeJournalIdentity = await identity(shared);
+    expect((await readJson(ledgerFile)).blocks[sourceHash]).toEqual(older);
+  } else {
+    interruptRepair = true;
+    try { await intake.resolveConflict(input, later); }
+    catch (error) { refusal = error; }
+    expect.soft(refusal?.message).toMatch(/annotation preserved.*paused for repair/i);
+    expect.soft(await readOptional(shared)).toBeNull();
+    expect.soft(await readOptional(intentFile)).toBeNull();
+  }
   expect(movedIntent, 'the new repair intent existed before its current reviewed snapshot was removed').toBeDefined();
   expect(movedIntent.tx.resolution).not.toBe(pendingTx.resolution);
-  expect.soft(refusal?.message).toMatch(/annotation preserved.*paused for repair/i);
-  expect.soft(await readOptional(shared)).toBeNull();
-  expect.soft(await readOptional(path.join(intake.dir, 'repair-intent.json'))).toBeNull();
   await writeDraft(draftRoot, 'independent', '4', 'd');
   const restarted = new Intake(new Vault(vault.vault, 'Companion'));
   const result = await restarted.reconcile({ now: later });
@@ -707,6 +768,9 @@ test('a new retained-current repair cannot reuse an older deferred conflict witn
   expect(result.captures['d'.repeat(64)]).toBeDefined();
   expect(next.journal).not.toBe(older.journal);
   expect(await readJson(newArchive)).toEqual(movedIntent.tx);
+  if (activeJournalIdentity) expect(await identity(newArchive)).toEqual(activeJournalIdentity);
+  expect(await readOptional(shared)).toBeNull();
+  expect(await readOptional(intentFile)).toBeNull();
   expect(await fs.readFile(olderArchive)).toEqual(olderBytes);
   expect(await identity(olderArchive)).toEqual(originalPendingIdentity);
   const intentArchive = await readJson(path.join(intake.dir, `repair-${movedIntent.annotationId}.json`));
@@ -719,6 +783,15 @@ test('a new retained-current repair cannot reuse an older deferred conflict witn
   expect(await identity(displaced)).toEqual(snapshotIdentity);
   expect(await fs.readFile(destination)).toEqual(local);
   expect(await identity(destination)).toEqual(localIdentity);
+  if (heldRestoration) {
+    const { aHash, id, authority, file, replacement, fileIdentity, journal, journalBytes, journalIdentity } = heldRestoration;
+    expect(result.sourceAuthority[id]).toEqual(authority);
+    expect(result.suppressed).toContain(aHash);
+    expect(await fs.readFile(file)).toEqual(replacement);
+    expect(await identity(file)).toEqual(fileIdentity);
+    expect(await fs.readFile(journal)).toEqual(journalBytes);
+    expect(await identity(journal)).toEqual(journalIdentity);
+  }
 });
 
 for (const phase of ['staged ledger', 'committed ledger']) {
