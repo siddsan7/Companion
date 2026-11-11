@@ -20,20 +20,25 @@ const readOptional = file => fs.readFile(file).catch(error => {
   throw error;
 });
 
-async function fixture(testInfo, checkpoint) {
-  const vaultDirectory = testInfo.outputPath('vault');
-  const producer = testInfo.outputPath('producer');
-  const folder = path.join(producer, 'draft');
-  await fs.mkdir(vaultDirectory, { recursive: true });
+async function writeDraft(producer, name, attempt, input) {
+  const folder = path.join(producer, name);
   await fs.mkdir(folder, { recursive: true });
   const clip = 'b'.repeat(64);
   await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify({
-    job_id: clip, attempt_id: '1'.repeat(32), started_utc: now, input_sha256: 'a'.repeat(64),
+    job_id: clip, attempt_id: attempt.repeat(32), started_utc: now, input_sha256: input.repeat(64),
     input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
   }));
   await fs.writeFile(path.join(folder, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
   await fs.writeFile(path.join(folder, 'first-pass-target.json'), JSON.stringify(draft.target));
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(folder, 'notes.md'));
+  return folder;
+}
+
+async function fixture(testInfo, checkpoint) {
+  const vaultDirectory = testInfo.outputPath('vault');
+  const producer = testInfo.outputPath('producer');
+  const folder = await writeDraft(producer, 'draft', '1', 'a');
+  await fs.mkdir(vaultDirectory, { recursive: true });
   const vault = new Vault(await fs.realpath(vaultDirectory), 'Companion', { checkpoint });
   await vault.setup();
   const intake = new Intake(vault);
@@ -47,10 +52,10 @@ async function fixture(testInfo, checkpoint) {
   const removal = await deletion.preview(capture.id);
   await deletion.confirm(removal.token);
   const restoration = await deletion.previewRestoration({ id: capture.id, kind: 'draft', folder });
-  return { vault, intake, deletion, restoration, sourceHash, id: capture.id, ledgerFile: path.join(intake.dir, 'ledger.json') };
+  return { vault, intake, deletion, restoration, producer, sourceHash, id: capture.id, ledgerFile: path.join(intake.dir, 'ledger.json') };
 }
 
-test('imported restoration restart retires only the selected journal after activation commits', async ({}, testInfo) => {
+async function stopAfterActivation(testInfo) {
   const interruption = Error('Stopped immediately after the activation ledger was replaced.');
   let context, witness;
   context = await fixture(testInfo, async boundary => {
@@ -86,6 +91,11 @@ test('imported restoration restart retires only the selected journal after activ
   expect(witness, 'the selected journal was present at restoration admission').toBeDefined();
   expect(await readJson(ledgerFile)).toEqual(committed);
   expect(committed.suppressed).not.toContain(sourceHash);
+  return { ...context, committed, witness };
+}
+
+test('imported restoration restart retires only the selected journal after activation commits', async ({}, testInfo) => {
+  const { vault, intake, id, sourceHash, ledgerFile, committed, witness } = await stopAfterActivation(testInfo);
   const journal = await readOptional(witness.journal);
   expect.soft(journal).toEqual(witness.bytes);
   if (journal) expect(await identity(witness.journal)).toEqual(witness.identity);
@@ -105,6 +115,83 @@ test('imported restoration restart retires only the selected journal after activ
   expect(final.attempts).toEqual(committed.attempts);
   expect(await identity(destination)).toEqual(captureIdentity);
   expect(await identity(snapshot)).toEqual(snapshotIdentity);
+});
+
+test('restoration hold allows independent import after a published output changes', async ({}, testInfo) => {
+  const interruption = Error('Stopped after restoration publication.');
+  const { vault, intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = await fixture(testInfo, async boundary => {
+    if (boundary === 'capture-restoration-published') throw interruption;
+  });
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+  const before = await readJson(ledgerFile), authority = before.sourceAuthority[id];
+  expect(authority).toMatchObject({ phase: 'restoring', restoration: { published: true } });
+  expect(before.suppressed).toContain(sourceHash);
+  const journal = path.join(intake.dir, authority.restoration.journal), journalBytes = await fs.readFile(journal);
+  const journalIdentity = await identity(journal);
+  const destination = intake.destination(before.captures[sourceHash]), displaced = testInfo.outputPath('original-capture.md');
+  const originalBytes = await fs.readFile(destination), originalIdentity = await identity(destination);
+  await fs.rename(destination, displaced);
+  await fs.writeFile(destination, originalBytes, { flag: 'wx' });
+  const replacementIdentity = await identity(destination);
+  expect(replacementIdentity).not.toEqual(originalIdentity);
+  const shared = path.join(intake.dir, 'transaction.json');
+  expect(await readOptional(shared)).toBeNull();
+  await writeDraft(producer, 'independent', '2', 'c');
+
+  // An unrecognised shared transaction remains a global stop.
+  const sharedBytes = Buffer.from('{"schema":0,"fixture":"independent unknown transaction"}');
+  await fs.writeFile(shared, sharedBytes, { flag: 'wx' });
+  const blocked = new Intake(new Vault(vault.vault, 'Companion'));
+  await expect(blocked.reconcile({ now: later })).rejects.toThrow();
+  expect(await fs.readFile(shared)).toEqual(sharedBytes);
+  expect(await readJson(ledgerFile)).toEqual(before);
+  await fs.rename(shared, testInfo.outputPath('independent-unknown-transaction.json'));
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const result = await restarted.reconcile({ now: later });
+  const independent = result.captures['c'.repeat(64)];
+  expect(independent).toBeDefined();
+  expect(await readOptional(restarted.destination(independent))).not.toBeNull();
+  expect((await restarted.info()).captures['c'.repeat(64)]).toEqual(independent);
+  expect(result.sourceAuthority[id]).toEqual(authority);
+  expect(result.suppressed).toContain(sourceHash);
+  expect(result.admissions).toEqual(before.admissions);
+  expect(result.attempts[Object.keys(before.attempts)[0]]).toEqual(Object.values(before.attempts)[0]);
+  expect(await fs.readFile(destination)).toEqual(originalBytes);
+  expect(await identity(destination)).toEqual(replacementIdentity);
+  expect(await identity(displaced)).toEqual(originalIdentity);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect(await identity(journal)).toEqual(journalIdentity);
+  expect(await readOptional(shared)).toBeNull();
+});
+
+test('restoration hold allows independent import with a foreign active cleanup journal', async ({}, testInfo) => {
+  const { vault, intake, producer, id, sourceHash, committed, witness } = await stopAfterActivation(testInfo);
+  expect(committed.sourceAuthority[id].restorationCleanup).toBeDefined();
+  expect(await fs.readFile(witness.journal)).toEqual(witness.bytes);
+  const displaced = testInfo.outputPath('original-selected-journal.json');
+  await fs.rename(witness.journal, displaced);
+  // A byte-identical copy is still a different file.
+  await fs.writeFile(witness.journal, witness.bytes, { flag: 'wx' });
+  const replacementIdentity = await identity(witness.journal);
+  expect(replacementIdentity).not.toEqual(witness.identity);
+  expect(await readOptional(path.join(intake.dir, 'transaction.json'))).toBeNull();
+  await writeDraft(producer, 'independent', '2', 'c');
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const result = await restarted.reconcile({ now: later });
+  const independent = result.captures['c'.repeat(64)];
+  expect(independent).toBeDefined();
+  expect(await readOptional(restarted.destination(independent))).not.toBeNull();
+  expect((await restarted.info()).captures['c'.repeat(64)]).toEqual(independent);
+  expect(result.sourceAuthority[id]).toEqual(committed.sourceAuthority[id]);
+  expect(result.suppressed).not.toContain(sourceHash);
+  expect(result.admissions).toEqual(committed.admissions);
+  expect(result.attempts[Object.keys(committed.attempts)[0]]).toEqual(Object.values(committed.attempts)[0]);
+  expect(await fs.readFile(witness.journal)).toEqual(witness.bytes);
+  expect(await identity(witness.journal)).toEqual(replacementIdentity);
+  expect(await identity(displaced)).toEqual(witness.identity);
+  expect(await readOptional(path.join(intake.dir, 'transaction.json'))).toBeNull();
 });
 
 for (const { output, restart } of [{ output: 'capture', restart: false }, { output: 'snapshot', restart: true }]) {
