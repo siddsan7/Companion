@@ -1,6 +1,8 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
+const { ordinaryDirectories, readExactSync, verifyStageSync } = require('./staged-publication');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const same = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
 const changed = () => Error('Intake ledger changed during this operation. Refresh before retrying; the changed authority was preserved.');
@@ -48,30 +50,54 @@ class IntakeLedger {
   matches(view, expected = this.expected) { return !!expected && JSON.stringify(view.parents) === JSON.stringify(expected.parents) && JSON.stringify(view.identity) === JSON.stringify(expected.identity); }
   async guard() { if (!this.matches(await this.view())) throw changed(); }
   async guardParents() { if (!this.expected || JSON.stringify(await this.parents()) !== JSON.stringify(this.expected.parents)) throw changed(); }
+  parentGuard(expected) {
+    if (!expected || expected.parents.missing) throw changed();
+    const directories = expected.parents.directories;
+    return ordinaryDirectories(directories.map(item => item.file), changed().message, directories).guard;
+  }
+  guardSync(expected = this.expected, guard = this.parentGuard(expected)) {
+    try {
+      const current = readExactSync(this.file, guard, 1, expected.identity || undefined);
+      if (!expected.identity || current.proof.digest !== expected.identity.digest) throw changed();
+    } catch (error) {
+      if (error.code === 'ENOENT' && expected.identity === null) { guard(); return; }
+      if (['ENOENT', 'STAGING_CHANGED'].includes(error.code)) throw changed();
+      throw error;
+    }
+  }
   async replace(text) {
     if (!this.matches(await this.view()) || this.expected.parents.missing) throw changed();
-    if (hash(Buffer.from(text, 'utf8')) === this.expected.identity?.digest) return;
     const stage = path.join(this.directory, `ledger-${randomUUID()}.tmp`), bytes = Buffer.from(text, 'utf8');
-    let own;
+    const expected = this.expected, digest = hash(bytes);
+    if (digest === expected.identity?.digest) return;
+    const guard = this.parentGuard(expected);
+    let proof;
     try {
       const handle = await fs.open(stage, 'wx');
-      try { await handle.writeFile(bytes); await handle.sync(); own = await handle.stat({ bigint: true }); }
+      try {
+        await handle.writeFile(bytes);
+        await handle.sync();
+        const own = await handle.stat({ bigint: true });
+        proof = { dev: String(own.dev), ino: String(own.ino), digest };
+      }
       finally { await handle.close(); }
       const prepared = await this.view(stage);
-      if (prepared.identity?.dev !== String(own.dev) || prepared.identity?.ino !== String(own.ino) || prepared.identity?.digest !== hash(bytes) || JSON.stringify(prepared.parents) !== JSON.stringify(this.expected.parents)) throw changed();
-      if (!this.matches(await this.view())) throw changed();
-      await fs.rename(stage, this.file);
+      if (!this.matches(prepared, { parents: expected.parents, identity: proof })) throw changed();
+      if (!this.matches(await this.view(), expected)) throw changed();
+      this.guardSync(expected, guard);
+      try { verifyStageSync(stage, guard, proof); }
+      catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
+      local.renameSync(stage, this.file);
       const published = await this.view();
-      if (published.identity?.dev !== String(own.dev) || published.identity?.ino !== String(own.ino) || published.identity?.digest !== hash(bytes) || JSON.stringify(published.parents) !== JSON.stringify(this.expected.parents)) throw changed();
+      if (!this.matches(published, { parents: expected.parents, identity: proof })) throw changed();
+      this.guardSync(published, guard);
       this.expected = published;
     } finally {
-      if (own) {
+      if (proof) {
         // Never clean a new file or a path reached through a replaced parent.
         try {
-          if (JSON.stringify(await this.parents()) === JSON.stringify(this.expected.parents)) {
-            const remaining = await this.view(stage);
-            if (remaining.identity?.dev === String(own.dev) && remaining.identity?.ino === String(own.ino) && remaining.identity?.digest === hash(bytes)) await fs.unlink(stage);
-          }
+          readExactSync(stage, guard, 1, proof);
+          local.unlinkSync(stage);
         } catch (error) { if (error.code !== 'ENOENT') this.vault.warnings.push('An intake ledger stage remains for guarded inspection.'); }
       }
     }

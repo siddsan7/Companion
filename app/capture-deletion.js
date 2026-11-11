@@ -8,7 +8,7 @@ const { readReview } = require('./intake-review');
 const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
 const { parse } = require('./vault');
-const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf } = require('./source-recovery');
+const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf, removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const sourceInventory = require('./source-inventory');
 const sourceTitle = require('./source-title');
 const manualTitle = require('./manual-title');
@@ -287,7 +287,11 @@ class CaptureDeletion {
       if (JSON.stringify(fresh) !== JSON.stringify(selected)) throw changed();
       const acquired = [];
       try {
-        for (const target of fresh.targets.filter(target => target.kind === 'capture')) { const file = path.join(vault.vault, target.file); await vault.acquire(file); acquired.push(file); }
+        for (const target of fresh.targets.filter(target => target.kind === 'capture')) {
+          const file = path.join(vault.vault, target.file), { guard } = vault.publicationFolders(path.dirname(file));
+          const proof = await vault.acquire(file, undefined, guard);
+          acquired.push({ file, proof, guard });
+        }
         if (JSON.stringify(await this.inventory(selected.id, selected, vault)) !== JSON.stringify(selected)) throw changed();
         const intake = new Intake(vault), ledger = await intake.load();
         if (JSON.stringify(intake.storage.expected.identity) !== JSON.stringify(fresh.ledgerIdentity) || this.getVault() !== vault) throw changed();
@@ -303,7 +307,7 @@ class CaptureDeletion {
         await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
         await vault.checkpoint('capture-deletion-authorized');
         await finishDeletion(intake, ledger, selected.id);
-      } finally { for (const file of acquired.reverse()) await vault.release(file); }
+      } finally { for (const { file, proof, guard } of acquired.reverse()) await vault.release(file, proof, guard); }
       return true;
     }));
   }
@@ -420,17 +424,23 @@ async function finishDeletion(intake, ledger, id) {
   const remaining = await inspectDeletion(intake, ledger, id);
   const deletion = new CaptureDeletion({ getVault: () => vault });
   const extendedInventory = authority.inventoryVersion === 2 || manualTitle.explicit(authority);
+  const guard = removalParentGuard(vault, authority.directories);
   for (const target of remaining) {
     const file = path.join(vault.vault, target.file);
+    let peers = [target.file];
     await inspectDeletion(intake, ledger, id);
     await intake.storage.guard();
     if (extendedInventory) {
       await sourceParents(intake, authority);
       if (manualTitle.explicit(authority)) {
         if (!(await manualTitle.inspect(intake, authority)).some(item => item.file === target.file)) throw changed();
-      } else await sourceInventory.inspectTarget(intake, authority, target);
+      } else peers = (await sourceInventory.inspectTarget(intake, authority, target)).map(item => item.file);
     } else if (JSON.stringify(await deletion.target(vault, file, target.kind)) !== JSON.stringify(target)) throw changed();
     if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
+    intake.storage.guardSync();
+    if (authority.mixedRecovery) mixedDeletion.verifyRetainedWritingSync(intake, authority, guard);
+    verifyRemovalTarget(vault, target, peers, guard, changed);
+    // Dispatch directly after the last proof so no application work runs in between.
     await fs.unlink(file); await vault.checkpoint('capture-deletion-unlinked');
   }
   if ((await inspectDeletion(intake, ledger, id)).length) throw changed();
@@ -439,6 +449,8 @@ async function finishDeletion(intake, ledger, id) {
     if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
     if (authority.inventoryVersion === 2) sourceInventory.retirePointers(ledger, authority);
   }
+  intake.storage.guardSync();
+  if (authority.mixedRecovery) mixedDeletion.verifyRetainedWritingSync(intake, authority, guard);
   authority.phase = 'deleted'; await intake.save(ledger);
 }
 function installCaptureDeletion({ ipcMain, ...options }) {

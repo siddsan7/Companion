@@ -350,6 +350,7 @@ async function inspectTarget(intake, authority, target) {
   const peers = new Set(target.peers || [target.file]);
   const remaining = await inspectTargets(intake, { ...authority, targets: authority.targets.filter(item => peers.has(item.file)) });
   if (!remaining.some(item => item.file === target.file)) fail();
+  return remaining;
 }
 function inspectPointers(ledger, authority) {
   if (authority.mixedRecovery) return require('./mixed-deletion').inspectPointers(ledger, authority);

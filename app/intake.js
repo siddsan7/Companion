@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { readDraft, hash } = require('./intake-producer');
@@ -8,7 +9,8 @@ const { withTitle, captureHeading } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission } = require('./source-authority');
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
-const { pendingParents, isManualHold } = require('./source-recovery');
+const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
+const { ordinaryDirectories, verifyStageSync } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -455,6 +457,30 @@ class Intake {
     if (tx.keptCurrent) await this.verifiedKeptCurrent(tx, ledger);
     await this.vault.contained(path.dirname(this.destination(tx.capture)));
     const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
+    const parents = [...requiredDirectories(this, [{ file: path.relative(this.vault.vault, destination) }])]
+      .map(directory => path.join(this.vault.vault, directory));
+    const { guard } = ordinaryDirectories(parents, 'An intake publication folder changed or is an alias. All files were preserved.');
+    const exact = (file, info, content, label, peers = []) => {
+      const changed = () => conflict(`${label} changed. Independent files and the incoming revision were preserved.`);
+      if (!info) throw changed();
+      const proof = { dev: String(info.dev), ino: String(info.ino), digest: hash(content) };
+      try {
+        verifyStageSync(file, guard, proof, Number(info.nlink));
+        if (info.nlink === 2n) {
+          const peer = peers.find(candidate => {
+            try {
+              const stat = local.lstatSync(candidate, { bigint: true });
+              return stat.dev === info.dev && stat.ino === info.ino;
+            } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+          });
+          if (!peer) throw changed();
+          verifyStageSync(peer, guard, proof, 2);
+        }
+      } catch (error) {
+        if (error.code === 'STAGING_CHANGED') throw changed();
+        throw error;
+      }
+    };
     // Keep exact existing peers before successful admission clears pending state.
     const journalPeers = [];
     if (tx.restoreOperation) journalPeers.push(path.join(this.dir, `restoration-${tx.restoreOperation}.json`));
@@ -471,13 +497,16 @@ class Intake {
         await fs.rename(file, `${file}.damaged-${randomUUID()}`);
       }
       await immutable(file, content);
-      await this.ownedFile(file, peer, 'Unsafe import staging file');
+      return this.ownedFile(file, peer, 'Unsafe import staging file');
     };
-    await staged(snapshotStage, snapshotBytes, snapshot); await this.vault.checkpoint('intake-snapshot-staged');
+    const snapshotProof = await staged(snapshotStage, snapshotBytes, snapshot);
+    await this.vault.checkpoint('intake-snapshot-staged');
     await this.publicationAuthority(tx, ledger);
     if (!await this.ownedFile(snapshotStage, snapshot, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
     await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
-    try { await fs.link(snapshotStage, snapshot); } catch (error) {
+    this.storage.guardSync();
+    exact(snapshotStage, snapshotProof, snapshotBytes, 'Revision snapshot stage', [snapshot]);
+    try { local.linkSync(snapshotStage, snapshot); } catch (error) {
       let existing;
       try { existing = await fs.lstat(snapshot); } catch { throw error; }
       if (!existing.isFile() || existing.isSymbolicLink()) throw conflict('Immutable revision snapshot destination is not an ordinary file. The destination and incoming stage were preserved.');
@@ -488,25 +517,36 @@ class Intake {
     await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
     if (await read(snapshot) !== snapshotBytes) throw conflict('Immutable revision snapshot changed during publication. All versions were preserved.');
     await this.vault.checkpoint('intake-snapshot');
-    await this.ownedFile(destination, [stage, backup], 'Capture destination');
+    const currentProof = await this.ownedFile(destination, [stage, backup], 'Capture destination');
     await this.ownedFile(backup, destination, 'Previous capture backup');
     let current = await read(destination), old = await read(backup);
     if (current !== tx.content) {
       if (tx.previousHash !== null) {
         if (old === null) {
           if (current === null || hash(current) !== tx.previousHash) throw conflict('Destination changed outside Companion. Both source revision and local writing were preserved.');
-          try { await this.vault.checkpoint('intake-before-move'); await this.publicationAuthority(tx, ledger); await fs.rename(destination, backup); }
+          try {
+            await this.vault.checkpoint('intake-before-move');
+            await this.publicationAuthority(tx, ledger);
+            this.storage.guardSync();
+            exact(destination, currentProof, tx.previous, 'Capture destination');
+            guard();
+            const occupied = local.lstatSync(backup, { throwIfNoEntry: false });
+            if (occupied) throw conflict('Previous capture backup appeared during publication. Both files were preserved.');
+            await fs.rename(destination, backup);
+          }
           catch (error) { if (['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw deferred('Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.'); throw error; }
           await this.vault.checkpoint('intake-moved'); old = await read(backup); current = await read(destination);
         }
         if (old === null || hash(old) !== tx.previousHash) { if (current === null && old !== null) { await this.publicationAuthority(tx, ledger); await fs.link(backup, destination).catch(() => {}); } throw conflict('External edit conflict. Previous and current files were preserved.'); }
       }
       if (current !== null) throw conflict('Destination changed outside Companion. The new destination was preserved.');
-      await staged(stage, tx.content, destination);
+      const captureProof = await staged(stage, tx.content, destination);
       await this.vault.checkpoint('intake-capture-staged');
       await this.publicationAuthority(tx, ledger);
       if (!await this.ownedFile(stage, destination, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
-      try { await fs.link(stage, destination); } catch (error) { if (error.code !== 'EEXIST') throw error; await this.ownedFile(destination, [stage, backup], 'Capture destination'); if (await read(destination) !== tx.content) throw conflict('External edit conflict. The new destination was preserved.'); }
+      this.storage.guardSync();
+      exact(stage, captureProof, tx.content, 'Imported capture stage', [destination]);
+      try { local.linkSync(stage, destination); } catch (error) { if (error.code !== 'EEXIST') throw error; await this.ownedFile(destination, [stage, backup], 'Capture destination'); if (await read(destination) !== tx.content) throw conflict('External edit conflict. The new destination was preserved.'); }
     }
     await this.vault.checkpoint('intake-published');
     await this.publicationAuthority(tx, ledger);
@@ -537,6 +577,9 @@ class Intake {
       await this.publicationAuthority(tx, ledger);
       const info = await this.ownedFile(item.file, item.peers, 'Intake publication cleanup');
       if (!info || info.dev !== item.dev || info.ino !== item.ino || await read(item.file) !== item.expected) throw Error('Intake publication cleanup identity changed. Independent files were preserved.');
+      this.storage.guardSync();
+      try { exact(item.file, info, item.expected, 'Intake publication cleanup', Array.isArray(item.peers) ? item.peers : [item.peers]); }
+      catch (error) { if (error.intakeConflict) throw Error(error.message); throw error; }
       await fs.unlink(item.file);
     }
   }
