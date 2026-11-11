@@ -5,11 +5,10 @@ const { randomUUID } = require('node:crypto');
 const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent, inactiveCoverage, codexHints, inactiveCodexHints } = require('./archive-format');
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
-const { withBriefMutation } = require('./briefs-lock');
-const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
+const { readNoteScope, changeNoteScope } = require('./note-scope');
+const { ordinaryDirectories, writeStage, verifyStage, verifyPeers, removeStage } = require('./staged-publication');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
-const noteScopeReceipt = '.archive-note-scope-publication.json';
 class Archives {
   constructor(options) { Object.assign(this, options); this.review = null; }
   guard() { this.history.safeDirectory(false, this.directory); }
@@ -77,8 +76,7 @@ class Archives {
       const contextScopes = [];
       for (const name of (await fs.readdir(this.history.dataRoot)).sort().filter(name => /^context-settings-[a-f0-9]{64}$/.test(name))) {
         const directory = path.join(this.history.dataRoot, name), guard = this.directoryGuard(directory), file = path.join(directory, 'notes.json');
-        const read = await this.readNoteScope(directory, file, guard, assertSelection); if (!read) continue;
-        if (read.value.schema !== 1 || !Array.isArray(read.value.files) || read.value.files.some(file => typeof file !== 'string' || !path.isAbsolute(file))) throw Error('Explicit note settings need repair.');
+        const read = await readNoteScope(file, { guard, assertSelection }); if (!read) continue;
         contextScopes.push({ binding: name.slice('context-settings-'.length), schema: 1, files: read.value.files }); fingerprints[file] = read.digest;
       }
       const scheduleFile = path.join(this.history.dataRoot, 'schedule.json'), scheduleRead = await this.json(scheduleFile, undefined, true);
@@ -290,103 +288,26 @@ class Archives {
     }
     return candidates;
   }
-  async readNoteScope(directory, file, guard, assertSelection) {
-    guard();
-    const pending = await fs.lstat(path.join(directory, noteScopeReceipt)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-    if (!pending) return this.json(file, guard, true);
-    return withBriefMutation(directory, async () => {
-      await this.settleNoteScope(directory, file, guard, assertSelection);
-      return this.json(file, guard, true);
-    });
-  }
-  async settleNoteScope(directory, file, guard, assertSelection = () => {}) {
-    const receipt = path.join(directory, noteScopeReceipt);
-    const stored = await readExact(receipt, guard).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-    if (!stored) return;
-    const proof = JSON.parse(stored.bytes);
-    if (proof?.schema !== 1 || !stored.bytes.equals(Buffer.from(JSON.stringify(proof))) ||
-        typeof proof.stage !== 'string' || !/^notes-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/.test(proof.stage) ||
-        !validProof(proof.staged) || !Array.isArray(proof.identities)) throw Error('Archive note scope receipt is invalid. Files were preserved for inspection.');
-    const folders = ordinaryDirectories([directory], 'The reviewed note settings folder changed. Files were preserved for inspection.', proof.identities);
-    const pinned = () => { assertSelection(); guard(); folders.guard(); };
-    await verifyStage(receipt, pinned, stored.proof);
-    const stage = path.join(directory, proof.stage);
-    const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-    if (await exists(file)) {
-      await settlePublishedLink(stage, file, pinned, proof.staged);
-      await removeStage(receipt, pinned, stored.proof);
-    } else {
-      const stillUnpublished = () => {
-        pinned();
-        try { local.lstatSync(file); }
-        catch (error) { if (error.code === 'ENOENT') return; throw error; }
-        throw Error('Note scope appeared while retiring an unpublished archive stage. Files were preserved for inspection.');
-      };
-      if (await exists(stage)) await removeStage(stage, stillUnpublished, proof.staged);
-      await removeStage(receipt, stillUnpublished, stored.proof);
-    }
-  }
   async includeReviewedNotes(files, matched, committed) {
     const { vault, root, assertSelection } = matched;
     const directory = path.join(this.history.dataRoot, `context-settings-${hash(root)}`), file = path.join(directory, 'notes.json');
-    assertSelection(); this.guard();
-    try { await fs.mkdir(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    assertSelection(); this.guard();
-    const guard = this.directoryGuard(directory);
-    return withBriefMutation(directory, async () => {
-      assertSelection();
-      await this.settleNoteScope(directory, file, guard, assertSelection);
-      guard(); const current = await this.json(file, guard, true);
-      if ((current?.digest || null) !== (matched.snapshot.fingerprints[file] || null)) throw Error('Current note inclusions changed. Preview settings again.');
-      const existing = current?.value.files || [];
-      for (const chosen of files) {
-        assertSelection();
-        const actual = await this.noteSnapshot(chosen, vault), approved = matched.noteCandidates.find(candidate => candidate.file === chosen);
-        if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.');
-      }
-      const next = [...new Set([...existing, ...files])], stage = path.join(directory, `notes-${randomUUID()}.tmp`), receipt = path.join(directory, noteScopeReceipt);
-      const folders = ordinaryDirectories([directory], 'The reviewed note settings folder changed. Files were preserved for inspection.');
-      const pinned = () => { guard(); folders.guard(); };
-      const guardedSelection = () => { assertSelection(); pinned(); };
-      let staged, recorded, published = false, verified = false;
-      const commit = () => {
-        verified = true;
-        committed(next.length - existing.length);
-        this.history.tokens.clear(); this.invalidateContextApprovals();
-      };
-      try {
-        staged = await writeStage(stage, JSON.stringify({ schema: 1, files: next }, null, 2), guardedSelection);
-        const latest = await this.json(file, guard, true);
-        if ((latest?.digest || null) !== (current?.digest || null)) throw Error('Note inclusion settings changed before publication. Existing scope was preserved.');
-        if (!current) {
-          const proof = { schema: 1, stage: path.basename(stage), staged, identities: folders.identities };
-          recorded = await writeStage(receipt, JSON.stringify(proof), guardedSelection);
-          await verifyStage(receipt, pinned, recorded);
+    return changeNoteScope(file, {
+      guard: () => this.guard(), assertSelection,
+      update: (existing, currentDigest) => {
+        if (currentDigest !== (matched.snapshot.fingerprints[file] || null)) throw Error('Current note inclusions changed. Preview settings again.');
+        return [...new Set([...existing, ...files])];
+      },
+      beforePublish: async () => {
+        for (const chosen of files) {
+          assertSelection();
+          const actual = await this.noteSnapshot(chosen, vault), approved = matched.noteCandidates.find(candidate => candidate.file === chosen);
+          if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.');
         }
-        await verifyStage(stage, pinned, staged);
-        guardedSelection();
-        if (current) {
-          await fs.rename(stage, file); published = true;
-          await verifyStage(file, pinned, staged);
-          commit();
-        } else {
-          await fs.link(stage, file); published = true;
-          await verifyPeers(stage, file, pinned, staged);
-          commit();
-          await settlePublishedLink(stage, file, guardedSelection, staged);
-          await removeStage(receipt, guardedSelection, recorded);
-        }
-      } catch (error) {
-        if (!published) throw error;
-        if (!verified) throw Error(`Note inclusion publication could not be verified. Inspect the current scope and any staging file before retrying. ${error.message}`);
-        throw Error(`The reviewed note scope was published, but cleanup could not be verified. Inspect the current scope and any retained staging file before retrying. ${error.message}`);
-      } finally {
-        if (staged && !published) {
-          try {
-            if (recorded) await removeStage(receipt, guardedSelection, recorded);
-            await removeStage(stage, guardedSelection, staged);
-          } catch {}
-        }
+      },
+      committed: count => {
+        committed(count);
+        this.history.tokens.clear();
+        this.invalidateContextApprovals();
       }
     });
   }

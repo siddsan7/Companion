@@ -3,6 +3,7 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const YAML = require('yaml');
 const { withBriefMutation } = require('./briefs-lock');
+const { ordinaryDirectories, writeStage, verifyStage, verifyPeers, removeStage } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
 const instant = value => typeof value === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
@@ -40,7 +41,11 @@ function markdown(record) {
   return `---\n${metadata}---\n\n# MyTune brief — ${record.kind}${record.version ? ` version ${record.version}` : ''}\n\nOffline source extraction; edited statements are user writing, not model verification.\n\n${record.sections.map(s => `## ${s.title}\n\n${s.text}\n\n${s.references.map(r => `[${path.basename(record.sources[r.source].path)}:L${r.start}-L${r.end}](#source-${r.source + 1}) (source ${r.source + 1}, sha256 ${record.sources[r.source].sha256})`).join('\n')}`).join('\n\n')}\n\n# Selected source snapshots\n\n${record.sources.map((s, i) => `## Source ${i + 1}\n\n${s.path}\n\nsha256: ${s.sha256}\n\n${s.text}`).join('\n\n')}\n`;
 }
 class Briefs {
-  constructor(vault) { this.vault = vault; this.dir = path.join(vault.root, 'Briefs'); }
+  constructor(vault, { assertSelection = () => {} } = {}) {
+    this.vault = vault;
+    this.dir = path.join(vault.root, 'Briefs');
+    this.assertSelection = assertSelection;
+  }
   async safe() { await this.vault.contained(this.vault.root); await this.vault.contained(this.dir); if ((await fs.lstat(this.dir)).isSymbolicLink()) throw Error('Briefs folder is a link. Choose an ordinary folder inside the vault.'); }
   async records(onlyVersion) {
     await this.safe(); const records = [];
@@ -62,9 +67,30 @@ class Briefs {
     return records;
   }
   async write(record, name) {
-    await this.safe(); const stage = path.join(this.dir, `.brief-stage-${randomUUID()}`);
-    try { await fs.writeFile(stage, markdown(record), { flag: 'wx', flush: true }); await this.safe(); if (record.kind === 'approved') await this.vault.checkpoint('brief-before-approval-publish'); await fs.link(stage, path.join(this.dir, name)); }
-    finally { await fs.unlink(stage).catch(() => { /* A leftover stage is ignored; publication success stays success. */ }); }
+    this.assertSelection();
+    await this.safe();
+    const stage = path.join(this.dir, `.brief-stage-${randomUUID()}`), destination = path.join(this.dir, name);
+    const { guard } = ordinaryDirectories([this.vault.vault, this.dir], 'The Briefs folder changed or is an alias. Files were preserved for inspection.');
+    const selected = () => { this.assertSelection(); guard(); };
+    let staged, linked = false;
+    try {
+      staged = await writeStage(stage, markdown(record), selected);
+      if (record.kind === 'approved') {
+        await this.vault.checkpoint('brief-before-approval-publish');
+        selected();
+        await this.requireCurrentSources(record);
+      }
+      await verifyStage(stage, selected, staged);
+      selected();
+      await fs.link(stage, destination);
+      linked = true;
+      await verifyPeers(stage, destination, guard, staged);
+      try { await removeStage(stage, guard, staged, 2); }
+      catch (error) { throw Error(`The Project Brief was published, but stage cleanup could not be verified. Inspect the saved version before retrying. ${error.message}`); }
+      await verifyStage(destination, guard, staged);
+    } finally {
+      if (staged && !linked) await removeStage(stage, guard, staged).catch(() => {});
+    }
   }
   async readSources(paths) {
     if (!Array.isArray(paths) || !paths.length || paths.some(p => typeof p !== 'string' || !path.isAbsolute(p))) throw Error('Select the current MyTune README first.');
@@ -101,6 +127,10 @@ class Briefs {
     }
     return issues;
   }
+  async requireCurrentSources(record) {
+    const issues = await this.outdated(record);
+    if (issues.length) throw Error(`Refresh approval blocked. ${issues.join(' ')} Restore or explicitly replace the source, then propose again.`);
+  }
   async state() {
     const records = await this.records(); const approved = records.filter(r => r.kind === 'approved').sort((a, b) => b.version - a.version);
     const proposed = records.filter(r => r.kind === 'proposal').sort((a, b) => b.ordinal - a.ordinal)[0];
@@ -111,7 +141,7 @@ class Briefs {
     return withBriefMutation(this.vault.root, async () => {
       const records = await this.records(), proposed = records.find(r => r.kind === 'proposal' && r.id === id);
       if (!proposed || proposed.digest !== digest) throw Error('Proposal changed. Inspect it again.');
-      const issues = await this.outdated(proposed); if (issues.length) throw Error(`Refresh approval blocked. ${issues.join(' ')} Restore or explicitly replace the source, then propose again.`);
+      await this.requireCurrentSources(proposed);
       const latestAttempt = records.filter(r => r.kind !== 'approved').sort((a, b) => b.ordinal - a.ordinal)[0];
       if (latestAttempt?.kind === 'failure') throw Error('Refresh approval blocked. Resolve the failed refresh and propose again.');
       if (records.some(r => r.kind === 'approved' && r.id === id)) return this.state();
