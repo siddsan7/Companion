@@ -147,7 +147,7 @@ $('reconnect-selection').onchange = updateIntakeControls;
 $('reconnect-source').onclick = () => {
   const source = state?.intake?.sources.find(item => item.id === $('reconnect-selection').value);
   if (!source) return;
-  const { id, folder, kind = 'draft', identity } = source;
-  return connectSource('reconnect-source', { location: state.location, id, folder, kind, identity, replacement: $('reconnect-folder').value });
+  const { id, folder, kind = 'draft', identity, epoch } = source;
+  return connectSource('reconnect-source', { location: state.location, id, folder, kind, identity, epoch, replacement: $('reconnect-folder').value });
 };
 window.addEventListener('focus', () => action(refresh)); setInterval(() => action(refresh), 60000); action(refresh);

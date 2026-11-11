@@ -9,11 +9,16 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold } = require('./source-recovery');
-const { producerCandidate, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
+const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
 const conflict = message => Object.assign(Error(message), { intakeConflict: true });
 const deferred = message => Object.assign(Error(message), { intakeDeferred: true });
+const conflictPause = ' Updates to this source are paused for explicit conflict repair.';
+const heldArtifact = (folder, error, now) => ({
+  status: 'held', locator: folder, checkedAt: now,
+  reason: error.code ? 'Unreadable artifact. Check source access and complete the producer transfer, then Check now.' : error.message
+});
 function noteText(capture, revision) {
   const fields = { companion_id: capture.id, artifact_type: 'capture', schema_version: 1, capture_type: 'reel_import', captured_at: capture.capturedAt, title: capture.title, source_hash: revision.sourceHash, source_revision: revision.id, source_started_at: revision.run.started_utc, imported_at: revision.importedAt, extraction_status: revision.extraction, human_review: revision.humanReview, ...(revision.review ? { processing_status: revision.processing || revision.run.state || 'unknown', support_eligible: revision.supportEligible !== false } : {}), provenance: revision.review ? 'Reel to MD finalized human decision; acceptance does not verify every claim' : 'Reel to MD validated draft; structural grounding is not factual verification' };
   return `---\n${Object.entries(fields).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n')}\n---\n\n${captureHeading(capture.title, 'reel_import')}\n\n${revision.text}`;
@@ -59,15 +64,19 @@ class Intake {
     });
     if (scan) return this.reconcile({ trigger: 'first-scan', now });
   }
-  async reconnect({ id, folder, kind, identity, replacement }) {
+  async reconnect({ id, folder, kind, identity, epoch, replacement }) {
     await this.locked(async () => {
       const ledger = await this.load();
       const source = ledger.sources.find(item => item.id === id);
-      if (!source || source.folder !== folder || (source.kind || 'draft') !== kind ||
+      if (!source || source.folder !== folder || (source.kind || 'draft') !== kind || source.epoch !== epoch ||
           (source.identity || identity) && !sameIdentity(source.identity, identity)) throw Error('Producer source selection changed. Refresh and select the source again.');
       const selected = await selectProducerRoot(replacement, this.vault.root);
       if (ledger.sources.some(item => item.id !== id && (item.kind || 'draft') === kind && samePath(item.folder, selected.folder))) throw Error('This folder is already connected for this kind of producer output.');
-      if (!samePath(source.folder, selected.folder)) source.previousFolders = [...new Set([...(source.previousFolders || []), source.folder])];
+      if (source.folder !== selected.folder || !sameIdentity(source.identity, selected.identity)) {
+        // Older journals retain their original locator and outcome key.
+        source.previousLocations = [...(source.previousLocations || []), { folder: source.folder, epoch: source.epoch }];
+        source.epoch = randomUUID();
+      }
       Object.assign(source, selected);
       delete source.error;
       await this.save(ledger);
@@ -85,7 +94,12 @@ class Intake {
       for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
         if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
         const child = path.join(folder, entry.name);
-        await visit(child, await producerCandidate(child, guardRoot), depth + 1);
+        try { await visit(child, await producerCandidate(child, guard), depth + 1); }
+        catch (error) {
+          if (error.producerRoot) throw error;
+          await guardRoot();
+          found.push({ folder: child, error });
+        }
       }
     };
     await visit(source.folder, guardRoot, 0);
@@ -94,21 +108,50 @@ class Intake {
   async scanSource(source, now) {
     const guardRoot = producerRootGuard(source);
     const ready = [], outcomes = new Map();
-    for (const { folder, guard } of await this.candidates(source, guardRoot)) {
-      const key = `${source.id}:${path.relative(source.folder, folder) || '.'}`;
-      outcomes.set(key, null);
+    for (const candidate of await this.candidates(source, guardRoot)) {
+      const { folder, guard } = candidate;
+      const key = producerOutcomeKey(source, folder);
       try {
+        if (candidate.error) throw candidate.error;
         const draft = await (source.kind === 'review' ? readReview(folder, guard) : readDraft(folder, guard));
         await guard();
         ready.push({ draft, key, sourceId: source.id, guard });
+        outcomes.set(key, null);
       } catch (error) {
-        await guardRoot();
         if (error.producerRoot) throw error;
-        outcomes.set(key, { status: 'held', reason: error.code ? 'Unreadable artifact. Check source access and complete the producer transfer, then Check now.' : error.message, locator: folder, checkedAt: now });
+        await guardRoot();
+        outcomes.set(key, heldArtifact(folder, error, now));
       }
     }
     await guardRoot();
     return { ready, outcomes };
+  }
+  async retainedOutcomes(ledger) {
+    const keys = new Set(Object.values(ledger.pending).map(item => item.key));
+    for (const [sourceHash, block] of Object.entries(ledger.blocks)) {
+      const matches = outcome => outcome?.status === 'held' && (outcome.sourceHash === sourceHash ||
+        (outcome.pendingRevision && outcome.pendingRevision === block.incomingRevision) ||
+        outcome.reason === block.reason || outcome.reason + conflictPause === block.reason);
+      try {
+        if (!/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) throw Error();
+        const journal = path.join(this.dir, block.journal);
+        const before = await this.ownedFile(journal, [], 'Held import journal');
+        if (!before) throw Error();
+        const tx = JSON.parse(await read(journal));
+        const after = await this.ownedFile(journal, [], 'Held import journal');
+        this.validateTransaction(tx);
+        const outcome = ledger.outcomes[tx.key];
+        if (tx.sourceHash !== sourceHash || tx.revision.id !== block.incomingRevision ||
+            block.journal !== `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json` ||
+            !after || after.dev !== before.dev || after.ino !== before.ino || after.mtimeNs !== before.mtimeNs ||
+            !matches(outcome) || outcome.locator !== tx.revision.locator) throw Error();
+        keys.add(tx.key);
+      } catch {
+        // A damaged journal cannot authorize retirement of its possible outcome.
+        for (const [key, outcome] of Object.entries(ledger.outcomes)) if (matches(outcome)) keys.add(key);
+      }
+    }
+    return keys;
   }
   async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit = async () => true } = {}) {
     return this.locked(async () => {
@@ -116,6 +159,7 @@ class Intake {
       await this.syncMoves();
       await this.retryPending();
       let ledger = await this.load(); const seen = new Map(), ready = [];
+      const retained = await this.retainedOutcomes(ledger);
       ledger.lastCheck = { at: now, trigger, status: 'running' }; await this.save(ledger);
       for (const source of ledger.sources) {
         let scan;
@@ -132,11 +176,15 @@ class Intake {
         }
         for (const [key, outcome] of scan.outcomes) if (outcome) ledger.outcomes[key] = outcome;
         for (const [key, outcome] of Object.entries(ledger.outcomes)) {
-          if (key.startsWith(`${source.id}:`) && outcome.status === 'held' && !outcome.pendingRevision && !scan.outcomes.has(key)) ledger.outcomes[key] = { ...outcome, status: 'absent', checkedAt: now };
+          if (outcome.status === 'held' && !retained.has(key) && !scan.outcomes.has(key) && matchesProducerOutcome(source, key, outcome.locator)) {
+            ledger.outcomes[key] = { ...outcome, status: 'absent', checkedAt: now };
+          }
         }
       }
       await this.save(ledger);
       for (const { draft, key, sourceId, guard } of ready) {
+        const source = ledger.sources.find(item => item.id === sourceId);
+        if (source.error) continue;
         try {
           await guard();
           if (seen.get(draft.identity) === false) throw Error('Ambiguous attempt identity: different artifact bytes claim the same attempt. Keep the intended producer copy, then Check now.');
@@ -144,7 +192,7 @@ class Intake {
           ledger = await this.load();
         } catch (error) {
           if (error.producerRoot) {
-            ledger.sources.find(source => source.id === sourceId).error = error.message;
+            source.error = error.message;
             await this.save(ledger);
             continue;
           }
@@ -548,7 +596,7 @@ class Intake {
   async archiveConflict(tx, ledger, message) {
     this.validateTransaction(tx);
     await this.setup();
-    const reason = `${message} Updates to this source are paused for explicit conflict repair.`;
+    const reason = message + conflictPause;
     const archive = `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`, journal = path.join(this.dir, 'transaction.json');
     ledger.blocks[tx.sourceHash] = { reason, journal: archive, incomingRevision: tx.revision.id };
     delete ledger.pending[tx.sourceHash];

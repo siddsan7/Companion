@@ -5,15 +5,17 @@ const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.
 const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const identity = stat => ({ dev: String(stat.dev), ino: String(stat.ino), birth: String(stat.birthtimeNs) });
 const sameIdentity = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino && a.birth === b.birth;
+const validEpoch = epoch => epoch === undefined || typeof epoch === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(epoch);
 const rootError = message => Object.assign(Error(message), { producerRoot: true });
 const unavailable = () => rootError('Source folder is missing or unreadable, or its identity changed. Reconnect it, then Check now.');
+const candidateUnavailable = () => Error('Producer artifact folder changed, is linked, or is unreadable. Check the producer transfer, then Check now.');
 
 async function ordinaryDirectory(folder) {
   const before = await fs.lstat(folder, { bigint: true });
-  if (!before.isDirectory() || before.isSymbolicLink()) throw unavailable();
+  if (!before.isDirectory() || before.isSymbolicLink()) throw candidateUnavailable();
   const canonical = await fs.realpath(folder);
   const after = await fs.lstat(folder, { bigint: true });
-  if (!samePath(folder, canonical) || !after.isDirectory() || after.isSymbolicLink() || !sameIdentity(identity(before), identity(after))) throw unavailable();
+  if (!samePath(folder, canonical) || !after.isDirectory() || after.isSymbolicLink() || !sameIdentity(identity(before), identity(after))) throw candidateUnavailable();
   return { folder: canonical, identity: identity(after) };
 }
 
@@ -31,12 +33,19 @@ function inside(root, file) {
   return relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative);
 }
 
+function producerOutcomeKey(source, locator, location = source) {
+  if (!validEpoch(location.epoch)) throw Error('Invalid producer connection identity. Preserve intake history for repair.');
+  const prefix = location.epoch ? `${source.id}::${location.epoch}:` : `${source.id}:`;
+  return prefix + (path.relative(location.folder, locator) || '.');
+}
+
 function matchesProducerOutcome(source, key, locator) {
   if (!source || typeof locator !== 'string' || !path.isAbsolute(locator)) return false;
-  const previous = Array.isArray(source.previousFolders) ? source.previousFolders : [];
-  return [source.folder, ...previous].some(folder =>
-    typeof folder === 'string' && path.isAbsolute(folder) && inside(folder, locator) &&
-    key === `${source.id}:${path.relative(folder, locator) || '.'}`);
+  const previous = Array.isArray(source.previousLocations) ? source.previousLocations : [];
+  const legacy = Array.isArray(source.previousFolders) ? source.previousFolders.map(folder => ({ folder })) : [];
+  return [source, ...previous, ...legacy].some(location =>
+    typeof location?.folder === 'string' && validEpoch(location.epoch) && path.isAbsolute(location.folder) && inside(location.folder, locator) &&
+    key === producerOutcomeKey(source, locator, location));
 }
 
 function producerRootGuard(source) {
@@ -49,15 +58,15 @@ function producerRootGuard(source) {
   };
 }
 
-async function producerCandidate(folder, guardRoot) {
-  await guardRoot();
+async function producerCandidate(folder, guardParent) {
+  await guardParent();
   const selected = await ordinaryDirectory(folder);
   return async () => {
-    await guardRoot();
+    await guardParent();
     try {
       const current = await ordinaryDirectory(folder);
-      if (current.folder !== selected.folder || !sameIdentity(selected.identity, current.identity)) throw unavailable();
-    } catch { throw unavailable(); }
+      if (current.folder !== selected.folder || !sameIdentity(selected.identity, current.identity)) throw candidateUnavailable();
+    } catch { throw candidateUnavailable(); }
   };
 }
 
@@ -78,4 +87,4 @@ async function readProducerFile(file, limit, guard, message) {
   } finally { await handle.close(); }
 }
 
-module.exports = { matchesProducerOutcome, producerCandidate, producerRootGuard, readProducerFile, sameIdentity, samePath, selectProducerRoot, unavailable };
+module.exports = { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, readProducerFile, sameIdentity, samePath, selectProducerRoot, unavailable };
