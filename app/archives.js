@@ -557,11 +557,14 @@ class Archives {
       () => controls.verifyRestorationComplete(marker, directory), () => {
         verifyMarker();
         verifySettled();
+      }, {
+        check: () => controls.check(record),
+        commit: () => {
+          verifySettled();
+          this.history.durable.set(record.id, digest);
+          committed();
+        }
       });
-    await controls.check(record);
-    verifySettled();
-    this.history.durable.set(record.id, digest);
-    committed();
   }
   async publishAddition(record, transition, assertSelection, committed) {
     if (transition) return this.publishGenerationAddition(record, transition, assertSelection, committed);

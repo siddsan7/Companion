@@ -163,7 +163,7 @@ class ConversationControls {
       return;
     }
   }
-  async put(marker, baseline, revalidate, assertSelection = () => {}) {
+  async put(marker, baseline, revalidate, assertSelection = () => {}, publication) {
     assertSelection();
     const directory = this.guard(true), file = path.join(directory.directory, `${marker.id}.json`);
     const value = { ...marker, publication: randomUUID() }, text = JSON.stringify(value, null, 2), stage = path.join(directory.directory, `${value.publication}.pending`);
@@ -183,8 +183,10 @@ class ConversationControls {
       local.linkSync(stage, file);
       await removeLinkedStage(stage, file, guard, staged, assertSelection);
     }
+    if (publication) await publication.check();
     verifyStageSync(file, guard, staged);
     this.known.add(marker.id);
+    publication?.commit();
     return value;
   }
   async inventory(id) {
