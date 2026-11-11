@@ -211,12 +211,11 @@
   byId('idea-confirm').onclick = async () => {
     const approved = operation; if (!approved || confirmation) return;
     const request = { editor: epoch, vault: vaultEpoch }, owns = () => request.editor === epoch && request.vault === vaultEpoch;
-    confirmation = request; updateConfirm(); byId('idea-status').textContent = 'Saving idea...';
+    confirmation = request; updateConfirm(); byId('idea-status').textContent = '';
     try {
       await window.companion['idea-confirm']({ operation: approved });
       if (!owns()) return;
       invalidate(); const completion = epoch;
-      byId('idea-status').textContent = 'Idea written. Checking current support...';
       await list({ reportError: false });
       if (completion === epoch && request.vault === vaultEpoch) byId('idea-status').textContent = 'Saved idea. The independent Markdown note is available in the vault.';
     } catch (error) { if (owns()) byId('idea-status').textContent = `Save failed. Proposed content is retained. Retry confirmation explicitly. ${error.message}`; }
