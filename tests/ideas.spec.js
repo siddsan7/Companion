@@ -80,6 +80,133 @@ async function dispatchedUri() {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
+async function saveCitedExperimentProposal(title, signal) {
+  await completedConversation({ imported: true });
+  const vault = path.join(root, 'vault', 'Companion');
+  const revisions = path.join(vault, 'Revisions');
+  const revisionNames = (await fs.readdir(revisions)).filter(name => name.endsWith('.json'));
+  expect(revisionNames).toHaveLength(1);
+  const snapshotBytes = await fs.readFile(path.join(revisions, revisionNames[0]));
+  const snapshot = JSON.parse(snapshotBytes.toString('utf8'));
+
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill(`${signal}: compare two practice queues.`);
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored synthetic source; no experiment was run.');
+  await page.getByLabel('Saved idea kind', { exact: true }).selectOption({ label: 'Experiment Proposal' });
+  for (const [label, value] of [
+    ['Hypothesis', 'A delayed revisit may improve next-day chord changes.'],
+    ['Borrowed mechanism', 'Retrieve a learned chord after a delay.'],
+    ['Project application', 'Offer a delayed revisit in the MyTune practice queue.'],
+    ['Smallest test', 'Compare two practice sessions with and without a delayed revisit.'],
+    ['Observable result', 'Count next-day clean chord changes out of ten attempts.']
+  ]) await page.getByLabel(label, { exact: true }).fill(value);
+  await page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  const preview = page.getByLabel('Proposed idea Markdown', { exact: true });
+  await expect(preview).toHaveValue(/evidence_id: a1/);
+  const text = await preview.inputValue();
+  const fields = YAML.parse(text.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect(fields.idea_kind).toBe('experiment_proposal');
+  expect(fields.citations).toHaveLength(1);
+  expect(fields.citations[0]).toMatchObject({
+    kind: 'imported_evidence', capture_id: snapshot.captureId, revision_id: snapshot.id,
+    snapshot_sha256: createHash('sha256').update(snapshotBytes).digest('hex'),
+    evidence_id: 'a1', excerpt: 'Authored synthetic review fixture only.'
+  });
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea.');
+  const bytes = await fs.readFile(destination);
+  expect(bytes.toString('utf8')).toBe(text);
+  return { vault, destination, bytes, id: fields.companion_id, snapshot };
+}
+
+test('a moved and renamed Experiment Proposal keeps its saved idea identity and exact citation after restart', async () => {
+  test.setTimeout(120000);
+  const title = 'Try a delayed practice queue';
+  const signal = 'movedproposalidentity';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  const directory = path.join(proposal.vault, 'Practice Notes', 'Proposed Tests');
+  await fs.mkdir(directory, { recursive: true });
+  const moved = path.join(directory, 'A delayed revisit.md');
+  await fs.rename(proposal.destination, moved);
+
+  await app.close(); app = null; await launch(false);
+  const idea = page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  await expect(idea).toHaveCount(1);
+  await idea.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(moved)}`);
+  await idea.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  await expect(page.locator('#idea-evidence')).toContainText(`Cited revision ${proposal.snapshot.id}; evidence a1`);
+  await expect(page.locator('#idea-evidence')).toContainText('Authored synthetic review fixture only.');
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(proposal.snapshot.text.replace(/\r\n?/g, '\n'));
+
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.locator('#context-results').getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await manual.selectOption({ label: title });
+  await expect(manual).toHaveValue(`idea:${proposal.id}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  await expect(packageText).toHaveValue(new RegExp(`Saved idea ${proposal.id};`));
+  await expect(packageText).toHaveValue(new RegExp(`${signal}: compare two practice queues`));
+  expect(await fs.readFile(moved)).toEqual(proposal.bytes);
+  await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('a duplicate saved idea in an ordinary nested folder blocks discovery and previously selected use', async () => {
+  test.setTimeout(120000);
+  const title = 'A proposal with an independent copy';
+  const signal = 'duplicateproposalidentity';
+  const proposal = await saveCitedExperimentProposal(title, signal);
+  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const results = page.locator('#context-results');
+  const result = results.getByRole('heading', { name: title, exact: true });
+  await expect(result).toBeVisible();
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await manual.selectOption({ label: title });
+  await expect(manual).toHaveValue(`idea:${proposal.id}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+
+  const directory = path.join(proposal.vault, 'Practice Notes', 'Independent Copies');
+  await fs.mkdir(directory, { recursive: true });
+  const duplicate = path.join(directory, 'A different file.md');
+  // This copy claims the same identity but could not qualify as supporting context.
+  const copyText = proposal.bytes.toString('utf8').replace('support_attribution_unavailable: false', 'support_attribution_unavailable: true');
+  expect(copyText).toContain('support_attribution_unavailable: true');
+  const duplicateBytes = Buffer.from(`${copyText}\nIndependent writing in the duplicate.\n`, 'utf8');
+  await fs.writeFile(duplicate, duplicateBytes, { flag: 'wx' });
+
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  const contextError = page.locator('#context-error');
+  await expect.poll(async () => !!(await contextError.textContent()) || !!(await packageText.inputValue())).toBe(true);
+  await expect.soft(packageText).toHaveValue('', { timeout: 1000 });
+  await expect.soft(contextError).toContainText(/unavailable|changed|duplicat|ambigu/i, { timeout: 1000 });
+
+  const idea = page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  const ideaStatus = page.locator('#idea-status');
+  await idea.getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(async () => !!await dispatchedUri() || /before opening/i.test(await ideaStatus.textContent())).toBe(true);
+  expect.soft(await dispatchedUri()).toBeNull();
+  await idea.getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  const evidence = page.getByLabel('Cited revision snapshot', { exact: true });
+  await expect.poll(async () => await evidence.isVisible() || /identity is missing or ambiguous/i.test(await ideaStatus.textContent())).toBe(true);
+  await expect.soft(evidence).toBeHidden({ timeout: 1000 });
+
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
+  await expect.soft(result).toHaveCount(0, { timeout: 1000 });
+  await expect.soft(manual.getByRole('option', { name: title, exact: true })).toHaveCount(0, { timeout: 1000 });
+  await expect.soft(contextError).toContainText(/duplicat|ambigu/i, { timeout: 1000 });
+  expect(await fs.readFile(proposal.destination)).toEqual(proposal.bytes);
+  expect(await fs.readFile(duplicate)).toEqual(duplicateBytes);
+});
+
 test('a completed conversation result becomes a standalone saved idea only after visible preview and confirmation', async () => {
   test.setTimeout(90000);
   await completedConversation();
