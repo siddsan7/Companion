@@ -56,6 +56,23 @@ async function authoredNote(vault, name) {
   return file;
 }
 
+async function duringStageRead(directory, pattern, change, operation) {
+  const open = fs.open;
+  let reached = false;
+  fs.open = async (file, flags, ...rest) => {
+    if (!reached && typeof flags === 'number' && path.dirname(file) === directory && pattern.test(path.basename(file))) {
+      reached = true;
+      await change();
+    }
+    return open(file, flags, ...rest);
+  };
+  try {
+    const result = await operation().then(() => null, error => error);
+    expect(reached).toBe(true);
+    return result;
+  } finally { fs.open = open; }
+}
+
 test('brief approval preserves a substituted stage and keeps the existing approved version readable', async ({ localVault }) => {
   const { root, vault, checkpoint } = localVault;
   const briefs = new Briefs(vault);
@@ -117,6 +134,24 @@ for (const change of ['missing', 'changed']) test(`brief refresh requires a new 
   expect(result.issues).toEqual([]);
 });
 
+test('brief refresh holds the previous approval when a source disappears during staged verification', async ({ localVault }) => {
+  const { root, vault } = localVault;
+  const briefs = new Briefs(vault), readme = path.join(root, 'README.md');
+  const source = '# MyTune\n\nA guitar practice tutor.\n';
+  await fs.writeFile(readme, source);
+  const first = await briefs.propose([readme], now);
+  const { approved: [prior] } = await briefs.approve(approval(first.proposed), now);
+  const refresh = await briefs.propose([readme], now);
+
+  const attempt = await duringStageRead(briefs.dir, /^\.brief-stage-/, () => fs.unlink(readme), () => briefs.approve(approval(refresh.proposed), now));
+  expect.soft(attempt?.message).toMatch(/approval blocked.*source/i);
+  expect.soft((await briefs.state()).approved.map(item => item.id)).toEqual([prior.id]);
+  expect(await fs.lstat(readme).catch(error => error.code)).toBe('ENOENT');
+  await fs.writeFile(readme, source);
+  const fresh = await briefs.propose([readme], now);
+  expect((await briefs.approve(approval(fresh.proposed), now)).approved.map(item => item.id)).toEqual([fresh.proposed.id, prior.id]);
+});
+
 test('direct note inclusion leaves a substituted stage outside the eligible corpus', async ({ localVault }) => {
   const { vault, scopeFile, context, checkpoint } = localVault;
   const chosen = await authoredNote(vault, 'reviewed');
@@ -165,6 +200,22 @@ test('direct note exclusion preserves the scope file if its reviewed bytes chang
   expect.soft(attempt?.message).toMatch(/chang|publication|scope/i);
   expect.soft(await fs.readFile(scopeFile)).toEqual(external);
   checkpoint(async () => {});
+  await context.exclude(key);
+  expect(await context.scope()).toEqual([retained, added]);
+});
+
+test('direct note exclusion preserves a destination edited during staged verification', async ({ localVault }) => {
+  const { vault, scopeFile, context } = localVault;
+  const excluded = await authoredNote(vault, 'excluded');
+  const retained = await authoredNote(vault, 'retained');
+  const added = await authoredNote(vault, 'editor selection');
+  await context.include([excluded, retained]);
+  const key = (await context.note(excluded)).key;
+  const external = scopeBytes([excluded, retained, added]);
+
+  const attempt = await duringStageRead(path.dirname(scopeFile), /^notes-.*\.tmp$/, () => fs.writeFile(scopeFile, external), () => context.exclude(key));
+  expect.soft(attempt?.message).toMatch(/chang|publication|scope/i);
+  expect.soft(await fs.readFile(scopeFile)).toEqual(external);
   await context.exclude(key);
   expect(await context.scope()).toEqual([retained, added]);
 });
