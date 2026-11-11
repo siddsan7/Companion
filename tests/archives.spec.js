@@ -639,6 +639,49 @@ test('matched archive restore stops when the selected managed parent changes ins
   await expect(summary).toContainText(/Restored 0 conversations.*selection changed.*Inspect again/i);
 });
 
+test('archive restore reports an exact published note inclusion when stage cleanup is refused', async () => {
+  test.setTimeout(90000);
+  const noteFile = path.join(root, 'vault', 'practice.md');
+  const valid = await createSafetyArchive(noteFile);
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  const scopeDirectory = path.join(root, (await fs.readdir(root)).find(name => name.startsWith('context-settings-')));
+  const scope = path.join(scopeDirectory, 'notes.json');
+  const history = path.join(root, 'conversations', `${valid.record.id}.json`);
+  const savedHistory = await fs.readFile(history), noteBytes = await fs.readFile(noteFile);
+  const expected = Buffer.from(JSON.stringify({ schema: 1, files: [noteFile] }, null, 2));
+  await fs.unlink(scope);
+  const observation = path.join(root, 'note-scope-cleanup-refusal.json');
+  await app.evaluate((_, { root, scope, scopeDirectory, observation }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Cleanup refusal requires a disposable archive fixture.');
+    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), native = io.unlink;
+    io.unlink = async function (file, ...args) {
+      if (paths.dirname(file) !== scopeDirectory || !/^notes-[a-f0-9-]+\.tmp$/.test(paths.basename(file))) return native.call(this, file, ...args);
+      const stage = await io.lstat(file, { bigint: true }), published = await io.lstat(scope, { bigint: true });
+      const bytes = await io.readFile(file);
+      await io.writeFile(observation, JSON.stringify({ stage: file, same: stage.dev === published.dev && stage.ino === published.ino, links: String(stage.nlink), bytes: bytes.toString('base64') }));
+      throw Object.assign(Error('Temporary reviewed note stage cleanup refusal.'), { code: 'EACCES', syscall: 'unlink' });
+    };
+  }, { root, scope, scopeDirectory, observation });
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(region).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByLabel('Application settings restoration', { exact: true }).selectOption('review-note-inclusions');
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await region.getByLabel(`Restore note inclusion ${noteFile}`, { exact: true }).check();
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  const summary = region.locator('#archive-restore-summary');
+  await expect(summary).toContainText(/cleanup refusal|Restored 1 reviewed note inclusion/i);
+  const refused = JSON.parse(await fs.readFile(observation));
+  expect(refused).toMatchObject({ same: true, links: '2', bytes: expected.toString('base64') });
+  expect(await fs.readFile(scope)).toEqual(expected);
+  expect(await fs.readFile(refused.stage)).toEqual(expected);
+  expect((await fs.readdir(scopeDirectory)).filter(name => /^notes-.*\.tmp$/.test(name))).toEqual([path.basename(refused.stage)]);
+  expect(await fs.readFile(history)).toEqual(savedHistory);
+  expect(await fs.readFile(noteFile)).toEqual(noteBytes);
+  await expect(summary).toContainText(/restored 1 reviewed note inclusion/i);
+  await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeDisabled();
+});
+
 test('invalid archive inputs and a file changed after matched preview preserve current history and authority', async () => {
   test.setTimeout(150000);
   const valid = await createSafetyArchive();

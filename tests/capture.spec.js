@@ -116,6 +116,53 @@ test('a staged capture recovers exactly once after interruption', async () => {
   expect(files).toHaveLength(1);
   expect(await fs.readFile(path.join(root, 'vault', 'My Companion', 'Captures', files[0]), 'utf8')).toContain('captured_at: "2026-11-08T06:59:00.000Z"');
 });
+test('interrupted quick capture keeps exact recovery proof through a temporary link refusal', async () => {
+  test.setTimeout(90000);
+  await launch(); await setup();
+  const writer = app, writerPage = page;
+  app = null;
+  try {
+    await launch();
+    await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+    const dir = path.join(root, 'vault', 'My Companion', 'Captures'), draft = 'Recover after a temporary sharing refusal.';
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'capture-staged' }));
+    await writerPage.getByLabel('Thought or link').fill(draft);
+    await writerPage.getByRole('button', { name: 'Save capture', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('capture-staged');
+    const stage = path.join(dir, (await fs.readdir(dir)).find(file => file.endsWith('.md.pending')));
+    const destination = stage.slice(0, -'.pending'.length), lock = `${destination}.lock`;
+    const stageBytes = await fs.readFile(stage), proofBytes = await fs.readFile(lock);
+    expect(JSON.parse(proofBytes).publication.kind).toBe('capture');
+    const refused = path.join(root, 'capture-recovery-link-refusal.json');
+    await app.evaluate((_, { root, stage, destination, refused }) => {
+      if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Link refusal requires a disposable capture fixture.');
+      const io = process.getBuiltinModule('fs').promises, native = io.link;
+      io.link = async function (from, to) {
+        if (from !== stage || to !== destination) return native.call(this, from, to);
+        const observed = await io.lstat(from, { bigint: true });
+        await io.writeFile(refused, JSON.stringify({ from, to, ino: String(observed.ino) }));
+        throw Object.assign(Error('Temporary recovery link refusal.'), { code: 'EACCES', syscall: 'link' });
+      };
+    }, { root, stage, destination, refused });
+    const child = writer.process(), pid = await writer.evaluate(() => process.pid);
+    const exited = new Promise(resolve => child.once('exit', resolve));
+    const abrupt = writer.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+    await exited; await abrupt;
+    await expect.poll(() => { try { process.kill(pid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+    await fs.unlink(path.join(root, 'faults.json'));
+    await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+    await expect(page.locator('#warnings')).toContainText('Temporary recovery link refusal.');
+    expect(JSON.parse(await fs.readFile(refused))).toEqual({ from: stage, to: destination, ino: String((await fs.lstat(stage, { bigint: true })).ino) });
+    expect(await fs.readFile(stage)).toEqual(stageBytes);
+    expect(await fs.stat(destination).catch(error => error.code)).toBe('ENOENT');
+    expect.soft(await fs.readFile(lock).catch(error => error.code)).toEqual(proofBytes);
+    await app.close(); app = null; await launch();
+    await expect(page.getByRole('heading', { name: draft, exact: true })).toHaveCount(1);
+    expect(await fs.readFile(destination)).toEqual(stageBytes);
+    expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.stat(lock).catch(error => error.code)).toBe('ENOENT');
+  } finally { await writer.close().catch(() => {}); }
+});
 test('a changed quick capture stage is held through restart even when it still parses', async () => {
   await launch(); await setup();
   const dir = path.join(root, 'vault', 'My Companion', 'Captures');
@@ -477,6 +524,34 @@ test('a title stage replaced with the same bytes after the move preserves the pr
   expect(await fs.readFile(backup)).toEqual(original);
   expect(await fs.readFile(movedStage)).toEqual(reviewed);
   await expect(page.getByRole('status')).toContainText(/staging.*preserv/i);
+});
+test('legacy PID-only title recovery restores the verified original and holds the untrusted stage', async () => {
+  await launch(); await setup();
+  const draft = 'Prior title from an interrupted older installation.';
+  await page.getByLabel('Thought or link').fill(draft);
+  await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  await expect(page.getByRole('heading', { name: draft, exact: true })).toBeVisible();
+  const dir = path.join(root, 'vault', 'My Companion', 'Captures');
+  const file = path.join(dir, (await fs.readdir(dir)).find(name => name.endsWith('.md')));
+  const original = await fs.readFile(file), stage = `${file}.pending`, journal = `${file}.title-transaction.json`;
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'title-moved' }));
+  await page.getByLabel('Display title').fill('Unverified proposed title');
+  await page.getByRole('button', { name: 'Save title' }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('title-moved');
+  const journalBytes = await fs.readFile(journal), pendingBytes = await fs.readFile(stage);
+  const backup = path.join(dir, JSON.parse(journalBytes).backup), lock = `${file}.lock`;
+  const { pid } = JSON.parse(await fs.readFile(lock));
+  app.process().kill(); await app.close().catch(() => {}); app = null;
+  await fs.writeFile(lock, JSON.stringify({ pid }));
+  await fs.unlink(path.join(root, 'faults.json')); await launch();
+  await expect(page.locator('#warnings')).toContainText(/staging.*preserv/i);
+  expect(await fs.readFile(backup)).toEqual(original);
+  expect(await fs.readFile(stage)).toEqual(pendingBytes);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect.soft(await fs.readFile(file).catch(error => error.code)).toEqual(original);
+  await expect(page.getByRole('heading', { name: draft, exact: true })).toBeVisible();
+  expect((await fs.lstat(file, { bigint: true })).nlink).toBe(1n);
+  expect((await fs.lstat(backup, { bigint: true })).nlink).toBe(1n);
 });
 test('recovery never restores an unrelated backup from an invalid title transaction', async () => {
   await launch(); await setup();
