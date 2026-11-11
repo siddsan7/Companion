@@ -6,7 +6,7 @@ const { Vault } = require('../app/vault');
 const { Context } = require('../app/context');
 const { Intake } = require('../app/intake');
 const { CaptureDeletion } = require('../app/capture-deletion');
-const { Conversations } = require('../app/conversations');
+const { requiredDirectories } = require('../app/source-recovery');
 const draft = require('./fixtures/reel-draft/example.json');
 
 const now = '2026-11-08T06:59:00.000Z';
@@ -38,6 +38,24 @@ async function addLegacy(vault) {
   await fs.writeFile(file, content);
   return { id, file, content };
 }
+
+async function legacyAuthority(vault, legacy) {
+  // Model the exact active record left by an older installation after a
+  // deliberate manual restoration, before ownership receipts existed.
+  const intake = new Intake(vault), inspector = new CaptureDeletion({ getVault: () => vault });
+  await intake.setup();
+  const ledger = await intake.load(), target = await inspector.target(vault, legacy.file, 'capture');
+  const directories = await Promise.all([...requiredDirectories(intake, [target])].sort().map(name => inspector.directory(vault, path.join(vault.vault, name))));
+  ledger.sourceAuthority = { [legacy.id]: {
+    generation: randomUUID(), phase: 'active', operationId: randomUUID(), sourceHash: null,
+    targets: [target], root: vault.vault, directories,
+    manual: { captureId: legacy.id, type: 'thought', capturedAt: now, currentHash: target.sha256, file: path.basename(legacy.file), relative: target.file }
+  } };
+  await intake.save(ledger);
+  return { intake, ledger, target };
+}
+
+const receiptPath = (vault, id) => path.join(vault.vault, '.companion-capture-owners', `${id}.json`);
 
 test('manual capture browsing keeps two managed parents in one vault separate', async ({}, testInfo) => {
   const { a, b, restart } = await managedParents(testInfo);
@@ -78,9 +96,10 @@ test('deletion in a different managed parent cannot authorize a manual capture',
   expect(await new Intake(b).load()).toEqual(before);
 });
 
-test('legacy capture metadata stays readable in its own Captures area without rewriting the file', async ({}, testInfo) => {
+test('legacy capture with exact active authority stays readable without rewriting the file', async ({}, testInfo) => {
   const { a, b, context, restart } = await managedParents(testInfo, { onlyFirst: true });
-  const { id, file, content } = await addLegacy(a);
+  const legacy = await addLegacy(a), { id, file, content } = legacy;
+  await legacyAuthority(a, legacy);
 
   await expect(restart(a).find(id)).resolves.toMatchObject({ id, file });
   await b.setup();
@@ -89,9 +108,10 @@ test('legacy capture metadata stays readable in its own Captures area without re
   expect(await fs.readFile(file, 'utf8')).toBe(content);
 });
 
-test('an observed legacy capture retains its parent when moved into another Captures area', async ({}, testInfo) => {
+test('a verified legacy capture retains its parent when moved into another Captures area', async ({}, testInfo) => {
   const { a, b, context, restart } = await managedParents(testInfo, { onlyFirst: true });
-  const { id, file, content } = await addLegacy(a);
+  const legacy = await addLegacy(a), { id, file, content } = legacy;
+  await legacyAuthority(a, legacy);
   await expect(a.find(id)).resolves.toMatchObject({ id, file });
   await b.setup();
   const before = await new Intake(b).info();
@@ -122,32 +142,13 @@ test('an unobserved legacy capture with several possible parents gains no automa
 
 test('an already restored legacy capture remains managed across a move and title edit', async ({}, testInfo) => {
   const { a, b, context, restart } = await managedParents(testInfo, { onlyFirst: true });
-  const { id, file, content } = await addLegacy(a);
-  await new Intake(a).info();
+  const legacy = await addLegacy(a), { id, file, content } = legacy;
+  await legacyAuthority(a, legacy);
   const backup = testInfo.outputPath('legacy-backup.md');
   await fs.writeFile(backup, content);
-  const clock = () => ({ now }), dataRoot = testInfo.outputPath('local-data');
-  const conversations = new Conversations({ dataRoot, getVault: () => a, clock });
-  await conversations.lock(async () => {});
-  const store = new CaptureDeletion({ getVault: () => a, conversations, clearApprovals: () => {}, clock });
-  await store.confirm((await store.preview(id)).token);
-  await store.confirmRestoration((await store.previewRestoration({ id, file: backup })).token);
   expect((await new Intake(a).load()).sourceAuthority[id]).toMatchObject({ phase: 'active' });
   expect(await fs.readFile(file, 'utf8')).toBe(content);
-  // Model an installation that already had active manual authority before
-  // legacy ownership receipts existed. Remove only this fixture's exact receipt.
-  const receipt = path.join(a.vault, '.companion-capture-owners', `${id}.json`);
-  const recorded = await fs.readFile(receipt, 'utf8').catch(error => {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  });
-  if (recorded !== null) {
-    const stat = await fs.lstat(receipt);
-    expect(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1).toBe(true);
-    expect(JSON.parse(recorded)).toEqual({ schema: 1, id, owner: path.basename(a.root), type: 'thought', capturedAt: now });
-    await fs.unlink(receipt);
-  }
-  await expect(fs.access(receipt)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(fs.access(receiptPath(a, id))).rejects.toMatchObject({ code: 'ENOENT' });
   await b.setup();
 
   const moved = path.join(a.vault, 'Moved legacy thought.md');
@@ -160,6 +161,68 @@ test('an already restored legacy capture remains managed across a move and title
   expect((await context(latest).corpus()).all.map(source => source.captureId)).toContain(id);
   expect((await context(restart(b)).corpus()).all.map(source => source.captureId)).not.toContain(id);
   expect(await fs.readFile(backup, 'utf8')).toBe(content);
+});
+
+test('a legacy capture moved from a vanished layout gains no authority in the sole remaining parent', async ({}, testInfo) => {
+  const { a, b, context, restart } = await managedParents(testInfo);
+  const { id, file, content } = await addLegacy(a);
+  const moved = path.join(b.root, 'Captures', 'Moved legacy thought.md');
+  await fs.rename(file, moved);
+  for (const area of ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions']) await fs.rmdir(path.join(a.root, area));
+  await fs.rmdir(a.root);
+  const reopened = restart(b), before = await new Intake(reopened).info();
+
+  expect.soft((await context(reopened).corpus()).all.map(source => source.captureId)).not.toContain(id);
+  await expect.soft(new CaptureDeletion({ getVault: () => reopened }).preview(id)).rejects.toThrow();
+  expect.soft(reopened.warnings.join('\n')).toMatch(/legacy.*(?:owner|managed parent)/i);
+  await expect.soft(fs.access(receiptPath(reopened, id))).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect.soft(reopened.title(id, 'Unapproved title')).rejects.toThrow();
+  expect(await new Intake(reopened).load()).toEqual(before);
+  expect(await fs.readFile(moved, 'utf8')).toBe(content);
+});
+
+test('changed bytes cannot establish the first receipt for active legacy authority', async ({}, testInfo) => {
+  const { a, context, restart } = await managedParents(testInfo);
+  const legacy = await addLegacy(a), { id, file, content } = legacy;
+  const { ledger } = await legacyAuthority(a, legacy);
+  const moved = path.join(a.vault, 'Changed legacy thought.md');
+  await fs.rename(file, moved);
+  const changed = content + '\nDifferent text with the same metadata.\n';
+  await fs.writeFile(moved, changed);
+  const reopened = restart(a);
+
+  await expect.soft(reopened.find(id)).rejects.toThrow();
+  expect.soft((await context(reopened).corpus()).all.map(source => source.captureId)).not.toContain(id);
+  await expect.soft(new CaptureDeletion({ getVault: () => reopened }).preview(id)).rejects.toThrow();
+  expect.soft(reopened.warnings.join('\n')).toMatch(/legacy.*(?:owner|managed parent)/i);
+  await expect.soft(fs.access(receiptPath(reopened, id))).rejects.toMatchObject({ code: 'ENOENT' });
+  expect((await new Intake(reopened).load()).sourceAuthority).toEqual(ledger.sourceAuthority);
+  expect(await fs.readFile(moved, 'utf8')).toBe(changed);
+});
+
+for (const recorded of [false, true]) test(`a recorded excluded legacy singleton stays unavailable ${recorded ? 'with' : 'without'} a prior receipt`, async ({}, testInfo) => {
+  const { a, context, restart } = await managedParents(testInfo);
+  const legacy = await addLegacy(a), { id, file, content } = legacy;
+  const { intake, ledger, target } = await legacyAuthority(a, legacy);
+  const receipt = receiptPath(a, id);
+  let prior;
+  if (recorded) {
+    await expect(a.find(id)).resolves.toMatchObject({ id, file });
+    prior = await fs.readFile(receipt);
+  }
+  const excluded = path.join(a.vault, 'Excluded legacy copy.md');
+  ledger.identityChoices = { [id]: { file: path.relative(a.vault, file), copies: [{ file: path.relative(a.vault, excluded), hash: target.sha256 }] } };
+  await intake.save(ledger);
+  await fs.rename(file, excluded);
+  const reopened = restart(a);
+
+  await expect.soft(reopened.find(id)).rejects.toThrow();
+  expect.soft((await context(reopened).corpus()).all.map(source => source.captureId)).not.toContain(id);
+  await expect.soft(new CaptureDeletion({ getVault: () => reopened }).preview(id)).rejects.toThrow();
+  if (recorded) expect(await fs.readFile(receipt)).toEqual(prior);
+  else await expect.soft(fs.access(receipt)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect((await new Intake(reopened).load()).identityChoices).toEqual(ledger.identityChoices);
+  expect(await fs.readFile(excluded, 'utf8')).toBe(content);
 });
 
 test('an admitted import stays browsable after a move and mutable capture type edit', async ({}, testInfo) => {
