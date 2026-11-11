@@ -124,6 +124,60 @@ for (const phase of ['pending', 'connected']) {
   });
 }
 
+for (const target of ['linked stage', 'initial receipt', 'final schedule']) {
+  test(`archive cadence detects a substituted ${target} when its proof handle closes`, async () => {
+    const fixture = await reconnectFixture();
+    const review = await fixture.preview();
+    const receipt = `${fixture.scheduleFile}.initial-publication.json`;
+    const foreignBytes = `Independent writing substituted for the ${target}.\n`;
+    const originalOpen = fs.open;
+    let linkedStageReads = 0, substitution;
+    fs.open = async (file, flags, ...args) => {
+      const handle = await originalOpen(file, flags, ...args);
+      if (typeof flags !== 'number' || typeof file !== 'string' || path.dirname(file) !== root) return handle;
+      const close = handle.close.bind(handle);
+      handle.close = async () => {
+        await close();
+        if (substitution) return;
+        let replace = false;
+        if (target === 'linked stage' && /^\.archive-reconnect-.+\.pending$/.test(path.basename(file))) {
+          const leaf = await fs.lstat(file);
+          // The first read proves the pair. The second authorizes stage cleanup.
+          replace = leaf.nlink === 2 && ++linkedStageReads === 2;
+        }
+        if (target === 'initial receipt') replace = file === receipt;
+        if (target === 'final schedule' && file === fixture.scheduleFile && fixture.calls.includes('enable')) {
+          replace = JSON.parse(await readOptional(file)).archiveReconnect.status === 'connected';
+        }
+        if (!replace) return;
+        const original = await readOptional(file), parked = `${file}.original-fixture`;
+        await fs.rename(file, parked);
+        await fs.writeFile(file, foreignBytes, { flag: 'wx' });
+        substitution = { file, parked, original };
+      };
+      return handle;
+    };
+    let outcome;
+    try { outcome = await fixture.confirm(review).then(value => ({ value }), error => ({ error: error.message })); }
+    finally { fs.open = originalOpen; }
+
+    expect(substitution, 'the replacement happened after the real proof read').toBeDefined();
+    expect(await readOptional(substitution.file), 'independent writing was preserved').toBe(foreignBytes);
+    expect(await readOptional(substitution.parked)).toBe(substitution.original);
+    expect(outcome.error, 'the operation refused to report an unproved publication').toBeTruthy();
+    if (target === 'final schedule') {
+      const connected = JSON.parse(substitution.original), task = JSON.parse(await readOptional(fixture.taskFile));
+      expect(connected).toMatchObject({ mode: 'enabled', archiveReconnect: { status: 'connected' } });
+      expect(task.name).toBe(`Companion-${connected.id}`);
+      expect(fixture.calls.filter(action => action === 'enable')).toHaveLength(1);
+    } else {
+      expect(JSON.parse(await readOptional(fixture.scheduleFile))).toMatchObject({ mode: 'disabled', archiveReconnect: { status: 'pending' } });
+      expect(fixture.calls).not.toContain('enable');
+      expect(await readOptional(fixture.taskFile)).toBeNull();
+    }
+  });
+}
+
 test('after verified Disable, explicit Enable sets up a fresh schedule for a different vault', async () => {
   const file = path.join(root, 'schedule.json'), taskFile = path.join(root, 'scheduler-task.json');
   async function connect(name) {
@@ -245,5 +299,73 @@ test('Configure cannot switch managed parents during native cadence reconnection
     expect(connected).toMatchObject({ id: result.value.id, vault: vault.vault, parent: 'Companion', mode: 'enabled' });
     const task = JSON.parse(await readOptional(path.join(root, 'scheduler-task.json')));
     expect(task.name).toBe(`Companion-${connected.id}`);
+  } finally { await app.close(); }
+});
+
+test('daily intake controls cannot enable a new vault from the old displayed schedule', async () => {
+  const vaultFolder = path.join(root, 'vault');
+  const first = new Vault(vaultFolder, 'Companion');
+  const second = new Vault(vaultFolder, 'Other parent');
+  const settings = path.join(root, 'settings.json'), scheduleFile = path.join(root, 'schedule.json');
+  const taskFile = path.join(root, 'scheduler-task.json');
+  for (const [name, vault] of [['A', first], ['B', second]]) {
+    await vault.setup();
+    const producer = path.join(root, `producer-${name}`);
+    await fs.mkdir(producer);
+    await new Intake(vault).connect(producer, false, anchor);
+  }
+  await fs.writeFile(settings, JSON.stringify({ vault: vaultFolder, parent: 'Companion' }));
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify(clock()));
+  const originalSchedule = new Schedule(scheduleFile, first, { testRoot: root });
+  await originalSchedule.control('enable', anchor);
+  const original = await originalSchedule.control('disable', now);
+  const before = await readOptional(scheduleFile);
+  expect(await readOptional(taskFile)).toBeNull();
+
+  const app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const page = await app.firstWindow();
+    const enable = page.getByRole('button', { name: 'Enable daily intake', exact: true });
+    await expect(page.locator('#location')).toHaveText(first.root);
+    await expect(page.getByLabel('Daily intake schedule')).toContainText('disabled');
+    await expect(enable).toBeEnabled();
+    await app.evaluate(({ ipcMain }) => {
+      const original = ipcMain._invokeHandlers.get('configure');
+      let release;
+      const wait = new Promise(resolve => { release = resolve; });
+      const control = globalThis.__heldCadenceConfiguration = { entered: false, release };
+      ipcMain._invokeHandlers.set('configure', async (...args) => {
+        const result = await original(...args);
+        control.entered = true;
+        await wait;
+        return result;
+      });
+    });
+    await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+    await expect(page.locator('#vault')).toHaveText(vaultFolder);
+    await page.getByLabel('Parent folder', { exact: true }).fill('Other parent');
+    await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+    try {
+      await expect.poll(() => app.evaluate(() => globalThis.__heldCadenceConfiguration.entered)).toBe(true);
+      await expect(page.locator('#location')).toHaveText(first.root);
+      expect(JSON.parse(await readOptional(settings))).toEqual({ vault: vaultFolder, parent: 'Other parent' });
+      const stale = await page.evaluate(async request => {
+        try { return { value: await window.companion['schedule-enable'](request) }; }
+        catch (error) { return { error: error.message }; }
+      }, { location: first.root, scheduleId: original.id });
+      expect(await readOptional(taskFile), 'the old view cannot authorize registration for the new vault').toBeNull();
+      expect(await readOptional(scheduleFile)).toBe(before);
+      expect(stale.error).toBeTruthy();
+      await expect(enable).toBeDisabled();
+    } finally { await app.evaluate(() => globalThis.__heldCadenceConfiguration.release()); }
+
+    await expect(page.locator('#location')).toHaveText(second.root);
+    await expect(page.getByRole('status')).toContainText('Vault ready.');
+    await enable.click();
+    await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+    const next = JSON.parse(await readOptional(scheduleFile));
+    expect(next).toMatchObject({ vault: vaultFolder, parent: 'Other parent', anchor: now, mode: 'enabled' });
+    expect(next.id).not.toBe(original.id);
+    expect(JSON.parse(await readOptional(taskFile)).name).toBe(`Companion-${next.id}`);
   } finally { await app.close(); }
 });
