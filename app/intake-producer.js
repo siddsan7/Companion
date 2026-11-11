@@ -1,8 +1,8 @@
 // Reel to MD 1.0 draft contract. Schemas are copied from the producer;
 // semantic checks and inert rendering mirror contracts.py, not a download receipt.
-const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const { readProducerFile } = require('./producer-root');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const fail = reason => { throw Error(reason); };
 function schema(value, rule) {
@@ -112,11 +112,11 @@ function bound(packet, target) {
   const equal = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
   if (target.title !== 'Selected source excerpts (unreviewed)' || target.status !== (packet.evidence.length ? 'partial' : 'insufficient_evidence') || target.steps.length || target.conflicts.length || target.claims.length < (variants.length ? 1 : 0) || target.claims.length > Math.min(8, variants.length) || target.claims.some(claim => !variants.some(v => equal(v, claim))) || !equal(target.unknowns, unknowns) || !equal(target.omissions, omissions)) fail('Bound excerpt generation validation failed.');
 }
-async function readDraft(folder) {
+async function readDraft(folder, guard) {
   const names = ['run.json', 'evidence.json', 'first-pass-target.json', 'notes.md'];
   const read = async () => {
     const result = [];
-    for (const name of names) { const file = path.join(folder, name), info = await fs.lstat(file); if (!info.isFile() || info.isSymbolicLink() || info.size > 16 * 1024 * 1024) fail('Unsupported artifact file. Use ordinary complete producer files.'); result.push(await fs.readFile(file)); }
+    for (const name of names) result.push(await readProducerFile(path.join(folder, name), 16 * 1024 * 1024, guard, 'Unsupported artifact file. Use ordinary complete producer files.'));
     return result;
   };
   let bytes; try { bytes = await read(); } catch (error) { if (error.code === 'ENOENT') fail('Incomplete transfer: run, evidence, first-pass target and notes are required. Retry after producer completion.'); throw error; }

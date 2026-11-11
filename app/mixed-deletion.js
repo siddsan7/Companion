@@ -3,6 +3,7 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { isDeepStrictEqual: equal } = require('node:util');
 const { hash } = require('./intake-producer');
+const { matchesProducerOutcome } = require('./producer-root');
 const YAML = require('yaml');
 const { validateNormalizedReview } = require('./source-review');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -189,7 +190,7 @@ async function inventory(intake, ledger, capture, sourceHash, note, seed, now) {
   const resolvedCapture = { ...originalCapture, title: note.title, currentHash: hash(noteText(originalCapture, admitted)) };
   if (!equal(original.capture, originalCapture) || !equal(tx.capture, resolvedCapture) || original.externalConflict !== true || original.retainOnly !== true || tx.externalConflict !== false || tx.retainOnly !== false || original.content !== current || original.previous !== current || original.previousHash !== hash(current) || tx.previous !== current || tx.previousHash !== hash(current) || tx.content !== noteText(resolvedCapture, admitted) || repair.localHash !== hash(current) || original.key !== tx.key || !uuid(tx.key.split(':')[0]) || !ledger.sources.some(source => source.id === tx.key.split(':')[0] && source.kind === 'review')) fail('exact kept-current writer relation');
   const producer = ledger.sources.find(source => source.id === tx.key.split(':')[0]);
-  if (!path.isAbsolute(tx.revision.locator) || tx.key !== `${producer.id}:${path.relative(producer.folder, tx.revision.locator) || '.'}`) fail('producer observation key');
+  if (!matchesProducerOutcome(producer, tx.key, tx.revision.locator)) fail('producer observation key');
   const block = ledger.blocks[sourceHash], outcome = ledger.outcomes[tx.key];
   if (!shape(block, ['reason', 'journal', 'incomingRevision']) || block.journal !== path.basename(resolutionFile) || block.incomingRevision !== tx.revision.id || typeof block.reason !== 'string' || block.reason !== capture.conflict || ledger.pending[sourceHash] || !equal(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail('held pointer/outcome');
   const sourceLink = path.relative(path.join(intake.vault.root, 'Annotations'), note.file).split(path.sep).map(encodeURIComponent).join('/');

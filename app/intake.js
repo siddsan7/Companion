@@ -9,6 +9,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold } = require('./source-recovery');
+const { producerCandidate, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
 const conflict = message => Object.assign(Error(message), { intakeConflict: true });
@@ -48,23 +49,66 @@ class Intake {
     try { return await this.locked(async () => { await this.syncMoves(); return this.load(); }); } catch (error) { if (error.message.includes('already running')) return this.load(); throw error; }
   }
   async connect(folder, scan, now, kind = 'draft') {
-    if (typeof folder !== 'string' || !path.isAbsolute(folder)) throw Error('Choose an absolute producer source folder.');
-    const source = await fs.realpath(folder); if (!(await fs.stat(source)).isDirectory()) throw Error('Choose a producer source folder.');
-    // Scanning the destination would feed imports back into their own intake.
-    const relative = path.relative(source, this.vault.root);
-    if (relative === '' || !relative.startsWith('..') && !path.isAbsolute(relative)) throw Error('Choose a producer folder that does not contain the Companion destination.');
-    await this.locked(async () => { const ledger = await this.load(); if (!ledger.sources.some(x => x.folder === source && (x.kind || 'draft') === kind)) ledger.sources.push({ id: randomUUID(), folder: source, kind, connectedAt: now, firstScan: !!scan }); await this.save(ledger); });
+    await this.locked(async () => {
+      const ledger = await this.load();
+      const selected = await selectProducerRoot(folder, this.vault.root);
+      const existing = ledger.sources.find(source => (source.kind || 'draft') === kind && samePath(source.folder, selected.folder));
+      if (existing) return producerRootGuard(existing)();
+      ledger.sources.push({ id: randomUUID(), ...selected, kind, connectedAt: now, firstScan: !!scan });
+      await this.save(ledger);
+    });
     if (scan) return this.reconcile({ trigger: 'first-scan', now });
   }
-  async candidates(folder, kind = 'draft') {
+  async reconnect({ id, folder, kind, identity, replacement }) {
+    await this.locked(async () => {
+      const ledger = await this.load();
+      const source = ledger.sources.find(item => item.id === id);
+      if (!source || source.folder !== folder || (source.kind || 'draft') !== kind ||
+          (source.identity || identity) && !sameIdentity(source.identity, identity)) throw Error('Producer source selection changed. Refresh and select the source again.');
+      const selected = await selectProducerRoot(replacement, this.vault.root);
+      if (ledger.sources.some(item => item.id !== id && (item.kind || 'draft') === kind && samePath(item.folder, selected.folder))) throw Error('This folder is already connected for this kind of producer output.');
+      if (!samePath(source.folder, selected.folder)) source.previousFolders = [...new Set([...(source.previousFolders || []), source.folder])];
+      Object.assign(source, selected);
+      delete source.error;
+      await this.save(ledger);
+    });
+  }
+  async candidates(source, guardRoot) {
     const found = [];
-    const visit = async (dir, depth) => {
+    const markers = source.kind === 'review' ? ['manifest.json', 'source.json', 'review.json'] : ['run.json', 'evidence.json', 'first-pass-target.json', 'notes.md'];
+    const visit = async (folder, guard, depth) => {
       if (depth > 12) throw Error('Source nesting exceeds the supported depth. Select a narrower producer folder.');
-      const entries = await fs.readdir(dir, { withFileTypes: true });
-      if (entries.some(x => (kind === 'review' ? ['manifest.json', 'source.json', 'review.json'] : ['run.json', 'evidence.json', 'first-pass-target.json', 'notes.md']).includes(x.name))) { found.push(dir); return; }
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(path.join(dir, entry.name), depth + 1);
+      await guard();
+      const entries = await fs.readdir(folder, { withFileTypes: true });
+      await guard();
+      if (entries.some(entry => markers.includes(entry.name))) { found.push({ folder, guard }); return; }
+      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const child = path.join(folder, entry.name);
+        await visit(child, await producerCandidate(child, guardRoot), depth + 1);
+      }
     };
-    await visit(folder, 0); return found;
+    await visit(source.folder, guardRoot, 0);
+    return found;
+  }
+  async scanSource(source, now) {
+    const guardRoot = producerRootGuard(source);
+    const ready = [], outcomes = new Map();
+    for (const { folder, guard } of await this.candidates(source, guardRoot)) {
+      const key = `${source.id}:${path.relative(source.folder, folder) || '.'}`;
+      outcomes.set(key, null);
+      try {
+        const draft = await (source.kind === 'review' ? readReview(folder, guard) : readDraft(folder, guard));
+        await guard();
+        ready.push({ draft, key, sourceId: source.id, guard });
+      } catch (error) {
+        await guardRoot();
+        if (error.producerRoot) throw error;
+        outcomes.set(key, { status: 'held', reason: error.code ? 'Unreadable artifact. Check source access and complete the producer transfer, then Check now.' : error.message, locator: folder, checkedAt: now });
+      }
+    }
+    await guardRoot();
+    return { ready, outcomes };
   }
   async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit = async () => true } = {}) {
     return this.locked(async () => {
@@ -74,41 +118,51 @@ class Intake {
       let ledger = await this.load(); const seen = new Map(), ready = [];
       ledger.lastCheck = { at: now, trigger, status: 'running' }; await this.save(ledger);
       for (const source of ledger.sources) {
-        let candidates;
-        try { candidates = await this.candidates(source.folder, source.kind); delete source.error; }
-        catch { source.error = 'Source folder is missing or unreadable. Reconnect it, then Check now.'; continue; }
+        let scan;
+        try { scan = await this.scanSource(source, now); delete source.error; }
+        catch (error) { source.error = error.producerRoot ? error.message : unavailable().message; continue; }
         // Validate all candidates before admitting any: conflicting copies of the
         // same producer attempt are held regardless of directory iteration order.
-        const present = new Set();
-        for (const folder of candidates) {
-          const key = `${source.id}:${path.relative(source.folder, folder) || '.'}`;
-          present.add(key);
-          try { const draft = await (source.kind === 'review' ? readReview(folder) : readDraft(folder)); ready.push({ draft, key }); const prior = seen.get(draft.identity); if (prior && prior !== draft.fingerprint) seen.set(draft.identity, false); else if (prior !== false) seen.set(draft.identity, draft.fingerprint); }
-          catch (error) { ledger.outcomes[key] = { status: 'held', reason: error.code ? 'Unreadable artifact. Check source access and complete the producer transfer, then Check now.' : error.message, locator: folder, checkedAt: now }; }
+        for (const item of scan.ready) {
+          const { identity, fingerprint } = item.draft;
+          const prior = seen.get(identity);
+          if (prior && prior !== fingerprint) seen.set(identity, false);
+          else if (prior !== false) seen.set(identity, fingerprint);
+          ready.push(item);
         }
-        for (const [key, outcome] of Object.entries(ledger.outcomes)) if (key.startsWith(`${source.id}:`) && outcome.status === 'held' && !present.has(key)) ledger.outcomes[key] = { ...outcome, status: 'absent', checkedAt: now };
+        for (const [key, outcome] of scan.outcomes) if (outcome) ledger.outcomes[key] = outcome;
+        for (const [key, outcome] of Object.entries(ledger.outcomes)) {
+          if (key.startsWith(`${source.id}:`) && outcome.status === 'held' && !outcome.pendingRevision && !scan.outcomes.has(key)) ledger.outcomes[key] = { ...outcome, status: 'absent', checkedAt: now };
+        }
       }
       await this.save(ledger);
-      for (const { draft, key } of ready) {
-          try {
-            if (seen.get(draft.identity) === false) throw Error('Ambiguous attempt identity: different artifact bytes claim the same attempt. Keep the intended producer copy, then Check now.');
-            await this.admit(ledger, draft, key, now); ledger = await this.load();
-          } catch (error) {
-            if (error.intakeConflict || error.intakeDeferred) {
-              const transaction = JSON.parse(await fs.readFile(path.join(this.dir, 'transaction.json'), 'utf8'));
-              if (error.intakeDeferred) await this.defer(transaction, ledger, error.message);
-              else await this.archiveConflict(transaction, ledger, error.message);
-            }
-            ledger.outcomes[key] = { status: 'held', reason: error.code ? 'Publication failed. Preserve the vault and retry Check now after fixing file access.' : error.message, locator: draft.locator, checkedAt: now };
+      for (const { draft, key, sourceId, guard } of ready) {
+        try {
+          await guard();
+          if (seen.get(draft.identity) === false) throw Error('Ambiguous attempt identity: different artifact bytes claim the same attempt. Keep the intended producer copy, then Check now.');
+          await this.admit(ledger, draft, key, now, guard);
+          ledger = await this.load();
+        } catch (error) {
+          if (error.producerRoot) {
+            ledger.sources.find(source => source.id === sourceId).error = error.message;
             await this.save(ledger);
+            continue;
           }
+          if (error.intakeConflict || error.intakeDeferred) {
+            const transaction = JSON.parse(await fs.readFile(path.join(this.dir, 'transaction.json'), 'utf8'));
+            if (error.intakeDeferred) await this.defer(transaction, ledger, error.message);
+            else await this.archiveConflict(transaction, ledger, error.message);
+          }
+          ledger.outcomes[key] = { status: 'held', reason: error.code ? 'Publication failed. Preserve the vault and retry Check now after fixing file access.' : error.message, locator: draft.locator, checkedAt: now };
+          await this.save(ledger);
+        }
       }
       ledger.lastCheck = { at: now, trigger, status: ledger.sources.some(x => x.error) ? 'error' : Object.values(ledger.outcomes).some(x => x.status === 'held') ? 'held' : 'complete' };
       if (ledger.lastCheck.status === 'complete') ledger.lastSuccess = { at: now, trigger };
       await this.save(ledger); return ledger;
     });
   }
-  async admit(ledger, draft, key, now) {
+  async admit(ledger, draft, key, now, guard) {
     const purged = require('./source-inventory').purgedAttempt(ledger, draft);
     if (ledger.suppressed.includes(draft.sourceHash)) throw Error('Automatic re-import is suppressed. Restore this source explicitly before intake.');
     if (ledger.captures[draft.sourceHash]?.identityIssue) throw Error(ledger.captures[draft.sourceHash].identityIssue);
@@ -118,6 +172,7 @@ class Intake {
     if (accepted && accepted.fingerprint !== draft.fingerprint) throw Error('Attempt identity changed after import. Original acceptance is immutable. Restore the original export or produce a distinct attempt.');
     const prior = accepted && activeAdmission(ledger, draft.identity, accepted.captureId);
     if (accepted && !prior || purged && !activeAdmission(ledger, draft.identity, purged.captureId)) {
+      await guard();
       ledger.outcomes[key] = { status: 'suppressed', sourceHash: draft.sourceHash, locator: draft.locator, checkedAt: now, reason: 'This earlier producer attempt was deleted. Only an explicitly selected restoration may admit it again.' };
       await this.save(ledger); return;
     }
@@ -125,6 +180,7 @@ class Intake {
       if (!/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(prior.revision)) throw Error('Invalid retained revision identity. Preserve intake history for repair.');
       const snapshot = await read(path.join(this.vault.root, 'Revisions', `${prior.revision}.json`));
       if (snapshot === null || hash(snapshot) !== prior.snapshotHash) throw Error('Immutable revision snapshot is missing or changed. Restore it from a vault backup before retrying.');
+      await guard();
       ledger.outcomes[key] = { ...prior, locator: draft.locator, checkedAt: now }; await this.save(ledger); return;
     }
     let capture = ledger.captures[draft.sourceHash];
@@ -145,6 +201,9 @@ class Intake {
     }
     const content = retainOnly ? current : noteText(capture, revision); capture.currentHash = hash(content);
     const transaction = { schema: 1, externalConflict, retainOnly, key, sourceHash: draft.sourceHash, capture, revision, content, previousHash: current === null ? null : hash(current), previous: current, backup: `${id}-${revisionId}.before.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
+    // The durable journal owns these verified bytes after this check. Recovery
+    // uses that local copy without reopening the producer.
+    await guard();
     await this.publishJournal(path.join(this.dir, 'transaction.json'), transaction);
     await this.vault.checkpoint('intake-journaled');
     if (externalConflict) throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
