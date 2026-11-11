@@ -53,7 +53,8 @@ function install(Intake, { hash, read, noteText }) {
       else ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) };
     }
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
-      if (capture.removed) continue;
+      // An output hold may deliberately retain a hardlinked capture stage.
+      if (capture.removed || ledger.blocks[sourceHash]?.outputHold) continue;
       if (ledger.identityIssues[capture.id]) { capture.identityIssue = ledger.identityIssues[capture.id].reason; continue; }
       if (capture.id === this.pendingTitleCapture) continue;
       delete capture.identityIssue;

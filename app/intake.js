@@ -469,7 +469,7 @@ class Intake {
     const destination = this.destination(tx.capture), snapshot = path.join(this.vault.root, 'Revisions', `${tx.revision.id}.json`), backup = path.join(this.dir, tx.backup), stage = path.join(this.dir, `${tx.revision.id}.stage`), snapshotStage = path.join(this.dir, `${tx.revision.id}.snapshot.stage`), snapshotBytes = JSON.stringify(tx.revision, null, 2);
     const parents = [...requiredDirectories(this, [{ file: path.relative(this.vault.vault, destination) }])]
       .map(directory => path.join(this.vault.vault, directory));
-    const { guard } = ordinaryDirectories(parents, 'An intake publication folder changed or is an alias. All files were preserved.');
+    const { guard, identities: directories } = ordinaryDirectories(parents, 'An intake publication folder changed or is an alias. All files were preserved.');
     const exact = (file, info, content, label, peers = []) => {
       const changed = () => conflict(`${label} changed. Independent files and the incoming revision were preserved.`);
       if (!info) throw changed();
@@ -629,7 +629,7 @@ class Intake {
           ...pending,
           acceptedCleanup: {
             journal: fileProof(journalInfo, journalBytes), capture: proofAt(destination), snapshot: proofAt(snapshot),
-            captureStage: proofAt(stage), snapshotStage: proofAt(snapshotStage), backup: proofAt(backup)
+            captureStage: proofAt(stage), snapshotStage: proofAt(snapshotStage), backup: proofAt(backup), directories
           }
         };
       }
@@ -667,58 +667,108 @@ class Intake {
     const pending = ledger.pending[sourceHash], receipt = pending?.acceptedCleanup;
     const changed = () => Error('Accepted deferred intake files or their exact journal peers changed. All files were preserved.');
     const names = ['journal', 'capture', 'snapshot', 'captureStage', 'snapshotStage', 'backup'];
+    const allowed = [...names, 'directories', 'retiring'];
     const match = /^pending-([a-f0-9-]{36})(?:-([a-f0-9-]{36}))?\.json$/.exec(pending?.journal);
     const outcome = ledger.outcomes[pending?.key], capture = ledger.captures[sourceHash];
-    if (!receipt || Object.keys(receipt).length !== names.length || !match || !uuid(match[1]) || match[2] && !uuid(match[2]) ||
+    if (!receipt || Object.keys(receipt).some(name => !allowed.includes(name)) || !match || !uuid(match[1]) || match[2] && !uuid(match[2]) ||
         !names.every((name, index) => (index >= 3 && receipt[name] === null) || validProof(receipt[name])) ||
+        receipt.directories !== undefined && !Array.isArray(receipt.directories) ||
+        receipt.retiring !== undefined && receipt.retiring !== true ||
         !capture || !outcome || outcome.status !== 'imported' || outcome.captureId !== capture.id || outcome.sourceHash !== sourceHash || outcome.revision !== match[1] ||
         receipt.capture.digest !== capture.currentHash || receipt.snapshot.digest !== outcome.snapshotHash ||
         revisionAdmission(ledger, match[1])?.snapshotHash !== outcome.snapshotHash) throw changed();
     const destination = this.destination(capture), revision = match[1];
     const parents = [...requiredDirectories(this, [{ file: path.relative(this.vault.vault, destination) }])]
       .map(directory => path.join(this.vault.vault, directory));
-    const { guard } = ordinaryDirectories(parents, changed().message);
-    const output = (file, proof) => ({ file, proof, present: true });
+    const { guard } = ordinaryDirectories(parents, changed().message, receipt.directories);
     const removable = (file, proof) => {
       guard();
-      const present = !!local.lstatSync(file, { throwIfNoEntry: false });
-      if (present && !proof) throw changed();
-      return { file, proof, present };
+      return { file, proof, present: !!local.lstatSync(file, { throwIfNoEntry: false }) };
     };
-    const outputs = [
-      output(destination, receipt.capture),
-      output(path.join(this.vault.root, 'Revisions', revision + '.json'), receipt.snapshot)
-    ];
-    if (receipt.backup) outputs.push(output(path.join(this.dir, `${capture.id}-${revision}.before${match[2] ? `-${match[2]}` : ''}.md`), receipt.backup));
-    const cleanup = [
-      removable(path.join(this.dir, revision + '.stage'), receipt.captureStage),
-      removable(path.join(this.dir, revision + '.snapshot.stage'), receipt.snapshotStage),
+    const journals = [
       removable(path.join(this.dir, 'transaction.json'), receipt.journal),
       removable(path.join(this.dir, pending.journal), receipt.journal)
     ];
-    const files = [...outputs, ...cleanup];
-    if (new Set(files.map(item => process.platform === 'win32' ? item.file.toLowerCase() : item.file)).size !== files.length) throw changed();
-    const verify = () => {
+    const verify = (files, mismatch) => {
       for (const item of files) {
-        if (!item.present) { verifyAbsentSync(item.file, guard, changed); continue; }
-        const links = files.filter(peer => peer.present && sameProofIdentity(peer.proof, item.proof)).length;
+        if (!item.present) { verifyAbsentSync(item.file, guard, mismatch); continue; }
+        if (!item.proof) throw mismatch();
+        const links = files.filter(peer => peer.present && peer.proof && sameProofIdentity(peer.proof, item.proof)).length;
         verifyStageSync(item.file, guard, item.proof, links);
       }
     };
-    this.storage.guardSync();
-    verify();
-    for (const item of cleanup) if (item.present) {
+    const verifyJournals = () => {
       this.storage.guardSync();
-      verify();
-      local.unlinkSync(item.file);
-      item.present = false;
-      verify();
+      verify(journals, changed);
+    };
+    const retire = (items, verifyOwned) => {
+      verifyOwned();
+      for (const item of items) if (item.present) {
+        local.unlinkSync(item.file);
+        item.present = false;
+        verifyOwned();
+      }
+    };
+    if (!receipt.retiring) {
+      const output = (file, proof) => ({ file, proof, present: true });
+      const outputs = [
+        output(destination, receipt.capture),
+        output(path.join(this.vault.root, 'Revisions', revision + '.json'), receipt.snapshot)
+      ];
+      if (receipt.backup) outputs.push(output(path.join(this.dir, `${capture.id}-${revision}.before${match[2] ? `-${match[2]}` : ''}.md`), receipt.backup));
+      const stages = [
+        removable(path.join(this.dir, revision + '.stage'), receipt.captureStage),
+        removable(path.join(this.dir, revision + '.snapshot.stage'), receipt.snapshotStage)
+      ];
+      const published = [...outputs, ...stages], files = [...published, ...journals];
+      if (new Set(files.map(item => process.platform === 'win32' ? item.file.toLowerCase() : item.file)).size !== files.length) throw changed();
+      const outputChanged = () => Object.assign(changed(), { code: 'STAGING_CHANGED' });
+      const verifyPublished = () => {
+        verifyJournals();
+        try { verify(published, outputChanged); }
+        catch (cause) {
+          verifyJournals();
+          if (cause.code !== 'STAGING_CHANGED') throw cause;
+          throw Object.assign(Error(`${outputHold} ${cause.message} The recorded producer acceptance was preserved.`, { cause }), { intakeOutputChanged: true });
+        }
+      };
+      const retiring = { ...ledger.pending, [sourceHash]: { ...pending, acceptedCleanup: { ...receipt, retiring: true } } };
+      try {
+        retire(stages, verifyPublished);
+        // Retain the exact journal until the ledger records that publication
+        // cleanup is complete. Later edits cannot block journal retirement.
+        await this.save({ ...ledger, pending: retiring }, verifyPublished);
+        ledger.pending = retiring;
+      } catch (error) {
+        if (!error.intakeOutputChanged) throw error;
+        verifyJournals();
+        const original = journals.find(item => item.present);
+        if (!original) throw error;
+        const { bytes } = verifyStageSync(original.file, guard, receipt.journal, journals.filter(item => item.present).length);
+        const tx = JSON.parse(bytes.toString('utf8'));
+        this.validateTransaction(tx);
+        if (tx.sourceHash !== sourceHash || tx.key !== pending.key || pendingName(tx) !== pending.journal ||
+            tx.capture.id !== capture.id || tx.restoreOperation) throw changed();
+        assertPublication(ledger, tx.capture.id, tx);
+        const [active] = journals;
+        if (!active.present) {
+          // An older interrupted cleanup may retain only the pending alias.
+          // Keep an exact active name for restart of the hold transition.
+          verifyJournals();
+          local.linkSync(original.file, active.file);
+          active.present = true;
+          verifyJournals();
+        }
+        await this.archiveConflict(tx, ledger, error.message, { journalProof: receipt.journal, guard });
+        return;
+      }
     }
+    retire(journals, verifyJournals);
     const next = { ...ledger.pending };
     delete next[sourceHash];
-    await this.save({ ...ledger, pending: next }, verify);
+    await this.save({ ...ledger, pending: next }, verifyJournals);
     ledger.pending = next;
-    verify();
+    verifyJournals();
     this.vault.expected.set(capture.id, capture.currentHash);
   }
   async recover() {
@@ -824,11 +874,11 @@ class Intake {
       const pending = path.join(this.dir, pendingName(tx)), names = [journal, pending, held];
       guard();
       const current = local.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
-      if (!current || retained && !exactIdentity(current, retained.journalInfo)) throw changed();
+      if (!current || retained?.journalInfo && !exactIdentity(current, retained.journalInfo)) throw changed();
       if (retained) {
         const association = ledger.pending[tx.sourceHash];
         if (association && (association.journal !== pendingName(tx) || association.key !== tx.key)) throw changed();
-        witness = { journal: fileProof(retained.journalInfo, JSON.stringify(tx)), pending: association?.journal || null };
+        witness = { journal: retained.journalProof || fileProof(retained.journalInfo, JSON.stringify(tx)), pending: association?.journal || null };
       } else witness = ledger.blocks[tx.sourceHash].outputHold;
       if (!witness || Object.keys(witness).length !== 2 || !validProof(witness.journal) ||
           witness.pending !== null && witness.pending !== pendingName(tx) ||
