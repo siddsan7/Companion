@@ -573,7 +573,8 @@ class Archives {
           state.task = await schedule.tasks.apply(action, { ...state, mode: requested }, schedule.file); guard();
           if (action === 'disable' && await schedule.tasks.apply('inspect', state, schedule.file)) throw Error('The daily intake task is still registered. Preview and retry reconnection.');
           state.mode = requested; state.archiveReconnect.status = 'connected'; delete state.taskError;
-          await schedule.save(state, pending, options);
+          const connected = await schedule.save(state, pending, options);
+          schedule.requireCurrent(connected, guard);
         } catch (error) {
           // The persisted pending/disabled record owns the attempted ID. Retry reuses it, even if task creation succeeded.
           throw Error(`Imported cadence reconnection did not finish. A pending disabled local record was saved before registration; the task or final connection write may have succeeded. Preview again to inspect the same local identity before an explicit retry. ${error.message}`);

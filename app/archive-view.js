@@ -156,7 +156,7 @@ archiveReconnectConfirm.onclick = async () => {
   const token = archiveReconnectToken; archiveReconnectToken = null; archiveReconnectConfirm.disabled = true; archiveReconnectPreview.disabled = true;
   try { const result = await window.companion['archive-reconnect']({ token }); archiveReconnectSummary.textContent = `Imported daily intake connected. Original anchor: ${result.anchor}. Current local schedule: ${result.id}. No historical missed checks were run.`; }
   catch (error) { archiveReconnectSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); }
-  finally { archiveReconnectPreview.disabled = false; }
+  finally { archiveReconnectPreview.disabled = false; window.dispatchEvent(new Event('companion-schedule-changed')); }
 };
 showArchiveIntents();
 

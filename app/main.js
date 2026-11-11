@@ -108,8 +108,11 @@ app.whenReady().then(async () => {
     finally { if (localVaultWork.get(key) === tail) localVaultWork.delete(key); }
   }
   await schedule().run(clock().now).catch(error => console.error('Scheduled catch-up:', error.message));
-  for (const operation of ['enable', 'pause', 'resume', 'disable', 'repair']) ipcMain.handle(`schedule-${operation}`, async () => {
-    if (!vault) throw Error('Choose a vault first.'); return schedule().control(operation, clock().now);
+  for (const operation of ['enable', 'pause', 'resume', 'disable', 'repair']) ipcMain.handle(`schedule-${operation}`, async (_, view) => {
+    const selected = vault;
+    if (!selected) throw Error('Choose a vault first.');
+    if (typeof view?.location !== 'string' || view.scheduleId !== null && typeof view.scheduleId !== 'string') throw Error('Refresh the daily intake view before changing its task.');
+    return schedule(selected).control(operation, clock().now, view);
   });
   ipcMain.handle('state', async () => {
     const selected = vault, selectedSchedule = schedule(selected);
@@ -120,7 +123,8 @@ app.whenReady().then(async () => {
       return { intake, captures, vaultError, warnings: [...(selected?.warnings || []), ...(vaultError ? [vaultError] : [])] };
     });
     const imported = new Map(Object.values(intake?.captures || {}).map(capture => [capture.id, capture]));
-    return { ...clock(), configured: !!selected, location: selected?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings, intake, vaultError, schedule: await selectedSchedule.info(clock().now) };
+    const daily = await selectedSchedule.info(clock().now);
+    return { ...clock(), configured: !!selected, location: selected?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings, intake, vaultError, schedule: selectedSchedule.matches(daily) ? daily : null, scheduleRecordId: daily?.id || null };
   });
   ipcMain.handle('capture', async (_, input) => {
     const selected = vault, now = clock().now;

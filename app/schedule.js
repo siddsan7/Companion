@@ -8,7 +8,7 @@ const { Intake } = require('./intake');
 const { intakeLock } = require('./intake-lock');
 const { TaskScheduler } = require('./task-scheduler');
 const { Vault } = require('./vault');
-const { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
+const { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyPeers, validProof } = require('./staged-publication');
 const DAY = 86400000;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const stagingName = /^\.archive-reconnect-[a-f0-9-]{36}\.pending$|^schedule-[a-f0-9-]{36}\.tmp$/;
@@ -24,6 +24,21 @@ async function optionalExact(file, guard) {
     if (error.code !== 'ENOENT') throw error;
     guard(); return null;
   }
+}
+
+function statIfPresent(file, guard) {
+  guard();
+  try { return local.lstatSync(file, { bigint: true }); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    guard(); return null;
+  }
+}
+
+async function removeOwned(file, guard, proof, links = 1) {
+  await verifyStage(file, guard, proof, links);
+  verifyStageSync(file, guard, proof, links);
+  local.unlinkSync(file);
 }
 
 class Schedule {
@@ -63,18 +78,20 @@ class Schedule {
     try { intent = JSON.parse(receipt.bytes); } catch { throw scheduleChanged(); }
     if (!intent || intent.schema !== 1 || typeof intent.stage !== 'string' || !stagingName.test(intent.stage) || !validProof(intent.proof)) throw scheduleChanged();
     const stage = path.join(path.dirname(this.file), intent.stage);
-    guard();
-    const published = await fs.lstat(this.file).then(() => true, error => {
-      if (error.code === 'ENOENT') return false;
-      throw error;
-    });
-    if (published) await settlePublishedLink(stage, this.file, guard, intent.proof);
-    else {
-      const staged = await optionalExact(stage, guard);
-      if (staged) await removeStage(stage, guard, intent.proof);
-      if (await optionalExact(this.file, guard)) throw scheduleChanged();
+    const receiptGuard = () => { verifyStageSync(this.initialReceipt, guard, receipt.proof); };
+    const destination = statIfPresent(this.file, receiptGuard);
+    if (destination?.nlink === 2n) {
+      const linked = () => { verifyStageSync(this.file, receiptGuard, intent.proof, 2); };
+      await removeOwned(stage, linked, intent.proof, 2);
+    } else if (!destination) {
+      const unpublished = () => { this.requireCurrent(null, receiptGuard); };
+      if (statIfPresent(stage, unpublished)) await removeOwned(stage, unpublished, intent.proof);
     }
-    await removeStage(this.initialReceipt, guard, receipt.proof);
+    const settled = () => {
+      this.requireCurrent(destination ? intent.proof : null, guard);
+      if (statIfPresent(stage, guard)) throw scheduleChanged();
+    };
+    await removeOwned(this.initialReceipt, settled, receipt.proof);
   }
   async change(work) {
     return intakeLock(path.dirname(this.file), async () => {
@@ -108,12 +125,19 @@ class Schedule {
         lastLook();
         receipt = await writeStage(this.initialReceipt, JSON.stringify({ schema: 1, stage: name, proof }), guard);
         await assertSelected();
+        const receiptGuard = () => { verifyStageSync(this.initialReceipt, guard, receipt); };
+        receiptGuard();
         lastLook();
         local.linkSync(stage, this.file);
-        await verifyPeers(stage, this.file, guard, proof);
-        await removeStage(stage, guard, proof, 2);
-        await verifyStage(this.file, guard, proof);
-        await removeStage(this.initialReceipt, guard, receipt);
+        const linked = () => { verifyStageSync(this.file, receiptGuard, proof, 2); };
+        await verifyPeers(stage, this.file, receiptGuard, proof);
+        await removeOwned(stage, linked, proof, 2);
+        await verifyStage(this.file, receiptGuard, proof);
+        const settled = () => {
+          this.requireCurrent(proof, guard);
+          if (statIfPresent(stage, guard)) throw scheduleChanged();
+        };
+        await removeOwned(this.initialReceipt, settled, receipt);
       } else {
         const deadline = performance.now() + 1000;
         let delay = 15;
@@ -130,20 +154,22 @@ class Schedule {
         }
         await verifyStage(this.file, guard, proof);
       }
-      return proof;
     } finally {
-      if (!receipt) await removeStage(stage, guard, proof).catch(() => {});
+      if (!receipt) await removeOwned(stage, guard, proof).catch(() => {});
     }
+    verifyStageSync(this.file, guard, proof);
+    return proof;
   }
   matches(state) { return !!(state && this.vault && samePath(path.resolve(state.vault, state.parent), path.resolve(this.vault.root))); }
   async requireDisabled(state) {
     if (state.mode !== 'disabled' || state.archiveReconnect?.status === 'pending') throw Error('Disable daily intake in its current vault before changing its vault.');
     if (await this.tasks.apply('inspect', state, this.file)) throw Error('The previous daily intake task still exists. Disable it in its original vault before continuing.');
   }
-  async control(operation, now) {
+  async control(operation, now, view) {
     return this.change(async guard => {
       await this.assertSelected();
       const current = await this.snapshot(guard);
+      if (view && (view.location !== this.vault?.root || view.scheduleId !== (current?.state.id || null))) throw Error('The displayed daily intake settings changed. Refresh the selected vault and try again.');
       let state = current?.state;
       if (state && !this.matches(state)) {
         if (operation !== 'enable' || !this.vault) throw Error('Daily intake belongs to another vault. Reconnect its original vault before changing the task.');
