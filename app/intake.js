@@ -1633,8 +1633,9 @@ class Intake {
     await this.save(ledger); await fs.unlink(file); return true;
   }
   async inspect(id) {
-    const ledger = await this.info(), capture = Object.values(ledger.captures).find(x => x.id === id);
-    if (!capture) throw Error('Imported capture is missing from intake history.');
+    const ledger = await this.info(), entry = Object.entries(ledger.captures).find(([, item]) => item.id === id);
+    if (!entry) throw Error('Imported capture is missing from intake history.');
+    const [sourceHash, capture] = entry;
     this.verifyReservedCaptureIdentity(ledger, id);
     const revisions = [];
     for (const revision of capture.revisions) {
@@ -1646,7 +1647,14 @@ class Intake {
     }
     const related = Object.entries(ledger.captures).filter(([, item]) => item.id !== id).map(([sourceHash, item]) => ({ id: item.id, title: item.title, sourceHash }));
     const links = (ledger.links || []).filter(link => link.captureIds.includes(id)).map(link => ({ ...link, related: related.find(item => link.captureIds.includes(item.id)) }));
-    return { capture, revisions, related, links };
+    const supportReason = capture.rejected ? 'excluded by rejection. Historical material remains inspectable.'
+      : capture.removed || ledger.suppressed.includes(sourceHash) ? 'unavailable because this source is removed or suppressed.'
+      : capture.conflict || ledger.blocks[sourceHash] ? 'paused because the imported source has an unresolved conflict or publication hold.'
+      : capture.reviewChoices?.length ? 'paused pending an explicit current reviewed revision choice.'
+      : capture.identityIssue || ledger.identityIssues?.[id] ? 'paused until the capture identity is resolved.'
+      : ledger.pending[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash ? 'paused while intake recovery is pending.'
+      : capture.supportEligible === false ? 'excluded by the recorded source eligibility.' : null;
+    return { capture, revisions, related, links, supportReason };
   }
 }
 require('./repairs').install(Intake, { hash, read, noteText, acceptedOutcome });

@@ -495,6 +495,21 @@ class Ideas {
     if (this.removal.fenced(vault, id) || claims?.length !== 1 || !claims[0].savedIdea || claims[0].stat.nlink !== 1n) return null;
     return { vault, parents, inventory, note: claims[0] };
   }
+  async linkedToCapture(vault, captureId) {
+    if (!uuid(captureId) || this.getVault() !== vault) throw Error('Inspect a capture in the selected vault.');
+    const parents = this.guard(vault), inventory = await scanIdeas(vault), related = [];
+    for (const [id, claims] of inventory.claims) {
+      if (claims.length !== 1 || !claims[0].savedIdea || claims[0].stat.nlink !== 1n || this.removal.fenced(vault, id)) continue;
+      const { source_dependencies: dependencies, citations, title } = claims[0].metadata;
+      const citesCapture = Array.isArray(citations) && citations.some(item => item?.kind === 'imported_evidence' && item.capture_id === captureId && uuid(item.revision_id));
+      const usesCapture = Array.isArray(dependencies) && dependencies.some(item => item?.capture_id === captureId &&
+        (uuid(item.revision_id) || typeof item.content_sha256 === 'string' && /^[a-f0-9]{64}$/.test(item.content_sha256)));
+      if (citesCapture || usesCapture) related.push({ id, title: typeof title === 'string' && title.trim() ? title : `Saved idea ${id}` });
+    }
+    if (this.getVault() !== vault) throw Error('Selected vault changed. Inspect saved ideas again.');
+    this.guard(vault, parents); inventory.check();
+    return related.filter(item => !this.removal.fenced(vault, item.id));
+  }
   async openNote(id) {
     if (!uuid(id)) throw Error('Saved idea identity is invalid.');
     const found = await this.locate(id);

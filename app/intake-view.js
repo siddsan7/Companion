@@ -79,10 +79,24 @@ window.intakeView = {
     }
   },
   async inspect(id) {
-    const info = await window.companion['inspect-source'](id), section = document.getElementById('source-inspection'), details = document.getElementById('source-details'); details.replaceChildren(); section.hidden = false;
+    const request = this.inspectionEpoch = (this.inspectionEpoch || 0) + 1, location = state.location, configuration = configurationEpoch;
+    const current = () => request === this.inspectionEpoch && location === state.location && configuration === configurationEpoch;
+    const info = await window.companion['inspect-source'](id);
+    if (!current()) return;
+    const section = document.getElementById('source-inspection'), details = document.getElementById('source-details'); details.replaceChildren(); section.hidden = false;
     const eligibility = document.createElement('p');
-    eligibility.textContent = info.capture.rejected ? 'Supporting evidence: excluded by rejection. Historical material remains inspectable.' : info.capture.reviewChoices?.length ? 'Supporting evidence: paused pending an explicit current reviewed revision choice.' : 'Supporting evidence: eligible with the recorded extraction limits and human findings. Acceptance does not verify every claim.';
+    eligibility.textContent = `Supporting evidence: ${info.supportReason || 'eligible with the recorded extraction limits and human findings. Acceptance does not verify every claim.'}`;
     details.append(eligibility);
+    if (info.linkedIdeasWarning || info.linkedIdeas?.length) {
+      const linked = document.createElement('section'), heading = document.createElement('h3');
+      heading.textContent = 'Linked saved ideas'; linked.append(heading);
+      if (info.linkedIdeasWarning) { const warning = document.createElement('p'); warning.textContent = info.linkedIdeasWarning; linked.append(warning); }
+      for (const idea of info.linkedIdeas || []) {
+        const open = document.createElement('button'); open.textContent = `Open linked saved idea in Obsidian: ${idea.title}`;
+        open.onclick = () => action(async () => { if (current()) await window.companion['idea-open'](idea.id); }); linked.append(open);
+      }
+      details.append(linked);
+    }
     for (const link of info.links) {
       const relation = document.createElement('p'); relation.textContent = `User-linked source: ${link.related?.title || 'Missing linked capture'} · ${link.related?.id || link.captureIds.find(item => item !== id)} · ${link.linkedAt}. Captures and revision histories remain separate.`; details.append(relation);
     }

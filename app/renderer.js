@@ -55,6 +55,11 @@ async function refresh() {
         } catch (error) { if (current()) throw scopeError(error, current); }
       });
       article.append(heading, details, content, label, save, open); $('captures').append(article);
+      if (note.type === 'reel_import') {
+        const ownership = document.createElement('p');
+        ownership.textContent = 'Companion manages the imported source text and metadata. Put your own writing in an annotation so it stays separate from source updates.';
+        article.insertBefore(ownership, open);
+      }
       if (['thought', 'link', 'reel_import'].includes(note.type)) {
         const remove = document.createElement('button'); remove.textContent = 'Delete capture';
         remove.onclick = () => action(() => window.captureDeletionView.preview(note.id)); article.append(remove);
