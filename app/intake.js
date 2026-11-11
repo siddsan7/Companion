@@ -620,12 +620,17 @@ class Intake {
         next.admissions[tx.revision.id] = outcome;
       }
       const pending = next.pending[tx.sourceHash];
+      const proofAt = file => {
+        const item = [...outputs, ...cleanup].find(candidate => candidate.file === file);
+        return item ? fileProof(item.info, item.content) : null;
+      };
+      if (tx.restoreOperation) {
+        next.sourceAuthority = require('./capture-deletion').recordRestorationAdmission(ledger, tx, {
+          capture: proofAt(destination), snapshot: proofAt(snapshot), journal: proofAt(journal)
+        });
+      }
       if (pending) {
         if (pending.journal !== pendingName(tx) || pending.key !== tx.key || journalInfo.nlink !== 2n) throw Error('Deferred intake journal authority changed. All files were preserved.');
-        const proofAt = file => {
-          const item = [...outputs, ...cleanup].find(candidate => candidate.file === file);
-          return item ? fileProof(item.info, item.content) : null;
-        };
         next.pending[tx.sourceHash] = {
           ...pending,
           acceptedCleanup: {
@@ -640,6 +645,7 @@ class Intake {
       verifyPublished();
       await this.vault.checkpoint('intake-ledger');
       await this.publicationAuthority(tx, ledger);
+      if (tx.restoreOperation) return;
       if (pending) {
         await this.acknowledgeDeferred(ledger, tx.sourceHash);
         return;
@@ -775,6 +781,9 @@ class Intake {
   async recover() {
     const controlled = await this.load();
     await pendingParents(this, controlled);
+    for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
+      if (authority.restorationCleanup) await require('./capture-deletion').finishRestorationCleanup(this, controlled, id);
+    }
     this.vault.warnings = this.vault.warnings.filter(warning => !warning.startsWith('Source restoration held:'));
     for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'deleting') await require('./capture-deletion').finishDeletion(this, controlled, id);
     for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) if (authority.phase === 'restoring') {

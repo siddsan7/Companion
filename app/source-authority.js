@@ -2,6 +2,8 @@ const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
 const identity = value => fields(value, ['dev', 'ino', 'bytes']) && ['dev', 'ino', 'bytes'].every(key => typeof value[key] === 'string' && /^[0-9]+$/.test(value[key]));
+const fileProof = value => fields(value, ['dev', 'ino', 'digest']) &&
+  ['dev', 'ino'].every(key => typeof value[key] === 'string' && /^[0-9]+$/.test(value[key])) && sha(value.digest);
 function retirement(value, id) {
   if (!fields(value, ['captureId', 'operationId', 'generation', 'publication', 'sourceSha256', 'journalSha256', 'slots']) || value.captureId !== id || !uuid(value.operationId) || !uuid(value.generation) || !identity(value.publication) || !sha(value.sourceSha256) || !sha(value.journalSha256) || !Array.isArray(value.slots) || value.slots.length !== 2) throw Error('Restoration retirement authority needs repair.');
   let previous = ''; const kinds = new Set(), parents = new Set();
@@ -20,7 +22,7 @@ function validateAuthority(ledger) {
   if (ledger.sourceAuthority !== undefined && (!ledger.sourceAuthority || typeof ledger.sourceAuthority !== 'object' || Array.isArray(ledger.sourceAuthority))) throw Error('Source authority needs repair.');
   const purgedIdentities = new Map();
   for (const [id, value] of Object.entries(ledger.sourceAuthority || {})) {
-    if (!uuid(id) || !fields(value, ['generation', 'phase', 'operationId', 'sourceHash', 'targets', 'root', 'directories', 'history', 'restoration', 'manual', 'retiredRestorations', 'inventoryVersion', 'originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs', 'titleRecovery', 'mixedRecovery', 'preservedWriting']) || !uuid(value.generation) || !uuid(value.operationId) || !['deleting', 'deleted', 'restoring', 'active'].includes(value.phase) || !(value.sourceHash === null ? validManual(value.manual, id) : sha(value.sourceHash) && value.manual === undefined) || !Array.isArray(value.targets) || !Array.isArray(value.directories) || typeof value.root !== 'string') throw Error('Source authority needs repair. Nothing can be published.');
+    if (!uuid(id) || !fields(value, ['generation', 'phase', 'operationId', 'sourceHash', 'targets', 'root', 'directories', 'history', 'restoration', 'restorationCleanup', 'manual', 'retiredRestorations', 'inventoryVersion', 'originGenerations', 'recovery', 'recoveryPointers', 'purgedProducerAttempts', 'titleProofs', 'titleRecovery', 'mixedRecovery', 'preservedWriting']) || !uuid(value.generation) || !uuid(value.operationId) || !['deleting', 'deleted', 'restoring', 'active'].includes(value.phase) || !(value.sourceHash === null ? validManual(value.manual, id) : sha(value.sourceHash) && value.manual === undefined) || !Array.isArray(value.targets) || !Array.isArray(value.directories) || typeof value.root !== 'string') throw Error('Source authority needs repair. Nothing can be published.');
     const paths = new Set();
     for (const target of value.targets) {
       if (!fields(target, ['file', 'sha256', 'dev', 'ino', 'bytes', 'kind', 'peers']) || typeof target.file !== 'string' || !target.file || /[\\]/.test(target.file) || target.file.split('/').some(part => !part || part === '.' || part === '..' || part.includes(':')) || paths.has(target.file) || !sha(target.sha256) || !['capture', 'snapshot', 'source-backup', 'source-recovery', 'source-title-backup', 'mixed-recovery'].includes(target.kind) || ![target.dev, target.ino, target.bytes].every(item => typeof item === 'string' && /^[0-9]+$/.test(item))) throw Error('Source deletion manifest needs repair. All files were preserved.');
@@ -44,14 +46,23 @@ function validateAuthority(ledger) {
     }
     if (value.phase === 'restoring') {
       const item = value.restoration;
-      if (!fields(item, ['journal', 'revision', 'sha256', 'published', 'publication', 'journalIdentity', 'retirement']) || !(value.manual ? item.revision === null : uuid(item.revision)) || !sha(item.sha256) || item.journal !== `restoration-${value.operationId}.json` || item.published !== undefined && item.published !== true) throw Error('Source restoration authority needs repair.');
+      if (!fields(item, ['journal', 'revision', 'sha256', 'published', 'publication', 'importedPublication', 'journalIdentity', 'retirement']) || !(value.manual ? item.revision === null : uuid(item.revision)) || !sha(item.sha256) || item.journal !== `restoration-${value.operationId}.json` || item.published !== undefined && item.published !== true) throw Error('Source restoration authority needs repair.');
       if (value.manual && item.published === true ? !fields(item.publication, ['dev', 'ino', 'bytes']) || ![item.publication.dev, item.publication.ino, item.publication.bytes].every(part => typeof part === 'string' && /^[0-9]+$/.test(part)) : item.publication !== undefined) throw Error('Manual restoration publication needs repair.');
+      const publication = item.importedPublication;
+      if (publication !== undefined && (value.manual || !fields(publication, ['capture', 'snapshot', 'journal']) ||
+          ![publication.capture, publication.snapshot, publication.journal].every(fileProof) || publication.journal.digest !== item.sha256)) {
+        throw Error('Imported restoration publication needs repair.');
+      }
       if (item.journalIdentity !== undefined && (!value.manual || !identity(item.journalIdentity))) throw Error('Manual restoration journal identity needs repair.');
       if (item.retirement !== undefined) {
         retirement(item.retirement, id);
         if (!value.manual || !item.journalIdentity || item.retirement.operationId === value.operationId || item.retirement.generation === value.generation || item.retirement.sourceSha256 !== value.manual.currentHash) throw Error('Manual retry authority needs repair.');
       }
     } else if (value.restoration !== undefined) throw Error('Unexpected source restoration authority.');
+    if (value.restorationCleanup !== undefined && (value.manual || value.phase !== 'active' ||
+        !fileProof(value.restorationCleanup) || ledger.suppressed?.includes(value.sourceHash))) {
+      throw Error('Imported restoration cleanup authority needs repair.');
+    }
     if (value.retiredRestorations !== undefined) {
       if (!value.manual || !Array.isArray(value.retiredRestorations)) throw Error('Completed restoration retirement authority needs repair.');
       const operations = new Set(), generations = new Set();

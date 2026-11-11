@@ -41,6 +41,7 @@ class CaptureDeletion {
     if (this.getVault() !== vault) throw changed();
     const intake = new Intake(vault), ledger = await intake.load(); validateAuthority(ledger);
     if (ledger.sourceAuthority?.[id] && ledger.sourceAuthority[id].phase !== 'active') throw Error('This capture already has a deletion operation.');
+    if (ledger.sourceAuthority?.[id]?.restorationCleanup) throw Error('Refresh the vault to finish restoration cleanup before previewing deletion.');
     await globalRecovery(intake, ledger);
     if (ledger.sourceAuthority?.[id]) await sourceParents(intake, ledger.sourceAuthority[id]);
     const entry = Object.entries(ledger.captures).find(([, capture]) => capture.id === id);
@@ -474,55 +475,17 @@ function installCaptureDeletion({ ipcMain, ...options }) {
 }
 async function finishRestoration(intake, ledger, id) {
   validateAuthority(ledger);
-  const authority = ledger.sourceAuthority[id], vault = intake.vault;
+  let authority = ledger.sourceAuthority[id];
+  const vault = intake.vault;
   if (authority?.phase !== 'restoring') return;
   await guardRestorationParents(intake, authority);
   if (authority.manual) return finishManualRestoration(intake, ledger, id);
   if (!ledger.suppressed.includes(authority.sourceHash)) throw Error('Restoration authority changed. Suppression remains.');
   const journal = path.join(intake.dir, authority.restoration.journal), transaction = path.join(intake.dir, 'transaction.json');
-  let verifyAdmittedOutputs;
-  if (!authority.restoration.published && ledger.admissions?.[authority.restoration.revision]) {
-    // A durable admission proves this exact publication already happened. Only
-    // verify and acknowledge it; replay must never recreate its missing output.
-    const admission = revisionAdmission(ledger, authority.restoration.revision), capture = ledger.captures[authority.sourceHash];
-    const snapshot = path.join(vault.root, 'Revisions', authority.restoration.revision + '.json'), destination = intake.destination(capture);
-    const stage = path.join(intake.dir, authority.restoration.revision + '.stage'), snapshotStage = path.join(intake.dir, authority.restoration.revision + '.snapshot.stage');
-    if (!admission || admission.captureId !== id || admission.sourceHash !== authority.sourceHash || admission.sourceGeneration !== authority.generation || capture.currentRevision !== authority.restoration.revision) throw Error('Restoration admission changed. Suppression remains.');
-    const current = await intake.ownedFile(destination, stage, 'Restoration capture'), retained = await intake.ownedFile(snapshot, snapshotStage, 'Restoration snapshot');
-    if (!current || !retained) throw Error('Restoration publication is missing. Its durable admission cannot recreate it; suppression remains.');
-    const snapshotBytes = await fs.readFile(snapshot, 'utf8'), revision = JSON.parse(snapshotBytes), content = await fs.readFile(destination, 'utf8');
-    if (hash(snapshotBytes) !== admission.snapshotHash || revision.id !== capture.currentRevision || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || hash(content) !== capture.currentHash || content !== noteText(capture, revision)) throw Error('Restoration publication changed. Its durable admission cannot replace it; suppression remains.');
-    const journalInfo = await intake.ownedFile(journal, transaction, 'Selected restoration journal');
-    if (!journalInfo) throw Error('Selected restoration journal is missing. Suppression remains.');
-    const guard = removalParentGuard(vault, authority.directories);
-    const changed = () => Error('Restoration publication changed during acknowledgement. Suppression remains and all remaining files were preserved.');
-    const pairs = [];
-    for (const [file, peer, peerInfo, digest] of [[stage, destination, current, hash(content)], [snapshotStage, snapshot, retained, admission.snapshotHash], [transaction, journal, journalInfo, authority.restoration.sha256]]) {
-      const info = await intake.ownedFile(file, peer, 'Restoration publication acknowledgement');
-      if (info ? info.nlink !== 2n || peerInfo.nlink !== 2n || info.dev !== peerInfo.dev || info.ino !== peerInfo.ino : peerInfo.nlink !== 1n) throw changed();
-      if (info && hash(await fs.readFile(file)) !== digest) throw changed();
-      pairs.push({ file, peer, proof: { dev: String(peerInfo.dev), ino: String(peerInfo.ino), digest }, linked: !!info });
+  if (!authority.restoration.importedPublication) {
+    if (authority.restoration.published || ledger.admissions?.[authority.restoration.revision]) {
+      throw Error('The admitted restoration has no original file identity proof. Preserve its files for review. Suppression remains.');
     }
-    const verifyPair = item => {
-      verifyStageSync(item.peer, guard, item.proof, item.linked ? 2 : 1);
-      if (item.linked) verifyStageSync(item.file, guard, item.proof, 2);
-      else verifyAbsentSync(item.file, guard, changed);
-    };
-    const verifyPairs = () => { for (const pair of pairs) verifyPair(pair); };
-    for (const pair of pairs.filter(item => item.linked)) {
-      await guardRestorationParents(intake, authority);
-      intake.storage.guardSync();
-      verifyPairs();
-      native.unlinkSync(pair.file);
-      pair.linked = false;
-    }
-    await guardRestorationParents(intake, authority);
-    const published = { ...authority, restoration: { ...authority.restoration, published: true } };
-    await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: published } }, verifyPairs);
-    authority.restoration.published = true;
-    verifyAdmittedOutputs = () => { for (const pair of pairs.slice(0, 2)) verifyPair(pair); };
-  }
-  if (!authority.restoration.published) {
     await intake.ownedFile(journal, transaction, 'Selected restoration journal');
     const bytes = await fs.readFile(journal, 'utf8'); if (hash(bytes) !== authority.restoration.sha256) throw Error('Selected restoration journal changed. Suppression remains.');
     const tx = JSON.parse(bytes); intake.validateTransaction(tx);
@@ -530,33 +493,58 @@ async function finishRestoration(intake, ledger, id) {
     await intake.ownedFile(transaction, journal, 'Active restoration journal');
     try { await fs.link(journal, transaction); } catch (error) { if (error.code !== 'EEXIST' || await fs.readFile(transaction, 'utf8') !== bytes) throw Error('Another source journal needs explicit recovery.'); }
     await intake.finish(tx, ledger);
-    await guardRestorationParents(intake, authority);
-    authority.restoration.published = true; await intake.save(ledger);
+    authority = ledger.sourceAuthority[id];
   }
-  await verifyRestorationPublication(intake, ledger, id);
-  verifyAdmittedOutputs?.();
-  const remaining = await intake.ownedFile(journal, [], 'Selected restoration journal');
-  if (remaining) {
-    if (hash(await fs.readFile(journal)) !== authority.restoration.sha256) throw Error('Selected restoration journal changed.');
-    if (verifyAdmittedOutputs) {
-      const guard = removalParentGuard(vault, authority.directories);
+  const publication = await verifyRestorationPublication(intake, ledger, id);
+  if (!authority.restoration.published) {
+    for (const pair of publication.pairs) {
+      if (!pair.linked) continue;
       intake.storage.guardSync();
-      verifyAdmittedOutputs();
-      verifyStageSync(journal, guard, { dev: String(remaining.dev), ino: String(remaining.ino), digest: authority.restoration.sha256 });
-      native.unlinkSync(journal);
-    } else await fs.unlink(journal);
+      publication.verify();
+      native.unlinkSync(pair.file);
+      pair.linked = false;
+      publication.verify();
+    }
+    authority = { ...authority, restoration: { ...authority.restoration, published: true } };
+    await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: authority } }, publication.verify);
+    ledger.sourceAuthority[id] = authority;
   }
   await vault.checkpoint('capture-restoration-published');
-  // This explicit asynchronous boundary can admit an external edit or parent
-  // replacement. Activation uses fresh ownership and literal bytes afterwards.
-  await verifyRestorationPublication(intake, ledger, id);
-  verifyAdmittedOutputs?.();
-  const active = { ...authority, phase: 'active' };
+  publication.verify();
+  const active = { ...authority, phase: 'active', restorationCleanup: authority.restoration.importedPublication.journal };
   delete active.restoration;
   const suppressed = ledger.suppressed.filter(item => item !== authority.sourceHash);
-  await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: active }, suppressed }, verifyAdmittedOutputs);
+  await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: active }, suppressed }, publication.verify);
   ledger.sourceAuthority[id] = active;
   ledger.suppressed = suppressed;
+  await finishRestorationCleanup(intake, ledger, id);
+  vault.expected.set(id, ledger.captures[authority.sourceHash].currentHash);
+}
+function recordRestorationAdmission(ledger, tx, proof) {
+  const id = tx.capture.id, authority = ledger.sourceAuthority?.[id], item = authority?.restoration;
+  if (authority?.phase !== 'restoring' || authority.manual || authority.operationId !== tx.restoreOperation ||
+      authority.generation !== tx.sourceGeneration || authority.sourceHash !== tx.sourceHash || item?.revision !== tx.revision.id ||
+      item.published || item.importedPublication || item.sha256 !== proof.journal?.digest) {
+    throw Error('Restoration admission authority changed. Suppression remains.');
+  }
+  return { ...ledger.sourceAuthority, [id]: { ...authority, restoration: { ...item, importedPublication: proof } } };
+}
+async function finishRestorationCleanup(intake, ledger, id) {
+  const authority = ledger.sourceAuthority[id], proof = authority.restorationCleanup;
+  if (authority.phase !== 'active' || !proof) return;
+  await guardRestorationParents(intake, authority);
+  const file = path.join(intake.dir, `restoration-${authority.operationId}.json`);
+  const guard = removalParentGuard(intake.vault, authority.directories);
+  intake.storage.guardSync();
+  guard();
+  if (native.lstatSync(file, { throwIfNoEntry: false })) {
+    verifyStageSync(file, guard, proof);
+    native.unlinkSync(file);
+  }
+  const active = { ...authority };
+  delete active.restorationCleanup;
+  await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: active } }, () => verifyAbsentSync(file, guard));
+  ledger.sourceAuthority[id] = active;
 }
 function manualFiles(intake, authority) {
   return { journal: path.join(intake.dir, authority.restoration.journal), stage: path.join(intake.dir, `manual-${authority.operationId}.stage`), destination: path.join(intake.vault.vault, authority.manual.relative) };
@@ -745,12 +733,34 @@ async function guardRestorationParents(intake, authority) {
 async function verifyRestorationPublication(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], vault = intake.vault;
   await guardRestorationParents(intake, authority);
-  const capture = ledger.captures[authority.sourceHash], admission = revisionAdmission(ledger, authority.restoration.revision);
-  const snapshot = path.join(vault.root, 'Revisions', authority.restoration.revision + '.json');
-  if (!capture || !admission || admission.sourceGeneration !== authority.generation || admission.captureId !== id || admission.sourceHash !== authority.sourceHash || capture.currentRevision !== authority.restoration.revision) throw Error('Restoration admission changed. Suppression remains.');
-  if (!await intake.ownedFile(snapshot, [], 'Restoration revision') || !await intake.ownedFile(intake.destination(capture), [], 'Restoration capture')) throw Error('Restoration publication is missing. Suppression remains.');
-  const snapshotBytes = await fs.readFile(snapshot, 'utf8'), revision = JSON.parse(snapshotBytes), content = await fs.readFile(intake.destination(capture), 'utf8');
-  if (hash(snapshotBytes) !== admission.snapshotHash || capture.currentRevision !== revision.id || revision.captureId !== id || revision.sourceHash !== authority.sourceHash || hash(content) !== capture.currentHash || content !== noteText(capture, revision)) throw Error('Restoration publication changed. Suppression remains.');
-  await guardRestorationParents(intake, authority);
+  const { revision, journal, published, importedPublication: proof } = authority.restoration;
+  const capture = ledger.captures[authority.sourceHash], admission = revisionAdmission(ledger, revision);
+  if (!capture || !admission || admission.sourceGeneration !== authority.generation || admission.captureId !== id ||
+      admission.sourceHash !== authority.sourceHash || capture.id !== id || capture.currentRevision !== revision ||
+      proof.capture.digest !== capture.currentHash || proof.snapshot.digest !== admission.snapshotHash) {
+    throw Error('Restoration admission changed. Suppression remains.');
+  }
+  const guard = removalParentGuard(vault, authority.directories);
+  const changed = () => Error('Restoration publication changed during acknowledgement. Suppression remains and all remaining files were preserved.');
+  const pairs = [];
+  for (const [name, peer, exact] of [
+    [revision + '.stage', intake.destination(capture), proof.capture],
+    [revision + '.snapshot.stage', path.join(vault.root, 'Revisions', revision + '.json'), proof.snapshot],
+    ['transaction.json', path.join(intake.dir, journal), proof.journal]
+  ]) {
+    const file = path.join(intake.dir, name);
+    const info = await intake.ownedFile(file, peer, 'Restoration publication acknowledgement');
+    if (info && (published || info.nlink !== 2n || hash(await fs.readFile(file)) !== exact.digest)) throw changed();
+    pairs.push({ file, peer, proof: exact, linked: !!info });
+  }
+  const verify = () => {
+    for (const pair of pairs) {
+      verifyStageSync(pair.peer, guard, pair.proof, pair.linked ? 2 : 1);
+      if (pair.linked) verifyStageSync(pair.file, guard, pair.proof, 2);
+      else verifyAbsentSync(pair.file, guard, changed);
+    }
+  };
+  verify();
+  return { pairs, verify };
 }
-module.exports = { CaptureDeletion, finishDeletion, finishRestoration, guardRestorationParents, installCaptureDeletion, inspectManualPeers };
+module.exports = { CaptureDeletion, finishDeletion, finishRestoration, finishRestorationCleanup, recordRestorationAdmission, guardRestorationParents, installCaptureDeletion, inspectManualPeers };
