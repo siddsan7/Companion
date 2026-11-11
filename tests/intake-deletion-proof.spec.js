@@ -364,7 +364,7 @@ for (const { change, legacy } of ordinaryRestartCases) {
   });
 }
 
-for (const target of ['published snapshot', 'shared journal']) test('Windows accepted intake read refusal at the ' + target, async ({}, testInfo) => {
+for (const target of ['published snapshot', 'published capture', 'shared journal']) test('Windows accepted intake read refusal at the ' + target, async ({}, testInfo) => {
   test.skip(process.platform !== 'win32', 'Requires a native Windows FileShare.None refusal.');
   const { vault, intake, ledgerFile } = await setup(testInfo);
   const producer = testInfo.outputPath('producer');
@@ -379,7 +379,7 @@ for (const target of ['published snapshot', 'shared journal']) test('Windows acc
   const files = await Promise.all([capture, snapshot, captureStage, snapshotStage].map(async file => ({
     file, bytes: await fs.readFile(file, 'utf8'), stat: await fs.lstat(file, { bigint: true })
   })));
-  const locked = target === 'published snapshot' ? snapshot : journal;
+  const locked = { 'published snapshot': snapshot, 'published capture': capture, 'shared journal': journal }[target];
   const script = [
     '$ErrorActionPreference = "Stop"',
     '$stream = [IO.File]::Open($env:COMPANION_LOCKED_INTAKE_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)',
