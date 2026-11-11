@@ -1,6 +1,7 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
 const { Briefs } = require('../app/briefs');
 const { Context } = require('../app/context');
 const { Vault } = require('../app/vault');
@@ -17,16 +18,17 @@ async function fixture(testInfo) {
   async function approve() {
     const briefs = restart();
     const { proposed } = await briefs.propose([readme], now);
-    const { approved } = await briefs.approve({
+    const request = {
       id: proposed.id,
       digest: proposed.digest,
       sections: proposed.sections.map(section => section.text),
       references: proposed.sections.map(section => section.references
         .map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
-    }, now);
+    };
+    const { approved } = await briefs.approve(request, now);
     const record = approved.find(brief => brief.id === proposed.id);
     expect(record).toBeDefined();
-    return { record, file: path.join(briefs.dir, record.file) };
+    return { record, file: path.join(briefs.dir, record.file), request };
   }
   async function archiveFile(name) {
     const directory = path.join(vault.vault, 'Project writing', 'History');
@@ -96,4 +98,53 @@ test('editing a moved approval holds its own pin without affecting another versi
   await expect.soft(restart().pinned(1)).rejects.toThrow(/integrity|changed/i);
   await expect.soft(restart().pinned(2)).resolves.toMatchObject({ id: second.record.id, digest: second.record.digest });
   expect(await fs.readFile(moved)).toEqual(edited);
+});
+
+test('a legacy canonical approval observed before moving keeps its pin and version', async ({}, testInfo) => {
+  const { restart, approve, archiveFile } = await fixture(testInfo);
+  const first = await approve();
+  const receipt = path.join(restart().dir, '.brief-approval-1.json');
+  const modern = await fs.readFile(first.file, 'utf8');
+  const legacy = modern.replace(/^managed_parent: .*\r?\n/m, '');
+  expect(legacy).not.toBe(modern);
+  const digest = createHash('sha256').update(legacy).digest('hex');
+  const canonical = path.join(restart().dir, `approved-1-${digest}.md`);
+  await fs.unlink(receipt);
+  await fs.unlink(first.file);
+  await fs.writeFile(canonical, legacy, { flag: 'wx' });
+
+  const pin = { id: first.record.id, version: 1, digest };
+  await expect(restart().pinned(1)).resolves.toMatchObject(pin);
+  const moved = await archiveFile('Legacy MyTune brief.md');
+  await fs.rename(canonical, moved);
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject(pin);
+  const next = await approve();
+  expect.soft(next.record.version).toBe(2);
+  expect(await fs.readFile(moved, 'utf8')).toBe(legacy);
+});
+
+test('a readable approval rename inside Briefs resolves the original receipt', async ({}, testInfo) => {
+  const { restart, approve } = await fixture(testInfo);
+  const first = await approve();
+  const moved = path.join(restart().dir, 'approved-1-MyTune.md');
+  const bytes = await fs.readFile(first.file);
+  await fs.rename(first.file, moved);
+
+  await expect.soft(restart().pinned(1)).resolves.toMatchObject({
+    id: first.record.id, version: 1, digest: first.record.digest
+  });
+  expect(await fs.readFile(moved)).toEqual(bytes);
+});
+
+test('retrying an already reserved approval cannot give the same proposal a new version', async ({}, testInfo) => {
+  const { root, restart, approve } = await fixture(testInfo);
+  const first = await approve();
+  const retained = path.join(root, 'Missing approved original.md');
+  const bytes = await fs.readFile(first.file);
+  await fs.rename(first.file, retained);
+
+  const attempt = await restart().approve(first.request, now).catch(error => error);
+  if (attempt instanceof Error) expect(attempt.message).toMatch(/unavailable|missing|already approved/i);
+  await expect(restart().pinned(2)).rejects.toThrow(/unavailable/i);
+  expect(await fs.readFile(retained)).toEqual(bytes);
 });
