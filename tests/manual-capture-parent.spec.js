@@ -134,6 +134,20 @@ test('an already restored legacy capture remains managed across a move and title
   await store.confirmRestoration((await store.previewRestoration({ id, file: backup })).token);
   expect((await new Intake(a).load()).sourceAuthority[id]).toMatchObject({ phase: 'active' });
   expect(await fs.readFile(file, 'utf8')).toBe(content);
+  // Model an installation that already had active manual authority before
+  // legacy ownership receipts existed. Remove only this fixture's exact receipt.
+  const receipt = path.join(a.vault, '.companion-capture-owners', `${id}.json`);
+  const recorded = await fs.readFile(receipt, 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (recorded !== null) {
+    const stat = await fs.lstat(receipt);
+    expect(stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1).toBe(true);
+    expect(JSON.parse(recorded)).toEqual({ schema: 1, id, owner: path.basename(a.root), type: 'thought', capturedAt: now });
+    await fs.unlink(receipt);
+  }
+  await expect(fs.access(receipt)).rejects.toMatchObject({ code: 'ENOENT' });
   await b.setup();
 
   const moved = path.join(a.vault, 'Moved legacy thought.md');
