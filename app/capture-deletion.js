@@ -42,8 +42,9 @@ class CaptureDeletion {
     await globalRecovery(intake, ledger);
     if (ledger.sourceAuthority?.[id]) await sourceParents(intake, ledger.sourceAuthority[id]);
     const entry = Object.entries(ledger.captures).find(([, capture]) => capture.id === id);
-    const notes = (await vault.scan()).filter(note => note.id === id);
-    if (!entry && (notes.length !== 1 || !vault.ownsManual(notes[0], ledger.sourceAuthority?.[id]))) throw changed();
+    const { notes: claims, owned } = await vault.captureInventory(ledger);
+    const notes = claims.filter(note => note.id === id);
+    if (!entry && (notes.length !== 1 || !owned.has(notes[0]) || notes[0].type === 'reel_import')) throw changed();
     const manual = !entry ? { captureId: id, type: notes[0].type, capturedAt: notes[0].capturedAt, currentHash: hash(notes[0].content), file: path.basename(notes[0].file), relative: relative(vault, notes[0].file) } : undefined;
     const [sourceHash, capture] = entry || [null, { id, title: notes[0].title, currentHash: manual.currentHash, revisions: [] }];
     if (notes.length !== 1 || manual && hash(notes[0].content) !== capture.currentHash) throw changed();

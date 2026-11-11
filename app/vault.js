@@ -5,10 +5,10 @@ const YAML = require('yaml');
 const { sourceMutation } = require('./source-mutation');
 const { assertPublication } = require('./source-authority');
 const { ordinaryDirectories, readExact, writeStage, verifyStage, verifyPeers, removeStage, validProof, settlePublishedLink } = require('./staged-publication');
+const { captureOwners, comparable, ownerWarning, parentOf, storeName } = require('./legacy-capture-ownership');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
-const portable = relative => relative.split(path.sep).join('/');
-const comparable = value => process.platform === 'win32' ? value.toLowerCase() : value;
+const artifactAreas = ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions'];
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
 const temporaryFileError = error => ['EACCES', 'EPERM', 'EBUSY', 'EMFILE', 'ENFILE', 'ENOSPC'].includes(error.code);
@@ -76,7 +76,7 @@ class Vault {
     await fs.mkdir(this.vault, { recursive: true });
     const relative = path.relative(this.vault, this.root).split(path.sep); let current = this.vault;
     for (const segment of relative) { current = path.join(current, segment); await fs.mkdir(current).catch(error => { if (error.code !== 'EEXIST') throw error; }); await this.contained(current); }
-    for (const area of ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions']) { const target = path.join(this.root, area); await fs.mkdir(target).catch(error => { if (error.code !== 'EEXIST') throw error; }); await this.contained(target); }
+    for (const area of artifactAreas) { const target = path.join(this.root, area); await fs.mkdir(target).catch(error => { if (error.code !== 'EEXIST') throw error; }); await this.contained(target); }
   }
   async writable() { await this.contained(this.root); await this.contained(path.join(this.root, 'Captures')); }
   publicationFolders(directory, expected) {
@@ -107,13 +107,18 @@ class Vault {
     const remove = proof ? removeStage(lock, guard, proof) : fs.unlink(lock);
     await remove.catch(error => { if (error.code !== 'ENOENT') this.warnings.push('A saved-note lock could not be removed. Inspect it before continuing.'); });
   }
-  async scan({ annotations = false } = {}) {
+  async scan({ annotations = false, managedRoots } = {}) {
     await this.writable();
     const notes = [];
     const visit = async dir => {
       await this.contained(dir);
-      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home'].includes(entry.name.toLowerCase())) continue;
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      if (managedRoots) {
+        const folders = new Set(entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink()).map(entry => comparable(entry.name)));
+        if (folders.has('.intake') && artifactAreas.some(area => folders.has(comparable(area))) || artifactAreas.every(area => folders.has(comparable(area)))) managedRoots.add(comparable(dir));
+      }
+      for (const entry of entries) {
+        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home', storeName].includes(entry.name.toLowerCase())) continue;
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
@@ -129,16 +134,22 @@ class Vault {
   async list() {
     return sourceMutation(this.root, () => this.listOwned());
   }
-  ownsManual(note, authority) {
-    if (!['thought', 'link'].includes(note.type)) return false;
-    if (Object.hasOwn(note, 'managedParent')) {
-      return typeof note.managedParent === 'string' && comparable(note.managedParent) === comparable(portable(path.relative(this.vault, this.root)));
+  matchesManualParent(note) {
+    return note.type !== 'reel_import' && typeof note.managedParent === 'string' &&
+      comparable(note.managedParent) === comparable(parentOf(this.vault, this.root));
+  }
+  async captureInventory(ledger) {
+    const managedRoots = new Set([comparable(path.resolve(this.root))]);
+    const notes = await this.scan({ managedRoots });
+    if (!ledger && notes.some(note => note.type !== 'reel_import' && !this.matchesManualParent(note))) {
+      ledger = await new (require('./intake').Intake)(this).load();
     }
-    // Older quick captures carry no parent. Accept their original layout or an
-    // exact manual capture already admitted by this parent's deletion ledger.
-    if (comparable(path.dirname(note.file)) === comparable(path.join(this.root, 'Captures'))) return true;
-    return authority?.phase === 'active' && authority.manual?.captureId === note.id &&
-      authority.manual.relative === portable(path.relative(this.vault, note.file)) && authority.manual.currentHash === hash(note.content);
+    const imported = new Set(Object.values(ledger?.captures || {}).map(capture => capture.id));
+    const { owned: legacy, held } = await captureOwners(this, notes, managedRoots, imported, ledger?.sourceAuthority);
+    this.warnings = this.warnings.filter(warning => warning !== ownerWarning);
+    if (held) this.warnings.push(ownerWarning);
+    const owned = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
+    return { notes, owned };
   }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();
@@ -150,15 +161,13 @@ class Vault {
     await this.writable();
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Invalid capture metadata in '));
     await this.recover(dir);
-    const notes = await this.scan();
+    const { notes, owned } = await this.captureInventory();
     const counts = new Map(); for (const note of notes) counts.set(note.id, (counts.get(note.id) || 0) + 1);
-    const legacyOutside = notes.some(note => note.type !== 'reel_import' && !Object.hasOwn(note, 'managedParent') && !this.ownsManual(note));
-    const authority = legacyOutside ? (await new (require('./intake').Intake)(this).load()).sourceAuthority : undefined;
-    const owned = notes.filter(note => note.type === 'reel_import' || this.ownsManual(note, authority?.[note.id]));
-    for (const note of owned) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
-    const visible = owned.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
+    const eligible = notes.filter(note => owned.has(note));
+    for (const note of eligible) if (!this.expected.has(note.id)) this.expected.set(note.id, hash(note.content));
+    const visible = eligible.filter(note => counts.get(note.id) === 1 || this.identityPaths?.get(note.id) === note.file);
     this.warnings = this.warnings.filter(warning => !warning.startsWith('Duplicate capture identity.'));
-    if (owned.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
+    if (eligible.some(note => counts.get(note.id) > 1 && !this.identityPaths?.get(note.id))) this.warnings.push('Duplicate capture identity. Preserve both notes and use Vault repairs to choose the managed file.');
     return visible.sort((a, b) => b.capturedAt.localeCompare(a.capturedAt));
   }
   async find(id) { const note = (await this.list()).find(note => note.id === id); if (!note) throw Error('Capture is missing. Restore it before editing.'); return note; }
@@ -172,7 +181,7 @@ class Vault {
     if (input.excerpt && type !== 'link') throw Error('An excerpt requires a source URL in Thought or link.');
     const note = { id: randomUUID(), type, capturedAt: new Date(now).toISOString(), title: text.trim().split(/\r?\n/)[0].slice(0, 90), text, excerpt: input.excerpt || '', url: type === 'link' ? text : null };
     const slug = note.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Capture';
-    const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note, portable(path.relative(this.vault, this.root))), stage = `${file}.pending`;
+    const file = path.join(this.root, 'Captures', `${slug}--${note.id}.md`), content = markdown(note, parentOf(this.vault, this.root)), stage = `${file}.pending`;
     const { guard, identities } = this.publicationFolders(path.dirname(file));
     const staged = await writeStage(stage, content, guard);
     const publication = { kind: 'capture', staged, identities };
