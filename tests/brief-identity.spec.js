@@ -85,6 +85,57 @@ async function interruptedFiles(briefs) {
   };
 }
 
+async function interruptMarkerOpen(root, vault, marker, request = null) {
+  const trace = path.join(root, 'interrupted-marker-path.txt');
+  const child = `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const { Briefs } = require('./app/briefs');
+    const { Vault } = require('./app/vault');
+    const [vault, input, now, marker, trace] = process.argv.slice(1);
+    const briefs = new Briefs(new Vault(vault, 'Companion'));
+    const open = fs.promises.open;
+    fs.promises.open = async (file, flags, ...args) => {
+      const handle = await open(file, flags, ...args);
+      if (flags === 'wx' && path.dirname(file) === briefs.dir) {
+        const name = path.basename(file);
+        if (name === marker || name.startsWith(marker + '.')) {
+          fs.writeFileSync(trace, file, { flag: 'wx' });
+          process.exit(75);
+        }
+      }
+      return handle;
+    };
+    const operation = JSON.parse(input);
+    const result = operation ? briefs.approve(operation, now) : briefs.pinned(1);
+    result.then(() => {
+      console.error('Approval did not reach the marker open interruption.');
+      process.exitCode = 76;
+    }, error => {
+      console.error(error);
+      process.exitCode = 77;
+    });
+  `;
+  await expect(execute(process.execPath, ['-e', child, vault.vault, JSON.stringify(request), now, marker, trace], {
+    cwd: path.resolve(__dirname, '..'), windowsHide: true
+  })).rejects.toMatchObject({ code: 75 });
+  const opened = await fs.readFile(trace, 'utf8');
+  expect((await fs.lstat(opened)).size).toBe(0);
+}
+
+async function makeLegacy(briefs, first) {
+  const receipt = path.join(briefs.dir, '.brief-approval-1.json');
+  const modern = await fs.readFile(first.file, 'utf8');
+  const legacy = modern.replace(/^managed_parent: .*\r?\n/m, '');
+  expect(legacy).not.toBe(modern);
+  const digest = createHash('sha256').update(legacy).digest('hex');
+  const canonical = path.join(briefs.dir, `approved-1-${digest}.md`);
+  await fs.unlink(receipt);
+  await fs.unlink(first.file);
+  await fs.writeFile(canonical, legacy, { flag: 'wx' });
+  return { legacy, digest, canonical };
+}
+
 test('an approved brief keeps its exact pin and discovery entry after a vault move', async ({}, testInfo) => {
   const { root, vault, restart, approve, archiveFile } = await fixture(testInfo);
   const { record, file } = await approve();
@@ -150,15 +201,7 @@ test('editing a moved approval holds its own pin without affecting another versi
 test('a legacy canonical approval observed before moving keeps its pin and version', async ({}, testInfo) => {
   const { restart, approve, archiveFile } = await fixture(testInfo);
   const first = await approve();
-  const receipt = path.join(restart().dir, '.brief-approval-1.json');
-  const modern = await fs.readFile(first.file, 'utf8');
-  const legacy = modern.replace(/^managed_parent: .*\r?\n/m, '');
-  expect(legacy).not.toBe(modern);
-  const digest = createHash('sha256').update(legacy).digest('hex');
-  const canonical = path.join(restart().dir, `approved-1-${digest}.md`);
-  await fs.unlink(receipt);
-  await fs.unlink(first.file);
-  await fs.writeFile(canonical, legacy, { flag: 'wx' });
+  const { legacy, digest, canonical } = await makeLegacy(restart(), first);
 
   const pin = { id: first.record.id, version: 1, digest };
   await expect(restart().pinned(1)).resolves.toMatchObject(pin);
@@ -301,4 +344,51 @@ for (const at of ['before', 'after']) test(`an interrupted approval preserves a 
   expect(await fs.readFile(retained)).toEqual(original);
   if (at === 'before') expect((await fs.readdir(restart().dir)).filter(name => name.startsWith('approved-2-'))).toEqual([]);
   else expect(await fs.readFile(stage)).toEqual(original);
+});
+
+test('an exit before writing the pending approval marker leaves explicit retry available', async ({}, testInfo) => {
+  const { root, vault, restart, propose, approve } = await fixture(testInfo);
+  const first = await approve();
+  const request = await propose();
+  await interruptMarkerOpen(root, vault, '.brief-approval-2.pending.json', request);
+  const { published } = await interruptedFiles(restart());
+  expect(published).toEqual([]);
+  await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest: first.record.digest });
+
+  await expect.soft(restart().pinned(2)).rejects.toThrow(/unavailable/i);
+  const repeated = await restart().approve(request, now);
+  expect(repeated.approved.map(record => [record.version, record.id])).toEqual([[2, request.id], [1, first.record.id]]);
+});
+
+test('an exit before writing the permanent approval marker leaves the exact linked approval recoverable', async ({}, testInfo) => {
+  const { root, vault, restart, propose, approve } = await fixture(testInfo);
+  const first = await approve();
+  const request = await propose();
+  await interruptMarkerOpen(root, vault, '.brief-approval-2.json', request);
+  const { stage, published } = await interruptedFiles(restart());
+  expect(published).toHaveLength(1);
+  const [destination] = published;
+  const before = await fs.lstat(destination, { bigint: true });
+  const stageBefore = await fs.lstat(stage, { bigint: true });
+  expect([before.dev, before.ino, before.nlink]).toEqual([stageBefore.dev, stageBefore.ino, 2n]);
+  const bytes = await fs.readFile(destination);
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest: first.record.digest });
+
+  await expect.soft(restart().pinned(2)).resolves.toMatchObject({ id: request.id, version: 2, digest });
+  await expect.soft(fs.lstat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await fs.readFile(destination)).toEqual(bytes);
+});
+
+test('an exit before writing an observed legacy approval marker preserves its canonical pin', async ({}, testInfo) => {
+  const { root, vault, restart, approve, archiveFile } = await fixture(testInfo);
+  const first = await approve();
+  const { legacy, digest, canonical } = await makeLegacy(restart(), first);
+  await interruptMarkerOpen(root, vault, '.brief-approval-1.json');
+
+  await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest });
+  const moved = await archiveFile('Observed legacy brief.md');
+  await fs.rename(canonical, moved);
+  await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest });
+  expect(await fs.readFile(moved, 'utf8')).toBe(legacy);
 });
