@@ -10,7 +10,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, verifyStageSync } = require('./staged-publication');
+const { ordinaryDirectories, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -18,6 +18,8 @@ const conflict = message => Object.assign(Error(message), { intakeConflict: true
 const deferred = message => Object.assign(Error(message), { intakeDeferred: true });
 const conflictPause = ' Updates to this source are paused for explicit conflict repair.';
 const outputHold = 'Published intake output or recovery evidence changed.';
+const heldName = tx => `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
+const pendingName = tx => `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
 const exactIdentity = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino;
 const publicationIdentity = (info, nlink = info.nlink) => ({ dev: info.dev, ino: info.ino, nlink });
 const heldArtifact = (folder, error, now) => ({
@@ -636,7 +638,7 @@ class Intake {
     } catch (error) {
       if (!error.intakeOutputChanged || tx.restoreOperation || !cleanup.some(item => item.file === journal)) throw error;
       const reason = error.message + (committed ? ' The recorded producer acceptance was preserved.' : '');
-      await this.archiveConflict(tx, ledger, reason, { journalInfo, journalPeers, guard });
+      await this.archiveConflict(tx, ledger, reason, { journalInfo, guard });
       throw Object.assign(Error(reason, { cause: error }), { intakeOutputHeld: true });
     }
   }
@@ -664,6 +666,7 @@ class Intake {
     this.validateTransaction(tx);
     const ledger = await this.load();
     assertPublication(ledger, tx.capture.id, tx);
+    if (this.hasOutputHold(ledger, tx)) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
     if (tx.externalConflict && !ledger.blocks[tx.sourceHash]) return this.archiveConflict(tx, ledger, 'Destination changed outside Companion. Both versions were preserved.');
     if (ledger.blocks[tx.sourceHash] && !tx.restore) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
     if (ledger.pending[tx.sourceHash]) return this.defer(tx, ledger, ledger.pending[tx.sourceHash].reason);
@@ -676,7 +679,7 @@ class Intake {
   }
   async defer(tx, ledger, reason) {
     this.validateTransaction(tx);
-    const name = `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`, journal = path.join(this.dir, 'transaction.json');
+    const name = pendingName(tx), journal = path.join(this.dir, 'transaction.json');
     ledger.pending[tx.sourceHash] = { journal: name, reason, key: tx.key };
     ledger.outcomes[tx.key] = { status: 'held', reason, locator: tx.revision.locator, sourceHash: tx.sourceHash, pendingRevision: tx.revision.id };
     await this.save(ledger);
@@ -689,7 +692,7 @@ class Intake {
       if (ledger.suppressed.includes(sourceHash)) continue;
       if (!/^pending-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(pending.journal)) throw Error('Invalid deferred intake journal identity. Preserve .intake for repair.');
       let tx; try { tx = JSON.parse(await fs.readFile(path.join(this.dir, pending.journal), 'utf8')); } catch { throw Error('Deferred intake journal is unreadable. Preserve .intake for repair.'); }
-      this.validateTransaction(tx); if (tx.sourceHash !== sourceHash || pending.journal !== `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`) throw Error('Deferred intake identity does not match its journal.');
+      this.validateTransaction(tx); if (tx.sourceHash !== sourceHash || pending.journal !== pendingName(tx)) throw Error('Deferred intake identity does not match its journal.');
       // Every retry has the same active recovery seam as first publication.
       // A crash while turning a pending item into a conflict remains recoverable.
       await fs.link(path.join(this.dir, pending.journal), path.join(this.dir, 'transaction.json'));
@@ -707,41 +710,59 @@ class Intake {
       ledger = await this.load();
     }
   }
+  hasOutputHold(ledger, tx) {
+    const block = ledger.blocks?.[tx.sourceHash];
+    return !!block?.reason?.startsWith(outputHold) && block.incomingRevision === tx.revision.id && block.journal === heldName(tx);
+  }
   async archiveConflict(tx, ledger, message, retained) {
     this.validateTransaction(tx);
     await this.setup();
     const preservePublication = message.startsWith(outputHold);
     const reason = preservePublication && message.endsWith(conflictPause) ? message : message + conflictPause;
-    const archive = `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`, journal = path.join(this.dir, 'transaction.json');
+    const archive = heldName(tx), journal = path.join(this.dir, 'transaction.json');
     const held = path.join(this.dir, archive);
     let holdJournal;
     if (preservePublication) {
-      const journalPeers = retained?.journalPeers || [held];
-      const info = retained?.journalInfo || await this.ownedFile(journal, journalPeers, 'Held intake transaction');
-      if (!info) throw Error('The exact held intake transaction is unavailable. All remaining files were preserved.');
       const guard = retained?.guard || this.vault.publicationFolders(this.dir).guard;
+      const changed = () => Error('Held intake transaction or its known peers changed. All files were preserved.');
+      if (!retained && !this.hasOutputHold(ledger, tx)) throw changed();
+      const pending = path.join(this.dir, pendingName(tx)), names = [journal, pending, held];
+      guard();
+      const current = local.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
+      const info = retained?.journalInfo || current;
+      if (!exactIdentity(current, info)) throw changed();
       const proof = { dev: String(info.dev), ino: String(info.ino), digest: hash(JSON.stringify(tx)) };
-      const peers = [...new Set(journalPeers)].filter(file => {
+      const present = new Set(names.filter(file => {
         guard();
         const stat = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
-        return exactIdentity(stat, info);
-      });
-      if (peers.length !== Number(info.nlink) - 1) throw Error('Held intake transaction peers changed. All files were preserved.');
-      const verify = (files, links) => { for (const file of files) verifyStageSync(file, guard, proof, links); };
+        if (stat && !exactIdentity(stat, info)) throw changed();
+        return !!stat;
+      }));
+      if (Number(info.nlink) !== present.size) throw changed();
+      const verify = () => {
+        for (const file of names) {
+          if (present.has(file)) verifyStageSync(file, guard, proof, present.size);
+          else verifyAbsentSync(file, guard, changed);
+        }
+      };
       holdJournal = {
-        verify: () => verify([journal, ...peers], Number(info.nlink)),
+        verify,
         publish: () => {
-          const alreadyHeld = peers.includes(held);
-          if (!alreadyHeld) local.linkSync(journal, held);
-          const linked = alreadyHeld ? peers : [...peers, held];
-          verify([journal, ...linked], linked.length + 1);
-          local.unlinkSync(journal);
-          const obsolete = linked.filter(file => file !== held);
-          while (obsolete.length) {
-            verify([held, ...obsolete], obsolete.length + 1);
-            local.unlinkSync(obsolete.pop());
+          if (!present.has(held)) {
+            local.linkSync(journal, held);
+            present.add(held);
           }
-          verify([held], 1);
+          verify();
+          // Keep the active name until the pending alias is retired. Any
+          // interrupted transition still has an exact transaction to inspect.
+          if (present.has(pending)) {
+            local.unlinkSync(pending);
+            present.delete(pending);
+          }
+          verify();
+          local.unlinkSync(journal);
+          present.delete(journal);
+          verify();
         }
       };
     }

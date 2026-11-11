@@ -1,9 +1,11 @@
 const fs = require('node:fs/promises');
+const native = require('node:fs');
 const { assertAnnotationPublication, annotationRemoved, validateAnnotationRemovals } = require('./annotation-authority');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { parseAnnotation } = require('./vault');
 const { revisionAdmission, activeAdmission, validateAuthority } = require('./source-authority');
+const { verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 
 async function annotationAuthority(intake) {
   // A caller can still hold the ledger it loaded before an awaited publication.
@@ -300,12 +302,61 @@ function install(Intake, { hash, read, noteText }) {
     });
   };
   Intake.prototype.finishRepair = async function () {
-    const intentFile = path.join(this.dir, 'repair-intent.json'), bytes = await read(intentFile); if (bytes === null) return;
+    const intentFile = path.join(this.dir, 'repair-intent.json');
+    const intentIdentity = await fs.lstat(intentFile, { bigint: true }).catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (!intentIdentity) return;
+    const bytes = await read(intentFile);
+    if (bytes === null) throw Error('The annotation repair intent changed. All remaining files were preserved.');
     const intent = JSON.parse(bytes), tx = intent.tx;
     this.validateTransaction(tx);
     if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
-    if (annotationRemoved(await annotationAuthority(this), intent.annotationId)) return { held: true, removed: true };
+    const owner = await annotationAuthority(this);
+    if (annotationRemoved(owner, intent.annotationId)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
+    const preserveOutputHold = (ledger, error) => {
+      if (!this.hasOutputHold(ledger, tx)) throw Error('The exact intake output hold changed. All files were preserved.');
+      const intentGuard = this.vault.publicationFolders(this.dir).guard;
+      const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
+      const guard = () => { intentGuard(); annotationGuard(); };
+      const archive = path.join(this.dir, `repair-${intent.annotationId}.json`);
+      const proof = { dev: String(intentIdentity.dev), ino: String(intentIdentity.ino), digest: hash(bytes) };
+      this.storage.guardSync();
+      guard();
+      if (native.lstatSync(archive, { throwIfNoEntry: false })) {
+        verifyStageSync(intentFile, guard, proof, 2);
+        verifyStageSync(archive, guard, proof, 2);
+      } else {
+        verifyStageSync(intentFile, guard, proof);
+        verifyAbsentSync(archive, guard);
+        native.linkSync(intentFile, archive);
+      }
+      // The annotation is already published. Only an exact owned pair can
+      // retire its stage. Independent edits and unknown copies stay intact.
+      try {
+        guard();
+        const staged = native.lstatSync(stage, { bigint: true, throwIfNoEntry: false });
+        if (staged) {
+          const annotationProof = { dev: String(staged.dev), ino: String(staged.ino), digest: hash(intent.annotation) };
+          verifyStageSync(stage, guard, annotationProof, 2);
+          verifyStageSync(file, guard, annotationProof, 2);
+          native.unlinkSync(stage);
+          verifyStageSync(file, guard, annotationProof);
+        }
+      } catch (cause) {
+        this.vault.warnings.push(`Held repair annotation files were preserved: ${cause.message}`);
+      }
+      this.storage.guardSync();
+      verifyStageSync(intentFile, guard, proof, 2);
+      verifyStageSync(archive, guard, proof, 2);
+      native.unlinkSync(intentFile);
+      verifyStageSync(archive, guard, proof);
+      if (error) throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for explicit repair.', { cause: error }), { intakeRepairHeld: true });
+      return { held: true };
+    };
+    if (this.hasOutputHold(owner, tx)) return preserveOutputHold(owner);
     const hold = async error => {
       // Retain the complete annotation intent before moving the active source
       // journal into its UUID-specific hold. Cleanup follows durable evidence.
@@ -355,6 +406,7 @@ function install(Intake, { hash, read, noteText }) {
       await this.save(ledger);
       try { await this.finish(tx, ledger); } catch (error) {
         if (error.keptCurrentFailure) return hold(error);
+        if (error.intakeOutputHeld) return preserveOutputHold(await annotationAuthority(this), error);
         if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message);
         else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
         else throw error;
