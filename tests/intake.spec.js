@@ -506,3 +506,39 @@ test('producer title syntax remains literal in Markdown and editable without cha
   expect(note).toContain(String.raw`# My \[literal\] title`);
   expect(note).toContain(sourceNotes);
 });
+
+for (const substitute of ['junction', 'ordinary replacement']) {
+  test(`a ${substitute} at a connected producer path cannot import unselected files`, async () => {
+    const first = await artifact();
+    await launch(); await setup(); await connect(true);
+    const base = path.join(root, 'vault', 'Companion');
+    const ledger = async () => JSON.parse(await fs.readFile(path.join(base, '.intake', 'ledger.json'), 'utf8'));
+    const before = await ledger();
+    const producer = path.dirname(first), relocated = path.join(root, 'relocated-producer');
+    await fs.rename(producer, relocated);
+
+    const unselected = substitute === 'junction' ? path.join(root, 'unselected-producer') : producer;
+    const incoming = path.join(unselected, 'new-attempt');
+    await fs.mkdir(unselected);
+    await fs.cp(path.join(relocated, path.basename(first)), incoming, { recursive: true });
+    const runPath = path.join(incoming, 'run.json');
+    const run = JSON.parse(await fs.readFile(runPath, 'utf8'));
+    await fs.writeFile(runPath, JSON.stringify({ ...run, input_sha256: 'c'.repeat(64), attempt_id: '2'.repeat(32) }));
+    const names = (await fs.readdir(incoming)).sort();
+    const bytes = await Promise.all(names.map(name => fs.readFile(path.join(incoming, name))));
+    if (substitute === 'junction') await fs.symlink(unselected, producer, process.platform === 'win32' ? 'junction' : 'dir');
+
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T07:00:00Z', timezone: 'America/Phoenix' }));
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Intake check complete');
+    const after = await ledger();
+    expect(after.attempts).toEqual(before.attempts);
+    expect(after.captures).toEqual(before.captures);
+    expect(after.lastSuccess).toEqual(before.lastSuccess);
+    expect(after.lastCheck.status).toBe('error');
+    await expect(page.locator('#intake-state')).toContainText('Reconnect it, then Check now.');
+    expect((await fs.readdir(path.join(base, 'Revisions'))).filter(name => name.endsWith('.json'))).toHaveLength(1);
+    expect((await fs.readdir(incoming)).sort()).toEqual(names);
+    expect(await Promise.all(names.map(name => fs.readFile(path.join(incoming, name))))).toEqual(bytes);
+  });
+}
