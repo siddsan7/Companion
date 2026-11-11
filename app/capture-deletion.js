@@ -8,7 +8,7 @@ const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
 const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
-const { parse } = require('./vault');
+const { parse, restorationReadRefused, matchesRestorationFile } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf, removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const sourceInventory = require('./source-inventory');
 const sourceTitle = require('./source-title');
@@ -533,11 +533,13 @@ function recordRestorationAdmission(ledger, tx, proof) {
   }
   return { ...ledger.sourceAuthority, [id]: { ...authority, restoration: { ...item, importedPublication: proof } } };
 }
-function importedRestorationLeaf(id, authority, message, verify) {
+function importedRestorationLeaf(id, authority, message, verify, readRefusal) {
   try { return verify(); }
   catch (error) {
-    if (error.code !== 'STAGING_CHANGED') throw error;
-    throw Object.assign(Error(message, { cause: error }), {
+    const changed = error.code === 'STAGING_CHANGED';
+    if (!changed && !readRefusal?.(error)) throw error;
+    const reason = changed ? message : 'A published restoration output could not be read. It was preserved and suppression remains.';
+    throw Object.assign(Error(reason, { cause: error }), {
       code: 'SOURCE_OPERATION_HELD', family: 'imported-restoration', captureId: id,
       operationId: authority.operationId, generation: authority.generation, phase: authority.phase
     });
@@ -550,15 +552,19 @@ function isImportedRestorationHold(error, id, authority) {
   return authority.phase === 'restoring' && !!authority.restoration.published && !!authority.restoration.importedPublication ||
     authority.phase === 'active' && !!authority.restorationCleanup;
 }
-function verifyImportedRestorationHold(intake, authority) {
+function verifyPublishedRestorationControls(intake, authority, guard = removalParentGuard(intake.vault, authority.directories)) {
+  verifyStageSync(path.join(intake.dir, authority.restoration.journal), guard, authority.restoration.importedPublication.journal);
+  verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.stage'), guard);
+  verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.snapshot.stage'), guard);
+}
+function verifyImportedRestorationHold(intake, authority, verifyShared) {
   const guard = removalParentGuard(intake.vault, authority.directories);
   intake.storage.guardSync();
-  verifyAbsentSync(path.join(intake.dir, 'transaction.json'), guard, () =>
+  if (verifyShared) verifyShared();
+  else verifyAbsentSync(path.join(intake.dir, 'transaction.json'), guard, () =>
     Error('A shared intake journal needs recovery before this source can be held independently.'));
   if (authority.phase === 'restoring') {
-    verifyStageSync(path.join(intake.dir, authority.restoration.journal), guard, authority.restoration.importedPublication.journal);
-    verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.stage'), guard);
-    verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.snapshot.stage'), guard);
+    verifyPublishedRestorationControls(intake, authority, guard);
   }
 }
 async function finishRestorationCleanup(intake, ledger, id) {
@@ -806,7 +812,8 @@ async function verifyRestorationPublication(intake, ledger, id) {
     for (const pair of pairs.slice(0, 2)) {
       importedRestorationLeaf(id, current,
         'A published restoration output changed. It was preserved and suppression remains.',
-        () => verifyStageSync(pair.peer, guard, pair.proof));
+        () => verifyStageSync(pair.peer, guard, pair.proof),
+        error => restorationReadRefused(error, pair.peer) && matchesRestorationFile(pair.peer, pair.proof, guard));
     }
   };
   verify();
@@ -814,5 +821,6 @@ async function verifyRestorationPublication(intake, ledger, id) {
 }
 module.exports = {
   CaptureDeletion, finishDeletion, finishRestoration, finishRestorationCleanup, recordRestorationAdmission,
-  isImportedRestorationHold, verifyImportedRestorationHold, guardRestorationParents, installCaptureDeletion, inspectManualPeers
+  isImportedRestorationHold, verifyImportedRestorationHold, verifyPublishedRestorationControls,
+  guardRestorationParents, installCaptureDeletion, inspectManualPeers
 };

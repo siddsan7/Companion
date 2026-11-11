@@ -461,6 +461,25 @@ test('reserved restoration Markdown cannot settle an interrupted linked brief ap
   const restarted = new Briefs(new Vault(vault.vault, 'Companion'));
   await expect.soft(restarted.pinned(2)).rejects.toThrow(/integrity|preserv|unavailable/i);
   await expect(restarted.pinned(1)).resolves.toMatchObject({ id: first.id, digest: first.digest });
+  const independentHash = 'c'.repeat(64), clip = 'b'.repeat(64);
+  const independent = testInfo.outputPath('producer', 'independent');
+  await fs.mkdir(independent, { recursive: true });
+  await fs.writeFile(path.join(independent, 'run.json'), JSON.stringify({
+    job_id: clip, attempt_id: '2'.repeat(32), started_utc: later, input_sha256: independentHash,
+    input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
+  }));
+  await fs.writeFile(path.join(independent, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
+  await fs.writeFile(path.join(independent, 'first-pass-target.json'), JSON.stringify(draft.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(independent, 'notes.md'));
+  const independentIntake = new Intake(new Vault(vault.vault, 'Companion'));
+  const result = await independentIntake.reconcile({ now: later }).catch(error => error);
+  expect.soft(result instanceof Error ? result.message : null).toBeNull();
+  if (!(result instanceof Error)) {
+    expect(result.captures[independentHash]).toBeDefined();
+    expect(await absent(independentIntake.destination(result.captures[independentHash]))).toBe(false);
+    expect(result.sourceAuthority[captureId]).toEqual(authority);
+    expect(result.suppressed).toContain(sourceHash);
+  }
   expect.soft(await absent(receipt)).toBe(true);
   expect.soft(await absent(stage)).toBe(false);
   expect.soft(await absent(pending)).toBe(false);
