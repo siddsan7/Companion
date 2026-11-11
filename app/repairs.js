@@ -70,7 +70,7 @@ function install(Intake, { hash, read, noteText }) {
     }
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
       // An output hold may deliberately retain a hardlinked capture stage.
-      if (capture.removed || ledger.blocks[sourceHash]?.outputHold || heldRestorations.has(capture.id)) continue;
+      if (capture.removed || this.isPublicationOutputHold(ledger.blocks[sourceHash]) || heldRestorations.has(capture.id)) continue;
       if (ledger.identityIssues[capture.id]) { capture.identityIssue = ledger.identityIssues[capture.id].reason; continue; }
       if (capture.id === this.pendingTitleCapture) continue;
       delete capture.identityIssue;
@@ -351,7 +351,7 @@ function install(Intake, { hash, read, noteText }) {
     if (annotationRemoved(owner, intent.annotationId)) return { held: true, removed: true };
     const file = path.join(this.vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(this.dir, `annotation-${intent.annotationId}.stage`);
     const preserveOutputHold = (ledger, error) => {
-      if (!this.hasOutputHold(ledger, tx)) throw Error('The exact intake output hold changed. All files were preserved.');
+      if (!this.hasHeldJournal(ledger, tx)) throw Error('The exact intake hold changed. All files were preserved.');
       const intentGuard = this.vault.publicationFolders(this.dir).guard;
       const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
       const guard = () => { intentGuard(); annotationGuard(); };
@@ -390,7 +390,7 @@ function install(Intake, { hash, read, noteText }) {
       if (error) throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for explicit repair.', { cause: error }), { intakeRepairHeld: true });
       return { held: true };
     };
-    if (this.hasOutputHold(owner, tx)) return preserveOutputHold(owner);
+    if (this.hasHeldJournal(owner, tx)) return preserveOutputHold(owner);
     const hold = async error => {
       // Retain the complete annotation intent before moving the active source
       // journal into its UUID-specific hold. Cleanup follows durable evidence.
@@ -441,7 +441,7 @@ function install(Intake, { hash, read, noteText }) {
       try { await this.finish(tx, ledger); } catch (error) {
         if (error.keptCurrentFailure) return hold(error);
         if (error.intakeOutputHeld) return preserveOutputHold(await annotationAuthority(this), error);
-        if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message);
+        if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message, error.intakeConflictProof);
         else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
         else throw error;
         await fs.unlink(stage).catch(cleanup => { if (cleanup.code !== 'ENOENT') throw cleanup; });
