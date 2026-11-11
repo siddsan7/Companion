@@ -368,6 +368,53 @@ for (const restartBeforeCleanup of [false, true]) test(`accepted deferred output
   await expectHeld(await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' }), restartBeforeCleanup ? 3 : 4);
 });
 
+test('accepted deferred bookkeeping resumes after exact journal retirement and a later capture edit', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), interruption = Error('Stopped after retiring the deferred journal.');
+  let deferMove = false;
+  const { vault, intake, ledgerFile } = await setup(testInfo, boundary => {
+    if (boundary === 'intake-before-move' && deferMove) throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+  });
+  await writeDraft(producer);
+  const first = await intake.connect(producer, true, now);
+  expect(first.lastCheck.status).toBe('complete');
+  const [sourceHash] = Object.keys(first.captures);
+  await writeDraft(producer, 'second', '2');
+  deferMove = true;
+  const deferred = await intake.reconcile({ now: later });
+  deferMove = false;
+  expect(deferred.lastCheck.status).toBe('held');
+  const pending = path.join(intake.dir, deferred.pending[sourceHash].journal), journal = path.join(intake.dir, 'transaction.json');
+  const tx = await readJson(pending), destination = intake.destination(tx.capture), foreign = tx.content + '\nAn independent capture edit.\n';
+  const unlink = local.unlinkSync;
+  let retired = false;
+  local.unlinkSync = file => {
+    unlink(file);
+    if (file !== pending) return;
+    expect(local.existsSync(journal)).toBe(false);
+    expect(local.existsSync(path.join(intake.dir, tx.revision.id + '.stage'))).toBe(false);
+    expect(local.existsSync(path.join(intake.dir, tx.revision.id + '.snapshot.stage'))).toBe(false);
+    local.writeFileSync(destination, foreign);
+    retired = true;
+    throw interruption;
+  };
+  try { await expect(intake.reconcile({ now: later })).rejects.toThrow(interruption.message); }
+  finally { local.unlinkSync = unlink; }
+  expect(retired).toBe(true);
+  const committed = await readJson(ledgerFile);
+  expect(committed.pending[sourceHash]).toBeDefined();
+  expect(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+  await writeDraft(producer, 'z-independent', '3', 'c');
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const completed = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
+  expect(completed.attempts[tx.revision.identity]).toEqual(committed.attempts[tx.revision.identity]);
+  expect(Object.values(completed.attempts)).toHaveLength(3);
+  expect(completed.pending[sourceHash]).toBeUndefined();
+  expect(completed.blocks[sourceHash]).toBeUndefined();
+  expect(await readOptional(journal)).toBeNull();
+  expect(await readOptional(pending)).toBeNull();
+  expect(await readOptional(destination)).toBe(foreign);
+});
+
 test('held explicit conflict repair does not adopt a byte-identical replacement on restart', async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   let repairing = false, replacement;
