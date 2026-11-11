@@ -5,6 +5,7 @@ const { createHash, randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { setTimeout: wait } = require('node:timers/promises');
 const { conversation } = require('./archive-format');
+const { verifyStageSync, verifyAbsentSync, removeLinkedStage } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -333,17 +334,41 @@ class ConversationControls {
     const { marker } = snapshot; await this.settlePublication(marker);
     const parent = this.store.safeDirectory(), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), target = marker.targets.find(target => target.name.endsWith('.json'));
     const stage = path.join(this.store.directory, stageTarget.name), destination = path.join(this.store.directory, target.name);
+    const selected = this.store.getVault()?.root;
+    const guard = () => {
+      this.store.safeDirectory(false, parent);
+      if (!selected || this.store.getVault()?.root !== selected) throw Error('The restoration vault selection changed. Preserve the payload for review.');
+    };
+    const directory = this.guard(), control = path.join(directory.directory, `${marker.id}.json`);
+    const saved = await this.file(control, directory, null, 1, true, true);
+    if (JSON.stringify(JSON.parse(saved.text)) !== JSON.stringify(marker)) throw Error('Restoration authority changed. Preserve the exact payload for review.');
+    const controlProof = { dev: saved.owned.dev, ino: saved.owned.ino, digest: saved.rawDigest };
+    const controlGuard = () => { guard(); this.guard(false, directory.stat); };
+    const verifyMarker = () => { verifyStageSync(control, controlGuard, controlProof); };
+    const proof = { dev: stageTarget.dev, ino: stageTarget.ino, digest: marker.restoration.recordDigest };
     if (!snapshot.destinationExists) {
-      await this.file(stage, parent, stageTarget); this.store.safeDirectory(false, parent);
-      await fs.link(stage, destination); this.store.safeDirectory(false, parent);
+      await this.file(stage, parent, stageTarget);
+      verifyMarker();
+      verifyStageSync(stage, guard, proof);
+      local.linkSync(stage, destination);
+      guard();
       await this.store.checkpoint('archive-restore-after-link');
     }
-    const current = await this.restorationSnapshot(marker.id);
+    const current = await this.restorationSnapshot(marker.id, { expectedParent: parent, exactBytes: true });
     if (JSON.stringify(current.marker) !== JSON.stringify(marker) || current.text !== snapshot.text) throw Error('Restoration authority changed. Preserve the exact payload for review.');
-    if (current.stageExists) { this.store.safeDirectory(false, parent); await fs.unlink(stage); }
+    if (current.stageExists) await removeLinkedStage(stage, destination, guard, proof, verifyMarker);
     await this.store.checkpoint('archive-restore-before-active');
     await this.file(destination, parent, target);
-    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker, () => this.verifyRestorationComplete(marker, parent));
+    const verifyPayload = () => {
+      verifyAbsentSync(stage, guard);
+      verifyStageSync(destination, guard, proof);
+    };
+    const active = await this.put({ ...marker, phase: 'active', targets: [] }, marker,
+      () => this.verifyRestorationComplete(marker, parent), () => {
+        verifyMarker();
+        verifyPayload();
+      });
+    verifyPayload();
     this.store.tokens.clear(); this.store.durable.set(marker.id, marker.restoration.recordDigest);
     return { id: marker.id, generation: active.generation };
   }

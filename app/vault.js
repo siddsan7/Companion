@@ -115,6 +115,21 @@ class Vault {
     const remove = proof ? removeStage(lock, guard, proof) : fs.unlink(lock);
     await remove.catch(error => { if (error.code !== 'ENOENT') this.warnings.push('A saved-note lock could not be removed. Inspect it before continuing.'); });
   }
+  async releaseCaptureLock(file, stage, guard, owner, published) {
+    const lock = `${file}.lock`;
+    const verifySettlement = () => {
+      verifyAbsentSync(stage, guard);
+      verifyStageSync(file, guard, published);
+    };
+    try { await removeStage(lock, guard, owner, 1, verifySettlement); }
+    catch (error) {
+      if (!temporaryFileError(error)) throw error;
+      verifySettlement();
+      verifyStageSync(lock, guard, owner);
+      this.warnings.push('A saved-note lock could not be removed. Inspect it before continuing.');
+    }
+    verifySettlement();
+  }
   async scan({ annotations = false } = {}) {
     await this.writable();
     const notes = [];
@@ -196,9 +211,9 @@ class Vault {
     const staged = await writeStage(stage, content, guard);
     const publication = { kind: 'capture', staged, identities };
     let lock, linked = false, clean = false;
+    const verifyOwner = () => { verifyStageSync(`${file}.lock`, guard, lock); };
     try {
       lock = await this.acquire(file, publication, guard);
-      const verifyOwner = () => { verifyStageSync(`${file}.lock`, guard, lock); };
       await this.checkpoint('capture-staged');
       await this.publication(note.id);
       await verifyStage(stage, guard, staged);
@@ -211,17 +226,18 @@ class Vault {
       catch (error) {
         if (!['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw error;
         await verifyPeers(stage, file, guard, staged);
-        this.warnings.push('Capture saved. Its staging file will be cleaned on restart.');
       }
     } catch (error) {
       if (!linked) await removeStage(stage, guard, staged).catch(() => {});
       if (lock && !linked) await this.release(file, lock, guard);
       throw error;
     }
-    if (clean) {
-      await this.release(file, lock, guard);
-      verifyStageSync(file, guard, staged);
-    } else verifyPeersSync(stage, file, guard, staged);
+    if (clean) await this.releaseCaptureLock(file, stage, guard, lock, staged);
+    else {
+      verifyPeersSync(stage, file, guard, staged);
+      verifyOwner();
+      this.warnings.push('Capture saved. Its staging file will be cleaned on restart.');
+    }
     this.expected.set(note.id, hash(content)); return note.id;
   }
   async title(id, title) {
@@ -532,8 +548,7 @@ class Vault {
         }
         await verifyPeers(stage, file, pinned, publication.staged);
         await removeLinkedStage(stage, file, pinned, publication.staged, verifyOwner);
-        await this.release(file, lock.proof, pinned);
-        verifyStageSync(file, pinned, publication.staged);
+        await this.releaseCaptureLock(file, stage, pinned, lock.proof, publication.staged);
         this.warnings.push('Recovered an interrupted capture save.');
       } catch (error) {
         this.warnings.push(`${entry}: ${error.message}`);
