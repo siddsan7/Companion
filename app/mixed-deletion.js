@@ -195,7 +195,13 @@ async function inventory(intake, ledger, capture, sourceHash, note, seed, now) {
   const producer = ledger.sources.find(source => source.id === tx.key.split(':')[0]);
   if (!matchesProducerOutcome(producer, tx.key, tx.revision.locator)) fail('producer observation key');
   const block = ledger.blocks[sourceHash], outcome = ledger.outcomes[tx.key];
-  if (!shape(block, ['reason', 'journal', 'incomingRevision']) || block.journal !== path.basename(resolutionFile) || block.incomingRevision !== tx.revision.id || typeof block.reason !== 'string' || block.reason !== capture.conflict || ledger.pending[sourceHash] || !equal(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail('held pointer/outcome');
+  if (!shape(block, ['reason', 'journal', 'incomingRevision'], ['outputHold']) || block.journal !== path.basename(resolutionFile) || block.incomingRevision !== tx.revision.id || typeof block.reason !== 'string' || block.reason !== capture.conflict || ledger.pending[sourceHash] || !equal(outcome, { status: 'held', reason: block.reason, locator: tx.revision.locator, sourceHash, pendingRevision: tx.revision.id })) fail('held pointer/outcome');
+  if (block.outputHold !== undefined) {
+    const witness = block.outputHold, target = resolutionLeaf.target;
+    const pending = `pending-${tx.revision.id}-${tx.resolution}.json`;
+    if (!witness || intake.isPublicationOutputHold(block) || !intake.validOutputHold(witness, pending, tx.previousHash) ||
+        witness.journal.dev !== target.dev || witness.journal.ino !== target.ino || witness.journal.digest !== target.sha256) fail('exact held resolution journal');
+  }
   const sourceLink = path.relative(path.join(intake.vault.root, 'Annotations'), note.file).split(path.sep).map(encodeURIComponent).join('/');
   const annotation = annotationParts(repair.annotation, capture.id, repair.annotationId, sourceLink);
   const descriptor = { format: 'kept-current-repair-v1', current: currentLeaf.target.file, snapshot: snapshotLeaf.target.file, originalConflict: originalLeaf.target.file, resolutionConflict: resolutionLeaf.target.file, repair: repairLeaf.target.file, admittedRevision: admitted.id, incomingRevision: tx.revision.id, incomingIdentity: tx.revision.identity, incomingFingerprint: tx.revision.fingerprint, annotationId: repair.annotationId, sourceGeneration: generation ?? null, admissionSha256: hash(JSON.stringify(known)), pointerSha256: hash(JSON.stringify(block)), conflictSha256: hash(capture.conflict), outcomeKey: tx.key, outcomeSha256: hash(JSON.stringify(outcome)) };

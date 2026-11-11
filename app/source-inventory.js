@@ -318,7 +318,7 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     if (kind === 'blocks' && pointer.outputHold !== undefined) {
       const held = pointer.outputHold, target = targets.get(journal);
       const pending = `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
-      if (!target || !intake.validOutputHold(held, pending) || held.journal.dev !== target.dev ||
+      if (!target || !intake.validOutputHold(held, pending, tx.previousHash) || held.journal.dev !== target.dev ||
           held.journal.ino !== target.ino || held.journal.digest !== target.sha256) fail();
     }
     recoveryPointers.push({ kind, journal, sha256: hash(JSON.stringify(pointer)), captureConflictSha256: capture.conflict === undefined ? null : hash(capture.conflict) });

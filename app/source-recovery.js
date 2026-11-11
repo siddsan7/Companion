@@ -72,6 +72,11 @@ async function globalRecovery(intake, ledger) {
   }
   const peers = Object.values(ledger.sourceAuthority || {}).filter(authority => authority.phase === 'restoring' && !authority.manual).map(authority => path.join(intake.dir, authority.restoration.journal));
   for (const item of [...Object.values(ledger.pending), ...Object.values(ledger.blocks)]) if (typeof item?.journal === 'string' && /^(?:pending|conflict)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.journal)) peers.push(path.join(intake.dir, item.journal));
+  const links = local.lstatSync(file, { bigint: true, throwIfNoEntry: false })?.nlink;
+  if (links === 3n || links === 2n && Object.values(ledger.blocks).some(item => item.outputHold?.pending)) {
+    const exact = intake.ordinaryRecoveryJournal(ledger);
+    if (exact?.links === Number(links)) return;
+  }
   const info = await intake.ownedFile(file, peers, 'Global intake recovery journal');
   if (info) intake.validateTransaction(JSON.parse(await fs.readFile(file, 'utf8')));
 }

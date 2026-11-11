@@ -6,7 +6,7 @@ const YAML = require('yaml');
 const { sourceMutation } = require('./source-mutation');
 const { assertPublication } = require('./source-authority');
 const {
-  ordinaryDirectories, readExact, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
+  ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
   verifyPeers, verifyPeersSync, removeStage, removeLinkedStage, validProof, settlePublishedLink
 } = require('./staged-publication');
 const { captureOwners, comparable, ownerWarning, parentOf, storeName } = require('./legacy-capture-ownership');
@@ -130,7 +130,7 @@ class Vault {
     }
     verifySettlement();
   }
-  async scan({ annotations = false } = {}) {
+  async scan({ annotations = false, excludedCapturePaths } = {}) {
     await this.writable();
     const notes = [];
     const visit = async dir => {
@@ -140,6 +140,7 @@ class Vault {
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
+          if (excludedCapturePaths?.has(comparableRelative(path.relative(this.vault, file)))) continue;
           await this.contained(file); const content = await fs.readFile(file, 'utf8'), note = annotations ? parseAnnotation(content) : parse(content);
           if (note) notes.push({ ...note, file });
           else if (!annotations && /^(?:companion_id|artifact_type):/m.test(content) && path.dirname(file) === path.join(this.root, 'Captures')) this.warnings.push('Invalid capture metadata in ' + entry.name + '. The file was preserved; repair its identity, type, schema, title and absolute captured_at timestamp.');
@@ -156,25 +157,112 @@ class Vault {
     return note.type !== 'reel_import' && typeof note.managedParent === 'string' &&
       comparable(note.managedParent) === comparable(parentOf(this.vault, this.root));
   }
+  reservedRestorationPaths(ledger) {
+    const heldRestorations = new Map(), paths = new Set(), slots = [];
+    const intake = new (require('./intake').Intake)(this);
+    const { requiredDirectories, removalParentGuard } = require('./source-recovery');
+    for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) {
+      if (authority.phase !== 'restoring' || authority.manual) continue;
+      const capture = ledger.captures[authority.sourceHash];
+      if (capture?.id !== id || !ledger.suppressed.includes(authority.sourceHash) ||
+          comparable(path.resolve(this.vault)) !== comparable(authority.root)) {
+        throw Error('The recorded restoration path or vault identity changed. Files were preserved.');
+      }
+      const file = intake.destination(capture), relative = comparableRelative(path.relative(this.vault, file));
+      if (!authority.targets.some(target => target.kind === 'capture' && comparableRelative(target.file) === relative) || paths.has(relative)) {
+        throw Error('The selected capture path disagrees with the recorded restoration target. Files were preserved.');
+      }
+      const recorded = new Set(authority.directories.map(item => comparableRelative(item.file)));
+      const required = requiredDirectories(intake, [{ file: path.relative(this.vault, file) }]);
+      if ([...required].some(parent => !recorded.has(comparableRelative(parent)))) {
+        throw Error('The recorded restoration folder scope is incomplete. Files were preserved.');
+      }
+      const guard = removalParentGuard(this, authority.directories);
+      slots.push({ id, file, guard, authority });
+      heldRestorations.set(id, file);
+      paths.add(relative);
+    }
+    const guard = () => { for (const slot of slots) slot.guard(); };
+    return { heldRestorations, paths, guard, slots };
+  }
+  reservedRestorationIdentities(ledger) {
+    const reservation = this.reservedRestorationPaths(ledger);
+    const captures = new Set(), annotations = new Set(), observations = [];
+    for (const { id, file, guard, authority } of reservation.slots) {
+      guard();
+      const stat = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+      if (!stat) {
+        verifyAbsentSync(file, guard);
+        observations.push(() => verifyAbsentSync(file, guard));
+        continue;
+      }
+      if (stat.nlink === 2n && !authority.restoration.published) {
+        observations.push(this.verifyActiveRestorationPair(id, file, guard, authority));
+        continue;
+      }
+      // Observe only identity claims. A reserved slot can never confer ownership.
+      const { bytes, proof } = readExactSync(file, guard), text = bytes.toString('utf8');
+      observations.push(() => verifyStageSync(file, guard, proof));
+      const capture = parse(text), annotation = parseAnnotation(text);
+      if (capture && capture.id !== id) captures.add(capture.id);
+      if (annotation) annotations.add(annotation.id);
+    }
+    const verify = () => {
+      reservation.guard();
+      for (const observe of observations) observe();
+    };
+    return { heldRestorations: reservation.heldRestorations, paths: reservation.paths, captures, annotations, verify };
+  }
+  verifyActiveRestorationPair(id, file, guard, authority) {
+    const intake = new (require('./intake').Intake)(this);
+    const { revision, journal, sha256, importedPublication } = authority.restoration;
+    const selected = path.join(intake.dir, journal), active = path.join(intake.dir, 'transaction.json');
+    const stage = path.join(intake.dir, revision + '.stage');
+    const { bytes, proof: journalProof } = readExactSync(selected, guard, 2, importedPublication?.journal);
+    const tx = JSON.parse(bytes);
+    intake.validateTransaction(tx);
+    if (journalProof.digest !== sha256 || tx.capture.id !== id || tx.revision.id !== revision ||
+        tx.sourceHash !== authority.sourceHash || tx.sourceGeneration !== authority.generation ||
+        tx.restoreOperation !== authority.operationId || comparable(intake.destination(tx.capture)) !== comparable(file)) {
+      throw Error('The active restoration pair disagrees with its recorded identity. Files were preserved.');
+    }
+    const { proof } = readExactSync(file, guard, 2, importedPublication?.capture);
+    if (proof.digest !== tx.capture.currentHash) throw Error('The active restoration capture changed. Files were preserved.');
+    const verify = () => {
+      verifyStageSync(selected, guard, journalProof, 2);
+      verifyStageSync(active, guard, journalProof, 2);
+      verifyStageSync(stage, guard, proof, 2);
+      verifyStageSync(file, guard, proof, 2);
+    };
+    verify();
+    return verify;
+  }
   async captureInventory({ ledger, guardLedger, id } = {}) {
-    const all = await this.scan();
-    const notes = id ? all.filter(note => note.id === id) : all;
     if (!ledger) {
       const intake = new (require('./intake').Intake)(this);
       ledger = await intake.load();
       guardLedger = () => intake.storage.guard();
     }
+    const reserved = this.reservedRestorationIdentities(ledger), { heldRestorations } = reserved;
+    const all = await this.scan({ excludedCapturePaths: reserved.paths });
+    reserved.verify();
+    const notes = all.filter(note => !heldRestorations.has(note.id) && (!id || note.id === id));
+    const unclaimed = notes.filter(note => !reserved.captures.has(note.id));
     const imported = new Set(Object.values(ledger.captures).map(capture => capture.id));
     const excluded = new Set(notes.filter(note => {
       const relative = comparableRelative(path.relative(this.vault, note.file));
       return ledger.identityChoices?.[note.id]?.copies.some(copy => typeof copy.file === 'string' && comparableRelative(copy.file) === relative);
     }));
-    const { owned: legacy, held } = await captureOwners(this, notes, imported, excluded, ledger.sourceAuthority, guardLedger);
+    const { owned: legacy, held } = await captureOwners(this, unclaimed, imported, excluded, ledger.sourceAuthority, async () => {
+      await guardLedger();
+      reserved.verify();
+    });
+    reserved.verify();
     if (!id) this.warnings = this.warnings.filter(warning => warning !== ownerWarning);
     if (held && !this.warnings.includes(ownerWarning)) this.warnings.push(ownerWarning);
-    const repairable = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
+    const repairable = new Set(unclaimed.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
     const owned = new Set([...repairable].filter(note => !excluded.has(note)));
-    return { notes, owned, repairable, excluded };
+    return { notes, owned, repairable, excluded, heldRestorations, reserved };
   }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();

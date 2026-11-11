@@ -529,21 +529,52 @@ function recordRestorationAdmission(ledger, tx, proof) {
   }
   return { ...ledger.sourceAuthority, [id]: { ...authority, restoration: { ...item, importedPublication: proof } } };
 }
+function importedRestorationLeaf(id, authority, message, verify) {
+  try { return verify(); }
+  catch (error) {
+    if (error.code !== 'STAGING_CHANGED') throw error;
+    throw Object.assign(Error(message, { cause: error }), {
+      code: 'SOURCE_OPERATION_HELD', family: 'imported-restoration', captureId: id,
+      operationId: authority.operationId, generation: authority.generation, phase: authority.phase
+    });
+  }
+}
+function isImportedRestorationHold(error, id, authority) {
+  if (!authority || authority.manual || error.code !== 'SOURCE_OPERATION_HELD' ||
+      error.family !== 'imported-restoration' || error.captureId !== id ||
+      error.operationId !== authority.operationId || error.generation !== authority.generation || error.phase !== authority.phase) return false;
+  return authority.phase === 'restoring' && !!authority.restoration.published && !!authority.restoration.importedPublication ||
+    authority.phase === 'active' && !!authority.restorationCleanup;
+}
+function verifyImportedRestorationHold(intake, authority) {
+  const guard = removalParentGuard(intake.vault, authority.directories);
+  intake.storage.guardSync();
+  verifyAbsentSync(path.join(intake.dir, 'transaction.json'), guard, () =>
+    Error('A shared intake journal needs recovery before this source can be held independently.'));
+  if (authority.phase === 'restoring') {
+    verifyStageSync(path.join(intake.dir, authority.restoration.journal), guard, authority.restoration.importedPublication.journal);
+    verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.stage'), guard);
+    verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.snapshot.stage'), guard);
+  }
+}
 async function finishRestorationCleanup(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], proof = authority.restorationCleanup;
   if (authority.phase !== 'active' || !proof) return;
   await guardRestorationParents(intake, authority);
   const file = path.join(intake.dir, `restoration-${authority.operationId}.json`);
   const guard = removalParentGuard(intake.vault, authority.directories);
+  const verifyJournal = verify => importedRestorationLeaf(id, authority,
+    'The selected cleanup journal changed. It was preserved and restoration remains active.', verify);
   intake.storage.guardSync();
   guard();
   if (native.lstatSync(file, { throwIfNoEntry: false })) {
-    verifyStageSync(file, guard, proof);
+    verifyJournal(() => verifyStageSync(file, guard, proof));
     native.unlinkSync(file);
   }
   const active = { ...authority };
   delete active.restorationCleanup;
-  await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: active } }, () => verifyAbsentSync(file, guard));
+  await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: active } },
+    () => verifyJournal(() => verifyAbsentSync(file, guard)));
   ledger.sourceAuthority[id] = active;
 }
 function manualFiles(intake, authority) {
@@ -753,14 +784,31 @@ async function verifyRestorationPublication(intake, ledger, id) {
     if (info && (published || info.nlink !== 2n || hash(await fs.readFile(file)) !== exact.digest)) throw changed();
     pairs.push({ file, peer, proof: exact, linked: !!info });
   }
+  const verifyPair = pair => {
+    verifyStageSync(pair.peer, guard, pair.proof, pair.linked ? 2 : 1);
+    if (pair.linked) verifyStageSync(pair.file, guard, pair.proof, 2);
+    else verifyAbsentSync(pair.file, guard, changed);
+  };
   const verify = () => {
-    for (const pair of pairs) {
-      verifyStageSync(pair.peer, guard, pair.proof, pair.linked ? 2 : 1);
-      if (pair.linked) verifyStageSync(pair.file, guard, pair.proof, 2);
-      else verifyAbsentSync(pair.file, guard, changed);
+    const current = ledger.sourceAuthority[id];
+    if (!current.restoration.published) {
+      for (const pair of pairs) verifyPair(pair);
+      return;
+    }
+    // The private output failure is local only after the selected journal and
+    // the absence of all private stages and the shared alias have been proved.
+    verifyPair(pairs[2]);
+    for (const pair of pairs.slice(0, 2)) verifyAbsentSync(pair.file, guard, changed);
+    for (const pair of pairs.slice(0, 2)) {
+      importedRestorationLeaf(id, current,
+        'A published restoration output changed. It was preserved and suppression remains.',
+        () => verifyStageSync(pair.peer, guard, pair.proof));
     }
   };
   verify();
   return { pairs, verify };
 }
-module.exports = { CaptureDeletion, finishDeletion, finishRestoration, finishRestorationCleanup, recordRestorationAdmission, guardRestorationParents, installCaptureDeletion, inspectManualPeers };
+module.exports = {
+  CaptureDeletion, finishDeletion, finishRestoration, finishRestorationCleanup, recordRestorationAdmission,
+  isImportedRestorationHold, verifyImportedRestorationHold, guardRestorationParents, installCaptureDeletion, inspectManualPeers
+};
