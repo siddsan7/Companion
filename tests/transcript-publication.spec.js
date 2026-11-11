@@ -203,3 +203,67 @@ test('source deletion preserves legacy pending transcript writing proved by its 
   expect(await read(destination)).toBe(preview.text);
   expect(await read(receipt)).toBe(receiptBytes);
 });
+
+for (const change of ['equal-byte replacement', 'unchanged target']) {
+  test(`transcript removal rechecks the selected target after its final guarded read: ${change}`, async ({}, testInfo) => {
+    let armed = false, unlinks = 0;
+    const { store, preview, vault, directory, destination } = await transcriptFixture(testInfo, async boundary => {
+      if (boundary === 'transcript-remove-after-tombstone') armed = true;
+      if (boundary === 'transcript-remove-after-unlink') unlinks++;
+    });
+    await store.confirm(preview.token);
+    const name = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
+    const target = path.join(directory, name), bytes = await fs.readFile(target);
+    const { operation, id } = JSON.parse(bytes.toString('utf8'));
+    const receipt = path.join(directory, `${operation}.published.json`), receiptBytes = await read(receipt);
+    const marker = path.join(directory, `${id}.removed.json`);
+    const retained = path.join(vault.vault, 'Retained original transcript intent.json');
+    const original = await fs.lstat(target, { bigint: true });
+    const output = await fs.lstat(destination, { bigint: true });
+    const review = await store.removal.preview(operation);
+    expect(review.files[0]).toBe(target);
+    expect(await absent(marker)).toBe('ENOENT');
+
+    const open = fs.open;
+    let reads = 0, markerBytes, replacement;
+    fs.open = async (file, ...args) => {
+      const handle = await open(file, ...args);
+      if (!armed || file !== target || args[0] !== 'r' || ++reads !== 3) return handle;
+      // The third read is the final target check after both remaining-scope reads.
+      const close = handle.close.bind(handle);
+      handle.close = async () => {
+        await close();
+        markerBytes = await read(marker);
+        if (change === 'unchanged target') return;
+        await fs.rename(target, retained);
+        await fs.writeFile(target, bytes, { flag: 'wx' });
+        replacement = await fs.lstat(target, { bigint: true });
+        expect(identity(replacement)).not.toEqual(identity(original));
+      };
+      return handle;
+    };
+    let outcome;
+    try {
+      outcome = await store.removal.confirm(review.token).then(result => ({ result }), error => ({ error: error.message }));
+    } finally { fs.open = open; }
+    expect(markerBytes, 'the real final guarded target handle was closed').toBeTruthy();
+    expect(await read(marker)).toBe(markerBytes);
+    expect(JSON.parse(markerBytes)).toMatchObject({ id, exportOperation: operation });
+    if (change === 'unchanged target') {
+      expect(outcome).toEqual({ result: { id, destination, completed: true } });
+      expect(unlinks).toBe(review.files.length);
+      for (const file of review.files) expect(await absent(file)).toBe('ENOENT');
+    } else {
+      expect(replacement, 'the original and replacement are distinct files').toBeDefined();
+      expect.soft(outcome).toMatchObject({ error: expect.stringMatching(/identity|changed|scope|preserve/i) });
+      expect.soft(unlinks).toBe(0);
+      expect.soft(await fs.readFile(target).catch(error => error.code)).toEqual(bytes);
+      expect.soft(identity(await fs.lstat(target, { bigint: true }).catch(error => error.code))).toEqual(identity(replacement));
+      expect.soft(await read(receipt).catch(error => error.code)).toBe(receiptBytes);
+      expect.soft(await read(destination).catch(error => error.code)).toBe(preview.text);
+      expect.soft(identity(await fs.lstat(destination, { bigint: true }).catch(error => error.code))).toEqual(identity(output));
+      expect(await fs.readFile(retained)).toEqual(bytes);
+      expect(identity(await fs.lstat(retained, { bigint: true }))).toEqual(identity(original));
+    }
+  });
+}
