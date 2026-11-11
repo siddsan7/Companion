@@ -38,6 +38,11 @@ window.intakeView = {
     // A transient busy/error response must not erase the last successful same-vault view.
     section.replaceChildren();
     for (const item of repairs) {
+      if (item.kind === 'restoration-collision') {
+        const article = document.createElement('article'), reason = document.createElement('p');
+        reason.textContent = `Identity held for ${item.id}. ${item.reason}`;
+        article.append(reason); section.append(article); continue;
+      }
       if (item.kind === 'intake-output-hold') {
         const article = document.createElement('article'), reason = document.createElement('p');
         reason.textContent = `${item.title || item.id} · Publication held. ${item.reason}`;

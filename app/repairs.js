@@ -17,6 +17,7 @@ async function annotationAuthority(intake) {
 }
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
+const reservedIdentityReason = 'A preserved file at a held restoration path claims this identity. Review the preserved file and refresh before editing or choosing a copy.';
 function admittedOutputHold(intake, ledger, sourceHash) {
   const block = ledger.blocks[sourceHash];
   if (!intake.isCommittedOutputHold(block)) return false;
@@ -33,11 +34,16 @@ function sourceLink(content, relative) {
 function install(Intake, { hash, read, noteText }) {
   Intake.prototype.syncMoves = async function () {
     const annotations = await this.annotations(), ledger = await this.load();
-    const { notes, owned, repairable, excluded, heldRestorations } = await this.vault.captureInventory({ ledger, guardLedger: () => this.storage.guard() });
+    const { notes, owned, repairable, excluded, heldRestorations, reserved } = await this.vault.captureInventory({ ledger, guardLedger: () => this.storage.guard() });
     ledger.identityIssues = {}; ledger.identityChoices ||= {}; this.vault.identityPaths = new Map();
     const groups = new Map(); for (const note of notes) { if (!groups.has(note.id)) groups.set(note.id, []); groups.get(note.id).push(note); }
     const importedIds = new Set(Object.values(ledger.captures).map(capture => capture.id));
+    for (const id of reserved.captures) if (importedIds.has(id) || groups.has(id)) {
+      ledger.identityIssues[id] = { kind: 'restoration-collision', id, reason: reservedIdentityReason };
+      this.vault.identityPaths.set(id, null);
+    }
     for (const [id, matches] of groups) {
+      if (reserved.captures.has(id)) continue;
       if (!importedIds.has(id) && !matches.some(note => repairable.has(note))) continue;
       const choice = ledger.identityChoices[id];
       if (matches.length === 1 && !excluded.has(matches[0])) continue;
@@ -48,7 +54,11 @@ function install(Intake, { hash, read, noteText }) {
     }
     const annotationGroups = new Map(), annotationPaths = new Set();
     for (const annotation of annotations) { if (!annotationGroups.has(annotation.id)) annotationGroups.set(annotation.id, []); annotationGroups.get(annotation.id).push(annotation); }
+    for (const id of reserved.annotations) {
+      ledger.identityIssues['annotation:' + id] = { kind: 'restoration-collision', id, reason: reservedIdentityReason };
+    }
     for (const [annotationId, matches] of annotationGroups) {
+      if (reserved.annotations.has(annotationId)) continue;
       // Annotation choices never confer authority over a capture with the same UUID.
       const id = 'annotation:' + annotationId;
       const choice = ledger.identityChoices[id];
@@ -73,6 +83,7 @@ function install(Intake, { hash, read, noteText }) {
       if (matches.length !== 1) continue;
       const note = matches[0];
       capture.relative = path.relative(this.vault.vault, note.file);
+      reserved.verify();
       await this.detachRestoredBackup(note, sourceHash, capture, ledger);
       await this.ownedFile(note.file, [], 'Moved capture');
       for (const annotation of annotations.filter(item => item.captureId === capture.id)) {
@@ -80,12 +91,13 @@ function install(Intake, { hash, read, noteText }) {
         const relative = path.relative(path.dirname(annotation.file), note.file), content = sourceLink(annotation.content, relative);
         if (content === annotation.content) continue;
         const id = randomUUID();
+        reserved.verify();
         await this.publishJournal(path.join(this.dir, 'link-intent.json'), { schema: 1, id, file: path.relative(this.vault.vault, annotation.file), before: annotation.content, content, relative });
         await this.vault.checkpoint('link-intent-published');
         await this.finishLink(ledger);
       }
     }
-    await this.save(ledger);
+    await this.save(ledger, reserved.verify);
   };
   Intake.prototype.restoreMissing = async function ({ id, token }, now) {
     return this.locked(async () => {
@@ -120,7 +132,7 @@ function install(Intake, { hash, read, noteText }) {
   Intake.prototype.chooseIdentity = async function ({ id, file, token }) {
     return this.locked(async () => {
       await this.syncMoves(); const ledger = await this.load(), issue = ledger.identityIssues[id];
-      if (!issue || issue.token !== token || !issue.files.some(item => item.file === file)) throw Error('Identity copies changed. Refresh and inspect all copies before choosing.');
+      if (issue?.kind !== 'duplicate' || issue.token !== token || !issue.files.some(item => item.file === file)) throw Error('Identity copies changed. Refresh and inspect all copies before choosing.');
       const selected = this.destination({ relative: file }); await this.ownedFile(selected, [], 'Selected identity file');
       if (!id.startsWith('annotation:') && !Object.values(ledger.captures).some(capture => capture.id === id)) {
         const { repairable } = await this.vault.captureInventory({ ledger, id, guardLedger: () => this.storage.guard() });
@@ -223,10 +235,13 @@ function install(Intake, { hash, read, noteText }) {
   Intake.prototype.annotations = async function (captureId) {
     // Keep this read's authority separate from an outer writer's CAS baseline.
     const reader = new Intake(this.vault), ledger = await reader.load(), observed = reader.storage.expected;
-    const excludedCapturePaths = new Set(this.vault.restoringImportedCaptures(ledger).values());
-    const notes = (await this.vault.scan({ annotations: true, excludedCapturePaths })).filter(note => (!captureId || note.captureId === captureId) && !annotationRemoved(ledger, note.id));
+    const reserved = this.vault.reservedRestorationIdentities(ledger);
+    const notes = (await this.vault.scan({ annotations: true, excludedCapturePaths: reserved.paths }))
+      .filter(note => !reserved.annotations.has(note.id) && (!captureId || note.captureId === captureId) && !annotationRemoved(ledger, note.id));
+    reserved.verify();
     for (const note of notes) await this.ownedFile(note.file, [], 'Annotation');
     if (!reader.storage.matches(await reader.storage.view(), observed)) throw Error('Intake ledger changed during the annotation read. Retry context discovery against the current authority.');
+    reserved.verify();
     return notes;
   };
   const inspect = Intake.prototype.inspect;

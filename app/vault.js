@@ -6,7 +6,7 @@ const YAML = require('yaml');
 const { sourceMutation } = require('./source-mutation');
 const { assertPublication } = require('./source-authority');
 const {
-  ordinaryDirectories, readExact, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
+  ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyAbsentSync,
   verifyPeers, verifyPeersSync, removeStage, removeLinkedStage, validProof, settlePublishedLink
 } = require('./staged-publication');
 const { captureOwners, comparable, ownerWarning, parentOf, storeName } = require('./legacy-capture-ownership');
@@ -164,10 +164,37 @@ class Vault {
           !authority.restoration.importedPublication || !ledger.suppressed.includes(authority.sourceHash)) continue;
       const capture = ledger.captures[authority.sourceHash];
       if (capture?.id === id && capture.currentRevision === authority.restoration.revision) {
-        held.set(id, comparableRelative(path.relative(this.vault, intake.destination(capture))));
+        held.set(id, intake.destination(capture));
       }
     }
     return held;
+  }
+  reservedRestorationIdentities(ledger) {
+    const heldRestorations = this.restoringImportedCaptures(ledger);
+    const paths = new Set([...heldRestorations.values()].map(file => comparableRelative(path.relative(this.vault, file))));
+    const captures = new Set(), annotations = new Set(), observations = [];
+    for (const [id, file] of heldRestorations) {
+      const { guard } = this.publicationFolders(path.dirname(file));
+      guard();
+      if (!local.lstatSync(file, { throwIfNoEntry: false })) {
+        verifyAbsentSync(file, guard);
+        observations.push({ file, guard });
+        continue;
+      }
+      // Observe only identity claims. A reserved slot can never confer ownership.
+      const { bytes, proof } = readExactSync(file, guard), text = bytes.toString('utf8');
+      observations.push({ file, guard, proof });
+      const capture = parse(text), annotation = parseAnnotation(text);
+      if (capture && capture.id !== id) captures.add(capture.id);
+      if (annotation) annotations.add(annotation.id);
+    }
+    const verify = () => {
+      for (const { file, guard, proof } of observations) {
+        if (proof) verifyStageSync(file, guard, proof);
+        else verifyAbsentSync(file, guard);
+      }
+    };
+    return { heldRestorations, paths, captures, annotations, verify };
   }
   async captureInventory({ ledger, guardLedger, id } = {}) {
     if (!ledger) {
@@ -175,20 +202,26 @@ class Vault {
       ledger = await intake.load();
       guardLedger = () => intake.storage.guard();
     }
-    const heldRestorations = this.restoringImportedCaptures(ledger);
-    const all = await this.scan({ excludedCapturePaths: new Set(heldRestorations.values()) });
+    const reserved = this.reservedRestorationIdentities(ledger), { heldRestorations } = reserved;
+    const all = await this.scan({ excludedCapturePaths: reserved.paths });
+    reserved.verify();
     const notes = all.filter(note => !heldRestorations.has(note.id) && (!id || note.id === id));
+    const unclaimed = notes.filter(note => !reserved.captures.has(note.id));
     const imported = new Set(Object.values(ledger.captures).map(capture => capture.id));
     const excluded = new Set(notes.filter(note => {
       const relative = comparableRelative(path.relative(this.vault, note.file));
       return ledger.identityChoices?.[note.id]?.copies.some(copy => typeof copy.file === 'string' && comparableRelative(copy.file) === relative);
     }));
-    const { owned: legacy, held } = await captureOwners(this, notes, imported, excluded, ledger.sourceAuthority, guardLedger);
+    const { owned: legacy, held } = await captureOwners(this, unclaimed, imported, excluded, ledger.sourceAuthority, async () => {
+      await guardLedger();
+      reserved.verify();
+    });
+    reserved.verify();
     if (!id) this.warnings = this.warnings.filter(warning => warning !== ownerWarning);
     if (held && !this.warnings.includes(ownerWarning)) this.warnings.push(ownerWarning);
-    const repairable = new Set(notes.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
+    const repairable = new Set(unclaimed.filter(note => imported.has(note.id) || note.type === 'reel_import' || this.matchesManualParent(note) || legacy.has(note)));
     const owned = new Set([...repairable].filter(note => !excluded.has(note)));
-    return { notes, owned, repairable, excluded, heldRestorations };
+    return { notes, owned, repairable, excluded, heldRestorations, reserved };
   }
   async publication(id, transaction = {}) {
     const intake = new (require('./intake').Intake)(this), ledger = await intake.load();

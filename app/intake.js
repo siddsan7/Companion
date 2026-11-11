@@ -10,7 +10,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -461,6 +461,12 @@ class Intake {
     if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed before publication. Refresh before retrying; changed authority was preserved.');
     assertPublication(ledger, tx.capture.id, tx);
     if (ledger.sourceAuthority?.[tx.capture.id]?.phase === 'restoring') await require('./capture-deletion').guardRestorationParents(this, ledger.sourceAuthority[tx.capture.id]);
+    this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
+  }
+  verifyReservedCaptureIdentity(ledger, id) {
+    if (this.vault.reservedRestorationIdentities(ledger).captures.has(id)) {
+      throw Error('A preserved file at a held restoration path claims this capture identity. Both files were preserved.');
+    }
   }
   async finish(tx, ledger) {
     this.validateTransaction(tx);
@@ -592,6 +598,7 @@ class Intake {
     cleanup.push({ file: journal, info: journalInfo, content: journalBytes, label: 'Intake transaction', peers: journalPeers });
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
     const verifyPublished = () => {
+      this.verifyReservedCaptureIdentity(ledger, tx.capture.id);
       try {
         for (const item of [...outputs, ...cleanup]) verify(item);
       } catch (cause) {
@@ -783,26 +790,82 @@ class Intake {
     await pendingParents(this, controlled);
     const { finishDeletion, finishRestoration, finishRestorationCleanup, isImportedRestorationHold, verifyImportedRestorationHold } = require('./capture-deletion');
     this.vault.warnings = this.vault.warnings.filter(warning => !warning.startsWith('Source restoration held:'));
-    const recoverRestoration = async (id, work) => {
-      try { await work(this, controlled, id); }
+    const recoverRestoration = async (ledger, id, work) => {
+      try { await work(this, ledger, id); }
       catch (error) {
-        const authority = controlled.sourceAuthority[id], imported = isImportedRestorationHold(error, id, authority);
+        const authority = ledger.sourceAuthority[id], imported = isImportedRestorationHold(error, id, authority);
         if (!imported && !isManualHold(error, id, authority)) throw error;
-        await pendingParents(this, controlled);
+        await pendingParents(this, ledger);
         if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed during source recovery. Refresh before retrying.');
         if (imported) verifyImportedRestorationHold(this, authority);
         this.vault.warnings.push(`Source restoration held: ${id}. ${error.message}`);
       }
     };
+    const delayed = [];
+    let ordinaryJournal;
+    const finishLaterPhase = async (id, work) => {
+      const candidate = this.independentRecoveryJournal(controlled, id);
+      if (!candidate) return recoverRestoration(controlled, id, work);
+      if (ordinaryJournal && (!sameProofIdentity(candidate, ordinaryJournal) || candidate.digest !== ordinaryJournal.digest)) {
+        throw Error('The independent intake journal changed. Recovery files were preserved.');
+      }
+      ordinaryJournal = candidate;
+      delayed.push({ id, work });
+    };
     for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
-      if (authority.restorationCleanup) await recoverRestoration(id, finishRestorationCleanup);
+      if (authority.restorationCleanup) await finishLaterPhase(id, finishRestorationCleanup);
     }
     for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
       if (authority.phase === 'deleting') await finishDeletion(this, controlled, id);
     }
     for (const [id, authority] of Object.entries(controlled.sourceAuthority || {})) {
-      if (authority.phase === 'restoring') await recoverRestoration(id, finishRestoration);
+      if (authority.phase !== 'restoring') continue;
+      if (!authority.manual && authority.restoration.published && authority.restoration.importedPublication) {
+        await finishLaterPhase(id, finishRestoration);
+      } else await recoverRestoration(controlled, id, finishRestoration);
     }
+    await this.recoverOrdinaryIntake(controlled, ordinaryJournal);
+    if (delayed.length) {
+      const ledger = await this.load();
+      await pendingParents(this, ledger);
+      this.storage.guardSync();
+      verifyAbsentSync(path.join(this.dir, 'transaction.json'), this.vault.publicationFolders(this.dir).guard);
+      this.verifyIndependentRecoveryDisposition(ledger, ordinaryJournal);
+      for (const { id, work } of delayed) await recoverRestoration(ledger, id, work);
+    }
+  }
+  independentRecoveryJournal(ledger, id) {
+    const journal = path.join(this.dir, 'transaction.json'), authority = ledger.sourceAuthority[id];
+    const guard = this.vault.publicationFolders(this.dir).guard;
+    this.storage.guardSync();
+    guard();
+    const info = local.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
+    if (!info) { verifyAbsentSync(journal, guard); return null; }
+    if (info.nlink !== 1n || Object.values(ledger.sourceAuthority).some(value =>
+      value.phase === 'deleting' && value.recovery?.some(item => item.format === 'transaction' &&
+        path.join(this.vault.vault, item.file) === journal))) return null;
+    const { bytes, proof } = readExactSync(journal, guard);
+    const tx = JSON.parse(bytes);
+    this.validateTransaction(tx);
+    if (tx.restoreOperation || ledger.pending[tx.sourceHash] || ledger.blocks[tx.sourceHash] ||
+        tx.sourceHash === authority.sourceHash || tx.capture.id === id) return null;
+    assertPublication(ledger, tx.capture.id, tx);
+    if (this.vault.reservedRestorationIdentities(ledger).captures.has(tx.capture.id)) return null;
+    if (!bytes.equals(Buffer.from(JSON.stringify(tx)))) throw Error('The independent intake journal is not canonical. Recovery files were preserved.');
+    return { ...proof, tx };
+  }
+  verifyIndependentRecoveryDisposition(ledger, journal) {
+    const { tx } = journal, outcome = ledger.outcomes[tx.key];
+    if (outcome?.status === 'imported' && outcome.sourceHash === tx.sourceHash &&
+        outcome.captureId === tx.capture.id && outcome.revision === tx.revision.id) return;
+    const held = ledger.blocks[tx.sourceHash], pending = ledger.pending[tx.sourceHash];
+    if (held?.journal === heldName(tx) && held.incomingRevision === tx.revision.id ||
+        pending?.journal === pendingName(tx) && pending.key === tx.key) return;
+    throw Error('The independent intake journal has no settled disposition. Restoration recovery files were preserved.');
+  }
+  async recoverOrdinaryIntake(controlled, expectedJournal) {
+    const journal = path.join(this.dir, 'transaction.json');
+    if (expectedJournal) verifyStageSync(journal, this.vault.publicationFolders(this.dir).guard, expectedJournal);
     await this.finishLink();
     await this.finishAnnotation();
     try { await this.finishRepair(); }
@@ -814,10 +877,17 @@ class Intake {
       if (acknowledgements.length > 1) throw Error('Accepted deferred intake authority is ambiguous. All files were preserved.');
       if (acknowledgements.length) await this.acknowledgeDeferred(accepted, acknowledgements[0][0]);
     }
-    const text = await read(path.join(this.dir, 'transaction.json')); if (text === null) return;
+    const text = expectedJournal && local.lstatSync(journal, { throwIfNoEntry: false })
+      ? verifyStageSync(journal, this.vault.publicationFolders(this.dir).guard, expectedJournal).bytes.toString('utf8')
+      : await read(journal);
+    if (text === null) {
+      if (expectedJournal) this.verifyIndependentRecoveryDisposition(await this.load(), expectedJournal);
+      return;
+    }
     let tx; try { tx = JSON.parse(text); } catch { throw Error('Unreadable intake recovery journal. Preserve .intake for repair before retrying.'); }
     this.validateTransaction(tx);
     const ledger = await this.load();
+    if (expectedJournal) verifyStageSync(journal, this.vault.publicationFolders(this.dir).guard, expectedJournal);
     assertPublication(ledger, tx.capture.id, tx);
     if (this.hasOutputHold(ledger, tx)) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
     if (tx.externalConflict && !ledger.blocks[tx.sourceHash]) return this.archiveConflict(tx, ledger, 'Destination changed outside Companion. Both versions were preserved.');
@@ -1063,6 +1133,7 @@ class Intake {
   async inspect(id) {
     const ledger = await this.info(), capture = Object.values(ledger.captures).find(x => x.id === id);
     if (!capture) throw Error('Imported capture is missing from intake history.');
+    this.verifyReservedCaptureIdentity(ledger, id);
     const revisions = [];
     for (const revision of capture.revisions) {
       if (!/^[a-f0-9-]{36}$/.test(revision)) throw Error('Invalid revision identity.');
