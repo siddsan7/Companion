@@ -579,6 +579,69 @@ test('restart retires exact deferred aliases after an interrupted external edit 
   expect(await identity(selected)).toEqual(selectedIdentity);
 });
 
+for (const replaceBackup of [false, true]) {
+  test(`deferred capture stage loss ${replaceBackup ? 'does not adopt an unproved backup' : 'restores the exact previous capture for ordinary repair'}`, async ({}, testInfo) => {
+    const context = await fixtureForLaterClaim(testInfo);
+    const { vault, intake, producer, sourceHash, id, before, authority, bHash, cHash, reserved, existing,
+      existingBytes, existingIdentity, selected, selectedBytes, selectedIdentity, shared } = context;
+    const reservedBytes = await fs.readFile(reserved), reservedIdentity = await identity(reserved);
+    const deferring = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async name => {
+      if (name === 'intake-before-move') throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+    } }));
+    const deferred = await deferring.reconcile({ now: later });
+    const pending = path.join(intake.dir, deferred.pending[bHash].journal), raw = await fs.readFile(pending), tx = JSON.parse(raw);
+    const journalIdentity = await identity(pending), backup = path.join(intake.dir, tx.backup);
+    const stage = path.join(intake.dir, tx.revision.id + '.stage'), displacedStage = testInfo.outputPath('original-incoming-stage.md');
+    const displacedBackup = testInfo.outputPath('original-prior-capture.md');
+    expect(tx.sourceHash).toBe(bHash);
+    await writeDraft(producer, 'new-independent', '4', 'd');
+    let fault;
+    const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async name => {
+      if (name !== 'intake-capture-staged' || fault || (await readJson(shared)).sourceHash !== bHash) return;
+      expect(await readOptional(existing)).toBeNull();
+      expect(await fs.readFile(backup)).toEqual(existingBytes);
+      expect(await identity(backup)).toEqual(existingIdentity);
+      await fs.rename(stage, displacedStage);
+      if (replaceBackup) {
+        await fs.rename(backup, displacedBackup);
+        await fs.writeFile(backup, existingBytes, { flag: 'wx' });
+      }
+      fault = { backupIdentity: await identity(backup), stageIdentity: await identity(displacedStage) };
+    } }));
+    const result = await restarted.reconcile({ now: later });
+    expect(fault, 'the old capture had already moved when the exact new stage disappeared').toBeDefined();
+    expect(result.captures[cHash]).toBeDefined();
+    expect(result.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+    expect(result.attempts[tx.revision.identity]).toBeUndefined();
+    expect(result.sourceAuthority[id]).toEqual(authority);
+    expect(result.suppressed).toContain(sourceHash);
+    expect(await fs.readFile(reserved)).toEqual(reservedBytes);
+    expect(await identity(reserved)).toEqual(reservedIdentity);
+    expect(await fs.readFile(selected)).toEqual(selectedBytes);
+    expect(await identity(selected)).toEqual(selectedIdentity);
+    expect(await readOptional(shared)).toBeNull();
+    expect(await readOptional(pending)).toBeNull();
+    const block = result.blocks[bHash], held = path.join(intake.dir, block.journal);
+    expect(await fs.readFile(held)).toEqual(raw);
+    expect(await identity(held)).toEqual(journalIdentity);
+    expect(await fs.readFile(displacedStage, 'utf8')).toBe(tx.content);
+    expect(await identity(displacedStage)).toEqual(fault.stageIdentity);
+    if (replaceBackup) {
+      expect(fault.backupIdentity).not.toEqual(existingIdentity);
+      expect(await readOptional(existing)).toBeNull();
+      expect(await fs.readFile(backup)).toEqual(existingBytes);
+      expect(await identity(backup)).toEqual(fault.backupIdentity);
+      expect(await identity(displacedBackup)).toEqual(existingIdentity);
+    } else {
+      expect.soft(await readOptional(existing)).toEqual(existingBytes);
+      if (await readOptional(existing)) expect.soft(await identity(existing)).toEqual(existingIdentity);
+      const ordinary = (await restarted.repairs()).find(item => item.sourceHash === bHash);
+      expect.soft(ordinary).toMatchObject({ id: before.captures[bHash].id, local: existingBytes.toString('utf8'), incoming: tx.revision.text });
+      expect(await fs.readFile(backup)).toEqual(existingBytes);
+    }
+  });
+}
+
 for (const phase of ['staged ledger', 'committed ledger']) {
   test(`a reserved restoration claim at the ${phase} respects the intake commit boundary`, async ({}, testInfo) => {
     const context = await fixtureForLaterClaim(testInfo);
