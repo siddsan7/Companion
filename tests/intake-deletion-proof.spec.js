@@ -452,6 +452,62 @@ test('accepted deferred bookkeeping resumes after exact journal retirement and a
   expect(await readOptional(destination)).toBe(foreign);
 });
 
+test('precommit reviewed selection hold remains actionable for an already-admitted revision', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer');
+  let selecting = false, replaced;
+  const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (boundary !== 'intake-published' || !selecting || replaced) return;
+    const raw = await fs.readFile(path.join(intake.dir, 'transaction.json'), 'utf8'), tx = JSON.parse(raw);
+    const file = intake.destination(tx.capture), stage = path.join(intake.dir, tx.revision.id + '.stage');
+    const proof = await fs.lstat(stage, { bigint: true });
+    expect(await fs.readFile(file, 'utf8')).toBe(tx.content);
+    expect(proof.nlink).toBe(2n);
+    const localWriting = tx.previous + '\nIndependent local writing during the selection.\n';
+    await fs.unlink(file);
+    await fs.writeFile(file, localWriting, { flag: 'wx' });
+    replaced = { tx, raw, file, stage, localWriting, proof };
+  });
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  const first = await intake.connect(producer, true, now, 'review');
+  expect(first.lastCheck.status).toBe('complete');
+  const [sourceHash, capture] = Object.entries(first.captures)[0];
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(producer, 'edit'), { recursive: true });
+  const choices = await intake.reconcile({ now: later });
+  const candidate = Object.values(choices.attempts).find(item => item.revision !== capture.currentRevision);
+  expect(candidate).toMatchObject({ status: 'imported', sourceHash, captureId: capture.id });
+  expect(choices.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  selecting = true;
+  const selectedAt = '2026-11-10T06:59:00.000Z';
+  await expect(intake.selectCurrent(capture.id, candidate.revision, selectedAt)).rejects.toThrow(/published intake output/i);
+  expect(replaced?.tx.revision.id).toBe(candidate.revision);
+  const { tx, raw, file, stage, localWriting, proof } = replaced;
+  const durable = await readJson(ledgerFile), hold = durable.blocks[sourceHash];
+  expect(durable.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect(durable.captures[sourceHash].selectionHistory).toEqual(choices.captures[sourceHash].selectionHistory);
+  expect(durable.attempts).toEqual(choices.attempts);
+  expect(await fs.readFile(path.join(intake.dir, hold.journal), 'utf8')).toBe(raw);
+  const staged = await fs.lstat(stage, { bigint: true });
+  expect([staged.dev, staged.ino, staged.nlink]).toEqual([proof.dev, proof.ino, 1n]);
+  expect(await fs.readFile(stage, 'utf8')).toBe(tx.content);
+  expect(await fs.readFile(file, 'utf8')).toBe(localWriting);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const repairs = await restarted.repairs();
+  expect(repairs.find(item => item.sourceHash === sourceHash)).toMatchObject({
+    id: capture.id, local: localWriting, incoming: tx.revision.text, incomingRevision: candidate.revision
+  });
+  const annotation = 'Preserve the independent writing from before selection.';
+  await restarted.resolveConflict({ sourceHash, text: annotation, localHash: hash(localWriting) }, selectedAt);
+  const resolved = await readJson(ledgerFile);
+  expect(resolved.blocks[sourceHash]).toBeUndefined();
+  expect(resolved.captures[sourceHash].currentRevision).toBe(candidate.revision);
+  expect(resolved.attempts).toEqual(choices.attempts);
+  expect(await fs.readFile(file, 'utf8')).toBe(tx.content);
+  const annotations = path.join(vault.root, 'Annotations');
+  const [annotationFile] = await fs.readdir(annotations);
+  expect(await fs.readFile(path.join(annotations, annotationFile), 'utf8')).toContain(annotation);
+});
+
 test('held explicit conflict repair does not adopt a byte-identical replacement on restart', async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   let repairing = false, replacement;
