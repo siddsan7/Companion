@@ -251,8 +251,13 @@ for (const boundary of ['held ledger rename', 'held journal link', 'edited journ
   expect(await readOptional(pending)).toBeNull();
 });
 
-for (const change of ['unchanged', 'missing capture', 'missing snapshot', 'replaced capture', 'replaced snapshot']) {
-  test('accepted ordinary intake restart preserves the exact publication with ' + change, async ({}, testInfo) => {
+const ordinaryRestartCases = [
+  ...['unchanged', 'missing capture', 'missing snapshot', 'replaced capture', 'replaced snapshot'].map(change => ({ change })),
+  { change: 'missing snapshot', legacy: true },
+  { change: 'replaced capture', legacy: true }
+];
+for (const { change, legacy } of ordinaryRestartCases) {
+  test('accepted ordinary intake restart preserves the exact publication with ' + change + (legacy ? ' on legacy upgrade' : ''), async ({}, testInfo) => {
     const producer = testInfo.outputPath('producer');
     const { vault, intake, ledgerFile } = await setup(testInfo);
     await writeDraft(producer);
@@ -284,6 +289,12 @@ for (const change of ['unchanged', 'missing capture', 'missing snapshot', 'repla
     const committed = await readJson(ledgerFile);
     expect(committed.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
     expect(committed.captures[tx.sourceHash].currentRevision).toBe(tx.revision.id);
+    if (legacy) {
+      const { acceptedCleanup, ...previousSchema } = committed;
+      expect(acceptedCleanup).toMatchObject({ sourceHash: tx.sourceHash, key: tx.key, revision: tx.revision.id });
+      await fs.writeFile(ledgerFile, JSON.stringify(previousSchema, null, 2));
+      expect(await readJson(ledgerFile)).toEqual(previousSchema);
+    }
     const originalJournal = await fs.lstat(journal, { bigint: true });
     expect(originalJournal.nlink).toBe(1n);
     const capture = intake.destination(tx.capture), snapshot = path.join(vault.root, 'Revisions', tx.revision.id + '.json');
