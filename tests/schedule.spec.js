@@ -7,7 +7,7 @@ const path = require('node:path');
 let root, app, page;
 const children = new Set();
 async function clock(now = '2026-11-08T06:59:00Z') { await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now, timezone: 'America/Phoenix' })); }
-async function launch() { app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } }); page = await app.firstWindow(); }
+async function launch(dataRoot = root) { app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: dataRoot } }); page = await app.firstWindow(); }
 test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-schedule-')); await clock(); });
 test.afterEach(async () => {
   if (app) await app.close(); app = null;
@@ -113,6 +113,29 @@ test('an existing unbound task still runs and disables through its original laun
   await launch();
   await page.getByRole('button', { name: 'Disable daily intake', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Daily intake disabled');
+  expect(await fs.lstat(taskFile).then(() => null, error => error.code)).toBe('ENOENT');
+});
+
+test('an existing Windows task retains its case-only data path spelling for ownership checks', async () => {
+  test.skip(process.platform !== 'win32', 'Windows task arguments retain exact path spelling');
+  await launch(); await setup();
+  const runtime = await app.evaluate(({ app: electronApp }) => ({ appPath: electronApp.getAppPath(), executable: process.execPath }));
+  await app.close(); app = null;
+  const ordinary = await fs.realpath(root);
+  const caseVariant = path.join(path.dirname(ordinary), path.basename(ordinary).toUpperCase());
+  expect(caseVariant).not.toBe(ordinary);
+  expect(await fs.realpath(caseVariant)).toBe(ordinary);
+  const { Schedule } = require('../app/schedule'), { Vault } = require('../app/vault');
+  const file = path.join(caseVariant, 'schedule.json'), taskFile = path.join(root, 'scheduler-task.json');
+  const schedule = new Schedule(file, new Vault(path.join(root, 'vault'), 'Companion'), { ...runtime, testRoot: root });
+  const state = await schedule.enable('2026-11-08T06:59:00Z');
+  const task = JSON.parse(await fs.readFile(taskFile, 'utf8'));
+  expect(task.arguments).toContain(`"--schedule-file" "${file}"`);
+  await launch(caseVariant);
+  await expect(page.getByLabel('Daily intake schedule')).toContainText('enabled');
+  await page.getByRole('button', { name: 'Disable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake disabled');
+  expect((await schedule.load())).toMatchObject({ id: state.id, mode: 'disabled' });
   expect(await fs.lstat(taskFile).then(() => null, error => error.code)).toBe('ENOENT');
 });
 
