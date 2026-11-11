@@ -323,7 +323,7 @@ test('an interrupted linked approval settles the exact peer and keeps its origin
   expect(repeated.approved.map(record => [record.version, record.id])).toEqual([[2, request.id], [1, first.record.id]]);
 });
 
-for (const at of ['before', 'after']) test(`an interrupted approval preserves a changed ${at === 'before' ? 'stage before linking' : 'destination after linking'}`, async ({}, testInfo) => {
+for (const at of ['before', 'after']) test(`a held brief refresh leaves the prior approval inspectable after changing the ${at === 'before' ? 'stage before linking' : 'destination after linking'}`, async ({}, testInfo) => {
   const { root, vault, restart, propose, approve } = await fixture(testInfo);
   const first = await approve();
   const request = await propose();
@@ -339,6 +339,11 @@ for (const at of ['before', 'after']) test(`an interrupted approval preserves a 
 
   await expect(restart().pinned(1)).resolves.toMatchObject({ id: first.record.id, digest: first.record.digest });
   await expect(restart().pinned(2)).rejects.toThrow(/held|integrity|changed/i);
+  await expect(restart().state()).resolves.toMatchObject({
+    approved: [{ version: 1, id: first.record.id, digest: first.record.digest }],
+    failure: expect.stringMatching(/held|integrity|changed/i)
+  });
+  await expect(propose()).rejects.toThrow(/held|integrity|changed/i);
   await expect(restart().approve(request, now)).rejects.toThrow(/held|integrity|changed/i);
   expect(await fs.readFile(changed)).toEqual(foreign);
   expect(await fs.readFile(retained)).toEqual(original);
