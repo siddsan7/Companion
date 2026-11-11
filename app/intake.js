@@ -561,9 +561,9 @@ class Intake {
       for (const authority of restorations) verifyImportedRestorationHold(this, authority, journal.verify);
     });
   }
-  async finish(tx, ledger, journalProof) {
+  async finish(tx, ledger, journalProof, verifyRelated) {
     const publication = {};
-    try { return await this.publishTransaction(tx, ledger, journalProof, publication); }
+    try { return await this.publishTransaction(tx, ledger, journalProof, publication, verifyRelated); }
     catch (error) {
       if (error.intakeConflict && publication.rollback && !publication.committed && !tx.restoreOperation) {
         error.intakeConflictProof = { mode: precommitConflict, journalProof: publication.journalProof, rollback: publication.rollback };
@@ -575,7 +575,7 @@ class Intake {
       throw Object.assign(Error(reason, { cause: error }), { intakeOutputHeld: true });
     }
   }
-  async publishTransaction(tx, ledger, journalProof, publication) {
+  async publishTransaction(tx, ledger, journalProof, publication, verifyRelated) {
     this.validateTransaction(tx);
     const verifyRestorationControls = this.ordinaryPublicationControls(tx, ledger, journalProof);
     const verifyIndependentJournal = validProof(journalProof) && this.isIndependentNewSource(tx, ledger) ? verifyRestorationControls : undefined;
@@ -712,6 +712,7 @@ class Intake {
     const verify = item => exact(item.file, item.info, item.content, item.label, item.peers);
     let committed = false;
     const verifyPublished = () => {
+      if (!committed) verifyRelated?.();
       if (!committed && journalProof?.freshRepair) journalProof.verify();
       if (!committed || tx.restoreOperation) {
         verifyRestorationControls?.();
