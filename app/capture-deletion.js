@@ -552,15 +552,19 @@ function isImportedRestorationHold(error, id, authority) {
   return authority.phase === 'restoring' && !!authority.restoration.published && !!authority.restoration.importedPublication ||
     authority.phase === 'active' && !!authority.restorationCleanup;
 }
-function verifyImportedRestorationHold(intake, authority) {
+function verifyPublishedRestorationControls(intake, authority, guard = removalParentGuard(intake.vault, authority.directories)) {
+  verifyStageSync(path.join(intake.dir, authority.restoration.journal), guard, authority.restoration.importedPublication.journal);
+  verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.stage'), guard);
+  verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.snapshot.stage'), guard);
+}
+function verifyImportedRestorationHold(intake, authority, verifyShared) {
   const guard = removalParentGuard(intake.vault, authority.directories);
   intake.storage.guardSync();
-  verifyAbsentSync(path.join(intake.dir, 'transaction.json'), guard, () =>
+  if (verifyShared) verifyShared();
+  else verifyAbsentSync(path.join(intake.dir, 'transaction.json'), guard, () =>
     Error('A shared intake journal needs recovery before this source can be held independently.'));
   if (authority.phase === 'restoring') {
-    verifyStageSync(path.join(intake.dir, authority.restoration.journal), guard, authority.restoration.importedPublication.journal);
-    verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.stage'), guard);
-    verifyAbsentSync(path.join(intake.dir, authority.restoration.revision + '.snapshot.stage'), guard);
+    verifyPublishedRestorationControls(intake, authority, guard);
   }
 }
 async function finishRestorationCleanup(intake, ledger, id) {
@@ -817,5 +821,6 @@ async function verifyRestorationPublication(intake, ledger, id) {
 }
 module.exports = {
   CaptureDeletion, finishDeletion, finishRestoration, finishRestorationCleanup, recordRestorationAdmission,
-  isImportedRestorationHold, verifyImportedRestorationHold, guardRestorationParents, installCaptureDeletion, inspectManualPeers
+  isImportedRestorationHold, verifyImportedRestorationHold, verifyPublishedRestorationControls,
+  guardRestorationParents, installCaptureDeletion, inspectManualPeers
 };

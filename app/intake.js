@@ -22,6 +22,9 @@ const outputHold = 'Published intake output or recovery evidence changed.';
 const precommitConflict = 'precommit-conflict';
 const acceptancePreserved = ' The recorded producer acceptance was preserved.';
 const acceptedCleanupFailures = new WeakSet();
+const sharedRestorationFailures = new WeakSet();
+const publishedImportedRestorations = ledger => Object.values(ledger.sourceAuthority || {}).filter(authority =>
+  authority.phase === 'restoring' && !authority.manual && authority.restoration.published && authority.restoration.importedPublication);
 const heldName = tx => `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
 const pendingName = tx => `pending-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json`;
 const exactIdentity = (a, b) => !!a && !!b && a.dev === b.dev && a.ino === b.ino;
@@ -252,7 +255,7 @@ class Intake {
           await this.admit(ledger, draft, key, now, guard);
           ledger = await this.load();
         } catch (error) {
-          if (acceptedCleanupFailures.has(error)) throw error;
+          if (acceptedCleanupFailures.has(error) || sharedRestorationFailures.has(error)) throw error;
           if (error.intakeOutputHeld) continue;
           if (error.producerRoot) {
             source.error = error.message;
@@ -507,6 +510,7 @@ class Intake {
     if (!verifyOnly || tx.restoreOperation) this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
   }
   verifyReservedCaptureIdentity(ledger, id, verifyIndependentJournal) {
+    verifyIndependentJournal?.();
     const reserved = this.vault.reservedRestorationIdentities(ledger, { verifyIndependentJournal });
     if (reserved.captures.has(id)) {
       throw Object.assign(Error('A preserved file at a held restoration path claims this capture identity. Both files were preserved.'),
@@ -520,10 +524,19 @@ class Intake {
         ledger.captures[tx.sourceHash] || ledger.attempts[tx.revision.identity] || ledger.suppressed.includes(tx.sourceHash) ||
         ledger.blocks[tx.sourceHash] || ledger.pending[tx.sourceHash] ||
         Object.values(ledger.captures).some(capture => capture.id === tx.capture.id)) return undefined;
+    const restorations = publishedImportedRestorations(ledger);
+    if (!restorations.length) return undefined;
     const journal = path.join(this.dir, 'transaction.json'), guard = this.vault.publicationFolders(this.dir).guard;
+    const { verifyImportedRestorationHold } = require('./capture-deletion');
+    const verifyShared = () => verifyStageSync(journal, guard, proof);
     return () => {
-      this.storage.guardSync();
-      verifyStageSync(journal, guard, proof);
+      try {
+        for (const authority of restorations) verifyImportedRestorationHold(this, authority, verifyShared);
+      } catch (error) {
+        const failure = error instanceof Error ? error : Error('Shared restoration or intake journal proof failed.', { cause: error });
+        sharedRestorationFailures.add(failure);
+        throw failure;
+      }
     };
   }
   async finish(tx, ledger, journalProof) {
@@ -893,6 +906,13 @@ class Intake {
   async recover() {
     let controlled = await this.load();
     await pendingParents(this, controlled);
+    const { finishDeletion, finishRestoration, finishRestorationCleanup, isImportedRestorationHold,
+      verifyImportedRestorationHold, verifyPublishedRestorationControls } = require('./capture-deletion');
+    const publishedRestorations = publishedImportedRestorations(controlled);
+    if (publishedRestorations.length) {
+      this.storage.guardSync();
+      for (const authority of publishedRestorations) verifyPublishedRestorationControls(this, authority);
+    }
     if (Object.hasOwn(controlled, 'acceptedCleanup') || Object.values(controlled.pending).some(item => item?.acceptedCleanup !== undefined)) {
       const expected = this.storage.expected;
       const accepted = await this.load();
@@ -905,7 +925,6 @@ class Intake {
       controlled = await this.load();
       await pendingParents(this, controlled);
     }
-    const { finishDeletion, finishRestoration, finishRestorationCleanup, isImportedRestorationHold, verifyImportedRestorationHold } = require('./capture-deletion');
     this.vault.warnings = this.vault.warnings.filter(warning => !warning.startsWith('Source restoration held:'));
     const recoverRestoration = async (ledger, id, work) => {
       try { await work(this, ledger, id); }
@@ -940,6 +959,19 @@ class Intake {
       if (!authority.manual && authority.restoration.published && authority.restoration.importedPublication) {
         await finishLaterPhase(id, finishRestoration);
       } else await recoverRestoration(controlled, id, finishRestoration);
+    }
+    if (ordinaryJournal) {
+      const verifyShared = ordinaryJournal.verify;
+      ordinaryJournal = {
+        ...ordinaryJournal,
+        verify: () => {
+          verifyShared();
+          for (const { id } of delayed) {
+            const authority = controlled.sourceAuthority[id];
+            if (authority.phase === 'restoring') verifyImportedRestorationHold(this, authority, verifyShared);
+          }
+        }
+      };
     }
     await this.recoverOrdinaryIntake(ordinaryJournal);
     if (delayed.length) {
