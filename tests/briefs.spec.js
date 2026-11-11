@@ -128,13 +128,15 @@ test('same-vault configuration read failure leaves explicit brief recovery avail
   await fs.rename(folder, preserved);
   let restored = false;
   try {
-    await fs.writeFile(folder, 'Owned fixture obstruction: preserve the approved directory.');
+    const obstruction = 'Owned fixture obstruction: preserve the approved directory.';
+    await fs.writeFile(folder, obstruction);
     await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
-    // The real configured event reads the ordinary file as a directory; no error is fabricated.
-    await expect(page.locator('#brief-error')).toContainText(/ENOTDIR|not a directory/i);
+    // The real configured read reaches the ordinary-folder guard.
+    await expect(page.locator('#brief-error')).toHaveText('The Briefs folder changed or is an alias. Files were preserved for inspection.');
     await expect(page.getByRole('button', { name: 'Check brief inputs', exact: true })).toBeEnabled();
     await expect(page.getByRole('button', { name: 'Propose brief', exact: true })).toBeEnabled();
     await expect(page.getByRole('button', { name: 'Approve proposed brief', exact: true })).toBeDisabled();
+    expect(await fs.readFile(folder, 'utf8')).toBe(obstruction);
     expect(await fs.readFile(path.join(preserved, file))).toEqual(approvedBytes);
     await fs.unlink(folder); await fs.rename(preserved, folder); restored = true;
     const previousProposal = await page.locator('#brief-proposal').elementHandle();
