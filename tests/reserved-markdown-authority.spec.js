@@ -3,6 +3,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { AnnotationRemoval } = require('../app/annotation-removal');
+const { Briefs } = require('../app/briefs');
 const { CaptureDeletion } = require('../app/capture-deletion');
 const { Context } = require('../app/context');
 const { Conversations } = require('../app/conversations');
@@ -136,6 +137,53 @@ test('reserved restoration Markdown under Ideas cannot supply saved-idea context
   expect(all.map(source => source.key)).toContain(`idea:${ordinaryId}`);
   expect(await fs.readFile(reserved, 'utf8')).toBe(foreign);
   expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(displaced)).toEqual(before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+});
+
+test('reserved restoration Markdown cannot supply an exact moved approved brief', async ({}, testInfo) => {
+  const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures');
+  const briefs = new Briefs(vault), readme = testInfo.outputPath('README.md');
+  async function approve(projectText) {
+    await fs.writeFile(readme, `# MyTune\n\n${projectText}\n`);
+    const { proposed } = await briefs.propose([readme], now);
+    const request = {
+      id: proposed.id, digest: proposed.digest,
+      sections: proposed.sections.map(section => section.text),
+      references: proposed.sections.map(section => section.references
+        .map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+    };
+    const { approved } = await briefs.approve(request, now);
+    const record = approved.find(item => item.id === proposed.id);
+    expect(record).toBeDefined();
+    return { record, file: path.join(briefs.dir, record.file) };
+  }
+  const first = await approve('A guitar practice tutor.');
+  const unaffected = await approve('An independent second project brief.');
+  expect(first.record.version).toBe(1);
+  expect(unaffected.record.version).toBe(2);
+  await expect(briefs.pinned(1)).resolves.toMatchObject({ id: first.record.id, digest: first.record.digest });
+
+  const firstBytes = await fs.readFile(first.file);
+  const receipt = path.join(briefs.dir, '.brief-approval-1.json'), receiptBytes = await fs.readFile(receipt);
+  const originalBrief = testInfo.outputPath('original-approved-brief.md');
+  await fs.rename(first.file, originalBrief);
+  const { displaced, before, replacementIdentity } = await replaceRestoration(testInfo, reserved, firstBytes);
+  expect(replacementIdentity).not.toEqual(await identity(originalBrief));
+
+  const restarted = new Briefs(new Vault(vault.vault, 'Companion'));
+  await expect.soft(restarted.pinned(1)).rejects.toThrow(/unavailable|preserv|reserved/i);
+  await expect(restarted.pinned(2)).resolves.toMatchObject({ id: unaffected.record.id, digest: unaffected.record.digest });
+  const context = new Context(vault, { scopeFile: testInfo.outputPath('scope', 'notes.json') });
+  const { all } = await context.corpus();
+  expect.soft(all.map(source => source.key)).not.toContain('brief:1');
+  expect(all.map(source => source.key)).toContain('brief:2');
+  expect(await absent(first.file)).toBe(true);
+  expect(await fs.readFile(originalBrief)).toEqual(firstBytes);
+  expect(await fs.readFile(reserved)).toEqual(firstBytes);
+  expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(receipt)).toEqual(receiptBytes);
   expect(await fs.readFile(displaced)).toEqual(before);
   expect(await fs.readFile(journal)).toEqual(journalBytes);
   expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
