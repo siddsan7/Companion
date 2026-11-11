@@ -264,6 +264,7 @@ function install(Intake, { hash, read, noteText }) {
       for (const [sourceHash, block] of Object.entries(ledger.blocks)) {
         if (!/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) continue;
         const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
+        this.verifyHeldTransaction(ledger, tx);
         const current = ledger.captures[sourceHash];
         if (current?.identityIssue || current?.removed) continue;
         if (tx.sourceHash !== sourceHash || current && current.id !== tx.capture.id) throw Error('Conflict identity does not match current intake history. All files were preserved.');
@@ -282,6 +283,7 @@ function install(Intake, { hash, read, noteText }) {
       const ledger = await this.load(), block = ledger.blocks[sourceHash];
       if (!block || !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) throw Error('This source has no resolvable incoming conflict.');
       const tx = JSON.parse(await read(path.join(this.dir, block.journal))); this.validateTransaction(tx);
+      this.verifyHeldTransaction(ledger, tx);
       const current = ledger.captures[sourceHash];
       if (!current || current.id !== tx.capture.id || tx.sourceHash !== sourceHash || current.identityIssue || current.removed || ledger.suppressed.includes(sourceHash)) throw Error('Resolve the current capture identity or missing-note state before transferring local writing.');
       const note = await this.vault.find(current.id), file = this.destination(current);
