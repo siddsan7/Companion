@@ -6,6 +6,7 @@ const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { Vault } = require('../app/vault');
 const { Intake } = require('../app/intake');
+const { AnnotationRemoval } = require('../app/annotation-removal');
 const draft = require('./fixtures/reel-draft/example.json');
 
 const now = '2026-11-08T06:59:00.000Z';
@@ -274,6 +275,104 @@ for (const altered of [true, false]) test(altered ?
   }
 });
 
+async function ordinaryConflict(testInfo, checkpoint) {
+  const context = await fixture(testInfo, checkpoint, 'draft');
+  const { intake, producer, sourceHash, capture } = context;
+  const destination = intake.destination(capture), ledgerFile = path.join(intake.dir, 'ledger.json');
+  await fs.appendFile(destination, '\nLocal writing before the interrupted ordinary transfer.\n');
+  const local = await fs.readFile(destination), localIdentity = await identity(destination);
+  await writeDraft(producer, '2', later);
+  const before = await intake.reconcile({ now: later }), block = before.blocks[sourceHash];
+  expect(block).toBeDefined();
+  const older = path.join(intake.dir, block.journal), olderBytes = await fs.readFile(older), olderIdentity = await identity(older);
+  const input = { sourceHash, localHash: createHash('sha256').update(local).digest('hex'), text: 'Only-copy interrupted transfer writing.' };
+  return { ...context, destination, ledgerFile, local, localIdentity, before, block, older, olderBytes, olderIdentity, input };
+}
+
+async function exactTransfer(context) {
+  const { intake, vault, input } = context;
+  const journal = path.join(intake.dir, 'repair-intent.json'), bytes = await fs.readFile(journal), intent = JSON.parse(bytes);
+  const note = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
+  const stage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
+  const original = await identity(note);
+  expect(intent.tx.keptCurrent).toBeUndefined();
+  expect(intent.annotation).toContain(input.text);
+  expect(original.nlink).toBe(2n);
+  expect(await identity(stage)).toEqual(original);
+  expect(await fs.readFile(note, 'utf8')).toBe(intent.annotation);
+  return { journal, bytes, intent, note, stage, original };
+}
+
+test('ordinary transfer restart restores its prior capture when the published annotation is withdrawn', async ({}, testInfo) => {
+  const interrupted = Error('Stopped at the exact ordinary pre-admission publication.');
+  const displaced = testInfo.outputPath('withdrawn-after-interruption.md');
+  let context, witness;
+  context = await ordinaryConflict(testInfo, async boundary => {
+    if (boundary !== 'intake-published' || !context) return;
+    witness = await exactTransfer(context);
+    const shared = path.join(context.intake.dir, 'transaction.json');
+    expect(JSON.parse(await fs.readFile(shared))).toEqual(witness.intent.tx);
+    throw interrupted;
+  });
+  const { vault, intake, sourceHash, destination, ledgerFile, local, localIdentity, block, older, olderBytes, olderIdentity, input } = context;
+  await expect(intake.resolveConflict(input, later)).rejects.toBe(interrupted);
+  expect(witness).toBeDefined();
+  const { intent, note, stage, original, journal, bytes } = witness;
+  const backup = path.join(intake.dir, intent.tx.backup);
+  expect(await fs.readFile(backup)).toEqual(local);
+  expect(await identity(backup)).toMatchObject({ dev: localIdentity.dev, ino: localIdentity.ino });
+  const stopped = JSON.parse(await fs.readFile(ledgerFile));
+  expect(stopped.blocks[sourceHash]).toEqual(block);
+  expect(stopped.attempts[intent.tx.revision.identity]).toBeUndefined();
+  await fs.rename(note, displaced);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.locked(() => restarted.load()).catch(() => {});
+  const after = JSON.parse(await fs.readFile(ledgerFile));
+  expect(after.blocks[sourceHash]).toEqual(block);
+  expect(after.attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect.soft(await readOptional(destination)).toEqual(local);
+  expect.soft(await identity(destination).catch(error => error.code)).toMatchObject({ dev: localIdentity.dev, ino: localIdentity.ino });
+  expect(await fs.readFile(older)).toEqual(olderBytes);
+  expect(await identity(older)).toEqual(olderIdentity);
+  expect(await fs.readFile(journal)).toEqual(bytes);
+  for (const file of [stage, displaced]) {
+    expect(await identity(file)).toEqual(original);
+    expect(await fs.readFile(file, 'utf8')).toBe(intent.annotation);
+  }
+});
+
+test('ordinary transfer retry cannot admit after a deferred transfer annotation is withdrawn', async ({}, testInfo) => {
+  const displaced = testInfo.outputPath('withdrawn-before-retry.md');
+  let context, witness;
+  context = await ordinaryConflict(testInfo, async boundary => {
+    if (boundary !== 'intake-before-move' || !context) return;
+    witness = await exactTransfer(context);
+    throw Object.assign(Error('Fixture native capture move refused.'), { code: 'EACCES' });
+  });
+  const { vault, intake, sourceHash, destination, ledgerFile, local, localIdentity, older, olderBytes, olderIdentity, input } = context;
+  await expect(intake.resolveConflict(input, later)).rejects.toThrow();
+  expect(witness, 'the exact ordinary transfer hit the native refusal seam').toBeDefined();
+  const { intent, note } = witness;
+  const deferred = JSON.parse(await fs.readFile(ledgerFile));
+  expect(deferred.attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect(await fs.readFile(destination)).toEqual(local);
+  const withdrawnIdentity = await identity(note);
+  await fs.rename(note, displaced);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.reconcile({ now: later }).catch(() => {});
+  const after = JSON.parse(await fs.readFile(ledgerFile));
+  expect.soft(after.attempts[intent.tx.revision.identity]).toBeUndefined();
+  expect.soft(after.blocks[sourceHash] || after.pending[sourceHash]).toBeDefined();
+  expect.soft(await readOptional(destination)).toEqual(local);
+  expect.soft(await identity(destination).catch(error => error.code)).toMatchObject({ dev: localIdentity.dev, ino: localIdentity.ino });
+  expect(await fs.readFile(older)).toEqual(olderBytes);
+  expect(await identity(older)).toEqual(olderIdentity);
+  expect(await fs.readFile(displaced, 'utf8')).toBe(intent.annotation);
+  expect(await identity(displaced)).toEqual(withdrawnIdentity);
+});
+
 test('relationship repair preserves an independent backup created during authority verification', async ({}, testInfo) => {
   const foreignText = 'Independent backup writing created after the backup was observed absent.\n';
   let armed = false, views = 0, context, witness;
@@ -317,7 +416,7 @@ test('relationship repair preserves an independent backup created during authori
 
 test('relationship repair refuses an independent equal-byte stage at its exclusive open', async ({}, testInfo) => {
   let armed = false, witness;
-  const { intake, input, note } = await fixture(testInfo, boundary => { if (boundary === 'link-intent-published') armed = true; });
+  const { vault, intake, input, note } = await fixture(testInfo, boundary => { if (boundary === 'link-intent-published') armed = true; });
   await intake.addAnnotation(input, now);
   const original = await fs.readFile(note), originalIdentity = await identity(note);
   const moved = path.join(path.dirname(note), 'Nested', path.basename(note));
@@ -350,7 +449,8 @@ test('relationship repair refuses an independent equal-byte stage at its exclusi
   expect.soft(await identity(witness.stage).catch(error => error.code)).toEqual(witness.foreign);
   expect.soft((await readOptional(witness.stage))?.toString('utf8')).toBe(witness.intent.content);
   const destination = await readOptional(moved);
-  expect.soft(destination === null || destination.equals(original)).toBe(true);
+  expect.soft(destination).toEqual(original);
+  expect.soft(await identity(moved).catch(error => error.code)).toMatchObject({ dev: originalIdentity.dev, ino: originalIdentity.ino });
   const locations = [moved, witness.backup];
   const surviving = (await Promise.all(locations.map(async file => {
     const bytes = await readOptional(file);
@@ -362,4 +462,8 @@ test('relationship repair refuses an independent equal-byte stage at its exclusi
   const evidence = await readOptional(witness.journal) ? witness.journal : archive;
   expect.soft(await readOptional(evidence)).toEqual(witness.bytes);
   expect.soft(await identity(evidence).catch(error => error.code)).toMatchObject({ dev: witness.journalIdentity.dev, ino: witness.journalIdentity.ino });
+  const removal = new AnnotationRemoval({ getVault: () => vault, clearApprovals() {} });
+  const preview = await removal.preview(input.id).catch(() => null);
+  const relativeStage = path.relative(vault.vault, witness.stage).split(path.sep).join('/');
+  expect(preview?.targets || []).not.toContain(relativeStage);
 });
