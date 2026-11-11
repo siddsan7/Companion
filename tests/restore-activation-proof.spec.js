@@ -253,13 +253,22 @@ test('restoration hold lets an exact interrupted independent intake settle befor
   expect(await identity(selected)).toEqual(selectedIdentity);
 });
 
-async function stopChildIntake(directory, boundary, pending = '', shared = '') {
+async function stopChildIntake(directory, boundary, pending = '', shared = '', claim = null) {
   const code = `
     const fs = require('node:fs/promises');
+    const native = require('node:fs');
     const { Vault } = require('./app/vault');
     const { Intake } = require('./app/intake');
-    const [directory, now, boundary, pending, shared] = process.argv.slice(1);
-    const checkpoint = async name => { if (name === boundary) process.exit(77); };
+    const [directory, now, boundary, pending, shared, rawClaim] = process.argv.slice(1);
+    const checkpoint = async name => {
+      if (name !== boundary) return;
+      const claim = JSON.parse(rawClaim);
+      if (claim) {
+        await fs.rename(claim.reserved, claim.displaced);
+        await fs.writeFile(claim.reserved, await fs.readFile(claim.existing), { flag: 'wx' });
+      }
+      process.exit(77);
+    };
     if (boundary === 'pending-retry-link') {
       const link = fs.link;
       fs.link = async (from, to) => {
@@ -267,10 +276,24 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '') {
         if (from === pending && to === shared) process.exit(77);
       };
     }
+    if (boundary === 'held-conflict-ledger') {
+      const details = JSON.parse(rawClaim), rename = native.renameSync;
+      native.renameSync = (from, to) => {
+        if (to === details.ledgerFile && /^ledger-.*\\.tmp$/.test(require('node:path').basename(from))) {
+          const staged = JSON.parse(native.readFileSync(from, 'utf8'));
+          if (staged.blocks[details.sourceHash]?.incomingRevision === details.revision &&
+              !staged.pending[details.sourceHash]) {
+            rename(from, to);
+            process.exit(77);
+          }
+        }
+        return rename(from, to);
+      };
+    }
     const intake = new Intake(new Vault(directory, 'Companion', { checkpoint }));
     intake.reconcile({ now }).then(() => process.exit(78), error => { console.error(error); process.exit(79); });
   `;
-  const child = spawn(process.execPath, ['-e', code, directory, later, boundary, pending, shared], {
+  const child = spawn(process.execPath, ['-e', code, directory, later, boundary, pending, shared, JSON.stringify(claim)], {
     cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
   });
   let stderr = '';
@@ -387,6 +410,185 @@ test('a late reserved restoration identity claim holds only its exact journaled 
   expect(await fs.readFile(selected)).toEqual(selectedBytes);
   expect(await identity(selected)).toEqual(selectedIdentity);
 });
+
+async function fixtureForLaterClaim(testInfo) {
+  const interruption = Error('Stopped after restoration publication.');
+  const context = await fixture(testInfo, async name => {
+    if (name === 'capture-restoration-published') throw interruption;
+  }, { existing: true });
+  const { intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = context;
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+  const before = await readJson(ledgerFile), authority = before.sourceAuthority[id], bHash = 'c'.repeat(64), cHash = 'd'.repeat(64);
+  const reserved = intake.destination(before.captures[sourceHash]), existing = intake.destination(before.captures[bHash]);
+  await fs.rename(reserved, testInfo.outputPath('original-reserved-capture.md'));
+  await fs.writeFile(reserved, 'Independent writing at the held restoration path.\n', { flag: 'wx' });
+  const existingBytes = await fs.readFile(existing), existingIdentity = await identity(existing);
+  const selected = path.join(intake.dir, authority.restoration.journal);
+  const selectedBytes = await fs.readFile(selected), selectedIdentity = await identity(selected);
+  const shared = path.join(intake.dir, 'transaction.json'), displaced = testInfo.outputPath('first-foreign-reserved-file.md');
+  await writeDraft(producer, 'existing-update', '3', 'c');
+  return {
+    ...context, before, authority, bHash, cHash, reserved, existing, existingBytes, existingIdentity,
+    selected, selectedBytes, selectedIdentity, shared, displaced
+  };
+}
+
+test('restart archives the exact journal after a late reserved restoration claim and admits a disjoint draft', async ({}, testInfo) => {
+  const context = await fixtureForLaterClaim(testInfo);
+  const { vault, intake, producer, sourceHash, id, ledgerFile, before, authority, bHash, cHash,
+    reserved, existing, existingBytes, existingIdentity, selected, selectedBytes, selectedIdentity, shared, displaced } = context;
+  await stopChildIntake(vault.vault, 'intake-journaled', '', '', { reserved, existing, displaced });
+  const raw = await fs.readFile(shared), tx = JSON.parse(raw), journalIdentity = await identity(shared);
+  const original = await readJson(ledgerFile), replacementIdentity = await identity(reserved);
+  expect(tx.sourceHash).toBe(bHash);
+  expect(tx.capture.id).toBe(before.captures[bHash].id);
+  expect(original.captures[bHash]).toMatchObject({ currentRevision: before.captures[bHash].currentRevision });
+  expect(original.attempts[tx.revision.identity]).toBeUndefined();
+  expect((await fs.lstat(shared, { bigint: true })).nlink).toBe(1n);
+  await writeDraft(producer, 'new-independent', '4', 'd');
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const result = await restarted.reconcile({ now: later });
+  expect(result.captures[cHash]).toBeDefined();
+  expect(result.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+  expect(result.attempts[tx.revision.identity]).toBeUndefined();
+  const hold = result.blocks[bHash];
+  expect(hold).toMatchObject({ incomingRevision: tx.revision.id, reason: expect.stringMatching(/restoration path.*identity/i) });
+  expect(hold.outputHold?.committed).toBe(false);
+  const archived = path.join(intake.dir, hold.journal);
+  expect(await fs.readFile(archived)).toEqual(raw);
+  expect(await identity(archived)).toEqual(journalIdentity);
+  expect(await readOptional(shared)).toBeNull();
+  expect(result.sourceAuthority[id]).toEqual(authority);
+  expect(result.suppressed).toContain(sourceHash);
+  expect(await fs.readFile(existing)).toEqual(existingBytes);
+  expect(await identity(existing)).toEqual(existingIdentity);
+  expect(await fs.readFile(reserved)).toEqual(existingBytes);
+  expect(await identity(reserved)).toEqual(replacementIdentity);
+  expect(await fs.readFile(selected)).toEqual(selectedBytes);
+  expect(await identity(selected)).toEqual(selectedIdentity);
+});
+
+test('restart retires exact deferred aliases after an interrupted external edit conflict and continues independent intake', async ({}, testInfo) => {
+  const context = await fixtureForLaterClaim(testInfo);
+  const { vault, intake, producer, sourceHash, id, ledgerFile, before, authority, bHash, cHash,
+    reserved, existing, selected, selectedBytes, selectedIdentity, shared } = context;
+  const reservedBytes = await fs.readFile(reserved), reservedIdentity = await identity(reserved);
+  const deferring = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async name => {
+    if (name === 'intake-before-move') throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+  } }));
+  const deferred = await deferring.reconcile({ now: later });
+  const pending = path.join(intake.dir, deferred.pending[bHash].journal), raw = await fs.readFile(pending);
+  const tx = JSON.parse(raw), journalIdentity = await identity(pending);
+  expect(tx.sourceHash).toBe(bHash);
+  await fs.appendFile(existing, '\nIndependent local editing while the draft was deferred.\n');
+  const editedBytes = await fs.readFile(existing), editedIdentity = await identity(existing);
+  await stopChildIntake(vault.vault, 'held-conflict-ledger', '', '', { ledgerFile, sourceHash: bHash, revision: tx.revision.id });
+  const interrupted = await readJson(ledgerFile), pointer = interrupted.blocks[bHash];
+  const held = path.join(intake.dir, pointer.journal);
+  expect(interrupted.pending[bHash]).toBeUndefined();
+  expect(interrupted.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+  expect(interrupted.attempts[tx.revision.identity]).toBeUndefined();
+  expect(await fs.readFile(shared)).toEqual(raw);
+  expect(await fs.readFile(pending)).toEqual(raw);
+  expect(await identity(shared)).toEqual(journalIdentity);
+  expect(await identity(pending)).toEqual(journalIdentity);
+  expect((await fs.lstat(shared, { bigint: true })).nlink).toBe(2n);
+  expect(await readOptional(held)).toBeNull();
+  await writeDraft(producer, 'new-independent', '4', 'd');
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const result = await restarted.reconcile({ now: later });
+  expect(result.captures[cHash]).toBeDefined();
+  expect(result.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+  expect(result.attempts[tx.revision.identity]).toBeUndefined();
+  expect(result.blocks[bHash]).toMatchObject({ incomingRevision: tx.revision.id });
+  expect(result.blocks[bHash].outputHold?.committed).toBe(false);
+  expect(await readOptional(shared)).toBeNull();
+  expect(await readOptional(pending)).toBeNull();
+  expect(await fs.readFile(held)).toEqual(raw);
+  expect(await identity(held)).toEqual(journalIdentity);
+  expect(await fs.readFile(existing)).toEqual(editedBytes);
+  expect(await identity(existing)).toEqual(editedIdentity);
+  expect(await fs.readFile(reserved)).toEqual(reservedBytes);
+  expect(await identity(reserved)).toEqual(reservedIdentity);
+  expect(result.sourceAuthority[id]).toEqual(authority);
+  expect(result.suppressed).toContain(sourceHash);
+  expect(await fs.readFile(selected)).toEqual(selectedBytes);
+  expect(await identity(selected)).toEqual(selectedIdentity);
+});
+
+for (const phase of ['staged ledger', 'committed ledger']) {
+  test(`a reserved restoration claim at the ${phase} respects the intake commit boundary`, async ({}, testInfo) => {
+    const context = await fixtureForLaterClaim(testInfo);
+    const { vault, intake, producer, sourceHash, id, ledgerFile, before, authority, bHash, cHash,
+      reserved, existing, existingBytes, selected, selectedBytes, selectedIdentity, shared, displaced } = context;
+    await writeDraft(producer, 'new-independent', '4', 'd');
+    let observed;
+    const replaceReserved = async expectedCommitted => {
+      if (observed) return;
+      const raw = await fs.readFile(shared), tx = JSON.parse(raw);
+      if (tx.sourceHash !== bHash) return;
+      const ledger = await readJson(ledgerFile);
+      if (expectedCommitted) {
+        expect(ledger.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+        expect(ledger.captures[bHash].currentRevision).toBe(tx.revision.id);
+      } else {
+        expect(ledger.attempts[tx.revision.identity]).toBeUndefined();
+        expect(ledger.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+      }
+      const journalIdentity = await identity(shared);
+      await fs.rename(reserved, displaced);
+      await fs.writeFile(reserved, existingBytes, { flag: 'wx' });
+      observed = { tx, raw, journalIdentity, replacementIdentity: await identity(reserved) };
+    };
+    const open = fs.open;
+    if (phase === 'staged ledger') fs.open = async (file, ...args) => {
+      const handle = await open(file, ...args);
+      if (args[0] !== 'wx' || path.dirname(String(file)) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(String(file)))) return handle;
+      const close = handle.close;
+      handle.close = async () => {
+        await close.call(handle);
+        if (observed || !await readOptional(shared)) return;
+        const tx = await readJson(shared), staged = await readJson(file);
+        if (tx.sourceHash === bHash && staged.attempts[tx.revision.identity]?.revision === tx.revision.id) await replaceReserved(false);
+      };
+      return handle;
+    };
+    const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async name => {
+      if (phase === 'committed ledger' && name === 'intake-ledger') await replaceReserved(true);
+    } }));
+    let result;
+    try { result = await restarted.reconcile({ now: later }); }
+    finally { fs.open = open; }
+    expect(observed, 'the replacement occurred at the targeted native ledger boundary').toBeDefined();
+    const { tx } = observed;
+    expect(result.captures[cHash]).toBeDefined();
+    expect(result.sourceAuthority[id]).toEqual(authority);
+    expect(result.suppressed).toContain(sourceHash);
+    expect(await fs.readFile(reserved)).toEqual(existingBytes);
+    expect(await identity(reserved)).toEqual(observed.replacementIdentity);
+    expect(await fs.readFile(selected)).toEqual(selectedBytes);
+    expect(await identity(selected)).toEqual(selectedIdentity);
+    expect(await readOptional(shared)).toBeNull();
+    expect(await fs.readFile(existing, 'utf8')).toBe(tx.content);
+    expect(await fs.readFile(path.join(intake.dir, tx.backup))).toEqual(existingBytes);
+    if (phase === 'staged ledger') {
+      expect(result.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+      expect(result.attempts[tx.revision.identity]).toBeUndefined();
+      const hold = result.blocks[bHash];
+      expect(hold.outputHold?.committed).toBe(false);
+      const archived = path.join(intake.dir, hold.journal);
+      expect(await fs.readFile(archived)).toEqual(observed.raw);
+      expect(await identity(archived)).toEqual(observed.journalIdentity);
+    } else {
+      expect(result.captures[bHash].currentRevision).toBe(tx.revision.id);
+      expect(result.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+      expect.soft(result.outcomes[tx.key]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+      expect.soft(result.blocks[bHash]).toBeUndefined();
+    }
+  });
+}
 
 test('restoration hold allows independent import with a foreign active cleanup journal', async ({}, testInfo) => {
   const { vault, intake, producer, id, sourceHash, committed, witness } = await stopAfterActivation(testInfo);
