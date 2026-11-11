@@ -13,6 +13,7 @@ const stageProof = stat => Object.fromEntries(stageFields.map(field => [field, S
 const matchesStage = (proof, stat) => Boolean(proof && stageFields.every(field => proof[field] === String(stat[field])));
 const sameRead = (a, b) => same(a, b) && a.birthtimeNs === b.birthtimeNs && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs && a.size === b.size && a.nlink === b.nlink;
 const changed = () => Error('Transcript publication identity changed. Preserve all files for review.');
+const missingPublication = () => Error('A transcript publication may already have occurred. Its exact output is missing. Preserve the retained writing for review.');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const number = value => typeof value === 'string' && /^\d+$/.test(value);
@@ -83,9 +84,38 @@ class Transcripts {
   }
   async readReceipt(intent, vault, receipt, parents) {
     const { text, stat } = await this.read(vault, intent.destination, receipt, parents);
-    const value = JSON.parse(text);
+    return { value: this.validateReceipt(intent, JSON.parse(text)), stat };
+  }
+  validateReceipt(intent, value) {
     if (!value || Object.keys(value).length !== 6 || value.schema !== 1 || value.operation !== intent.operation || value.id !== intent.id || value.digest !== intent.digest || !number(value.dev) || !number(value.ino)) throw Error('Transcript publication receipt is damaged. Preserve the writing for review.');
-    return { value, stat };
+    return value;
+  }
+  validateAttempt(intent, text, stat) {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw changed();
+    const { control, ...details } = value;
+    this.validateReceipt(intent, details);
+    if (!control || Object.keys(control).length !== 2 || control.dev !== String(stat.dev) || control.ino !== String(stat.ino)
+      || !intent.stageProof || intent.stageProof.dev !== value.dev || intent.stageProof.ino !== value.ino
+      || text !== JSON.stringify(value, null, 2)) throw changed();
+    return value;
+  }
+  async readAttempt(intent, vault, file, parents) {
+    this.guard(vault, intent.destination, parents);
+    const before = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!before) return null;
+    const record = await this.read(vault, intent.destination, file, parents);
+    if (!sameRead(before, record.stat)) throw changed();
+    this.validateAttempt(intent, record.text, record.stat);
+    return record;
+  }
+  writeControl(file, value) {
+    const handle = local.openSync(file, 'wx');
+    try {
+      local.writeFileSync(handle, JSON.stringify(value(local.fstatSync(handle, { bigint: true })), null, 2));
+      local.fsyncSync(handle);
+      return local.fstatSync(handle, { bigint: true });
+    } finally { local.closeSync(handle); }
   }
   async writeExclusive(file, bytes) {
     const handle = await fs.open(file, 'wx');
@@ -186,14 +216,16 @@ class Transcripts {
     const stage = `${base}.md.pending`, receipt = `${base}.published.json`;
     const hasStage = await exists(stage), hasReceipt = await exists(receipt);
     const saved = hasReceipt ? await this.readReceipt(intent, vault, receipt, parents) : null;
+    const attempt = await this.readAttempt(intent, vault, `${base}.link.json`, parents);
     if (saved && !hasStage) return { completed: true, published: true };
     if (!hasStage) throw Error('Transcript stage is unavailable. Preserve the retained intent writing; no publication was attempted.');
     const hasDestination = await exists(intent.destination);
     if (hasDestination) {
+      if (!saved && !attempt) throw changed();
       await this.readPair(intent, vault, stage, parents, saved?.value);
-      return { completed: false, published: true };
+      return { completed: false, published: true, attempt: attempt?.stat };
     }
-    if (saved) throw Error('Completed transcript destination is missing. Preserve the stage; it will not be recreated.');
+    if (saved || attempt) throw missingPublication();
     const stageFile = await this.read(vault, intent.destination, stage, parents);
     if (stageFile.text !== intent.text) throw Error('Transcript stage was edited. Preserve the retained writing for review.');
     this.checkStage(intent, stageFile.stat);
@@ -217,7 +249,7 @@ class Transcripts {
       let intent;
       try {
         const retained = await this.retained(match[1]); intent = retained.intent;
-        owned.add(`${intent.operation}.md.pending`); owned.add(`${intent.operation}.published.json`);
+        owned.add(`${intent.operation}.md.pending`); owned.add(`${intent.operation}.published.json`); owned.add(`${intent.operation}.link.json`);
         const parents = this.guard(vault, intent.destination), state = await this.publicationState(intent, vault, retained.base, parents);
         if (!state.completed) records.push({ operation: intent.operation, destination: intent.destination, text: intent.text, canResume: true, warning: state.published ? 'Already-published copy awaits explicit acknowledgement. No fresh source eligibility is needed to acknowledge the exact pair.' : 'Unpublished retained writing. Resume and confirm explicitly; current origin and warnings will be rechecked.' });
       } catch (error) {
@@ -236,7 +268,7 @@ class Transcripts {
       if (JSON.stringify(fresh.state) !== JSON.stringify(intent.reviewState) || this.markdown(fresh, intent.id, intent.createdAt) !== intent.text) throw Error('The original conversation or support warnings changed. Retained writing remains inspectable; new publication requires a fresh preview.');
     }
     const token = randomUUID(); if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
-    this.previews.set(token, { intent, parents, journal });
+    this.previews.set(token, { intent, parents, journal, published: state.published, attempt: state.attempt });
     return { token, destination: intent.destination, text: intent.text };
   }
   async confirm(token) {
@@ -252,7 +284,7 @@ class Transcripts {
       return withBriefMutation(directory, async () => {
         this.guard(vault, intent.destination, parents);
         await this.removal.fence(intent, vault);
-        const base = path.join(directory, intent.operation), journalFile = `${base}.intent.json`, stage = `${base}.md.pending`, receipt = `${base}.published.json`;
+        const base = path.join(directory, intent.operation), journalFile = `${base}.intent.json`, stage = `${base}.md.pending`, receipt = `${base}.published.json`, attemptFile = `${base}.link.json`;
         const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
         let journal;
         if (await exists(journalFile)) {
@@ -260,6 +292,7 @@ class Transcripts {
           if (!preview.journal || !sameRead(preview.journal, current.stat) || current.text !== JSON.stringify(intent, null, 2)) throw changed();
           journal = current.stat;
         } else if (preview.journal) throw changed();
+        let attempt = await this.readAttempt(intent, vault, attemptFile, parents);
 
         const checkPair = stat => {
           this.guard(vault, intent.destination, parents);
@@ -268,9 +301,20 @@ class Transcripts {
           this.checkLeaf(intent.destination, stat);
           this.removal.fenceSync(intent, vault);
         };
+        const retireAttempt = receiptStat => {
+          this.checkLeaf(receipt, receiptStat);
+          if (!attempt) return;
+          this.checkLeaf(attemptFile, attempt.stat);
+          local.unlinkSync(attemptFile);
+          attempt = null;
+        };
         const retireStage = async (stat, receiptStat) => {
           await this.removal.fence(intent, vault);
           checkPair(stat);
+          if (attempt) {
+            retireAttempt(receiptStat);
+            checkPair(stat);
+          }
           this.checkLeaf(receipt, receiptStat);
           local.unlinkSync(stage);
         };
@@ -282,16 +326,28 @@ class Transcripts {
             const stat = await this.readPair(intent, vault, stage, parents, saved.value);
             await retireStage(stat, saved.stat);
           } else {
+            const output = await this.read(vault, intent.destination, intent.destination, parents).catch(error => {
+              if (error.code === 'ENOENT') throw missingPublication();
+              throw error;
+            });
+            this.checkStage(intent, output.stat, saved.value);
+            if (output.text !== intent.text) throw changed();
+            await this.removal.fence(intent, vault);
             this.guard(vault, intent.destination, parents);
             this.checkLeaf(journalFile, journal);
             this.checkLeaf(receipt, saved.stat);
+            this.checkLeaf(intent.destination, output.stat);
+            if (attempt) this.checkLeaf(attemptFile, attempt.stat);
             this.removal.fenceSync(intent, vault);
+            if (local.lstatSync(stage, { throwIfNoEntry: false })) throw changed();
           }
           this.previews.delete(token); return { destination: intent.destination, completed: true };
         }
 
         const published = await exists(stage) && await exists(intent.destination);
-        if (published && !journal) throw changed();
+        if (published && (!journal || !attempt)) throw changed();
+        if (preview.attempt && (!attempt || !sameRead(preview.attempt, attempt.stat))) throw changed();
+        if (!published && (preview.published || attempt)) throw missingPublication();
         if (!published) {
           const fresh = await this.snapshot(intent.conversationId);
           if (fresh.digest !== intent.recordDigest || JSON.stringify(fresh.state) !== JSON.stringify(intent.reviewState)) throw Error('Conversation or support warnings changed. Preview the transcript again before new publication.');
@@ -322,6 +378,21 @@ class Transcripts {
           this.checkLeaf(journalFile, journal);
           this.checkLeaf(stage, staged.stat);
           this.removal.fenceSync(intent, vault);
+          if (local.lstatSync(intent.destination, { throwIfNoEntry: false })) throw Error('Transcript destination already exists. Existing writing was preserved.');
+          // Once an attempt is durable, recovery can acknowledge an exact pair only.
+          // An interruption before link then conservatively holds the proposal.
+          const stat = this.writeControl(attemptFile, control => ({
+            schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest,
+            dev: String(staged.stat.dev), ino: String(staged.stat.ino), control: { dev: String(control.dev), ino: String(control.ino) }
+          }));
+          attempt = { stat };
+          preview.published = true;
+          preview.attempt = stat;
+          this.guard(vault, intent.destination, parents);
+          this.checkLeaf(journalFile, journal);
+          this.checkLeaf(stage, staged.stat);
+          this.checkLeaf(attemptFile, stat);
+          this.removal.fenceSync(intent, vault);
           local.linkSync(stage, intent.destination);
           await this.checkpoint('transcript-after-link');
           await this.removal.fence(intent, vault);
@@ -330,14 +401,11 @@ class Transcripts {
         const stat = await this.readPair(intent, vault, stage, parents);
         await this.removal.fence(intent, vault);
         checkPair(stat);
+        this.checkLeaf(attemptFile, attempt.stat);
         const saved = { schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest, dev: String(stat.dev), ino: String(stat.ino) };
-        const handle = local.openSync(receipt, 'wx');
-        let receiptStat;
-        try {
-          local.writeFileSync(handle, JSON.stringify(saved, null, 2));
-          local.fsyncSync(handle);
-          receiptStat = local.fstatSync(handle, { bigint: true });
-        } finally { local.closeSync(handle); }
+        const receiptStat = this.writeControl(receipt, () => saved);
+        checkPair(stat);
+        retireAttempt(receiptStat);
         await this.checkpoint('transcript-after-receipt');
         await this.removal.fence(intent, vault);
         const ready = await this.readPair(intent, vault, stage, parents, saved);

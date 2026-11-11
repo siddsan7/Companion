@@ -69,7 +69,8 @@ class TranscriptRemoval {
     const candidates = [
       { file: intent.destination, kind: 'output' }, { file: journal, kind: 'intent' },
       { file: path.join(directory, `${operation}.md.pending`), kind: 'stage' },
-      { file: path.join(directory, `${operation}.published.json`), kind: 'receipt' }
+      { file: path.join(directory, `${operation}.published.json`), kind: 'receipt' },
+      { file: path.join(directory, `${operation}.link.json`), kind: 'attempt' }
     ];
     const names = await fs.readdir(directory);
     const allowed = new Set(candidates.map(item => path.basename(item.file)));
@@ -87,6 +88,10 @@ class TranscriptRemoval {
       const read = await this.store.read(vault, intent.destination, item.file, parents, peers.length);
       if (!same(read.stat, item.stat)) throw held();
       if (['output', 'stage'].includes(item.kind) && read.text !== intent.text) throw held();
+      if (item.kind === 'attempt') {
+        if (read.stat.nlink !== 1n) throw held();
+        this.store.validateAttempt(intent, read.text, read.stat);
+      }
       texts.set(item.kind, read.text);
       targets.push({ file: this.relative(vault, item.file), kind: item.kind, sha256: sha(read.text), dev: String(read.stat.dev), ino: String(read.stat.ino), bytes: String(read.stat.size), peers });
     }
@@ -97,7 +102,7 @@ class TranscriptRemoval {
       receipt = JSON.parse(texts.get('receipt'));
       const target = output || stage;
       if (!exact(receipt, ['schema', 'operation', 'id', 'digest', 'dev', 'ino']) || receipt.schema !== 1 || receipt.operation !== operation || receipt.id !== intent.id || receipt.digest !== intent.digest || !number(receipt.dev) || !number(receipt.ino) || target && !same(receipt, target.stat)) throw held();
-    } else if (output && !stage) throw held();
+    } else if (output && (!stage || !texts.has('attempt'))) throw held();
     if (stage) this.store.checkStage(intent, stage.stat, receipt);
     return {
       vault, intent, parents,
@@ -158,7 +163,8 @@ class TranscriptRemoval {
       if (!required.has(file) || !same(parent, required.get(file))) throw held();
     }
     const base = path.join(vault.root, '.transcripts', marker.exportOperation), allowed = new Map([
-      [marker.destination, 'output'], [`${base}.intent.json`, 'intent'], [`${base}.md.pending`, 'stage'], [`${base}.published.json`, 'receipt']
+      [marker.destination, 'output'], [`${base}.intent.json`, 'intent'], [`${base}.md.pending`, 'stage'],
+      [`${base}.published.json`, 'receipt'], [`${base}.link.json`, 'attempt']
     ]);
     for (const target of marker.targets) {
       if (!exact(target, ['file', 'kind', 'sha256', 'dev', 'ino', 'bytes', 'peers']) || !digest(target.sha256) || !number(target.dev) || !number(target.ino) || !number(target.bytes) || allowed.get(this.absolute(vault, target.file)) !== target.kind || !Array.isArray(target.peers) || !sortedUnique(target.peers) || !target.peers.includes(target.file)) throw held();
@@ -195,7 +201,7 @@ class TranscriptRemoval {
     if (names.some(name => name.startsWith(`${marker.exportOperation}.`) && !allowed.has(name))) throw held();
     // A committed scope cannot silently accept an output that was absent at review.
     const expected = new Set(marker.targets.map(item => this.absolute(vault, item.file)));
-    for (const file of [marker.destination, ...['intent.json', 'md.pending', 'published.json'].map(suffix => path.join(vault.root, '.transcripts', `${marker.exportOperation}.${suffix}`))]) if (!expected.has(file) && await exists(file)) throw held();
+    for (const file of [marker.destination, ...['intent.json', 'md.pending', 'published.json', 'link.json'].map(suffix => path.join(vault.root, '.transcripts', `${marker.exportOperation}.${suffix}`))]) if (!expected.has(file) && await exists(file)) throw held();
     for (const target of remaining) await this.checkTarget(marker, vault, target, remaining);
     return remaining;
   }
