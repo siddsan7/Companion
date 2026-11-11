@@ -120,7 +120,7 @@ async function scanIdeas(vault) {
       const metadata = front && parseHeader(front[1]);
       if (metadata?.artifact_type !== 'saved_idea' || metadata.schema_version !== 1 || metadata.companion_id !== receipt.id ||
         !uuid(metadata.origin?.conversation_id) || !uuid(metadata.origin?.request_id) || metadata.origin.conversation_id !== intent.input?.conversationId || metadata.origin.request_id !== intent.input?.requestId) continue;
-      publications.set(receipt.id, `${receipt.dev}:${receipt.ino}`);
+      publications.set(receipt.id, { identity: `${receipt.dev}:${receipt.ino}`, destination: intent.destination });
     }
   }
 
@@ -154,7 +154,10 @@ async function scanIdeas(vault) {
       for (const retainedId of retainedIds) if (retainedId !== id) record(retainedId, { file, stat, relevant: true });
       // Reserve ordinary identity claims before ownership, schema, link count,
       // or support eligibility. Only current-parent owners supply note content.
-      const owned = retainedIds.includes(id) || localIdea && isIdea && !publications.has(id);
+      // Editors may replace the file at its recorded destination. This grants
+      // read access only. Removal verifies the original publication identity.
+      const recordedDestination = publications.get(id)?.destination === file;
+      const owned = retainedIds.includes(id) || recordedDestination || localIdea && isIdea && !publications.has(id);
       const savedIdea = owned && isIdea && metadata.schema_version === 1 && rawId === id;
       const content = savedIdea ? decode.decode(await readBytes(file, stat, handle)) : undefined;
       record(id, { file, stat, relevant: owned || publications.has(id), savedIdea, ...(savedIdea ? { content, metadata } : {}) });
@@ -164,8 +167,7 @@ async function scanIdeas(vault) {
   async function visit(directory, before, publishedIds) {
     for (const entry of await entries(directory, before)) {
       const file = path.join(directory, entry.name);
-      const hidden = entry.name.startsWith('.') && !inside(file, managed);
-      if (privateStores.has(entry.name.toLowerCase()) || hidden || entry.isSymbolicLink() || !entry.isDirectory() && !/\.md$/i.test(entry.name)) continue;
+      if (privateStores.has(entry.name.toLowerCase()) || entry.isSymbolicLink() || !entry.isDirectory() && !/\.md$/i.test(entry.name)) continue;
       const stat = await fs.lstat(file, { bigint: true });
       if (entry.isDirectory()) await visit(file, stat, publishedIds);
       else if (entry.isFile()) await markdown(file, stat, publishedIds);
@@ -185,7 +187,8 @@ async function scanIdeas(vault) {
     if (!anchor.isDirectory() || anchor.isSymbolicLink() || await fs.realpath(root) !== root || !inside(root, managed) || relative(managed).split(path.sep).some(part => privateStores.has(part.toLowerCase()))) throw changed(managed);
     await publishedIdeas();
     const publishedIds = new Map();
-    for (const [id, identity] of publications) if (identity) {
+    for (const [id, publication] of publications) if (publication) {
+      const { identity } = publication;
       if (!publishedIds.has(identity)) publishedIds.set(identity, []);
       publishedIds.get(identity).push(id);
     }
