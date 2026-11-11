@@ -275,21 +275,30 @@ for (const alias of ['directory junction', 'history hardlink']) test(`comparison
   }
 });
 
-test('abrupt Electron main exit retains an interrupted comparison and never reuses process proof or replays', async () => {
+test('abrupt Electron main exit retains an interrupted comparison and permits blind feedback without replay', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
     capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
     comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
   }), 'utf8');
-  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', turn: 'pending', messages: [{ phase: 'partial_answer', text: 'DURABLE_INTERRUPTED_COMPARISON_TEXT. Authored partial response, not a completed result.' }] }), 'utf8');
+  const provider = { model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default' };
+  const providerFile = path.join(root, 'conversation-provider.json');
+  const completedText = 'DURABLE_COMPLETED_COMPARISON_TEXT. Authored final response.';
+  const interruptedText = 'DURABLE_INTERRUPTED_COMPARISON_TEXT. Authored partial response.';
+  await fs.writeFile(providerFile, JSON.stringify({ ...provider, turn: 'completed', messages: [{ phase: 'final_answer', text: completedText }] }), 'utf8');
   await launch(); await approveBrief();
   await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
   await expect(page.locator('#comparison-slots article')).toHaveCount(6);
   await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
-  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes('DURABLE_INTERRUPTED_COMPARISON_TEXT'))).toBe(true);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('completed');
+  await fs.writeFile(providerFile, JSON.stringify({ ...provider, turn: 'pending', messages: [{ phase: 'partial_answer', text: interruptedText }] }), 'utf8');
+  await page.getByRole('button', { name: 'Preview Output 2', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes(interruptedText))).toBe(true);
   const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
   const child = app.process(), mainPid = await app.evaluate(() => process.pid);
   const evidence = { wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
@@ -299,20 +308,42 @@ test('abrupt Electron main exit retains an interrupted comparison and never reus
   await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
   await fs.writeFile(test.info().outputPath('comparison-crash-processes.json'), JSON.stringify(evidence, null, 2), 'utf8');
   app = null; await launch(false);
-  await expect(page.locator('#comparison-slots article').first()).toContainText('interrupted');
-  await expect(page.locator('#comparison-slots article').first()).toContainText('DURABLE_INTERRUPTED_COMPARISON_TEXT');
-  await expect(page.locator('#comparison-slots article').first()).toContainText('Elapsed: unavailable');
-  await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
+  const interruptedArticle = page.locator('#comparison-slots article').nth(1);
+  await expect(interruptedArticle).toContainText('interrupted');
+  await expect(interruptedArticle).toContainText(interruptedText);
+  await expect(interruptedArticle).toContainText('Elapsed: unavailable');
+  await expect(page.getByRole('button', { name: 'Preview Output 2', exact: true })).toBeDisabled();
   const saved = await savedComparison(), interrupted = saved.slots.find(slot => slot.status === 'interrupted');
   expect(interrupted.elapsedMs).toBeNull();
   expect(interrupted.candidate.warning).toContain('unavailable or ambiguous');
   expect(interrupted.messages[0].completed).toBe(false);
-  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(5);
-  await page.getByRole('button', { name: 'Preview Output 2', exact: true }).click();
+  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(4);
+  await page.getByRole('button', { name: 'Preview Output 3', exact: true }).click();
   await expect(page.locator('#comparison-error')).toContainText('Evidence changed or the process restarted');
+  await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Blind scoring', exact: true })).toBeVisible();
+  for (const [text, status] of [[completedText, 'completed'], [interruptedText, 'interrupted']]) {
+    const sample = page.locator('#comparison-score article').filter({ hasText: text });
+    await expect(sample).toHaveCount(1);
+    await expect(sample).toContainText(status);
+    const label = await sample.getByRole('heading').first().innerText();
+    expect(label).toMatch(/^Sample [a-f0-9]{8}$/);
+    for (const dimension of ['Usefulness', 'Surprise', 'Grounding', 'Ease of testing']) {
+      await sample.getByLabel(label + ' ' + dimension, { exact: true }).fill('2');
+    }
+    await sample.getByLabel(label + ' Rating reason', { exact: true }).fill(`Reviewed the retained ${status} outcome.`);
+    await sample.getByRole('button', { name: 'Save feedback ' + label, exact: true }).click();
+    await expect(sample).toContainText('Feedback saved');
+  }
+  expect(await page.getByRole('button', { name: /^Save feedback Sample/ }).evaluateAll(buttons => buttons.filter(button => !button.disabled).length)).toBe(2);
+  await expect(page.getByRole('button', { name: 'Reveal methods and effort', exact: true })).toBeDisabled();
+  const scored = await savedComparison();
+  expect(scored.slots.filter(slot => slot.status === 'pending' && !slot.rating)).toHaveLength(4);
+  expect(scored.slots.filter(slot => slot.rating).map(slot => slot.status).sort()).toEqual(['completed', 'interrupted']);
+  expect(scored.blindOrder.filter(entry => scored.slots.some(slot => slot.id === entry.slotId && slot.rating))).toHaveLength(2);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
   const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
+  expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(2);
 });
 
 test('an active comparison poll cannot authorize overwriting an external history edit', async () => {
@@ -450,6 +481,8 @@ test('independent blind aliases retain six validated ratings and reveal methods 
   expect(byDisplay[5].error).toContain('usage limit');
   const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
   expect(submissions.trim().split('\n')).toHaveLength(6);
+  const laterBriefText = 'CURRENT_SOURCE_TEXT_MUST_NOT_REPLACE_PINNED_SCORING_EVIDENCE';
+  await fs.writeFile(path.join(root, 'README.md'), laterBriefText, 'utf8');
   await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
   await expect(page.locator('#comparison-score article')).toHaveCount(6);
   await expect(page.locator('#comparison-score')).not.toContainText('analogy');
@@ -459,6 +492,27 @@ test('independent blind aliases retain six validated ratings and reveal methods 
   const blindLabels = await page.locator('#comparison-score article h4').allTextContents();
   expect(blindLabels).toHaveLength(6);
   expect(blindLabels.every(label => /^Sample [a-f0-9]{8}$/.test(label))).toBe(true);
+  const blindPanel = page.locator('#comparison-score-panel');
+  await expect(blindPanel).toContainText('Five-minute practice sessions; no audio recognition or social ranking.');
+  await expect(blindPanel).toContainText('No controlled evidence of retention gains.');
+  await expect(blindPanel).not.toContainText(laterBriefText);
+  await expect(blindPanel).not.toContainText('Explicitly map the source mechanism');
+  await expect(blindPanel).not.toContainText('Output 1');
+  const blindRecord = await savedComparison();
+  for (const entry of blindRecord.blindOrder) {
+    const slot = generated.slots.find(item => item.id === entry.slotId);
+    const fixture = generated.fixtures.find(item => item.id === slot.fixtureId);
+    const sample = page.locator('#comparison-score article').filter({ has: page.getByRole('heading', { name: entry.label, exact: true }) });
+    await expect(sample).toContainText(/synthetic/i);
+    for (const passage of fixture.passages) {
+      await expect(sample).toContainText(passage.id);
+      await expect(sample).toContainText(passage.text);
+    }
+    await expect(sample).toContainText(fixture.limitations);
+    for (const other of generated.fixtures.filter(item => item.id !== fixture.id)) {
+      await expect(sample).not.toContainText(other.passages[0].text);
+    }
+  }
   const firstLabel = blindLabels[0];
   const shownCandidate = await page.locator('#comparison-score article').first().locator('pre').innerText();
   expect(shownCandidate).not.toBe('');
