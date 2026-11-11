@@ -2,6 +2,8 @@ const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { AnnotationRemoval } = require('../app/annotation-removal');
 const { Briefs } = require('../app/briefs');
 const { CaptureDeletion } = require('../app/capture-deletion');
@@ -15,6 +17,7 @@ const draft = require('./fixtures/reel-draft/example.json');
 const now = '2026-11-08T06:59:00.000Z';
 const later = '2026-11-09T06:59:00.000Z';
 const sourceHash = 'a'.repeat(64);
+const execute = promisify(execFile);
 const identity = async file => {
   const { dev, ino } = await fs.lstat(file, { bigint: true });
   return [dev, ino];
@@ -185,6 +188,89 @@ test('reserved restoration Markdown cannot supply an exact moved approved brief'
   expect(await identity(reserved)).toEqual(replacementIdentity);
   expect(await fs.readFile(receipt)).toEqual(receiptBytes);
   expect(await fs.readFile(displaced)).toEqual(before);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
+});
+
+test('reserved restoration Markdown cannot settle an interrupted linked brief approval', async ({}, testInfo) => {
+  const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures');
+  const briefs = new Briefs(vault), readme = testInfo.outputPath('README.md');
+  async function propose(projectText) {
+    await fs.writeFile(readme, `# MyTune\n\n${projectText}\n`);
+    const { proposed } = await briefs.propose([readme], now);
+    return {
+      id: proposed.id, digest: proposed.digest,
+      sections: proposed.sections.map(section => section.text),
+      references: proposed.sections.map(section => section.references
+        .map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+    };
+  }
+  const firstRequest = await propose('A guitar practice tutor.');
+  const { approved } = await briefs.approve(firstRequest, now);
+  const first = approved.find(item => item.id === firstRequest.id);
+  expect(first.version).toBe(1);
+  const request = await propose('A new draft awaiting approval.');
+  const child = `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const { Briefs } = require('./app/briefs');
+    const { Vault } = require('./app/vault');
+    const [vault, input, now] = process.argv.slice(1);
+    const briefs = new Briefs(new Vault(vault, 'Companion'));
+    const link = fs.linkSync;
+    fs.linkSync = (from, to) => {
+      link(from, to);
+      if (path.dirname(from) === briefs.dir && path.dirname(to) === briefs.dir &&
+          path.basename(from).startsWith('.brief-stage-') && path.basename(to).startsWith('approved-2-')) {
+        process.exit(71);
+      }
+    };
+    briefs.approve(JSON.parse(input), now).then(() => {
+      console.error('Approval did not stop at the exact linked file.');
+      process.exitCode = 72;
+    }, error => {
+      console.error(error);
+      process.exitCode = 73;
+    });
+  `;
+  await expect(execute(process.execPath, ['-e', child, vault.vault, JSON.stringify(request), now], {
+    cwd: path.resolve(__dirname, '..'), windowsHide: true
+  })).rejects.toMatchObject({ code: 71 });
+
+  const pending = path.join(briefs.dir, '.brief-approval-2.pending.json');
+  const receipt = path.join(briefs.dir, '.brief-approval-2.json');
+  const pendingBytes = await fs.readFile(pending), pendingIdentity = await identity(pending);
+  const marker = JSON.parse(pendingBytes.toString('utf8'));
+  const stage = path.join(briefs.dir, marker.stage);
+  const destination = path.join(briefs.dir, `approved-2-${marker.staged.digest}.md`);
+  const bytes = await fs.readFile(stage), stageIdentity = await identity(stage);
+  expect(await identity(destination)).toEqual(stageIdentity);
+  expect((await fs.lstat(stage)).nlink).toBe(2);
+  expect(await absent(receipt)).toBe(true);
+  const displaced = testInfo.outputPath('original-restoration.md'), original = await fs.readFile(reserved);
+  await fs.rename(reserved, displaced);
+  await fs.rename(destination, reserved);
+  expect(await identity(reserved)).toEqual(stageIdentity);
+
+  const restarted = new Briefs(new Vault(vault.vault, 'Companion'));
+  await expect.soft(restarted.pinned(2)).rejects.toThrow(/integrity|preserv|unavailable/i);
+  await expect(restarted.pinned(1)).resolves.toMatchObject({ id: first.id, digest: first.digest });
+  expect.soft(await absent(receipt)).toBe(true);
+  expect.soft(await absent(stage)).toBe(false);
+  expect.soft(await absent(pending)).toBe(false);
+  if (!await absent(stage)) {
+    expect(await fs.readFile(stage)).toEqual(bytes);
+    expect(await identity(stage)).toEqual(stageIdentity);
+  }
+  if (!await absent(pending)) {
+    expect(await fs.readFile(pending)).toEqual(pendingBytes);
+    expect(await identity(pending)).toEqual(pendingIdentity);
+  }
+  expect(await absent(destination)).toBe(true);
+  expect(await fs.readFile(reserved)).toEqual(bytes);
+  expect(await identity(reserved)).toEqual(stageIdentity);
+  expect.soft((await fs.lstat(reserved)).nlink).toBe(2);
+  expect(await fs.readFile(displaced)).toEqual(original);
   expect(await fs.readFile(journal)).toEqual(journalBytes);
   expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
 });
