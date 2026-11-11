@@ -525,7 +525,13 @@ test('a missing canonical capture never promotes its recorded excluded copy duri
   await expect(page.getByRole('status')).toContainText('Intake check complete');
   expect(await fs.readFile(copy, 'utf8')).toBe(before);
   await expect(page.getByRole('button', { name: 'Use this file: Projects/Excluded capture.md', exact: true })).toBeVisible();
-  await expect(page.locator('#captures article')).toHaveCount(2);
+  const ledger = JSON.parse(await fs.readFile(path.join(base, '.intake', 'ledger.json'), 'utf8'));
+  const independentId = ledger.captures['c'.repeat(64)].id;
+  const excludedId = Object.values(ledger.captures).find(capture => capture.id !== independentId).id;
+  const captures = () => page.locator('#captures article');
+  await expect(captures()).toHaveCount(1);
+  await expect(captures().first()).toContainText(independentId);
+  await expect(captures().filter({ hasText: excludedId })).toHaveCount(0);
   await app.close(); app = null; await launch();
   expect(await fs.readFile(copy, 'utf8')).toBe(before);
   await page.getByRole('button', { name: 'Use this file: Projects/Excluded capture.md', exact: true }).click();
@@ -534,6 +540,7 @@ test('a missing canonical capture never promotes its recorded excluded copy duri
   await expect(page.getByRole('status')).toContainText('Intake check complete');
   expect(await fs.readFile(copy, 'utf8')).not.toBe(before);
   expect(await fs.readFile(original, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+  await expect(captures().filter({ hasText: excludedId })).toHaveCount(1);
 });
 
 test('missing captures pause until explicit restore or confirmed intake removal with retained history', async () => {
