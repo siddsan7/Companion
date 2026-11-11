@@ -107,9 +107,10 @@ test('reserved restoration direct reads cannot offer an exact foreign capture ci
   expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
 });
 
-test('idea confirmation holds a selected citation changed by a reserved claim after preview', async ({}, testInfo) => {
+for (const claim of ['reserved claim', 'new ordinary duplicate']) test(`idea confirmation holds a selected citation changed by a ${claim} after preview`, async ({}, testInfo) => {
   const { vault, intake, reserved, captureId, authority, journal, journalBytes } = await publishedRestoration(testInfo, 'Captures', { independent: true });
-  const initial = await replaceRestoration(testInfo, reserved, 'An ordinary restoration replacement before citation review.\n');
+  const replacement = 'An ordinary restoration replacement before citation review.\n';
+  const initial = await replaceRestoration(testInfo, reserved, replacement);
   const context = new Context(vault, { scopeFile: testInfo.outputPath('scope', 'notes.json') });
   const briefStore = new Briefs(vault), readme = testInfo.outputPath('README.md');
   await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
@@ -123,6 +124,7 @@ test('idea confirmation holds a selected citation changed by a reserved claim af
   const { id: briefId, version, digest: briefDigest } = approved.approved[0];
   const ledger = await intake.load(), cited = ledger.captures['c'.repeat(64)], unaffected = ledger.captures['d'.repeat(64)];
   const citedFile = intake.destination(cited), citedBytes = await fs.readFile(citedFile);
+  const citedIdentity = await identity(citedFile), duplicate = path.join(vault.vault, 'New capture claim.md');
   const originalCited = testInfo.outputPath('original-cited-before-confirm.md'), displacedReplacement = testInfo.outputPath('prior-reserved-replacement.md');
   const source = (await context.corpus()).all.find(item => item.captureId === cited.id && item.revisionId === cited.currentRevision);
   expect(source).toBeDefined();
@@ -157,29 +159,44 @@ test('idea confirmation holds a selected citation changed by a reserved claim af
   expect(proposal.text).toContain(`evidence_id: ${evidence.id}`);
 
   const preview = ideas.preview.bind(ideas);
-  let replaced = false;
+  let changed = false, duplicateIdentity;
   ideas.preview = async (input, retained) => {
     const checked = await preview(input, retained);
-    if (retained?.operation === proposal.operation && !replaced) {
+    if (retained?.operation === proposal.operation && !changed) {
       // Let the real confirmation finish its last preview, then change the source files.
-      await fs.rename(citedFile, originalCited);
-      await fs.rename(reserved, displacedReplacement);
-      await fs.writeFile(reserved, citedBytes, { flag: 'wx' });
-      replaced = true;
+      if (claim === 'reserved claim') {
+        await fs.rename(citedFile, originalCited);
+        await fs.rename(reserved, displacedReplacement);
+        await fs.writeFile(reserved, citedBytes, { flag: 'wx' });
+      } else {
+        await fs.writeFile(duplicate, citedBytes, { flag: 'wx' });
+        duplicateIdentity = await identity(duplicate);
+        expect(duplicateIdentity).not.toEqual(citedIdentity);
+      }
+      changed = true;
     }
     return checked;
   };
   await expect.soft(ideas.confirm({ operation: proposal.operation })).rejects.toThrow(/reserved|identity|evidence|changed|unavailable/i);
-  expect(replaced).toBe(true);
+  expect(changed).toBe(true);
   const directory = path.join(vault.root, '.ideas'), stage = path.join(directory, `${proposal.operation}.md.pending`);
   expect.soft(await absent(proposal.destination)).toBe(true);
   expect.soft(await absent(path.join(directory, `${proposal.operation}.published.json`))).toBe(true);
   expect.soft(await absent(stage)).toBe(false);
   if (!await absent(stage)) expect(await fs.readFile(stage, 'utf8')).toBe(proposal.text);
-  expect(await absent(citedFile)).toBe(true);
-  expect(await fs.readFile(originalCited)).toEqual(citedBytes);
-  expect(await fs.readFile(reserved)).toEqual(citedBytes);
-  expect(await identity(displacedReplacement)).toEqual(initial.replacementIdentity);
+  if (claim === 'reserved claim') {
+    expect(await absent(citedFile)).toBe(true);
+    expect(await fs.readFile(originalCited)).toEqual(citedBytes);
+    expect(await fs.readFile(reserved)).toEqual(citedBytes);
+    expect(await identity(displacedReplacement)).toEqual(initial.replacementIdentity);
+  } else {
+    expect(await fs.readFile(citedFile)).toEqual(citedBytes);
+    expect(await identity(citedFile)).toEqual(citedIdentity);
+    expect(await fs.readFile(duplicate)).toEqual(citedBytes);
+    expect(await identity(duplicate)).toEqual(duplicateIdentity);
+    expect(await fs.readFile(reserved, 'utf8')).toBe(replacement);
+    expect(await identity(reserved)).toEqual(initial.replacementIdentity);
+  }
   expect(await fs.readFile(initial.displaced)).toEqual(initial.before);
   expect(await fs.readFile(journal)).toEqual(journalBytes);
   expect((await intake.load()).sourceAuthority[captureId]).toEqual(authority);
