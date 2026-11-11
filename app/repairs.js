@@ -33,7 +33,7 @@ function sourceLink(content, relative) {
   return frontmatter[0] + body.replace(/^(\r?\n# Annotation\r?\n\r?\n)Source: \[Capture\]\([^\r\n]*\)(?=\r?\n|$)/, (_, header) => header + 'Source: [Capture](' + urlPath(relative) + ')');
 }
 function install(Intake, { hash, read, noteText, acceptedOutcome }) {
-  async function writeRepairIntentStage(file, intent, guard) {
+  async function writeOwnedIntentStage(file, intent, guard) {
     guard();
     const handle = await fs.open(file, 'wx');
     try {
@@ -272,27 +272,104 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       assertAnnotationPublication(ledger, id);
       if (!capture) throw Error('Choose an imported capture before adding an annotation.');
       const annotation = '---\ncompanion_id: ' + JSON.stringify(id) + '\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ' + JSON.stringify(captureId) + (ledger.sourceAuthority?.[captureId]?.phase === 'active' ? '\nsource_generation: ' + JSON.stringify(ledger.sourceAuthority[captureId].generation) : '') + '\ncreated_at: ' + JSON.stringify(now) + '\n---\n\n# Annotation\n\nSource: [Capture](' + urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture))) + ')\n\n' + text + '\n';
-      await this.publishJournal(path.join(this.dir, 'annotation-intent.json'), { schema: 1, id, captureId, annotation });
+      const journal = path.join(this.dir, 'annotation-intent.json');
+      const ordinary = this.vault.publicationFolders(this.dir).guard;
+      const baseline = this.storage.expected;
+      const guard = () => { this.storage.guardSync(baseline); ordinary(); };
+      const { proof } = await writeOwnedIntentStage(journal, { schema: 1, id, captureId, annotation }, guard);
+      verifyStageSync(journal, guard, proof);
       await this.finishAnnotation();
     });
   };
+  Intake.prototype.validateAnnotationIntent = function (intent) {
+    const mandatory = ['schema', 'id', 'captureId', 'annotation'];
+    const allowed = [...mandatory, 'intentIdentity', 'annotationProof'];
+    const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
+    if (!intent || !mandatory.every(key => Object.hasOwn(intent, key)) || !Object.keys(intent).every(key => allowed.includes(key)) ||
+        intent.schema !== 1 || typeof intent.id !== 'string' || !uuid.test(intent.id) ||
+        typeof intent.captureId !== 'string' || !uuid.test(intent.captureId) || typeof intent.annotation !== 'string') {
+      throw Error('Invalid annotation save intent. Preserve .intake for repair.');
+    }
+    const note = parseAnnotation(intent.annotation), identity = intent.intentIdentity, proof = intent.annotationProof;
+    if (!note || note.id !== intent.id || note.captureId !== intent.captureId ||
+        Object.hasOwn(intent, 'intentIdentity') && (!identity || Object.keys(identity).length !== 2 ||
+          ![identity.dev, identity.ino].every(value => typeof value === 'string' && /^[0-9]+$/.test(value))) ||
+        Object.hasOwn(intent, 'annotationProof') && (!identity || !validProof(proof) || Object.keys(proof).length !== 3 ||
+          proof.digest !== hash(intent.annotation))) {
+      throw Error('Invalid annotation publication proof. Recovery files were preserved.');
+    }
+    return note;
+  };
   Intake.prototype.finishAnnotation = async function () {
-    const journal = path.join(this.dir, 'annotation-intent.json'), bytes = await read(journal); if (bytes === null) return;
-    const intent = JSON.parse(bytes), uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
-    if (intent.schema !== 1 || !uuid.test(intent.id) || !uuid.test(intent.captureId) || typeof intent.annotation !== 'string' || !intent.annotation.includes('capture_id: ' + JSON.stringify(intent.captureId) + '\n')) throw Error('Invalid annotation save intent. Preserve .intake for repair.');
-    if (annotationRemoved(await annotationAuthority(this), intent.id)) return { held: true, removed: true };
+    const journal = path.join(this.dir, 'annotation-intent.json'), baseline = this.storage.expected;
+    const ordinary = this.vault.publicationFolders(this.dir).guard;
+    let record;
+    try { record = readExactSync(journal, ordinary); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    const intent = JSON.parse(record.bytes);
+    this.validateAnnotationIntent(intent);
+    const authority = await annotationAuthority(this);
+    if (annotationRemoved(authority, intent.id)) return { held: true, removed: true };
+    assertAnnotationPublication(authority, intent.id);
+    if (!record.bytes.equals(Buffer.from(JSON.stringify(intent))) || intent.intentIdentity &&
+        (intent.intentIdentity.dev !== record.proof.dev || intent.intentIdentity.ino !== record.proof.ino)) {
+      throw Error('The annotation save intent changed. Recovery files were preserved.');
+    }
     const file = path.join(this.vault.root, 'Annotations', intent.id + '.md'), stage = path.join(this.dir, 'annotation-' + intent.id + '.stage');
-    await this.vault.contained(path.dirname(file)); await this.ownedFile(stage, file, 'Annotation staging file');
-    assertAnnotationPublication(await annotationAuthority(this), intent.id);
-    try { await fs.writeFile(stage, intent.annotation, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(stage) !== intent.annotation) throw Error('Annotation staging conflict. Both files were preserved.'); }
-    await this.ownedFile(stage, file, 'Annotation staging file'); await this.ownedFile(file, stage, 'Annotation destination');
-    assertAnnotationPublication(await annotationAuthority(this), intent.id);
-    try { await fs.link(stage, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    await this.ownedFile(file, stage, 'Annotation destination');
-    if (await read(file) !== intent.annotation) throw Error('Annotation destination changed. Both files were preserved.');
-    await this.vault.checkpoint('annotation-published');
-    assertAnnotationPublication(await annotationAuthority(this), intent.id);
-    await fs.unlink(stage); await fs.unlink(journal);
+    const annotationGuard = this.vault.publicationFolders(path.dirname(file)).guard;
+    const guard = () => { ordinary(); annotationGuard(); };
+    let journalProof = record.proof, proof = intent.annotationProof;
+    const verifyIntent = () => {
+      this.storage.guardSync(baseline);
+      verifyStageSync(journal, guard, journalProof);
+    };
+    if (!proof) {
+      verifyIntent();
+      verifyAbsentSync(file, guard);
+      verifyAbsentSync(stage, guard);
+      proof = await writeStage(stage, intent.annotation, guard);
+      const replacement = path.join(this.dir, `annotation-intent-${randomUUID()}.tmp`);
+      const { proof: replacementProof } = await writeOwnedIntentStage(replacement, { ...intent, annotationProof: proof }, guard);
+      try {
+        verifyIntent();
+        verifyAbsentSync(file, guard);
+        verifyStageSync(stage, guard, proof);
+        verifyStageSync(replacement, guard, replacementProof);
+        native.renameSync(replacement, journal);
+        verifyStageSync(journal, guard, replacementProof);
+        journalProof = replacementProof;
+      } finally {
+        try {
+          readExactSync(replacement, guard, 1, replacementProof);
+          native.unlinkSync(replacement);
+        } catch (error) {
+          if (error.code !== 'ENOENT') this.vault.warnings.push('An annotation intent stage remains for guarded inspection.');
+        }
+      }
+    }
+    const verifyPair = () => {
+      verifyStageSync(stage, guard, proof, 2);
+      verifyStageSync(file, guard, proof, 2);
+    };
+    verifyIntent();
+    const staged = native.lstatSync(stage, { throwIfNoEntry: false });
+    if (staged) {
+      if (!native.lstatSync(file, { throwIfNoEntry: false })) {
+        verifyStageSync(stage, guard, proof);
+        verifyAbsentSync(file, guard);
+        native.linkSync(stage, file);
+      }
+      verifyPair();
+      await this.vault.checkpoint('annotation-published');
+      assertAnnotationPublication(await annotationAuthority(this), intent.id);
+      verifyIntent();
+      verifyPair();
+      native.unlinkSync(stage);
+    }
+    verifyIntent();
+    verifyAbsentSync(stage, guard);
+    verifyStageSync(file, guard, proof);
+    native.unlinkSync(journal);
   };
   Intake.prototype.repairs = async function () {
     return this.locked(async () => {
@@ -356,7 +433,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         conflict.verify();
         intent.sourceProof = await writeStage(sourceStage, JSON.stringify(intent.tx), guard);
         const intentStage = path.join(this.dir, `repair-intent-${id}.stage`);
-        const { proof } = await writeRepairIntentStage(intentStage, intent, guard);
+        const { proof } = await writeOwnedIntentStage(intentStage, intent, guard);
         const verifyConflict = () => {
           this.storage.guardSync();
           conflict.verify();
@@ -671,7 +748,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     const recordIntentProof = async (field, proof, verifyFiles) => {
       verifyFiles();
       const replacement = path.join(this.dir, `repair-intent-${randomUUID()}.tmp`);
-      const updated = await writeRepairIntentStage(replacement, { ...intent, [field]: proof }, guard);
+      const updated = await writeOwnedIntentStage(replacement, { ...intent, [field]: proof }, guard);
       const replacementProof = updated.proof;
       try {
         guardPrecommit();
