@@ -173,6 +173,93 @@ test('restoration hold allows independent import after a published output change
   expect(await readOptional(shared)).toBeNull();
 });
 
+for (const target of ['capture', 'snapshot', 'shared ledger']) {
+  test(`Windows published restoration read refusal at the ${target}`, async ({}, testInfo) => {
+    test.skip(process.platform !== 'win32', 'Requires an actual Windows FileShare.None handle.');
+    const interruption = Error('Stopped after restoration publication.');
+    const { vault, intake, deletion, restoration, producer, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
+      if (name === 'capture-restoration-published') throw interruption;
+    }, { existing: target === 'capture' });
+    await expect(deletion.confirmRestoration(restoration.token)).rejects.toThrow(interruption.message);
+    const beforeBytes = await fs.readFile(ledgerFile), before = JSON.parse(beforeBytes);
+    const authority = before.sourceAuthority[id], revision = authority.restoration.revision;
+    expect(authority).toMatchObject({ phase: 'restoring', restoration: { published: true } });
+    expect(before.suppressed).toContain(sourceHash);
+    const capture = intake.destination(before.captures[sourceHash]);
+    const snapshot = path.join(vault.root, 'Revisions', revision + '.json');
+    const selected = path.join(intake.dir, authority.restoration.journal);
+    const files = await Promise.all([capture, snapshot, selected].map(async file => ({
+      file, bytes: await fs.readFile(file), stat: await fs.lstat(file, { bigint: true })
+    })));
+    const shared = path.join(intake.dir, 'transaction.json');
+    expect(await readOptional(shared)).toBeNull();
+    const bHash = 'c'.repeat(64), cHash = 'd'.repeat(64);
+    if (target === 'capture') await writeDraft(producer, 'existing-update', '3', 'c');
+    await writeDraft(producer, 'new-independent', '4', 'd');
+
+    const locked = { capture, snapshot, 'shared ledger': ledgerFile }[target];
+    const script = [
+      '$ErrorActionPreference = "Stop"',
+      '$stream = [IO.File]::Open($env:COMPANION_RESTORATION_LOCK_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)',
+      'try { [Console]::WriteLine("READY:" + $PID); [void][Console]::ReadLine() } finally { $stream.Dispose(); [Console]::WriteLine("RELEASED:" + $PID) }'
+    ].join('; ');
+    const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+      windowsHide: true, env: { ...process.env, COMPANION_RESTORATION_LOCK_FIXTURE: locked }, stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const helper = { pid: child.pid, stdout: '', stderr: '' };
+    child.stdout.on('data', chunk => { helper.stdout += chunk.toString(); });
+    child.stderr.on('data', chunk => { helper.stderr += chunk.toString(); });
+    child.stdin.on('error', error => { helper.inputError = error.message; });
+    child.on('error', error => { helper.error = error.message; });
+    const closed = new Promise(resolve => child.once('close', (code, signal) => {
+      helper.exit = { code, signal };
+      resolve();
+    }));
+    const sharing = ['EPERM', 'EBUSY', 'EACCES'];
+    let outcome, refusal;
+    try {
+      await expect.poll(() => {
+        if (helper.error || helper.exit) throw Error(JSON.stringify(helper));
+        return helper.stdout;
+      }).toContain('READY:' + child.pid);
+      try { native.readFileSync(locked); }
+      catch (error) { refusal = error.code; }
+      expect(sharing).toContain(refusal);
+      const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+      outcome = await restarted.reconcile({ now: later }).catch(error => error);
+      if (target === 'capture' && !(outcome instanceof Error)) {
+        await expect(restarted.vault.list()).rejects.toThrow();
+      }
+    } finally {
+      child.stdin.end('\n');
+      await closed;
+    }
+    expect(helper.exit).toEqual({ code: 0, signal: null });
+    expect(helper.stdout).toContain('RELEASED:' + child.pid);
+    for (const { file, bytes, stat } of files) {
+      expect(await fs.readFile(file)).toEqual(bytes);
+      const after = await fs.lstat(file, { bigint: true });
+      expect([after.dev, after.ino, after.nlink]).toEqual([stat.dev, stat.ino, stat.nlink]);
+    }
+    expect(await readOptional(shared)).toBeNull();
+    if (target === 'shared ledger') {
+      expect(outcome).toBeInstanceOf(Error);
+      expect(await fs.readFile(ledgerFile)).toEqual(beforeBytes);
+      return;
+    }
+    expect(outcome instanceof Error ? { code: outcome.code, message: outcome.message } : null).toBeNull();
+    expect(outcome.captures[cHash]).toBeDefined();
+    expect(await readOptional(intake.destination(outcome.captures[cHash]))).not.toBeNull();
+    expect(outcome.sourceAuthority[id]).toEqual(authority);
+    expect(outcome.suppressed).toContain(sourceHash);
+    expect(outcome.admissions).toEqual(before.admissions);
+    if (target === 'capture') {
+      expect(outcome.captures[bHash].currentRevision).toBe(before.captures[bHash].currentRevision);
+      expect(outcome.attempts[`${'b'.repeat(64)}:${'3'.repeat(32)}`]).toBeUndefined();
+    }
+  });
+}
+
 test('restoration reserves the selected capture path as soon as authorization is durable', async ({}, testInfo) => {
   const interruption = Error('Stopped after restoration authorization.');
   const { vault, intake, deletion, restoration, sourceHash, id, ledgerFile } = await fixture(testInfo, async name => {
