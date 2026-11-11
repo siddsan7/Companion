@@ -931,7 +931,8 @@ class Intake {
   }
   verifyDistinctHeldRepair(ledger, tx, journalBytes, held, guard) {
     const witness = held.outputHold, capture = ledger.captures[tx.sourceHash];
-    if (witness !== undefined && witness?.mode !== precommitConflict || held.incomingRevision !== tx.revision.id ||
+    // Any repairable prior hold can prove this handoff; committed output holds cannot.
+    if (witness === null || witness?.committed === true || this.isCommittedOutputHold(held) || held.incomingRevision !== tx.revision.id ||
         !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(held.journal) ||
         !tx.resolution || !tx.keptCurrent || capture?.id !== tx.capture.id || capture.conflict !== held.reason ||
         capture.currentRevision !== tx.keptCurrent.id) return null;
