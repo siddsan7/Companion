@@ -311,6 +311,7 @@ test('one explicit Save capture publishes once after earlier Browse repairs rele
     await refresh.click();
     await expect.poll(() => app.evaluate(() => globalThis.__browseAdmission.held)).toBe(true);
     await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+    expect.soft(await page.getByRole('button', { name: 'Use this folder', exact: true }).isDisabled(), 'The selected vault cannot change during an admitted Save').toBe(true);
     const observation = () => app.evaluate(() => {
       const { requests, releaseReason, filesBeforeRelease } = globalThis.__browseAdmission;
       return { requests, releaseReason, filesBeforeRelease };
