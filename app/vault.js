@@ -157,44 +157,85 @@ class Vault {
     return note.type !== 'reel_import' && typeof note.managedParent === 'string' &&
       comparable(note.managedParent) === comparable(parentOf(this.vault, this.root));
   }
-  restoringImportedCaptures(ledger) {
-    const held = new Map(), intake = new (require('./intake').Intake)(this);
+  reservedRestorationPaths(ledger) {
+    const heldRestorations = new Map(), paths = new Set(), slots = [];
+    const intake = new (require('./intake').Intake)(this);
+    const { requiredDirectories, removalParentGuard } = require('./source-recovery');
     for (const [id, authority] of Object.entries(ledger.sourceAuthority || {})) {
-      if (authority.phase !== 'restoring' || authority.manual || !authority.restoration.published ||
-          !authority.restoration.importedPublication || !ledger.suppressed.includes(authority.sourceHash)) continue;
+      if (authority.phase !== 'restoring' || authority.manual) continue;
       const capture = ledger.captures[authority.sourceHash];
-      if (capture?.id === id && capture.currentRevision === authority.restoration.revision) {
-        held.set(id, intake.destination(capture));
+      if (capture?.id !== id || !ledger.suppressed.includes(authority.sourceHash) ||
+          comparable(path.resolve(this.vault)) !== comparable(authority.root)) {
+        throw Error('The recorded restoration path or vault identity changed. Files were preserved.');
       }
+      const file = intake.destination(capture), relative = comparableRelative(path.relative(this.vault, file));
+      if (!authority.targets.some(target => target.kind === 'capture' && comparableRelative(target.file) === relative) || paths.has(relative)) {
+        throw Error('The selected capture path disagrees with the recorded restoration target. Files were preserved.');
+      }
+      const recorded = new Set(authority.directories.map(item => comparableRelative(item.file)));
+      const required = requiredDirectories(intake, [{ file: path.relative(this.vault, file) }]);
+      if ([...required].some(parent => !recorded.has(comparableRelative(parent)))) {
+        throw Error('The recorded restoration folder scope is incomplete. Files were preserved.');
+      }
+      const guard = removalParentGuard(this, authority.directories);
+      slots.push({ id, file, guard, authority });
+      heldRestorations.set(id, file);
+      paths.add(relative);
     }
-    return held;
+    const guard = () => { for (const slot of slots) slot.guard(); };
+    return { heldRestorations, paths, guard, slots };
   }
   reservedRestorationIdentities(ledger) {
-    const heldRestorations = this.restoringImportedCaptures(ledger);
-    const paths = new Set([...heldRestorations.values()].map(file => comparableRelative(path.relative(this.vault, file))));
+    const reservation = this.reservedRestorationPaths(ledger);
     const captures = new Set(), annotations = new Set(), observations = [];
-    for (const [id, file] of heldRestorations) {
-      const { guard } = this.publicationFolders(path.dirname(file));
+    for (const { id, file, guard, authority } of reservation.slots) {
       guard();
-      if (!local.lstatSync(file, { throwIfNoEntry: false })) {
+      const stat = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+      if (!stat) {
         verifyAbsentSync(file, guard);
-        observations.push({ file, guard });
+        observations.push(() => verifyAbsentSync(file, guard));
+        continue;
+      }
+      if (stat.nlink === 2n && !authority.restoration.published) {
+        observations.push(this.verifyActiveRestorationPair(id, file, guard, authority));
         continue;
       }
       // Observe only identity claims. A reserved slot can never confer ownership.
       const { bytes, proof } = readExactSync(file, guard), text = bytes.toString('utf8');
-      observations.push({ file, guard, proof });
+      observations.push(() => verifyStageSync(file, guard, proof));
       const capture = parse(text), annotation = parseAnnotation(text);
       if (capture && capture.id !== id) captures.add(capture.id);
       if (annotation) annotations.add(annotation.id);
     }
     const verify = () => {
-      for (const { file, guard, proof } of observations) {
-        if (proof) verifyStageSync(file, guard, proof);
-        else verifyAbsentSync(file, guard);
-      }
+      reservation.guard();
+      for (const observe of observations) observe();
     };
-    return { heldRestorations, paths, captures, annotations, verify };
+    return { heldRestorations: reservation.heldRestorations, paths: reservation.paths, captures, annotations, verify };
+  }
+  verifyActiveRestorationPair(id, file, guard, authority) {
+    const intake = new (require('./intake').Intake)(this);
+    const { revision, journal, sha256, importedPublication } = authority.restoration;
+    const selected = path.join(intake.dir, journal), active = path.join(intake.dir, 'transaction.json');
+    const stage = path.join(intake.dir, revision + '.stage');
+    const { bytes, proof: journalProof } = readExactSync(selected, guard, 2, importedPublication?.journal);
+    const tx = JSON.parse(bytes);
+    intake.validateTransaction(tx);
+    if (journalProof.digest !== sha256 || tx.capture.id !== id || tx.revision.id !== revision ||
+        tx.sourceHash !== authority.sourceHash || tx.sourceGeneration !== authority.generation ||
+        tx.restoreOperation !== authority.operationId || comparable(intake.destination(tx.capture)) !== comparable(file)) {
+      throw Error('The active restoration pair disagrees with its recorded identity. Files were preserved.');
+    }
+    const { proof } = readExactSync(file, guard, 2, importedPublication?.capture);
+    if (proof.digest !== tx.capture.currentHash) throw Error('The active restoration capture changed. Files were preserved.');
+    const verify = () => {
+      verifyStageSync(selected, guard, journalProof, 2);
+      verifyStageSync(active, guard, journalProof, 2);
+      verifyStageSync(stage, guard, proof, 2);
+      verifyStageSync(file, guard, proof, 2);
+    };
+    verify();
+    return verify;
   }
   async captureInventory({ ledger, guardLedger, id } = {}) {
     if (!ledger) {
