@@ -376,7 +376,33 @@ for (const { kind, restartBeforeCleanup, title } of deferredOutputChanges) test(
     await writeDraft(producer, 'zz-next-independent', '4', 'd');
   }
   const restarted = new Intake(new Vault(vault.vault, 'Companion'));
-  await expectHeld(await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' }), restartBeforeCleanup ? 3 : 4);
+  const restartAt = '2026-11-10T06:59:00.000Z';
+  let normalConflict;
+  if (kind === 'snapshot' && !(outcome instanceof Error)) {
+    const [otherSource, otherCapture] = Object.entries(outcome.captures).find(([source]) => source !== sourceHash);
+    const file = restarted.destination(otherCapture);
+    const localWriting = (await fs.readFile(file, 'utf8')) + '\nAn independent capture with an ordinary local edit.\n';
+    await fs.writeFile(file, localWriting);
+    await writeDraft(producer, 'zzz-independent-update', '5', 'c');
+    normalConflict = { sourceHash: otherSource, id: otherCapture.id, local: localWriting };
+  }
+  const recovered = await restarted.reconcile({ now: restartAt });
+  await expectHeld(recovered, restartBeforeCleanup ? 3 : 4);
+  if (kind === 'snapshot') {
+    expect(normalConflict).toBeDefined();
+    expect(recovered.blocks[normalConflict.sourceHash]?.journal).toBeTruthy();
+    const repairs = await restarted.repairs();
+    const hold = repairs.find(item => item.sourceHash === sourceHash);
+    expect(hold).toMatchObject({ kind: 'intake-output-hold', sourceHash, id: tx.capture.id, reason: recovered.blocks[sourceHash].reason });
+    expect(hold).not.toHaveProperty('local');
+    expect(hold).not.toHaveProperty('incoming');
+    expect(repairs.find(item => item.sourceHash === normalConflict.sourceHash)).toMatchObject({ ...normalConflict, incoming: expect.any(String) });
+    const before = await fs.readFile(ledgerFile);
+    await expect(restarted.resolveConflict({ sourceHash, text: 'Selected local writing.', localHash: hash(tx.content) }, restartAt))
+      .rejects.toThrow(/publication hold|published intake output/i);
+    expect(await fs.readFile(ledgerFile)).toEqual(before);
+    await expectHeld(await readJson(ledgerFile), 4);
+  }
 });
 
 test('accepted deferred bookkeeping resumes after exact journal retirement and a later capture edit', async ({}, testInfo) => {
