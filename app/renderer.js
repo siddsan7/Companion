@@ -1,5 +1,6 @@
 const $ = id => document.getElementById(id);
-let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0, checkingIntake = false;
+let selectedVault, view = 'today', state, configurationEpoch = 0, configurationBusy = false, refreshEpoch = 0;
+let checkingIntake = false, connectingIntake = false, savingCapture = false;
 const status = message => { document.querySelector('[role=status]').textContent = message; };
 function scopeError(error, owned) {
   const earlier = error.canReport;
@@ -66,9 +67,15 @@ for (const [operation, result] of Object.entries({ enable: 'enabled', pause: 'pa
   try { await window.companion['schedule-' + operation](); status('Daily intake ' + result + '.'); }
   finally { try { await refresh(); } finally { scheduleControls.forEach(control => { control.disabled = false; }); } }
 });
+function updateCaptureControl() { $('save').disabled = savingCapture || $('configure').disabled; }
+function updateIntakeControls() {
+  const pending = checkingIntake || connectingIntake || $('configure').disabled;
+  for (const id of ['check-intake', 'connect-drafts', 'connect-reviews']) $(id).disabled = pending;
+}
 $('choose').onclick = () => action(async () => { selectedVault = await window.companion['choose-vault'](); $('vault').textContent = selectedVault || 'Selection cancelled.'; });
 $('configure').onclick = () => {
-  const owner = ++configurationEpoch; configurationBusy = true; $('configure').disabled = true; $('check-intake').disabled = true; $('vault-repairs').replaceChildren();
+  const owner = ++configurationEpoch; configurationBusy = true; $('configure').disabled = true; $('vault-repairs').replaceChildren();
+  updateCaptureControl(); updateIntakeControls();
   retireCaptureLinks();
   return action(async () => {
     try {
@@ -76,19 +83,52 @@ $('configure').onclick = () => {
       if (owner !== configurationEpoch) return;
       configurationBusy = false; await refresh(); if (owner === configurationEpoch) status('Vault ready.');
     } catch (error) { if (owner === configurationEpoch) throw error; }
-    finally { if (owner === configurationEpoch) { configurationBusy = false; $('configure').disabled = false; $('check-intake').disabled = checkingIntake; window.dispatchEvent(new Event('companion-vault-configured')); } }
+    finally { if (owner === configurationEpoch) { configurationBusy = false; $('configure').disabled = false; updateCaptureControl(); updateIntakeControls(); window.dispatchEvent(new Event('companion-vault-configured')); } }
   });
 };
 $('add-excerpt').onclick = () => { $('excerpt-label').hidden = false; $('excerpt').focus(); };
-$('save').onclick = () => action(async () => { await window.companion.capture({ text: $('text').value, excerpt: $('excerpt').value }); $('text').value = ''; $('excerpt').value = ''; await refresh(); status('Capture saved.'); });
+$('save').onclick = () => {
+  if ($('save').disabled) return;
+  const owner = configurationEpoch, owned = () => owner === configurationEpoch && !configurationBusy;
+  const input = { text: $('text').value, excerpt: $('excerpt').value };
+  savingCapture = true; updateCaptureControl();
+  return action(async () => {
+    try {
+      await window.companion.capture(input);
+      if (!owned()) return;
+      if ($('text').value === input.text && $('excerpt').value === input.excerpt) { $('text').value = ''; $('excerpt').value = ''; }
+      try { await refresh(); }
+      catch (error) {
+        if (owned() && (typeof error.canReport !== 'function' || error.canReport())) status('Capture saved. Refresh Browse to update the list.');
+        return;
+      }
+      if (owned()) status('Capture saved.');
+    } catch (error) { if (owned()) throw scopeError(error, owned); }
+    finally { savingCapture = false; updateCaptureControl(); }
+  });
+};
 $('today').onclick = () => action(async () => { view = 'today'; await refresh(); });
 $('history').onclick = () => action(async () => { view = 'all'; await refresh(); });
 $('search').oninput = () => action(refresh); $('refresh').onclick = () => action(refresh);
-$('connect-drafts').onclick = () => action(async () => { const scan = $('first-scan').checked; await window.companion['connect-drafts']({ folder: $('draft-source').value, scan }); await refresh(); status(scan ? 'Intake check complete.' : 'Source connected. Use Check now when ready.'); });
+function connectSource(channel, input) {
+  if ($(channel).disabled) return;
+  const owner = configurationEpoch, owned = () => owner === configurationEpoch && !configurationBusy;
+  connectingIntake = true; updateIntakeControls(); status('Connecting source...');
+  return action(async () => {
+    try {
+      await window.companion[channel](input);
+      if (!owned()) return;
+      await refresh();
+      if (owned()) status(input.scan ? 'Intake check complete.' : 'Source connected. Use Check now when ready.');
+    } catch (error) { if (owned()) throw scopeError(error, owned); }
+    finally { connectingIntake = false; updateIntakeControls(); }
+  });
+}
+$('connect-drafts').onclick = () => connectSource('connect-drafts', { folder: $('draft-source').value, scan: $('first-scan').checked });
 $('check-intake').onclick = () => {
   if (checkingIntake || configurationBusy || $('check-intake').disabled) return;
   const owner = configurationEpoch, owned = () => owner === configurationEpoch && !configurationBusy;
-  checkingIntake = true; $('check-intake').disabled = true; status('Checking intake...');
+  checkingIntake = true; updateIntakeControls(); status('Checking intake...');
   return action(async () => {
     try {
       await window.companion['check-intake']();
@@ -96,8 +136,8 @@ $('check-intake').onclick = () => {
       await refresh();
       if (owned()) status('Intake check complete. Inspect held imports and source errors.');
     } catch (error) { if (owned()) throw scopeError(error, owned); }
-    finally { checkingIntake = false; $('check-intake').disabled = configurationBusy; }
+    finally { checkingIntake = false; updateIntakeControls(); }
   });
 };
-$('connect-reviews').onclick = () => action(async () => { await window.companion['connect-reviews']({ folder: $('review-source').value, scan: false }); await refresh(); status('Source connected. Use Check now when ready.'); });
+$('connect-reviews').onclick = () => connectSource('connect-reviews', { folder: $('review-source').value, scan: false });
 window.addEventListener('focus', () => action(refresh)); setInterval(() => action(refresh), 60000); action(refresh);
