@@ -359,15 +359,27 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '', c
     }
     if (repair) {
       const link = fs.link, unlink = fs.unlink;
+      const linkSync = native.linkSync, unlinkSync = native.unlinkSync;
       let exactStage;
+      const observeLink = (from, to) => {
+        if (to !== shared) return;
+        const tx = JSON.parse(native.readFileSync(to, 'utf8'));
+        if (tx.sourceHash === repair.input.sourceHash && tx.resolution && tx.resolution !== repair.priorResolution) exactStage = from;
+      };
       fs.link = async (from, to) => {
         await link(from, to);
-        if (to !== shared) return;
-        const tx = JSON.parse(await fs.readFile(to, 'utf8'));
-        if (tx.sourceHash === repair.input.sourceHash && tx.resolution && tx.resolution !== repair.priorResolution) exactStage = from;
+        observeLink(from, to);
+      };
+      native.linkSync = (from, to) => {
+        linkSync(from, to);
+        observeLink(from, to);
       };
       fs.unlink = async file => {
         await unlink(file);
+        if (file === exactStage) process.exit(77);
+      };
+      native.unlinkSync = file => {
+        unlinkSync(file);
         if (file === exactStage) process.exit(77);
       };
     }

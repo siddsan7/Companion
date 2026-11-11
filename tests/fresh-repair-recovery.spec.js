@@ -32,6 +32,10 @@ async function exitDuringRepair(directory, shared, input, checkpoint = '') {
     const selected = tx => tx.sourceHash === input.sourceHash && tx.keptCurrent && tx.resolution;
     let exactStage;
     const observeLink = (from, to) => {
+      if (stopAt === 'repair-intent-first-link' && to === intent && path.dirname(from) === path.dirname(intent)) {
+        const repair = JSON.parse(native.readFileSync(intent, 'utf8'));
+        if (selected(repair.tx)) process.exit(77);
+      }
       if (stopAt === 'repair-hold-intent-link' && from === intent) {
         const repair = JSON.parse(native.readFileSync(intent, 'utf8'));
         if (repair.sourceProof && selected(repair.tx) && to === path.join(path.dirname(intent), 'repair-' + repair.annotationId + '.json')) process.exit(77);
@@ -73,7 +77,7 @@ async function exitDuringRepair(directory, shared, input, checkpoint = '') {
         JSON.parse(await fs.readFile(shared, 'utf8'));
       if (selected(tx)) process.exit(77);
     } }));
-    const startRepair = !stopAt || stopAt === 'repair-source-first-link' || stopAt === 'repair-intent-published';
+    const startRepair = !stopAt || ['repair-source-first-link', 'repair-intent-first-link', 'repair-intent-published'].includes(stopAt);
     const operation = startRepair ? intake.resolveConflict(input, now) : intake.reconcile({ now });
     operation.then(() => process.exit(78), error => {
       console.error(error);
@@ -201,6 +205,147 @@ test('restart retires the exact source stage after a fresh repair first links it
   const context = await interruptedRepair(testInfo, 'repair-source-first-link');
   await expectFinished(context);
   await expect(fs.lstat(context.sourceStage)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+async function firstLinkedIntent(testInfo) {
+  const context = await repairConflict(testInfo);
+  const { vault, intake, sourceHash, ledgerFile, block, input, shared, intentFile } = context;
+  await exitDuringRepair(vault.vault, shared, input, 'repair-intent-first-link');
+  const intentBytes = await fs.readFile(intentFile), intent = JSON.parse(intentBytes), published = await identity(intentFile);
+  expect(published.nlink).toBe(2n);
+  const names = (await fs.readdir(intake.dir)).filter(name => name.endsWith('.stage'));
+  const candidates = await Promise.all(names.map(async name => {
+    const file = path.join(intake.dir, name);
+    return { file, identity: await identity(file) };
+  }));
+  const aliases = candidates.filter(item => item.identity.dev === published.dev && item.identity.ino === published.ino);
+  expect(aliases).toHaveLength(1);
+  const intentStage = aliases[0].file;
+  expect(aliases[0].identity).toEqual(published);
+  expect(await fs.readFile(intentStage)).toEqual(intentBytes);
+  const sourceStage = path.join(intake.dir, `journal-${intent.annotationId}.stage`);
+  const sourceIdentity = await identity(sourceStage), sourceBytes = await fs.readFile(sourceStage);
+  expect(sourceIdentity).toEqual({ dev: BigInt(intent.sourceProof.dev), ino: BigInt(intent.sourceProof.ino), nlink: 1n });
+  expect(JSON.parse(sourceBytes)).toEqual(intent.tx);
+  const annotationStage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
+  const annotation = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`);
+  const archive = path.join(intake.dir, `repair-${intent.annotationId}.json`);
+  for (const file of [shared, annotationStage, annotation, archive]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  const ledgerBytes = await fs.readFile(ledgerFile);
+  expect(JSON.parse(ledgerBytes).blocks[sourceHash]).toEqual(block);
+  return { ...context, intent, intentBytes, published, intentStage, sourceStage, sourceIdentity, sourceBytes,
+    annotationStage, annotation, archive, ledgerBytes };
+}
+
+test('restart settles the exact initial repair intent after its first hard link', async ({}, testInfo) => {
+  const { vault, sourceHash, current, destination, older, previous, previousIdentity, shared, intent, intentFile,
+    intentStage, sourceStage, annotationStage, annotation, archive } = await firstLinkedIntent(testInfo);
+  const result = await new Intake(new Vault(vault.vault, 'Companion')).reconcile({ now: later });
+  const { tx } = intent;
+  expect(result.blocks[sourceHash]).toBeUndefined();
+  expect(result.captures[sourceHash]).toMatchObject({ currentRevision: current.currentRevision, currentHash: tx.capture.currentHash });
+  expect(result.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+  expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
+  expect(await fs.readFile(annotation, 'utf8')).toBe(intent.annotation);
+  expect((await identity(annotation)).nlink).toBe(1n);
+  expect(await json(older)).toEqual(previous);
+  expect(await identity(older)).toEqual(previousIdentity);
+  for (const file of [intentFile, intentStage, sourceStage, annotationStage, shared, archive]) {
+    await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  }
+});
+
+test('restart refuses an equal-byte replacement of both initial repair intent names', async ({}, testInfo) => {
+  const { vault, destination, local, older, previous, previousIdentity, ledgerFile, ledgerBytes, shared, intentFile,
+    intentStage, intentBytes, published, sourceStage, sourceIdentity, sourceBytes, annotationStage, annotation, archive } =
+    await firstLinkedIntent(testInfo);
+  const displacedIntent = testInfo.outputPath('original-repair-intent.json');
+  const displacedStage = testInfo.outputPath('original-repair-intent.stage');
+  await fs.rename(intentFile, displacedIntent);
+  await fs.rename(intentStage, displacedStage);
+  await fs.writeFile(intentStage, intentBytes, { flag: 'wx' });
+  await fs.link(intentStage, intentFile);
+  const replacement = await identity(intentFile);
+  expect(replacement.nlink).toBe(2n);
+  expect(replacement).not.toEqual(published);
+  expect(await identity(intentStage)).toEqual(replacement);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.locked(() => restarted.load()).catch(() => {});
+  expect(await fs.readFile(ledgerFile)).toEqual(ledgerBytes);
+  expect(await fs.readFile(destination)).toEqual(local);
+  for (const file of [shared, annotationStage, annotation, archive]) await expect.soft(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  for (const file of [intentFile, intentStage]) {
+    expect(await identity(file)).toEqual(replacement);
+    expect(await fs.readFile(file)).toEqual(intentBytes);
+  }
+  for (const file of [displacedIntent, displacedStage]) {
+    expect(await identity(file)).toEqual(published);
+    expect(await fs.readFile(file)).toEqual(intentBytes);
+  }
+  expect(await identity(sourceStage)).toEqual(sourceIdentity);
+  expect(await fs.readFile(sourceStage)).toEqual(sourceBytes);
+  expect(await json(older)).toEqual(previous);
+  expect(await identity(older)).toEqual(previousIdentity);
+});
+
+test('fresh repair retires its exact source stage without queuing a foreign unlink', async ({}, testInfo) => {
+  const { vault, intake, sourceHash, input, ledgerFile, shared, intentFile } = await repairConflict(testInfo);
+  const displaced = testInfo.outputPath('original-source-alias.stage');
+  let selected;
+  const restarted = new Intake(new Vault(vault.vault, 'Companion', { checkpoint: async boundary => {
+    if (boundary !== 'repair-intent-published') return;
+    const intent = await json(intentFile);
+    selected = { intent, stage: path.join(intake.dir, `journal-${intent.annotationId}.stage`) };
+  } }));
+  const unlink = fs.unlink, unlinkSync = native.unlinkSync;
+  const stat = file => {
+    const { dev, ino, nlink } = native.lstatSync(file, { bigint: true });
+    return { dev, ino, nlink };
+  };
+  const provePair = file => {
+    const original = stat(file), proof = selected.intent.sourceProof;
+    expect(original).toEqual({ dev: BigInt(proof.dev), ino: BigInt(proof.ino), nlink: 2n });
+    expect(stat(shared)).toEqual(original);
+    const bytes = native.readFileSync(file);
+    expect(bytes.toString('utf8')).toBe(JSON.stringify(selected.intent.tx));
+    return { original, bytes };
+  };
+  let witness;
+  fs.unlink = file => {
+    if (file !== selected?.stage) return unlink(file);
+    const { original, bytes } = provePair(file);
+    const queued = new Promise((resolve, reject) => setImmediate(() => unlink(file).then(resolve, reject)));
+    native.renameSync(file, displaced);
+    native.writeFileSync(file, bytes, { flag: 'wx' });
+    const replacement = stat(file);
+    expect(replacement).not.toEqual(original);
+    witness = { original, bytes, replacement };
+    return queued;
+  };
+  native.unlinkSync = file => {
+    if (file === selected?.stage) witness = { ...provePair(file), synchronous: true };
+    return unlinkSync(file);
+  };
+  let recoveryError;
+  try { await restarted.resolveConflict(input, later); }
+  catch (error) { recoveryError = error; }
+  finally { fs.unlink = unlink; native.unlinkSync = unlinkSync; }
+
+  expect(witness, 'the native-backed source stage retirement was observed').toBeDefined();
+  const ledger = await json(ledgerFile), tx = selected.intent.tx;
+  if (witness.synchronous) {
+    expect(recoveryError).toBeUndefined();
+    expect(ledger.blocks[sourceHash]).toBeUndefined();
+    expect(ledger.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+    for (const file of [selected.stage, shared, displaced]) await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+  } else {
+    expect.soft(await identity(selected.stage).catch(error => error.code)).toEqual(witness.replacement);
+    expect.soft(await fs.readFile(selected.stage).catch(error => error.code)).toEqual(witness.bytes);
+    expect(await identity(displaced)).toEqual(witness.original);
+    expect(await identity(shared)).toEqual(witness.original);
+    expect(ledger.attempts[tx.revision.identity]).toBeUndefined();
+  }
 });
 
 test('an intent-only restart refuses a fresh repair after its original ledger block is removed', async ({}, testInfo) => {
