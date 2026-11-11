@@ -36,14 +36,19 @@ async function writeDraft(producer, name, attempt, input) {
   return folder;
 }
 
-async function fixture(testInfo, checkpoint, { existing = false } = {}) {
+async function localVault(testInfo, checkpoint) {
   const vaultDirectory = testInfo.outputPath('vault');
-  const producer = testInfo.outputPath('producer');
-  const folder = await writeDraft(producer, 'draft', '1', 'a');
-  if (existing) await writeDraft(producer, 'existing', '2', 'c');
   await fs.mkdir(vaultDirectory, { recursive: true });
   const vault = new Vault(await fs.realpath(vaultDirectory), 'Companion', { checkpoint });
   await vault.setup();
+  return vault;
+}
+
+async function fixture(testInfo, checkpoint, { existing = false } = {}) {
+  const producer = testInfo.outputPath('producer');
+  const folder = await writeDraft(producer, 'draft', '1', 'a');
+  if (existing) await writeDraft(producer, 'existing', '2', 'c');
+  const vault = await localVault(testInfo, checkpoint);
   const intake = new Intake(vault);
   const accepted = await intake.connect(producer, true, now);
   expect(accepted.lastCheck.status).toBe('complete');
@@ -57,6 +62,112 @@ async function fixture(testInfo, checkpoint, { existing = false } = {}) {
   const restoration = await deletion.previewRestoration({ id: capture.id, kind: 'draft', folder });
   return { vault, intake, deletion, restoration, producer, sourceHash, id: capture.id, ledgerFile: path.join(intake.dir, 'ledger.json') };
 }
+
+test('manual restoration activation holds a replaced capture during the ledger write', async ({}, testInfo) => {
+  const vault = await localVault(testInfo), intake = new Intake(vault);
+  await intake.info();
+  const id = await vault.capture({ text: 'Manual capture selected for exact restoration.' }, now);
+  const unrelatedId = await vault.capture({ text: 'Unrelated manual capture stays available.' }, now);
+  const { file } = await vault.find(id), unrelated = (await vault.find(unrelatedId)).file;
+  const bytes = await fs.readFile(file), unrelatedBytes = await fs.readFile(unrelated);
+  const backup = testInfo.outputPath('selected-manual-backup.md');
+  await fs.copyFile(file, backup);
+  const backupIdentity = await identity(backup), unrelatedIdentity = await identity(unrelated);
+  const getVault = () => vault, clock = () => ({ now: later });
+  const conversations = new Conversations({ dataRoot: testInfo.outputPath('history'), getVault, clock });
+  await conversations.lock(async () => {});
+  const deletion = new CaptureDeletion({ getVault, conversations, clock, clearApprovals() {} });
+  await deletion.confirm((await deletion.preview(id)).token);
+  const restoration = await deletion.previewRestoration({ id, file: backup });
+  expect(await readOptional(file)).toBeNull();
+
+  const ledgerFile = path.join(intake.dir, 'ledger.json');
+  const displaced = testInfo.outputPath('displaced-manual-capture.md');
+  const open = fs.open;
+  let witness;
+  fs.open = async (stage, ...args) => {
+    const handle = await open(stage, ...args);
+    if (args[0] !== 'wx' || path.dirname(String(stage)) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(String(stage)))) return handle;
+    const close = handle.close;
+    handle.close = async () => {
+      await close.call(handle);
+      const staged = await readJson(stage);
+      if (staged.sourceAuthority?.[id]?.phase !== 'active' || witness) return;
+      const before = await readJson(ledgerFile), authority = before.sourceAuthority[id];
+      expect(authority).toMatchObject({ phase: 'restoring', restoration: { published: true } });
+      expect(await fs.readFile(file)).toEqual(bytes);
+      const original = await identity(file);
+      expect(String(original[1])).toBe(authority.restoration.publication.ino);
+      await fs.rename(file, displaced);
+      await fs.writeFile(file, bytes, { flag: 'wx' });
+      const replacement = await identity(file);
+      expect(replacement).not.toEqual(original);
+      witness = { before, original, replacement };
+    };
+    return handle;
+  };
+  let result;
+  try { result = await deletion.confirmRestoration(restoration.token).catch(error => error); }
+  finally { fs.open = open; }
+
+  expect(witness, 'the exact active ledger stage was written before the replacement').toBeDefined();
+  expect.soft(result).toBeInstanceOf(Error);
+  expect.soft(await readJson(ledgerFile)).toEqual(witness.before);
+  expect(await fs.readFile(file)).toEqual(bytes);
+  expect(await identity(file)).toEqual(witness.replacement);
+  expect(await fs.readFile(displaced)).toEqual(bytes);
+  expect(await identity(displaced)).toEqual(witness.original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect(await identity(backup)).toEqual(backupIdentity);
+  expect(await fs.readFile(unrelated)).toEqual(unrelatedBytes);
+  expect(await identity(unrelated)).toEqual(unrelatedIdentity);
+  expect((await vault.find(unrelatedId)).file).toBe(unrelated);
+});
+
+test('imported title recovery preserves independent writing added after title publication', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer');
+  await writeDraft(producer, 'draft', '1', 'a');
+  const vault = await localVault(testInfo), intake = new Intake(vault);
+  const sourceHash = 'a'.repeat(64);
+  const accepted = await intake.connect(producer, true, now), capture = accepted.captures[sourceHash];
+  expect(accepted.lastCheck.status).toBe('complete');
+  const file = intake.destination(capture), before = await fs.readFile(file);
+  const title = 'Selected title on the interrupted import';
+  const intentFile = path.join(intake.dir, 'title-intent.json');
+  const interruption = Error('Stopped before the first Vault title write.');
+  vault.title = async () => { throw interruption; };
+  await expect(intake.title(capture.id, title)).rejects.toBe(interruption);
+  expect(await fs.readFile(file)).toEqual(before);
+  const intentBytes = await fs.readFile(intentFile), intent = JSON.parse(intentBytes);
+  expect(intent).toMatchObject({ id: capture.id, title, before: before.toString('utf8') });
+
+  const restartedVault = new Vault(vault.vault, 'Companion'), restarted = new Intake(restartedVault);
+  const publishTitle = restartedVault.title.bind(restartedVault);
+  const writing = Buffer.from('\nIndependent editor writing after the title publication.\n');
+  const edited = Buffer.concat([Buffer.from(intent.content), writing]);
+  let published;
+  restartedVault.title = async (...args) => {
+    await publishTitle(...args);
+    published = await fs.readFile(file);
+    expect(published).toEqual(Buffer.from(intent.content));
+    await fs.appendFile(file, writing);
+  };
+  const recovered = await restarted.info();
+  expect(published, 'recovery completed the real Vault title publication').toBeDefined();
+  expect(await fs.readFile(file)).toEqual(edited);
+  expect.soft(recovered.captures[sourceHash].currentHash).not.toBe(createHash('sha256').update(edited).digest('hex'));
+  expect.soft(recovered.outcomes[`title:${capture.id}`]).toMatchObject({ status: 'held' });
+  const names = await fs.readdir(intake.dir);
+  const retained = names.filter(name => name === 'title-intent.json' || name.startsWith(`title-conflict-${capture.id}-`));
+  expect.soft(retained).toHaveLength(1);
+  for (const name of retained) expect(await fs.readFile(path.join(intake.dir, name))).toEqual(intentBytes);
+
+  const next = await writeDraft(producer, 'next-attempt', '2', 'a');
+  const result = await new Intake(new Vault(vault.vault, 'Companion')).reconcile({ now: later });
+  expect.soft(result.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect.soft(Object.values(result.outcomes)).toContainEqual(expect.objectContaining({ status: 'held', locator: next }));
+  expect(await fs.readFile(file)).toEqual(edited);
+});
 
 async function stopAfterActivation(testInfo) {
   const interruption = Error('Stopped immediately after the activation ledger was replaced.');
