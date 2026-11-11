@@ -2,6 +2,7 @@ const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 let root, app, page;
 test.beforeEach(async () => {
   root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-comparison-'));
@@ -20,12 +21,13 @@ async function launch(configure = true) {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function approveBrief() {
+async function approveBrief({ constraints } = {}) {
   const readme = path.join(root, 'README.md');
   await fs.writeFile(readme, '# MyTune\nA guitar practice tutor.\n\n## Current behavior\nLearners revisit previously learned chord changes and log clean plays manually.\n\n## Constraints\nFive-minute practice sessions; no audio recognition or social ranking.\n\n## Known limitations\nNo controlled evidence of retention gains.\n\n## Questions\nWhich small practice change deserves a test?\n', 'utf8');
   await fs.writeFile(path.join(root, 'brief-selection.json'), JSON.stringify([readme]), 'utf8');
   await page.getByRole('button', { name: 'Select MyTune README', exact: true }).click();
   await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
+  if (constraints) await page.locator('#brief-proposal').getByLabel('Constraints', { exact: true }).fill(constraints);
   await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
 }
@@ -60,6 +62,88 @@ test('authored comparison keeps three inspectable cases and six pending slots ac
   expect(await savedComparison()).toEqual(before);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
 });
+
+for (const replaceStage of [false, true]) {
+  const expected = replaceStage ? 'preserves an unknown same-byte link family' : 'settles the exact first-save pair';
+  test(`comparison restart ${expected} after native link and abrupt exit`, async ({}, testInfo) => {
+    test.setTimeout(60000);
+    await launch(); await approveBrief();
+    const canonicalRoot = await fs.realpath(root);
+    const linkEvidence = path.join(canonicalRoot, 'comparison-first-link.json');
+    const mainPid = await app.evaluate(() => process.pid);
+    await app.evaluate((_, { testRoot, canonicalRoot, linkEvidence }) => {
+      if (process.env.COMPANION_TEST_ROOT !== testRoot) throw Error('Crash injection requires the disposable comparison fixture.');
+      const native = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path');
+      const directory = paths.join(canonicalRoot, 'comparisons'), link = native.linkSync;
+      native.linkSync = (source, destination) => {
+        link(source, destination);
+        if (paths.dirname(source) !== directory || paths.dirname(destination) !== directory ||
+          !source.endsWith('.pending') || !/^[a-f0-9-]{36}\.json$/.test(paths.basename(destination))) return;
+        const linked = native.lstatSync(destination, { bigint: true });
+        native.writeFileSync(linkEvidence, JSON.stringify({ source, destination, ino: String(linked.ino), nlink: Number(linked.nlink), mainPid: process.pid }), { flag: 'wx', flush: true });
+        // Hold the exact native boundary until the Playwright process kills
+        // this main process. Electron app.exit can return into stage cleanup.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15000);
+        throw Error('The fixture did not terminate the stopped comparison main process.');
+      };
+    }, { testRoot: root, canonicalRoot, linkEvidence });
+    const child = app.process();
+    const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const creating = page.getByRole('button', { name: 'Create comparison', exact: true }).click().then(() => null, error => error);
+    let linked;
+    await expect.poll(async () => {
+      const text = await fs.readFile(linkEvidence, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+      if (text?.endsWith('}')) linked = JSON.parse(text);
+      return linked?.mainPid;
+    }).toBe(mainPid);
+    expect(linked.nlink).toBe(2);
+    expect(process.kill(mainPid, 'SIGKILL')).toBe(true);
+    const wrapperExit = await exited;
+    const clickError = await creating;
+    if (clickError && !/closed|disposed/i.test(clickError.message)) throw clickError;
+    await expect.poll(() => {
+      try { process.kill(linked.mainPid, 0); return 'alive'; }
+      catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; }
+    }).toBe('exited');
+    await fs.writeFile(testInfo.outputPath('comparison-first-link-exit.json'), JSON.stringify({ ...linked, wrapperPid: child.pid, wrapperExit }, null, 2));
+    app = null;
+    const exactFile = async file => {
+      const { dev, ino, nlink } = await fs.lstat(file, { bigint: true });
+      return { dev, ino, nlink, bytes: await fs.readFile(file) };
+    };
+    const original = await exactFile(linked.destination);
+    expect(original.nlink).toBe(2n);
+    expect(String(original.ino)).toBe(linked.ino);
+    expect(await exactFile(linked.source)).toEqual(original);
+    const saved = JSON.parse(original.bytes.toString('utf8'));
+    expect(saved.slots.map(slot => slot.status)).toEqual(Array(6).fill('pending'));
+    let unknownPeer, foreignStage;
+    if (replaceStage) {
+      unknownPeer = path.join(path.dirname(linked.source), `${randomUUID()}.pending`);
+      await fs.rename(linked.source, unknownPeer);
+      await fs.writeFile(linked.source, original.bytes, { flag: 'wx' });
+      foreignStage = await exactFile(linked.source);
+      expect(foreignStage.ino).not.toBe(original.ino);
+      expect(await exactFile(unknownPeer)).toEqual(original);
+    }
+
+    await launch(false);
+    const retained = page.getByLabel('Retained comparison', { exact: true });
+    if (replaceStage) {
+      await expect(page.locator('#comparison-error')).toContainText(/ordinary|history|stage|link|repair/i);
+      await expect(retained.locator('option')).toHaveCount(1);
+      expect(await exactFile(linked.destination)).toEqual(original);
+      expect(await exactFile(unknownPeer)).toEqual(original);
+      expect(await exactFile(linked.source)).toEqual(foreignStage);
+    } else {
+      await expect(retained).toHaveValue(saved.id);
+      await expect(page.locator('#comparison-slots article')).toHaveCount(6);
+      expect(await exactFile(linked.destination)).toEqual({ ...original, nlink: 1n });
+      await expect(fs.lstat(linked.source)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+    expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
+  });
+}
 
 test('one reviewed comparison slot retains the authoritative final candidate and never replays on restart', async () => {
   test.setTimeout(60000);
@@ -275,21 +359,30 @@ for (const alias of ['directory junction', 'history hardlink']) test(`comparison
   }
 });
 
-test('abrupt Electron main exit retains an interrupted comparison and never reuses process proof or replays', async () => {
+test('abrupt Electron main exit retains an interrupted comparison and permits blind feedback without replay', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
     capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
     comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
   }), 'utf8');
-  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', turn: 'pending', messages: [{ phase: 'partial_answer', text: 'DURABLE_INTERRUPTED_COMPARISON_TEXT. Authored partial response, not a completed result.' }] }), 'utf8');
+  const provider = { model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default' };
+  const providerFile = path.join(root, 'conversation-provider.json');
+  const completedText = 'DURABLE_COMPLETED_COMPARISON_TEXT. Authored final response.';
+  const interruptedText = 'DURABLE_INTERRUPTED_COMPARISON_TEXT. Authored partial response.';
+  await fs.writeFile(providerFile, JSON.stringify({ ...provider, turn: 'completed', messages: [{ phase: 'final_answer', text: completedText }] }), 'utf8');
   await launch(); await approveBrief();
   await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
   await expect(page.locator('#comparison-slots article')).toHaveCount(6);
   await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
-  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes('DURABLE_INTERRUPTED_COMPARISON_TEXT'))).toBe(true);
+  await expect(page.locator('#comparison-slots article').first()).toContainText('completed');
+  await fs.writeFile(providerFile, JSON.stringify({ ...provider, turn: 'pending', messages: [{ phase: 'partial_answer', text: interruptedText }] }), 'utf8');
+  await page.getByRole('button', { name: 'Preview Output 2', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
+  await expect.poll(async () => (await savedComparison()).slots.some(slot => slot.status === 'inProgress' && slot.reply.includes(interruptedText))).toBe(true);
   const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
   const child = app.process(), mainPid = await app.evaluate(() => process.pid);
   const evidence = { wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
@@ -299,20 +392,42 @@ test('abrupt Electron main exit retains an interrupted comparison and never reus
   await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
   await fs.writeFile(test.info().outputPath('comparison-crash-processes.json'), JSON.stringify(evidence, null, 2), 'utf8');
   app = null; await launch(false);
-  await expect(page.locator('#comparison-slots article').first()).toContainText('interrupted');
-  await expect(page.locator('#comparison-slots article').first()).toContainText('DURABLE_INTERRUPTED_COMPARISON_TEXT');
-  await expect(page.locator('#comparison-slots article').first()).toContainText('Elapsed: unavailable');
-  await expect(page.getByRole('button', { name: 'Preview Output 1', exact: true })).toBeDisabled();
+  const interruptedArticle = page.locator('#comparison-slots article').nth(1);
+  await expect(interruptedArticle).toContainText('interrupted');
+  await expect(interruptedArticle).toContainText(interruptedText);
+  await expect(interruptedArticle).toContainText('Elapsed: unavailable');
+  await expect(page.getByRole('button', { name: 'Preview Output 2', exact: true })).toBeDisabled();
   const saved = await savedComparison(), interrupted = saved.slots.find(slot => slot.status === 'interrupted');
   expect(interrupted.elapsedMs).toBeNull();
   expect(interrupted.candidate.warning).toContain('unavailable or ambiguous');
   expect(interrupted.messages[0].completed).toBe(false);
-  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(5);
-  await page.getByRole('button', { name: 'Preview Output 2', exact: true }).click();
+  expect(saved.slots.filter(slot => slot.status === 'pending')).toHaveLength(4);
+  await page.getByRole('button', { name: 'Preview Output 3', exact: true }).click();
   await expect(page.locator('#comparison-error')).toContainText('Evidence changed or the process restarted');
+  await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Blind scoring', exact: true })).toBeVisible();
+  for (const [text, status] of [[completedText, 'completed'], [interruptedText, 'interrupted']]) {
+    const sample = page.locator('#comparison-score article').filter({ hasText: text });
+    await expect(sample).toHaveCount(1);
+    await expect(sample).toContainText(status);
+    const label = await sample.getByRole('heading').first().innerText();
+    expect(label).toMatch(/^Sample [a-f0-9]{8}$/);
+    for (const dimension of ['Usefulness', 'Surprise', 'Grounding', 'Ease of testing']) {
+      await sample.getByLabel(label + ' ' + dimension, { exact: true }).fill('2');
+    }
+    await sample.getByLabel(label + ' Rating reason', { exact: true }).fill(`Reviewed the retained ${status} outcome.`);
+    await sample.getByRole('button', { name: 'Save feedback ' + label, exact: true }).click();
+    await expect(sample).toContainText('Feedback saved');
+  }
+  expect(await page.getByRole('button', { name: /^Save feedback Sample/ }).evaluateAll(buttons => buttons.filter(button => !button.disabled).length)).toBe(2);
+  await expect(page.getByRole('button', { name: 'Reveal methods and effort', exact: true })).toBeDisabled();
+  const scored = await savedComparison();
+  expect(scored.slots.filter(slot => slot.status === 'pending' && !slot.rating)).toHaveLength(4);
+  expect(scored.slots.filter(slot => slot.rating).map(slot => slot.status).sort()).toEqual(['completed', 'interrupted']);
+  expect(scored.blindOrder.filter(entry => scored.slots.some(slot => slot.id === entry.slotId && slot.rating))).toHaveLength(2);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
   const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(1);
+  expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(2);
 });
 
 test('an active comparison poll cannot authorize overwriting an external history edit', async () => {
@@ -403,12 +518,13 @@ test('a missing comparison file keeps unsaved output visible until exact local s
 
 test('independent blind aliases retain six validated ratings and reveal methods only after feedback', async () => {
   test.setTimeout(180000);
+  const editedConstraints = 'Review this shorter practice constraint against its cited source.';
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
     capacity: { maxCodePoints: 32000, model: 'fixture', evidence: 'authored fixture input bound', harnessAndOutputEvidence: 'authored fixture harness and output allowance' },
     comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
   }), 'utf8');
-  await launch(); await approveBrief();
+  await launch(); await approveBrief({ constraints: editedConstraints });
   await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
   await expect(page.locator('#comparison-slots article')).toHaveCount(6);
   const initial = await savedComparison();
@@ -450,6 +566,8 @@ test('independent blind aliases retain six validated ratings and reveal methods 
   expect(byDisplay[5].error).toContain('usage limit');
   const submissions = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
   expect(submissions.trim().split('\n')).toHaveLength(6);
+  const laterBriefText = 'CURRENT_SOURCE_TEXT_MUST_NOT_REPLACE_PINNED_SCORING_EVIDENCE';
+  await fs.writeFile(path.join(root, 'README.md'), laterBriefText, 'utf8');
   await page.getByRole('button', { name: 'Start blind scoring', exact: true }).click();
   await expect(page.locator('#comparison-score article')).toHaveCount(6);
   await expect(page.locator('#comparison-score')).not.toContainText('analogy');
@@ -459,6 +577,29 @@ test('independent blind aliases retain six validated ratings and reveal methods 
   const blindLabels = await page.locator('#comparison-score article h4').allTextContents();
   expect(blindLabels).toHaveLength(6);
   expect(blindLabels.every(label => /^Sample [a-f0-9]{8}$/.test(label))).toBe(true);
+  const blindPanel = page.locator('#comparison-score-panel');
+  await expect(blindPanel).toContainText(editedConstraints);
+  await expect(blindPanel).toContainText('Source 1:L8');
+  await expect(blindPanel).toContainText('Five-minute practice sessions; no audio recognition or social ranking.');
+  await expect(blindPanel).toContainText('No controlled evidence of retention gains.');
+  await expect(blindPanel).not.toContainText(laterBriefText);
+  await expect(blindPanel).not.toContainText('Explicitly map the source mechanism');
+  await expect(blindPanel).not.toContainText('Output 1');
+  const blindRecord = await savedComparison();
+  for (const entry of blindRecord.blindOrder) {
+    const slot = generated.slots.find(item => item.id === entry.slotId);
+    const fixture = generated.fixtures.find(item => item.id === slot.fixtureId);
+    const sample = page.locator('#comparison-score article').filter({ has: page.getByRole('heading', { name: entry.label, exact: true }) });
+    await expect(sample).toContainText(/synthetic/i);
+    for (const passage of fixture.passages) {
+      await expect(sample).toContainText(passage.id);
+      await expect(sample).toContainText(passage.text);
+    }
+    await expect(sample).toContainText(fixture.limitations);
+    for (const other of generated.fixtures.filter(item => item.id !== fixture.id)) {
+      await expect(sample).not.toContainText(other.passages[0].text);
+    }
+  }
   const firstLabel = blindLabels[0];
   const shownCandidate = await page.locator('#comparison-score article').first().locator('pre').innerText();
   expect(shownCandidate).not.toBe('');
@@ -467,6 +608,9 @@ test('independent blind aliases retain six validated ratings and reveal methods 
   await expect(page.getByLabel('Reviewed comparison package', { exact: true })).toBeHidden();
   const blind = await page.evaluate(id => window.companion['comparison-score-view']({ id }), generated.id);
   const blindJson = JSON.stringify(blind);
+  expect(blindJson).toContain('Five-minute practice sessions; no audio recognition or social ranking.');
+  expect(blindJson).not.toContain(JSON.stringify(path.join(root, 'README.md')).slice(1, -1));
+  expect(blindJson).not.toContain('Explicitly map the source mechanism');
   for (const slot of generated.slots) expect(blindJson).not.toContain(slot.id);
   expect(blindJson).not.toContain('Output 1');
   for (const output of blind.outputs) {

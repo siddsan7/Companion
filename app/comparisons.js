@@ -5,16 +5,42 @@ const { createHash, randomUUID, randomInt } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
+const { readExact, readExactSync, writeStage, verifyStageSync, verifyPeersSync, verifyAbsentSync, validProof } = require('./staged-publication');
 const { fixtures, prompts } = require('./comparison-fixtures');
 const rubric = require('./comparison-rubric');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(value);
+const sameProof = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino && a.digest === b.digest;
+const historyChanged = () => Object.assign(Error('Comparison history changed or is unavailable. Existing history was not replaced. Preserve the retained text.'), { code: 'HISTORY_CONFLICT' });
+const creationName = id => `.${id}.creation`;
+const identity = stat => ({ dev: String(stat.dev), ino: String(stat.ino) });
+const sameIdentity = (a, b) => a && b && a.dev === b.dev && a.ino === b.ino;
+const creationChanged = () => Error('Comparison first-save history or its stage changed. Preserve the files for inspection.');
+const packageHeader = 'Synthetic comparison input. Authored source material is not actual reel evidence.';
+const terminal = slot => ['completed', 'failed', 'interrupted'].includes(slot.status);
+const candidateDigest = slot => hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
+function sharedInput(brief, fixture) {
+  const source = { id: fixture.id, version: fixture.version, synthetic: true, passages: fixture.passages, limitations: fixture.limitations };
+  return JSON.stringify({ source, brief }, null, 2).replace(/\r\n?/g, '\n');
+}
 function makePackage(brief, fixture, method) {
   // Fit labels are inspection metadata, never part of a model request.
-  const source = { id: fixture.id, version: fixture.version, synthetic: true, passages: fixture.passages, limitations: fixture.limitations };
-  const shared = JSON.stringify({ source, brief }, null, 2).replace(/\r\n?/g, '\n');
-  const text = `Synthetic comparison input. Authored source material is not actual reel evidence.\n\n${shared}\n\n${prompts[method].text}`;
+  const shared = sharedInput(brief, fixture);
+  const text = `${packageHeader}\n\n${shared}\n\n${prompts[method].text}`;
   return { text, digest: hash(text), sharedInputDigest: hash(shared), count: [...text].length, limit: 32000 };
+}
+function scoreCase(record, slot) {
+  const fixture = record.fixtures.find(item => item.id === slot.fixtureId);
+  if (!fixture || !fixture.synthetic) throw Error('Synthetic scoring case is unavailable. Preserve the comparison history.');
+  const shared = sharedInput(record.brief, fixture);
+  if (slot.package.sharedInputDigest !== hash(shared) || !slot.package.text.startsWith(`${packageHeader}\n\n${shared}\n\n`)) {
+    throw Error('Scoring evidence differs from the retained comparison input. Preserve the comparison history.');
+  }
+  return {
+    id: fixture.id, version: fixture.version,
+    passages: fixture.passages.map(({ id, text }) => ({ id, text })),
+    limitations: fixture.limitations
+  };
 }
 
 // Main owns packages and the private display mapping. Listing never generates.
@@ -33,13 +59,12 @@ class Comparisons {
   }
   safeDirectory(create = false, expected) {
     this.anchor();
-    const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
     const reject = () => { throw Error('Comparison directory is not an ordinary contained local history folder. Restore the folder before continuing.'); };
     const root = local.lstatSync(this.dataRoot, { bigint: true });
-    if (!root.isDirectory() || root.isSymbolicLink() || !same(root, this.rootIdentity) || local.realpathSync(this.dataRoot) !== this.dataRoot) reject();
+    if (!root.isDirectory() || root.isSymbolicLink() || !sameIdentity(root, this.rootIdentity) || local.realpathSync(this.dataRoot) !== this.dataRoot) reject();
     if (create) { try { local.mkdirSync(this.directory); } catch (error) { if (error.code !== 'EEXIST') throw error; } }
     const directory = local.lstatSync(this.directory, { bigint: true });
-    if (!directory.isDirectory() || directory.isSymbolicLink() || local.realpathSync(this.directory) !== this.directory || expected && !same(directory, expected)) reject();
+    if (!directory.isDirectory() || directory.isSymbolicLink() || local.realpathSync(this.directory) !== this.directory || expected && !sameIdentity(directory, expected)) reject();
     return directory;
   }
   async lock(work) {
@@ -50,57 +75,128 @@ class Comparisons {
     if (this.unsaved.has(id)) return structuredClone(this.unsaved.get(id));
     return this.readStored(id, forMutation);
   }
-  async readStored(id, forMutation = false, withBytes = false) {
-    if (!uuid(id)) throw Error('Comparison identity is invalid.');
-    const directory = this.safeDirectory(), file = path.join(this.directory, `${id}.json`);
-    const stat = await fs.lstat(file); this.safeDirectory(false, directory);
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw Error('Comparison is not an ordinary local history file.');
-    const bytes = await fs.readFile(file); this.safeDirectory(false, directory);
+  decodeHistory(id, bytes) {
     const record = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
     if (record.schema !== 1 || record.id !== id || !Array.isArray(record.fixtures) || record.fixtures.length !== 3 || !Array.isArray(record.slots) || record.slots.length !== 6 || !Array.isArray(record.displayOrder) || record.displayOrder.length !== 6 || new Set(record.displayOrder).size !== 6 || record.displayOrder.some(slotId => !record.slots.some(slot => slot.id === slotId)) || record.slots.some(slot => !uuid(slot.id) || !['direct', 'analogy'].includes(slot.method) || slot.package?.digest !== hash(slot.package.text))) throw Error('Comparison history needs repair. Preserve the file.');
     const pairs = record.slots.map(slot => `${slot.fixtureId}:${slot.method}`);
     if (new Set(pairs).size !== 6 || fixtures.some(fixture => ['direct', 'analogy'].some(method => !pairs.includes(`${fixture.id}:${method}`))) || record.slots.some(slot => !['pending', 'inProgress', 'completed', 'failed', 'interrupted'].includes(slot.status))) throw Error('Comparison outcome slots need repair. Preserve the file.');
     if (record.blindOrder !== undefined && (!Array.isArray(record.blindOrder) || record.blindOrder.length !== 6 || record.blindOrder.some(entry => !entry || !/^Sample [a-f0-9]{8}$/.test(entry.label) || !record.slots.some(slot => slot.id === entry.slotId)) || new Set(record.blindOrder.map(entry => entry.label)).size !== 6 || new Set(record.blindOrder.map(entry => entry.slotId)).size !== 6)) throw Error('Comparison blind mapping needs repair. Preserve the file; labels were not reassigned.');
+    return record;
+  }
+  async readStored(id, forMutation = false, withProof = false) {
+    if (!uuid(id)) throw Error('Comparison identity is invalid.');
+    const directory = this.safeDirectory(), file = path.join(this.directory, `${id}.json`);
+    const guard = () => this.safeDirectory(false, directory);
+    if (forMutation) this.recoverCreation(id, directory);
+    let exact;
+    try { exact = await readExact(file, guard); }
+    catch (error) {
+      if (error.code === 'STAGING_CHANGED') throw Error('Comparison is not an ordinary local history file or changed during the read.');
+      throw error;
+    }
+    const { bytes, proof } = exact;
+    const record = this.decodeHistory(id, bytes);
     // Only an intentional fresh read under the mutation lock establishes a
     // writer baseline. Background reads must not bless another writer's bytes
     // for an already active request. Its own successful writes advance it.
-    if (forMutation) this.durable.set(id, hash(bytes));
-    return withBytes ? { record, bytes } : record;
+    if (forMutation) this.durable.set(id, { directory, proof });
+    return withProof ? { record, proof } : record;
+  }
+  finishCreation(stage, destination, receipt, staged, receiptProof, guard) {
+    verifyStageSync(receipt, guard, receiptProof);
+    if (local.lstatSync(destination, { bigint: true }).nlink === 2n) {
+      verifyPeersSync(stage, destination, guard, staged);
+      verifyStageSync(receipt, guard, receiptProof);
+      verifyStageSync(stage, guard, staged, 2);
+      local.unlinkSync(stage);
+    }
+    verifyAbsentSync(stage, guard, creationChanged);
+    verifyStageSync(destination, guard, staged);
+    verifyStageSync(receipt, guard, receiptProof);
+    local.unlinkSync(receipt);
+  }
+  recoverCreation(id, directory) {
+    const guard = () => this.safeDirectory(false, directory);
+    const receipt = path.join(this.directory, creationName(id));
+    let exact;
+    try { exact = readExactSync(receipt, guard); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    let entry;
+    try { entry = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(exact.bytes)); }
+    catch { throw creationChanged(); }
+    if (entry?.schema !== 1 || entry.id !== id || typeof entry.stage !== 'string' || !entry.stage.endsWith('.pending') ||
+        !uuid(entry.stage.slice(0, -8)) || !validProof(entry.staged) || !sameIdentity(entry.root, identity(this.rootIdentity)) ||
+        !sameIdentity(entry.directory, identity(directory))) throw creationChanged();
+    const stage = path.join(this.directory, entry.stage), destination = path.join(this.directory, `${id}.json`);
+    try {
+      const links = local.lstatSync(destination, { bigint: true }).nlink;
+      if (links !== 1n && links !== 2n) throw creationChanged();
+      const { bytes } = readExactSync(destination, guard, Number(links), entry.staged);
+      let record;
+      try { record = this.decodeHistory(id, bytes); }
+      catch { throw creationChanged(); }
+      if (!record.slots.every(slot => slot.status === 'pending') || record.generationPin || record.blindOrder || record.revealedAt) throw creationChanged();
+      this.finishCreation(stage, destination, receipt, entry.staged, exact.proof, guard);
+    } catch (error) {
+      if (['ENOENT', 'STAGING_CHANGED'].includes(error.code)) throw creationChanged();
+      throw error;
+    }
+  }
+  async replace(stage, destination, staged, expected, guard) {
+    const deadline = performance.now() + 1000;
+    let delay = 15, refusal;
+    while (true) {
+      if (refusal && performance.now() >= deadline) throw refusal;
+      try { readExactSync(destination, guard, 1, expected); }
+      catch (error) {
+        if (['ENOENT', 'STAGING_CHANGED'].includes(error.code)) throw historyChanged();
+        throw error;
+      }
+      verifyStageSync(stage, guard, staged);
+      try { local.renameSync(stage, destination); return; }
+      catch (error) {
+        const remaining = deadline - performance.now();
+        if (process.platform !== 'win32' || error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
+        refusal = error;
+        await this.checkpoint('comparison-after-rename-refusal');
+        await new Promise(resolve => setTimeout(resolve, Math.min(delay, remaining)));
+        delay = Math.min(delay * 2, 100);
+      }
+    }
   }
   async write(record, create = false) {
+    const expected = this.durable.get(record.id);
+    if (!create && !expected) throw historyChanged();
+    const directory = this.safeDirectory(false, create ? undefined : expected.directory);
+    const guard = () => this.safeDirectory(false, directory);
     await this.checkpoint('comparison-before-store');
-    const directory = this.safeDirectory(), stage = path.join(this.directory, `${randomUUID()}.pending`);
-    let handle;
+    const stage = path.join(this.directory, `${randomUUID()}.pending`);
+    const destination = path.join(this.directory, `${record.id}.json`);
+    const receipt = path.join(this.directory, creationName(record.id));
+    let staged, receiptProof, linked = false, retired = false;
     try {
-      handle = await fs.open(stage, 'wx'); this.safeDirectory(false, directory);
-      const text = JSON.stringify(record, null, 2);
-      await handle.writeFile(text, 'utf8'); await handle.sync();
-      await handle.close(); handle = null; this.safeDirectory(false, directory);
-      const destination = path.join(this.directory, `${record.id}.json`);
-      if (create) await fs.link(stage, destination);
-      else {
-        const expected = this.durable.get(record.id);
-        const directoryIdentity = this.safeDirectory(false, directory), stat = await fs.lstat(destination);
-        this.safeDirectory(false, directoryIdentity);
-        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || !expected) throw Error('Comparison history changed or is unavailable. Preserve the retained text.');
-        const bytes = await fs.readFile(destination); this.safeDirectory(false, directory);
-        if (hash(bytes) !== expected) throw Error('Comparison history changed in another process. Existing history was not replaced.');
-        const deadline = performance.now() + 1000; let delay = 15;
-        while (true) {
-          try { this.safeDirectory(false, directory); await fs.rename(stage, destination); this.safeDirectory(false, directory); break; }
-          catch (error) {
-            const remaining = deadline - performance.now();
-            if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
-            await new Promise(resolve => setTimeout(resolve, Math.min(delay, remaining))); delay = Math.min(delay * 2, 100);
-          }
+      staged = await writeStage(stage, JSON.stringify(record, null, 2), guard);
+      if (create) {
+        const entry = { schema: 1, id: record.id, stage: path.basename(stage), staged, root: identity(this.rootIdentity), directory: identity(directory) };
+        receiptProof = await writeStage(receipt, JSON.stringify(entry), guard);
+        verifyStageSync(receipt, guard, receiptProof);
+        verifyStageSync(stage, guard, staged);
+        local.linkSync(stage, destination);
+        linked = true;
+        this.finishCreation(stage, destination, receipt, staged, receiptProof, guard);
+      } else await this.replace(stage, destination, staged, expected.proof, guard);
+      retired = true;
+      verifyStageSync(destination, guard, staged);
+      this.durable.set(record.id, { directory, proof: staged });
+    } finally {
+      if (!retired && !linked) {
+        for (const [file, proof] of [[receipt, receiptProof], [stage, staged]]) if (proof) {
+          try {
+            readExactSync(file, guard, 1, proof);
+            local.unlinkSync(file);
+          } catch { /* Preserve an unproved file or parent and surface the original failure. */ }
         }
       }
-      this.safeDirectory(false, directory);
-      this.durable.set(record.id, hash(text));
-    } finally {
-      await handle?.close();
-      this.safeDirectory(false, directory);
-      await fs.unlink(stage).catch(error => { if (error.code !== 'ENOENT') throw error; });
     }
   }
   view(record) {
@@ -120,7 +216,9 @@ class Comparisons {
     this.safeDirectory(false, directory);
     const records = [];
     for (const name of names) if (name.endsWith('.json')) {
-      let record = await this.read(name.slice(0, -5));
+      const id = name.slice(0, -5);
+      if (uuid(id) && names.has(creationName(id))) await this.lock(() => this.recoverCreation(id, directory));
+      let record = await this.read(id);
       if (!this.unsaved.has(record.id) && !this.running.has(record.id) && record.slots.some(slot => slot.status === 'inProgress')) record = await this.lock(async () => {
         const latest = await this.read(record.id, true);
         for (const slot of latest.slots) if (slot.status === 'inProgress') {
@@ -239,7 +337,7 @@ class Comparisons {
         try { stored = await this.readStored(retained.id, false, true); }
         catch { throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' }); }
         const expected = this.durable.get(retained.id);
-        if (!expected || hash(stored.bytes) !== expected) throw Object.assign(Error(), { code: 'HISTORY_CONFLICT' });
+        if (!sameProof(stored.proof, expected?.proof)) throw historyChanged();
         const record = structuredClone(retained); delete record.storageWarning;
         // This publication uses the exact last-owned durable baseline. It does
         // not establish a new baseline from the observed conflicting file.
@@ -254,28 +352,41 @@ class Comparisons {
     }
   }
   scoreProjection(record) {
-    return { id: record.id, rubric, storageWarning: record.storageWarning || null, canReveal: this.completeFeedback(record), revealedAt: record.revealedAt || null,
-      notice: `Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures. Three authored cases do not establish statistical reliability or equal consumption.${record.revealedAt ? ' Methods were already revealed; subsequent judgments are not blinded.' : ''}`,
-      outputs: record.blindOrder.map((entry, index) => {
-        const slot = record.slots.find(item => item.id === entry.slotId);
-        const candidateDigest = hash(JSON.stringify({ status: slot.status, candidate: slot.candidate || null, error: slot.error || null }));
-        return { displayIndex: index, displayId: entry.label, status: slot.status, candidate: slot.candidate || null, candidateDigest, error: slot.error || null, rating: slot.rating || null };
-      }) };
+    const { brief } = record;
+    const scoringBrief = { version: brief.version, sections: brief.snapshot.sections.map(({ title, text, references }) => ({
+      title, text, references: references.map(({ source, start, end }) => ({ source: source + 1, start, end }))
+    })), sources: brief.snapshot.sources.map(({ text }, index) => ({ number: index + 1, text })) };
+    const outputs = [];
+    for (const entry of record.blindOrder) {
+      const slot = record.slots.find(item => item.id === entry.slotId);
+      if (!terminal(slot)) continue;
+      const candidate = slot.candidate ? { text: slot.candidate.text, warning: slot.candidate.warning,
+        wordCount: slot.candidate.wordCount, overRequestedLimit: slot.candidate.overRequestedLimit } : null;
+      outputs.push({
+        displayIndex: outputs.length, displayId: entry.label, status: slot.status, candidate, candidateDigest: candidateDigest(slot),
+        error: slot.error ? 'Generation did not finish successfully. Any retained text is shown below.' : null,
+        rating: slot.rating || null, evidence: scoreCase(record, slot)
+      });
+    }
+    const pending = record.slots.filter(slot => slot.status === 'pending').length;
+    return { id: record.id, rubric, brief: scoringBrief, outputs, storageWarning: record.storageWarning || null, canReveal: this.completeFeedback(record), revealedAt: record.revealedAt || null,
+      notice: `Blind labels and order are stable. Output wording may suggest a method; blinding does not guarantee secrecy. Review every outcome, including generation failures.${pending ? ` ${pending} of six slots were never attempted. Only retained outcomes can receive feedback; method reveal requires feedback on all six attempts.` : ''} Three authored cases do not establish statistical reliability or equal consumption.${record.revealedAt ? ' Methods were already revealed; subsequent judgments are not blinded.' : ''}` };
   }
   completeFeedback(record) {
     return !record.storageWarning && record.slots.every(slot => {
       const rating = slot.rating;
-      return ['completed', 'failed', 'interrupted'].includes(slot.status) && slot.candidate && rating && rubric.dimensions.every(dimension => Number.isSafeInteger(rating[dimension.key]) && rating[dimension.key] >= 1 && rating[dimension.key] <= 5) && typeof rating.reason === 'string' && !!rating.reason.trim() && typeof rating.materialError === 'boolean' && rating.rubricVersion === rubric.version && rating.candidateDigest === hash(JSON.stringify({ status: slot.status, candidate: slot.candidate, error: slot.error || null }));
+      return terminal(slot) && slot.candidate && rating && rubric.dimensions.every(dimension => Number.isSafeInteger(rating[dimension.key]) && rating[dimension.key] >= 1 && rating[dimension.key] <= 5) && typeof rating.reason === 'string' && !!rating.reason.trim() && typeof rating.materialError === 'boolean' && rating.rubricVersion === rubric.version && rating.candidateDigest === candidateDigest(slot);
     });
   }
   async scoreView(input) {
     return this.lock(async () => {
       const record = await this.read(input?.id, true);
       if (record.vault.root !== this.getVault()?.root) throw Error('Comparison belongs to another vault.');
-      if (record.slots.some(slot => slot.status === 'pending' || slot.status === 'inProgress')) throw Error('Complete all six explicit attempts before blind scoring. Retained failures remain eligible.');
-      if (!record.blindOrder) {
+      if (record.slots.some(slot => slot.status === 'inProgress') || !record.slots.some(terminal)) throw Error('Blind scoring needs a retained terminal outcome after generation has settled.');
+      const assignLabels = !record.blindOrder;
+      if (assignLabels) {
         if (this.unsaved.has(record.id)) throw Error('Repair unsaved comparison storage before assigning persistent blind labels.');
-        // Independent post-generation shuffle. Never reuse the known preview
+        // Independent scoring shuffle. Never reuse the known preview
         // order or aliases, even if the permutations happen to coincide.
         const order = record.slots.map(slot => slot.id), labels = new Set();
         for (let i = order.length - 1; i > 0; i--) { const j = randomInt(i + 1); [order[i], order[j]] = [order[j], order[i]]; }
@@ -284,9 +395,10 @@ class Comparisons {
           do { label = `Sample ${randomUUID().slice(0, 8)}`; } while (labels.has(label));
           labels.add(label); return { label, slotId };
         });
-        await this.write(record);
       }
-      return this.scoreProjection(record);
+      const projection = this.scoreProjection(record);
+      if (assignLabels) await this.write(record);
+      return projection;
     });
   }
   async rate(input) {
@@ -296,7 +408,7 @@ class Comparisons {
       const record = await this.read(input.id, true);
       if (record.vault.root !== this.getVault()?.root || this.unsaved.has(record.id)) throw Error('Comparison belongs to another vault or has unsaved output. Repair storage before saving feedback.');
       const entry = record.blindOrder?.find(item => item.label === input.displayId), slot = record.slots.find(item => item.id === entry?.slotId);
-      if (!slot || !['completed', 'failed', 'interrupted'].includes(slot.status) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
+      if (!slot || !terminal(slot) || !slot.candidate) throw Error('An attempted terminal outcome is required before rating. A pending slot is not an abstention.');
       const projection = this.scoreProjection(record).outputs.find(item => item.displayId === input.displayId);
       if (projection.candidateDigest !== input.candidateDigest) throw Error('Retained output changed. Inspect it again before saving feedback.');
       const values = { ...rating, reason: rating.reason.trim() };
