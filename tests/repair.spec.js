@@ -172,10 +172,14 @@ for (const channel of ['state', 'vault-repairs']) test(`repair choices wait for 
 });
 
 test('external writing survives restart and transfers to an annotation before incoming source applies', async () => {
+  test.setTimeout(75000);
   await artifact(); await launch(); await setup(); await connect(true);
   const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
   const file = path.join(captures, (await fs.readdir(captures)).find(x => x.endsWith('.md')));
   await fs.appendFile(file, '\nMy external observation.\n');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect.soft(page.getByLabel('Source inspection')).toContainText(/Supporting evidence: paused[\s\S]*local changes/i);
+  await expect.soft(page.getByLabel('Source inspection')).not.toContainText('Supporting evidence: eligible');
   await artifact('next', '2'.repeat(32));
   const independent = await artifact('independent', '3'.repeat(32));
   const run = JSON.parse(await fs.readFile(path.join(independent, 'run.json'), 'utf8')); run.input_sha256 = 'c'.repeat(64);
@@ -193,6 +197,29 @@ test('external writing survives restart and transfers to an annotation before in
   const inspection = page.getByLabel('Source inspection');
   await expect.soft(inspection).toContainText(/Supporting evidence: paused[\s\S]*conflict/i);
   await expect.soft(inspection).not.toContainText('Supporting evidence: eligible');
+  await page.getByLabel('Context question', { exact: true }).fill('My external observation');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  await expect(page.locator('#context-results')).not.toContainText('My external observation.');
+  const localChoice = manual.locator('option').filter({ hasText: 'Local writing (conflict):' });
+  const importedChoice = manual.locator('option').filter({ hasText: 'Imported revision (conflict):' });
+  const localKey = await localChoice.first().getAttribute('value', { timeout: 5000 }).catch(() => null);
+  expect.soft(localKey).toBeTruthy();
+  const importedKey = await importedChoice.first().getAttribute('value', { timeout: 5000 }).catch(() => null);
+  expect.soft(importedKey).toBeTruthy();
+  if (localKey && importedKey) {
+    const packageText = page.getByLabel('Actual context package', { exact: true });
+    await manual.selectOption(localKey);
+    await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    await expect(packageText).toHaveValue(/exact local content sha256 [a-f0-9]{64}[\s\S]*not producer evidence[\s\S]*My external observation\./i);
+    await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+    await manual.selectOption(importedKey);
+    await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+    await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+    await expect(packageText).toHaveValue(/exact imported revision [a-f0-9-]{36}; snapshot sha256 [a-f0-9]{64}[\s\S]*unresolved local conflict/i);
+    await expect(packageText).not.toHaveValue(/My external observation\./);
+  }
   await page.getByLabel('Transfer local writing').fill('My external observation.');
   await page.getByRole('button', { name: 'Save annotation and apply incoming', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Conflict resolved');
@@ -204,6 +231,16 @@ test('external writing survives restart and transfers to an annotation before in
   await page.getByRole('button', { name: 'Check now', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Intake check complete');
   expect((await fs.readdir(path.join(base, 'Annotations'))).filter(x => x.endsWith('.md'))).toHaveLength(1);
+  const oldCapture = page.locator('#captures article').filter({ hasText: path.basename(file, '.md') });
+  await oldCapture.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const currentInspection = page.getByLabel('Source inspection');
+  await expect(currentInspection).toContainText('My external observation.');
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.locator('#parent').fill('Another managed parent');
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect.soft(currentInspection).toBeHidden();
+  await expect.soft(page.locator('#source-details')).toBeEmpty();
 });
 
 test('independent annotations stay linked and unchanged after a source revision', async () => {
