@@ -42,6 +42,31 @@ async function writeDraft(root, name = 'first', attempt = '1', input = 'a') {
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(directory, 'notes.md'));
 }
 
+test('a fresh intake conflict never retires an equal-byte replacement of its original journal', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), retained = testInfo.outputPath('original-transaction.json');
+  let armed = false, original, journal;
+  const { intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (!armed || boundary !== 'intake-journaled') return;
+    journal = path.join(intake.dir, 'transaction.json');
+    original = await fs.readFile(journal);
+    await fs.rename(journal, retained);
+    await fs.writeFile(journal, original, { flag: 'wx' });
+  });
+  await writeDraft(producer);
+  const baseline = await intake.connect(producer, true, now);
+  const capture = Object.values(baseline.captures)[0], captureFile = intake.destination(capture);
+  await fs.appendFile(captureFile, '\nIndependent local edit.\n');
+  const localWriting = await fs.readFile(captureFile);
+  await writeDraft(producer, 'second', '2');
+  armed = true;
+  await expect(intake.reconcile({ now: later })).rejects.toThrow(/intake journal.*changed/i);
+  expect(await fs.readFile(journal)).toEqual(original);
+  expect(await fs.readFile(retained)).toEqual(original);
+  expect((await fs.readdir(intake.dir)).filter(name => name.startsWith('conflict-'))).toEqual([]);
+  expect(await fs.readFile(captureFile)).toEqual(localWriting);
+  expect((await readJson(ledgerFile)).attempts).toEqual(baseline.attempts);
+});
+
 for (const kind of ['snapshot', 'capture']) test(`intake holds changed ${kind} stage bytes before publishing their final path`, async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   const replacement = `Independent writing at the ${kind} stage.\n`;
