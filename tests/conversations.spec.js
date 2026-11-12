@@ -1187,6 +1187,32 @@ async function holdFinalProviderEvidence() {
   return () => fs.writeFile(resume, 'read current provider evidence');
 }
 
+test('an edit to selected historical dialogue during the final provider evidence read prevents turn start', async () => {
+  test.setTimeout(60000);
+  const canary = 'LATE_HISTORY_DIALOGUE';
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: canary }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const origin = await onlyConversation(), file = path.join(root, 'conversations', `${origin.id}.json`);
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`What did we discuss about ${canary}?`);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: canary }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(`Assistant: ${canary}`));
+  const release = await holdFinalProviderEvidence();
+  origin.requests[0].reply = 'Independently edited local dialogue.';
+  const edited = JSON.stringify(origin, null, 2);
+  try { await fs.writeFile(file, edited); } finally { await release(); }
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  const rpc = await conversationRpc();
+  expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(2);
+  expect(rpc.filter(call => call.method === 'turn/start')).toHaveLength(1);
+  expect(await fs.readFile(file, 'utf8')).toBe(edited);
+});
+
 test('shared verified capacity bounds the complete Unicode package without trimming and keeps private proof local', async () => {
   test.setTimeout(60000);
   const evidence = capacityEvidence(); await writeCapacity(evidence);

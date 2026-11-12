@@ -111,20 +111,35 @@ class ConversationControls {
     const marker = this.checkedFile(data, id);
     const stage = `${marker.publication}.pending`;
     if (!id && name !== stage) throw Error('Unknown conversation control stage remains preserved; access is blocked.');
-    if (nlink === 2) {
-      const guard = () => this.guard(false, directory.stat), proof = rawProof(data);
-      const peer = path.join(directory.directory, id ? stage : `${marker.id}.json`);
-      verifyStageSync(peer, guard, proof, 2);
-      verifyStageSync(file, guard, proof, 2);
-    }
-    return { marker, owned: data.owned };
+    const guard = () => this.guard(false, directory.stat), proof = rawProof(data);
+    const verify = () => {
+      if (nlink === 2) verifyStageSync(path.join(directory.directory, id ? stage : `${marker.id}.json`), guard, proof, 2);
+      verifyStageSync(file, guard, proof, nlink);
+    };
+    if (nlink === 2) verify();
+    return { marker, owned: data.owned, verify };
   }
-  async state(id, reviewedPublication) {
+  verifyUnpublishedControlAbsent(id, expected) {
+    const directory = this.guard(false, expected); if (!directory) return;
+    const guard = () => this.guard(false, directory.stat);
+    const changed = () => Error('Conversation control changed. Preview current scope again.');
+    verifyAbsentSync(path.join(directory.directory, `${id}.json`), guard, changed);
+    for (const name of local.readdirSync(directory.directory)) {
+      if (!name.endsWith('.pending')) continue;
+      const file = path.join(directory.directory, name), { nlink } = local.lstatSync(file);
+      if (![1, 2].includes(nlink)) throw changed();
+      const { bytes } = readExactSync(file, guard, nlink);
+      if (JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)).id === id) throw changed();
+    }
+    verifyAbsentSync(path.join(directory.directory, `${id}.json`), guard, changed);
+  }
+  async state(id, reviewedPublication, observe) {
     if (!uuid(id)) throw Error('Conversation identity is invalid.');
-    const directory = this.guard(); if (!directory) return null;
-    let marker;
+    const directory = this.guard();
+    if (!directory) { observe?.(() => this.verifyUnpublishedControlAbsent(id)); return null; }
+    let marker, verify;
     try {
-      ({ marker } = await this.controlFile(`${id}.json`, directory, id));
+      ({ marker, verify } = await this.controlFile(`${id}.json`, directory, id));
       this.known.add(id);
     } catch (error) { if (error.code !== 'ENOENT' || this.known.has(id)) throw error; }
     for (const name of await fs.readdir(directory.directory)) {
@@ -136,12 +151,13 @@ class ConversationControls {
       const { marker: candidate } = await this.controlFile(name, directory);
       if (!marker && candidate.id === id && candidate.publication !== reviewedPublication) throw Error('An unpublished conversation control requires explicit recovery. History remains preserved and blocked.');
     }
+    observe?.(verify || (() => this.verifyUnpublishedControlAbsent(id, directory.stat)));
     return marker || null;
   }
-  async check(record) {
+  async check(record, observe) {
     const removed = record.removedRequests;
     if (removed !== undefined && (!validRemovedRequests(removed) || record.requests.some(request => removed.includes(request.id)))) throw Error('Removed request authority is invalid. Preserve local history for repair.');
-    const marker = await this.state(record.id);
+    const marker = await this.state(record.id, undefined, observe);
     if (!marker) { if (record.generation !== undefined && record.generation !== null) throw Error('Conversation generation has no local authority. Explicit restoration is required.'); return; }
     const matchesGeneration = (record.generation ?? null) === marker.generation;
     if (marker.requestRemoval && (!matchesGeneration || marker.removedRequests.some(id => !removed?.includes(id)))) {
