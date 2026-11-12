@@ -46,7 +46,7 @@ function validateAuthority(ledger) {
     }
     if (value.phase === 'restoring') {
       const item = value.restoration;
-      if (!fields(item, ['journal', 'revision', 'sha256', 'published', 'publication', 'importedPublication', 'journalIdentity', 'retirement']) || !(value.manual ? item.revision === null : uuid(item.revision)) || !sha(item.sha256) || item.journal !== `restoration-${value.operationId}.json` || item.published !== undefined && item.published !== true) throw Error('Source restoration authority needs repair.');
+      if (!fields(item, ['journal', 'revision', 'sha256', 'published', 'publication', 'importedPublication', 'journalIdentity', 'stageIdentity', 'stageState', 'retirement']) || !(value.manual ? item.revision === null : uuid(item.revision)) || !sha(item.sha256) || item.journal !== `restoration-${value.operationId}.json` || item.published !== undefined && item.published !== true) throw Error('Source restoration authority needs repair.');
       if (value.manual && item.published === true ? !fields(item.publication, ['dev', 'ino', 'bytes']) || ![item.publication.dev, item.publication.ino, item.publication.bytes].every(part => typeof part === 'string' && /^[0-9]+$/.test(part)) : item.publication !== undefined) throw Error('Manual restoration publication needs repair.');
       const publication = item.importedPublication;
       if (publication !== undefined && (value.manual || !fields(publication, ['capture', 'snapshot', 'journal']) ||
@@ -54,6 +54,8 @@ function validateAuthority(ledger) {
         throw Error('Imported restoration publication needs repair.');
       }
       if (item.journalIdentity !== undefined && (!value.manual || !identity(item.journalIdentity))) throw Error('Manual restoration journal identity needs repair.');
+      if (item.stageIdentity !== undefined && (!value.manual || item.published || item.retirement || !identity(item.stageIdentity))) throw Error('Manual restoration stage identity needs repair.');
+      if (item.stageState !== undefined && (!item.stageIdentity || !item.journalIdentity || !['prepared', 'attempted'].includes(item.stageState))) throw Error('Manual restoration stage state needs repair.');
       if (item.retirement !== undefined) {
         retirement(item.retirement, id);
         if (!value.manual || !item.journalIdentity || item.retirement.operationId === value.operationId || item.retirement.generation === value.generation || item.retirement.sourceSha256 !== value.manual.currentHash) throw Error('Manual retry authority needs repair.');
