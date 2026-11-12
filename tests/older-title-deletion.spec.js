@@ -526,13 +526,13 @@ test('restored-generation older title proof recovers after an actual first unlin
   expect(await files(base)).toEqual(before);
   const firstRelative = raw.preview.targets[0], firstFile = path.join(root, 'vault', firstRelative), observer = path.join(root, 'older-title-first-native-unlink.json'), faults = path.join(root, 'faults.json');
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), nativeUnlink = io.unlink;
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), nativeUnlink = io.unlinkSync;
     const exact = paths.resolve(options.firstFile).toLowerCase();
-    io.unlink = async function (file, ...args) {
-      const result = await nativeUnlink.call(this, file, ...args);
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
       if (typeof file === 'string' && paths.resolve(file).toLowerCase() === exact) {
-        io.unlink = nativeUnlink;
-        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, exactFirstFile: options.firstFile, nativeUnlinkReturned: true, controlledSourceOmissions: [] }, null, 2), 'utf8');
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, exactFirstFile: options.firstFile, nativeUnlinkReturned: true, controlledSourceOmissions: [] }, null, 2), 'utf8');
       }
       return result;
     };
