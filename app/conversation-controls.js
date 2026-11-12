@@ -103,35 +103,37 @@ class ConversationControls {
     if (control && (control.dev !== data.owned.dev || control.ino !== data.owned.ino)) throw requestChanged();
     return marker;
   }
+  async controlFile(name, directory, id) {
+    const file = path.join(directory.directory, name);
+    const { nlink } = await fs.lstat(file);
+    if (![1, 2].includes(nlink)) throw Error('Conversation control has unknown linked peers.');
+    const data = await this.file(file, directory, null, nlink, true, true);
+    const marker = this.checkedFile(data, id);
+    const stage = `${marker.publication}.pending`;
+    if (!id && name !== stage) throw Error('Unknown conversation control stage remains preserved; access is blocked.');
+    if (nlink === 2) {
+      const guard = () => this.guard(false, directory.stat), proof = rawProof(data);
+      const peer = path.join(directory.directory, id ? stage : `${marker.id}.json`);
+      verifyStageSync(peer, guard, proof, 2);
+      verifyStageSync(file, guard, proof, 2);
+    }
+    return { marker, owned: data.owned };
+  }
   async state(id, reviewedPublication) {
     if (!uuid(id)) throw Error('Conversation identity is invalid.');
     const directory = this.guard(); if (!directory) return null;
-    const file = path.join(directory.directory, `${id}.json`);
     let marker;
     try {
-      const stat = await fs.lstat(file);
-      if (![1, 2].includes(stat.nlink)) throw Error('Conversation control has unknown linked peers.');
-      const data = await this.file(file, directory, null, stat.nlink, true);
-      marker = this.checkedFile(data, id);
-      if (stat.nlink !== 1) {
-        if (stat.nlink !== 2) throw Error('Conversation control has unknown linked peers.');
-        const stage = await this.file(path.join(directory.directory, `${marker.publication}.pending`), directory, null, 2, true);
-        if (!same(data.stat, stage.stat) || data.text !== stage.text) throw Error('Conversation control has unknown linked peers.');
-      }
+      ({ marker } = await this.controlFile(`${id}.json`, directory, id));
       this.known.add(id);
-    } catch (error) { if (error.code !== 'ENOENT' || marker || this.known.has(id)) throw error; }
+    } catch (error) { if (error.code !== 'ENOENT' || this.known.has(id)) throw error; }
     for (const name of await fs.readdir(directory.directory)) {
       if (/^[a-f0-9-]{36}\.json$/.test(name)) {
         const otherId = name.slice(0, -5); if (otherId === id && marker) continue;
-        const other = await this.file(path.join(directory.directory, name), directory, null, 1, true);
-        this.checkedFile(other, otherId); continue;
+        await this.controlFile(name, directory, otherId); continue;
       }
       if (!/^[a-f0-9-]{36}\.pending$/.test(name)) throw Error('Unknown conversation control file remains preserved; access is blocked.');
-      const stat = await fs.lstat(path.join(directory.directory, name));
-      if (![1, 2].includes(stat.nlink)) throw Error('Conversation control stage has unknown linked peers.');
-      const stage = await this.file(path.join(directory.directory, name), directory, null, stat.nlink, true);
-      const candidate = this.checkedFile(stage);
-      if (name !== `${candidate.publication}.pending` || stat.nlink !== 1 && !(marker && candidate.publication === marker.publication && stat.nlink === 2)) throw Error('Unknown conversation control stage remains preserved; access is blocked.');
+      const { marker: candidate } = await this.controlFile(name, directory);
       if (!marker && candidate.id === id && candidate.publication !== reviewedPublication) throw Error('An unpublished conversation control requires explicit recovery. History remains preserved and blocked.');
     }
     return marker || null;
@@ -155,13 +157,8 @@ class ConversationControls {
     const markers = [], stages = [];
     for (const name of (await fs.readdir(directory.directory)).sort()) {
       if (/^[a-f0-9-]{36}\.json$/.test(name)) markers.push(await this.state(name.slice(0, -5)));
-      else if (/^[a-f0-9-]{36}\.pending$/.test(name)) {
-        const stat = await fs.lstat(path.join(directory.directory, name));
-        if (![1, 2].includes(stat.nlink)) throw Error('Unknown control stage peers remain preserved.');
-        const file = await this.file(path.join(directory.directory, name), directory, null, stat.nlink, true), value = this.checkedFile(file);
-        if (name !== `${value.publication}.pending`) throw Error('Unknown control stage remains preserved.');
-        stages.push(file.owned);
-      } else throw Error('Unknown local conversation authority remains preserved. Archive review is blocked.');
+      else if (/^[a-f0-9-]{36}\.pending$/.test(name)) stages.push((await this.controlFile(name, directory)).owned);
+      else throw Error('Unknown local conversation authority remains preserved. Archive review is blocked.');
     }
     return { markers, stages };
   }
@@ -646,17 +643,19 @@ class ConversationControls {
     this.store.tokens.clear();
     return { id: marker.id, generation: active.generation };
   }
-  verifyDeletionComplete(marker, guard) {
+  verifyDeletionScope(marker, guard, remaining = new Set()) {
     if (this.store.unsaved.has(marker.id) || this.store.running.has(marker.id)) throw deletionChanged();
     for (const target of marker.targets) {
-      verifyAbsentSync(path.join(this.store.directory, target.name), guard, deletionChanged);
+      const file = path.join(this.store.directory, target.name);
+      if (remaining.has(target.name)) verifyStageSync(file, guard, { dev: target.dev, ino: target.ino, digest: target.rawSha256 ?? target.sha256 });
+      else verifyAbsentSync(file, guard, deletionChanged);
     }
     if (initialPublicationPending(path.join(this.store.directory, `${marker.id}.json`), guard)) throw deletionChanged();
     for (const name of local.readdirSync(this.store.directory)) if (name.endsWith('.pending') || requestRemovalStageName(name)) {
       if (!pendingName(name) && !requestRemovalStageName(name)) throw deletionChanged();
       const { bytes } = readExactSync(path.join(this.store.directory, name), guard);
       const candidate = pendingRecord(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-      if (candidate.id === marker.id) throw deletionChanged();
+      if (candidate.id === marker.id && (!remaining.has(name) || candidate.vault.root !== this.store.getVault()?.root)) throw deletionChanged();
     }
     guard();
   }
@@ -672,15 +671,18 @@ class ConversationControls {
     await this.store.checkpoint('conversation-delete-after-tombstone');
     const current = await this.recoverySnapshot(marker.id, parent);
     if (JSON.stringify(current.marker) !== JSON.stringify(marker)) throw deletionChanged();
-    for (const target of marker.targets) if (current.remaining.includes(target.name)) {
+    const remaining = new Set(current.remaining);
+    for (const target of marker.targets) if (remaining.has(target.name)) {
       const file = path.join(this.store.directory, target.name);
       const exact = await this.deletionFile(file, parent, target);
       verifyMarker();
+      this.verifyDeletionScope(marker, guard, remaining);
       verifyStageSync(file, guard, rawProof(exact));
       local.unlinkSync(file);
+      remaining.delete(target.name);
       await this.store.checkpoint('conversation-delete-after-unlink');
     }
-    const verifyComplete = () => this.verifyDeletionComplete(marker, guard);
+    const verifyComplete = () => this.verifyDeletionScope(marker, guard);
     const beforeReplace = () => { verifyMarker(); verifyComplete(); };
     const revalidate = async () => {
       const after = await this.recoverySnapshot(marker.id, parent);

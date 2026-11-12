@@ -2720,6 +2720,34 @@ test('read-only source inspection preserves preview ledger identity while an ext
   expect(await files(path.join(root, 'producer'))).toEqual(producerBefore);
 });
 
+test('capture deletion preserves the reviewed files when an independent copy arrives at the last target read', async () => {
+  const { base, ledgerFile, capture } = await importedCapture();
+  const selected = path.join(base, 'Captures', capture.file), bytes = await fs.readFile(selected, 'utf8');
+  const copy = path.join(base, 'Captures', 'Late independent capture.md');
+  const independent = bytes + '\nIndependent writing added after the scope read.\n';
+  const snapshots = await files(path.join(base, 'Revisions'));
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await app.evaluate((_electron, options) => {
+    const local = process.getBuiltinModule('fs'), io = local.promises;
+    const read = io.readFile;
+    io.readFile = async function (file, ...rest) {
+      const atFinalRead = file === options.selected && /\bat async Object\.inspectTarget\b/.test(new Error().stack);
+      const value = await read.call(this, file, ...rest);
+      if (atFinalRead) {
+        io.readFile = read;
+        local.writeFileSync(options.copy, options.independent, { flag: 'wx' });
+      }
+      return value;
+    };
+  }, { selected, copy, independent });
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deletion files changed');
+  expect(await fs.readFile(copy, 'utf8')).toBe(independent);
+  expect(await fs.readFile(selected, 'utf8')).toBe(bytes);
+  expect(await files(path.join(base, 'Revisions'))).toEqual(snapshots);
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).sourceAuthority[capture.id].phase).toBe('deleting');
+});
+
 test('intake authority rejects an unknown hardlinked ledger before deletion preview', async () => {
   const { ledgerFile } = await importedCapture();
   const remove = page.getByRole('button', { name: 'Delete capture', exact: true }); await expect(remove).toBeVisible();

@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { installConversations } = require('../app/conversations');
@@ -89,6 +90,51 @@ test('selected request removal preserves a later same-conversation stage and ask
   expect((await call('conversation-list')).conversations).toEqual([record]);
 });
 
+test('a linked request-removal control remains recoverable alongside another conversation control', async ({}, testInfo) => {
+  const { id, requests: [selected, kept], record, call, install, file, directory } = await fixture(testInfo);
+  const otherId = randomUUID(), otherFile = path.join(directory, `${otherId}.json`);
+  await fs.writeFile(otherFile, JSON.stringify({ ...record, id: otherId }));
+  const other = await call('conversation-request-remove-preview', { id: otherId, requestId: selected.id });
+  await call('conversation-request-remove-confirm', { token: other.token });
+  const otherBytes = await fs.readFile(otherFile);
+  const reviewed = await call('conversation-request-remove-preview', { id, requestId: selected.id });
+  const control = path.join(directory, '.control', `${id}.json`), original = await fs.readFile(file);
+  const unlink = local.unlinkSync;
+  local.unlinkSync = function (target, ...rest) {
+    if (path.dirname(target) === path.dirname(control) && target.endsWith('.pending') && local.existsSync(control)) {
+      throw Error('Simulated exit after linking the exact control.');
+    }
+    return unlink.call(this, target, ...rest);
+  };
+  try {
+    await expect(call('conversation-request-remove-confirm', { token: reviewed.token })).rejects.toThrow('Simulated exit');
+  } finally {
+    local.unlinkSync = unlink;
+  }
+  const bytes = await fs.readFile(control), { publication } = JSON.parse(bytes);
+  const stage = path.join(path.dirname(control), `${publication}.pending`);
+  expect((await fs.lstat(control)).nlink).toBe(2);
+  expect((await fs.lstat(stage)).ino).toBe((await fs.lstat(control)).ino);
+  expect(await fs.readFile(stage)).toEqual(bytes);
+  expect(await fs.readFile(file)).toEqual(original);
+
+  const foreign = path.join(directory, 'foreign-control-alias');
+  await fs.link(stage, foreign);
+  await expect(install()('conversation-request-remove-pending')).rejects.toThrow(/linked|peers/i);
+  expect(await fs.readFile(foreign)).toEqual(bytes);
+  expect(await fs.readFile(otherFile)).toEqual(otherBytes);
+  await fs.unlink(foreign);
+
+  const restarted = install();
+  expect((await restarted('conversation-list')).conversations.map(item => item.id)).toEqual([otherId]);
+  expect(await restarted('conversation-request-remove-pending')).toEqual([{ id, requestId: selected.id, canResume: true }]);
+  const resume = await restarted('conversation-request-remove-preview', { id, requestId: selected.id, resume: true });
+  await restarted('conversation-request-remove-confirm', { token: resume.token });
+  expect((await restarted('conversation-list')).conversations.find(item => item.id === id).requests).toEqual([kept]);
+  expect(await fs.readFile(otherFile)).toEqual(otherBytes);
+  await expect(fs.readFile(stage)).rejects.toThrow(/ENOENT/);
+});
+
 test('request removal explicitly retires the exact replacement copy left before writing control', async ({}, testInfo) => {
   const checkpoint = async name => { if (name === 'conversation-request-removal-payload-staged') throw Error('Simulated exit before writing control.'); };
   const { id, requests: [removed, kept], call, install, file, directory } = await fixture(testInfo, checkpoint);
@@ -132,6 +178,30 @@ test('whole conversation deletion reviews and removes its exact reserved request
   await expect(fs.readFile(file)).rejects.toThrow(/ENOENT/);
   await expect(fs.readFile(path.join(directory, name))).rejects.toThrow(/ENOENT/);
   expect((await restarted('conversation-list')).conversations).toEqual([]);
+});
+
+test('whole conversation deletion stops before the next unlink when unreviewed pending history arrives', async ({}, testInfo) => {
+  const interrupted = async name => {
+    if (name === 'conversation-request-removal-payload-staged') throw Error('Simulated exit before writing control.');
+  };
+  const { id, requests: [selected], record, call, install, file, directory } = await fixture(testInfo, interrupted);
+  const first = await call('conversation-request-remove-preview', { id, requestId: selected.id });
+  await expect(call('conversation-request-remove-confirm', { token: first.token })).rejects.toThrow('Simulated exit');
+  const [stage] = (await fs.readdir(directory)).filter(name => name.startsWith('.request-removal-'));
+  const late = path.join(directory, `${randomUUID()}.pending`);
+  const independent = JSON.stringify({ ...record, requests: [{ ...selected, reply: 'Late independent reply.' }] });
+  let injected = false;
+  const resumed = install(async name => {
+    if (name !== 'conversation-delete-after-unlink' || injected) return;
+    await fs.writeFile(late, independent, { flag: 'wx' });
+    injected = true;
+  });
+  const preview = await resumed('conversation-delete-preview', { id }), original = await fs.readFile(file);
+  expect(preview.targets).toEqual([stage, path.basename(file)]);
+  await expect(resumed('conversation-delete-confirm', { token: preview.token })).rejects.toThrow(/changed|not part of/i);
+  expect(await fs.readFile(file)).toEqual(original);
+  expect(await fs.readFile(late, 'utf8')).toBe(independent);
+  await expect(fs.readFile(path.join(directory, stage))).rejects.toThrow(/ENOENT/);
 });
 
 test('request removal reviews an earlier copy containing the selected request and holds edits and noncanonical names', async ({}, testInfo) => {
