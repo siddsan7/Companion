@@ -412,26 +412,25 @@ test('mixed retention resumes an actual annotation link before receipt with orig
   const outputs = reviewedPaths.map(file => path.join(root, 'vault', file));
   const observerFile = testInfo.outputPath('mixed-native-link-observer.json'), beforeFile = testInfo.outputPath('mixed-native-link-before.json');
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), crypto = process.getBuiltinModule('crypto');
-    const nativeLink = io.link, selected = new Set(options.outputs.map(file => paths.resolve(file).toLowerCase()));
-    const snapshot = async file => {
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), crypto = process.getBuiltinModule('crypto');
+    const nativeLink = io.linkSync, selected = new Set(options.outputs.map(file => paths.resolve(file).toLowerCase()));
+    const snapshot = file => {
       try {
-        const bytes = await io.readFile(file), stat = await io.lstat(file, { bigint: true });
+        const bytes = io.readFileSync(file), stat = io.lstatSync(file, { bigint: true });
         return { path: file, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), dev: String(stat.dev), ino: String(stat.ino), bytes: String(stat.size), nlink: String(stat.nlink), ordinary: stat.isFile() && !stat.isSymbolicLink() };
       } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     };
-    io.link = async function (source, destination, ...args) {
+    io.linkSync = function (source, destination, ...args) {
       if (typeof destination !== 'string' || !selected.has(paths.resolve(destination).toLowerCase())) return nativeLink.call(this, source, destination, ...args);
-      io.link = nativeLink;
-      const before = { ledger: JSON.parse(await io.readFile(options.ledgerFile, 'utf8')), stage: await snapshot(source), output: await snapshot(destination), origins: await Promise.all(options.origins.map(snapshot)) };
-      await io.writeFile(options.beforeFile, JSON.stringify({ boundary: 'before actual native annotation link', mainPid: process.pid, source, destination, nativeLinkReturned: false, before }, null, 2), { flush: true });
-      await nativeLink.call(this, source, destination, ...args);
-      const after = { ledger: JSON.parse(await io.readFile(options.ledgerFile, 'utf8')), stage: await snapshot(source), output: await snapshot(destination), origins: await Promise.all(options.origins.map(snapshot)) };
-      await io.writeFile(options.observerFile, JSON.stringify({ boundary: 'actual native annotation link returned; before publication receipt', mainPid: process.pid, source, destination, nativeLinkReturned: true, before, after }, null, 2), { flush: true });
-      // Hold return to the product after the real link, before it can commit its receipt.
-      await new Promise(() => {});
+      io.linkSync = nativeLink;
+      const before = { ledger: JSON.parse(io.readFileSync(options.ledgerFile, 'utf8')), stage: snapshot(source), output: snapshot(destination), origins: options.origins.map(snapshot) };
+      io.writeFileSync(options.beforeFile, JSON.stringify({ boundary: 'before actual native annotation link', mainPid: process.pid, source, destination, nativeLinkReturned: false, before }, null, 2), { flush: true });
+      nativeLink.call(this, source, destination, ...args);
+      const after = { ledger: JSON.parse(io.readFileSync(options.ledgerFile, 'utf8')), stage: snapshot(source), output: snapshot(destination), origins: options.origins.map(snapshot) };
+      io.writeFileSync(options.observerFile, JSON.stringify({ boundary: 'actual native annotation link returned; before publication receipt', mainPid: process.pid, source, destination, nativeLinkReturned: true, before, after }, null, 2), { flush: true });
+      io.writeFileSync(options.faults, JSON.stringify({ pause: 'mixed-writing-after-link' }));
     };
-  }, { outputs, ledgerFile, origins, observerFile, beforeFile });
+  }, { outputs, ledgerFile, origins, observerFile, beforeFile, faults: path.join(root, 'faults.json') });
   await page.getByLabel('Capture deletion preview').getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
   await expect.poll(async () => {
     try { return JSON.parse(await fs.readFile(observerFile, 'utf8')).nativeLinkReturned; }
@@ -472,6 +471,7 @@ test('mixed retention resumes an actual annotation link before receipt with orig
   await save(testInfo, 'mixed-native-link-main-exit.json', proof);
   await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
   proof.mainObservedExited = true; await save(testInfo, 'mixed-native-link-main-exit.json', proof); app = null;
+  await fs.unlink(path.join(root, 'faults.json'));
   await launch();
   await expect.poll(async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8')).sourceAuthority[capture.id].phase).toBe('deleted');
   const recovered = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), completed = recovered.sourceAuthority[capture.id], observed = await observe(base);
@@ -520,33 +520,18 @@ test('mixed retention holds a missing receipted output before first native sourc
   for (const file of origins) expect(reviewed).toContain(portable(path.relative(path.join(root, 'vault'), file)));
   const reviewedPaths = [...new Set(reviewed.match(/Companion\/Annotations\/[a-f0-9-]{36}\.md/g) || [])]; expect(reviewedPaths).toHaveLength(2);
   const outputs = reviewedPaths.map(file => path.join(root, 'vault', file)), observerFile = testInfo.outputPath('mixed-before-native-source-unlink.json');
-  await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), crypto = process.getBuiltinModule('crypto');
-    const nativeUnlink = io.unlink, selected = new Set(options.origins.map(file => paths.resolve(file).toLowerCase()));
-    const snapshot = async file => {
-      try {
-        const bytes = await io.readFile(file), stat = await io.lstat(file, { bigint: true });
-        return { path: file, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), dev: String(stat.dev), ino: String(stat.ino), bytes: String(stat.size), nlink: String(stat.nlink), ordinary: stat.isFile() && !stat.isSymbolicLink() };
-      } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-    };
-    io.unlink = async function (file, ...args) {
-      if (typeof file !== 'string' || !selected.has(paths.resolve(file).toLowerCase())) return nativeUnlink.call(this, file, ...args);
-      io.unlink = nativeUnlink;
-      const ledger = JSON.parse(await io.readFile(options.ledgerFile, 'utf8')), authority = ledger.sourceAuthority[options.captureId];
-      const observation = { boundary: 'before-native-unlink', requestedSource: file, mainPid: process.pid, nativeUnlinkDelegated: false, nativeUnlinkReturned: false, ledger,
-        origins: await Promise.all(options.origins.map(snapshot)), outputs: await Promise.all(options.outputs.map(snapshot)),
-        stages: await Promise.all(authority.preservedWriting.map(plan => snapshot(paths.join(options.vault, plan.stage)))) };
-      await io.writeFile(options.observerFile, JSON.stringify(observation, null, 2), { flush: true });
-      // No source unlink is delegated. Actual main exit ends this observation boundary.
-      await new Promise(() => {});
-    };
-  }, { origins, outputs, ledgerFile, captureId: capture.id, vault: path.join(root, 'vault'), observerFile });
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'mixed-deletion-before-source-unlink' }));
   await page.getByLabel('Capture deletion preview').getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
-  await expect.poll(async () => {
-    try { return JSON.parse(await fs.readFile(observerFile, 'utf8')).boundary; }
-    catch (error) { if (error.code === 'ENOENT' || error instanceof SyntaxError) return ''; throw error; }
-  }).toBe('before-native-unlink');
-  const observation = JSON.parse(await fs.readFile(observerFile, 'utf8')), authority = observation.ledger.sourceAuthority[capture.id], paused = await observe(base);
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  })).toBe('mixed-deletion-before-source-unlink');
+  const { file: requestedSource } = JSON.parse(await fs.readFile(path.join(root, 'checkpoint-detail.json'), 'utf8'));
+  const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), authority = ledger.sourceAuthority[capture.id], paused = await observe(base);
+  const snapshot = file => paused[portable(path.relative(base, file))] || null;
+  const observation = { boundary: 'before-native-unlink', requestedSource, mainPid: await app.evaluate(() => process.pid), nativeUnlinkDelegated: false, nativeUnlinkReturned: false, ledger,
+    origins: origins.map(snapshot), outputs: outputs.map(snapshot), stages: authority.preservedWriting.map(plan => snapshot(path.join(root, 'vault', plan.stage))) };
+  await fs.writeFile(observerFile, JSON.stringify(observation, null, 2), { flush: true });
   await save(testInfo, 'mixed-before-native-unlink-vault.json', { observation, observed: paused, originalOrigins });
   expect(observation.mainPid).toBe(await app.evaluate(() => process.pid)); expect(origins).toContain(observation.requestedSource);
   expect(observation.nativeUnlinkDelegated).toBe(false); expect(observation.nativeUnlinkReturned).toBe(false);
@@ -579,6 +564,7 @@ test('mixed retention holds a missing receipted output before first native sourc
   proof.wrapperExit = await exited; await abrupt; await save(testInfo, 'mixed-before-native-unlink-main-exit.json', proof);
   await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
   proof.mainObservedExited = true; await save(testInfo, 'mixed-before-native-unlink-main-exit.json', proof); app = null;
+  await fs.unlink(path.join(root, 'faults.json'));
   const exitedVault = await observe(base);
   await save(testInfo, 'mixed-before-output-removal.json', { observed: exitedVault, authority, controlledRemoval: removedOutput });
   expect(exitedVault).toEqual(paused);

@@ -42,11 +42,12 @@ async function resolveDataRoot(requested) {
   return process.platform === 'win32' && supplied.toLowerCase() === actual.toLowerCase() ? supplied : actual;
 }
 function scheduleOptions() { return { testRoot, executable: process.execPath, appPath: app.getAppPath(), packaged: app.isPackaged }; }
-async function checkpoint(name) {
+async function checkpoint(name, detail) {
   if (!testRoot) return;
   let control; try { control = JSON.parse(await fs.readFile(path.join(testRoot, 'faults.json'), 'utf8')); } catch { return; }
   if (control.fail === name) throw Object.assign(Error('Controlled filesystem boundary failure.'), { code: control.code || 'EACCES' });
   if (control.pause !== name) return;
+  if (detail !== undefined) await fs.writeFile(path.join(testRoot, 'checkpoint-detail.json'), JSON.stringify(detail));
   await fs.writeFile(path.join(testRoot, 'checkpoint.txt'), name);
   while (true) {
     try { await fs.access(path.join(testRoot, 'release.txt')); return; } catch {}

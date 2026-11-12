@@ -4,10 +4,12 @@ const YAML = require('yaml');
 const { createHash } = require('node:crypto');
 const { Transcripts } = require('./transcripts');
 const { generations } = require('./source-generations');
-const { conversation } = require('./archive-format');
+const { conversation, requestRemovalStageName } = require('./archive-format');
 const { uuid } = require('./source-authority');
 const { isAnnotationIntent } = require('./annotation-authority');
 const { checkIdeaEnvelope } = require('./idea-envelope');
+const ideaPublication = require('./idea-publication');
+const { ordinaryDirectories, verifyStageSync, verifyAbsentSync } = require('./staged-publication');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const fail = () => { throw Error('Independent writing storage changed or has unknown aliases or linked copies. All writing was preserved. Restore ordinary folders and preview deletion again.'); };
@@ -95,6 +97,25 @@ async function pureWritingPending(vault, file) {
   }
   const stage = await io.read(file);
   if (!stage.bytes.equals(Buffer.from(value.text)) || stage.value.sha256 !== value.digest) return false;
+  if (area === '.ideas') {
+    await io.check();
+    const files = ideaPublication.locations(vault, operation);
+    const { guard } = ordinaryDirectories([vault.vault, vault.root, path.dirname(file), path.dirname(value.destination)], ideaPublication.changed().message);
+    const proofOf = item => ({ dev: item.value.dev, ino: item.value.ino, digest: item.value.sha256 });
+    const intentProof = proofOf(journal), stageProof = proofOf(stage);
+    verifyStageSync(files.intent, guard, intentProof);
+    const prepared = ideaPublication.readControl(files.prepared, guard, value, intentProof);
+    const attempt = ideaPublication.readControl(files.attempt, guard, value, intentProof);
+    const receipt = ideaPublication.readOptional(files.receipt, guard);
+    const saved = receipt && ideaPublication.receiptProof(JSON.parse(receipt.bytes), value);
+    if ([prepared?.stage, attempt?.stage, saved].some(proof => proof && !ideaPublication.sameProof(proof, stageProof))) return false;
+    if (stage.stat.nlink === 2n && (attempt || receipt)) verifyStageSync(value.destination, guard, stageProof, 2);
+    else if (stage.stat.nlink === 1n && prepared && !attempt && !receipt) verifyAbsentSync(value.destination, guard);
+    else return false;
+    verifyStageSync(files.stage, guard, stageProof, Number(stage.stat.nlink));
+    for (const [control, observed] of [[files.prepared, prepared], [files.attempt, attempt], [files.receipt, receipt]]) ideaPublication.verifyControl(control, guard, observed);
+    return true;
+  }
   let saved;
   if (stage.stat.nlink === 2n) {
     const output = await io.read(value.destination);
@@ -174,11 +195,11 @@ async function inventory(vault, conversations, captureId) {
     try { directory = conversations.safeDirectory(); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (directory) {
       const history = await reader(conversations.dataRoot, () => conversations.safeDirectory(false, directory));
-      for (const entry of await history.list(conversations.directory, entry => /^(?:archive-)?[a-f0-9-]{36}\.(?:json|pending)$/.test(entry.name))) {
+      for (const entry of await history.list(conversations.directory, entry => /^(?:archive-)?[a-f0-9-]{36}\.(?:json|pending)$/.test(entry.name) || requestRemovalStageName(entry.name))) {
         const value = await history.read(path.join(conversations.directory, entry.name));
         let record; try { record = conversation(JSON.parse(value.text)); } catch {}
         if (!record) rows.push({ kind: 'conversation writing', file: 'Local history/' + entry.name, attribution: 'unknown', text: 'Dependency attribution is unknown. Preserve and inspect this local history file.' });
-        else if (record.vault.root === vault.root) records.push({ record, file: 'Local history/' + entry.name, storage: 'durable' });
+        else if (record.vault.root === vault.root) records.push({ record, file: 'Local history/' + entry.name, storage: requestRemovalStageName(entry.name) ? 'retained request removal stage' : 'durable' });
       }
       knownPeers(history.observations.values());
       for (const observation of history.observations.values()) io.observations.set('history:' + observation.file, { ...observation, file: 'Local history/' + observation.file });

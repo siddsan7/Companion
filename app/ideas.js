@@ -425,7 +425,7 @@ class Ideas {
     }
   }
   checkReceipt(receipt, value) {
-    if (!receipt || Object.keys(receipt).length !== 6 || receipt.schema !== 1 || receipt.operation !== value.operation || receipt.id !== value.id || receipt.digest !== value.digest || ![receipt.dev, receipt.ino].every(part => typeof part === 'string' && /^[0-9]+$/.test(part))) throw Error('Saved idea receipt identity is damaged. Nothing was republished.');
+    return publication.receiptProof(receipt, value);
   }
   async retainedPublication(value, vault, parents, receipt) {
     const files = publication.locations(vault, value.operation), { stage } = files;
@@ -499,8 +499,7 @@ class Ideas {
       };
       if (receipt) {
         const prior = JSON.parse(receipt.bytes);
-        this.checkReceipt(prior, preview);
-        const proof = { dev: prior.dev, ino: prior.ino, digest: prior.digest };
+        const proof = this.checkReceipt(prior, preview);
         if ([prepared, attempt].some(control => control && !publication.sameProof(control.stage, proof))) throw publication.changed();
         return finish(proof);
       }
@@ -590,18 +589,29 @@ class Ideas {
     const vault = this.getVault();
     if (!uuid(id) || !vault) throw linkRepair.changed();
     const directory = path.join(vault.root, '.ideas'), intake = new Intake(vault);
-    const inSelectedVault = work => sourceInspection(vault.root, () => {
-      if (this.getVault() !== vault) throw linkRepair.changed();
-      return intake.locked(work);
-    });
-    return withBriefMutation(directory, () => inSelectedVault(async () => {
+    const withReviewedBrief = async work => {
+      const prior = (await scanIdeas(vault)).publications.get(id);
+      if (!prior?.repair || prior.repairIssue || !prior.repair.links.length) throw linkRepair.changed();
+      const { project_brief: reviewedPin } = metadata(prior.intent.text);
+      const briefs = new Briefs(vault);
+      const brief = await briefs.pinned(reviewedPin.version).catch(() => null);
+      const briefFile = brief?.id === reviewedPin.id && brief.digest === reviewedPin.digest ? path.resolve(briefs.dir, brief.file) : null;
+      const briefGuard = briefFile && briefs.folderGuard(path.dirname(briefFile));
+      const briefProof = briefFile && readExactSync(briefFile, briefGuard).proof;
+      if (briefProof && briefProof.digest !== reviewedPin.digest) throw linkRepair.changed();
+      return sourceInspection(vault.root, () => {
+        if (this.getVault() !== vault) throw linkRepair.changed();
+        return intake.locked(() => work({ prior, briefFile, briefGuard, briefProof }));
+      });
+    };
+    return withBriefMutation(directory, () => withReviewedBrief(async ({ prior, briefFile, briefGuard, briefProof }) => {
       this.removal.allow(vault, id);
       if (this.getVault() !== vault) throw linkRepair.changed();
       await intake.syncMoves();
       const ledger = await intake.load(), observed = intake.storage.expected;
       const guardLedger = () => intake.storage.guardSync(observed);
       const inventory = await scanIdeas(vault), owned = inventory.publications.get(id);
-      if (!owned?.repair || owned.repairIssue || !owned.repair.links.length) throw linkRepair.changed();
+      if (!owned?.repair || owned.repairIssue || !owned.repair.links.length || !publication.sameProof(prior.intentProof, owned.intentProof)) throw linkRepair.changed();
       const { intent, repair } = owned, { pending } = repair;
       const claims = inventory.claims.get(id) || [], [claim] = claims;
       const destination = pending?.data.destination || claim?.file;
@@ -632,9 +642,6 @@ class Ideas {
       const captureIds = new Set(originalLinks.map(link => link.captureId).filter(Boolean));
       const { project_brief: briefPin, source_dependencies: dependencies } = metadata(intent.text);
       const captures = await vault.captureInventory({ ledger, guardLedger });
-      const briefs = new Briefs(vault);
-      const brief = await briefs.pinned(briefPin.version).catch(() => null);
-      const briefFile = brief?.id === briefPin.id && brief.digest === briefPin.digest ? path.resolve(briefs.dir, brief.file) : null;
       const evidence = await scanIdeas(vault, { captureIds });
       const changes = [];
       const links = originalLinks.map(link => {
@@ -669,7 +676,7 @@ class Ideas {
               otherCopies.push(copy.verify);
             }
           }
-        } else if (briefPin.digest !== proof.digest) throw linkRepair.changed();
+        } else if (briefPin.digest !== proof.digest || !publication.sameProof(briefProof, proof)) throw linkRepair.changed();
         changes.push({ file, proof, captureId: link.captureId, rawClaims, verify, otherCopies });
         return { ...link, file };
       });
@@ -685,9 +692,10 @@ class Ideas {
         latest.check(); captures.reserved.verify();
         const claims = latest.claims.get(id);
         if (claims?.length !== 1 || claims[0].file !== destination || !same(claims[0].stat, claim.stat)) throw linkRepair.changed();
-        for (const { captureId, rawClaims, verify, otherCopies } of changes) {
+        for (const { file, captureId, rawClaims, verify, otherCopies } of changes) {
           if (captureId && JSON.stringify([...(latest.captureClaims.get(captureId) || [])].sort()) !== JSON.stringify(rawClaims)) throw linkRepair.changed();
           verify();
+          if (!captureId) verifyStageSync(file, briefGuard, briefProof);
           for (const verifyCopy of otherCopies) verifyCopy();
         }
       };

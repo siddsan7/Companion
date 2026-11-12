@@ -15,6 +15,68 @@
   let historyExclusions = [];
   const excludedHistory = new Set();
   const restoredSources = new Set(), restoredHistory = new Set();
+  const removalReview = document.createElement('section'), removalStatus = document.createElement('p');
+  const recoveryList = document.createElement('div'), recovery = document.createElement('button');
+  recovery.textContent = 'Review pending request removals';
+  removalReview.setAttribute('aria-label', 'Stored request removal review'); removalReview.hidden = true;
+  removalStatus.id = 'conversation-request-removal-status'; removalStatus.setAttribute('aria-live', 'polite');
+  byId('conversation-history').after(removalReview, removalStatus, recovery, recoveryList);
+  let removalToken, removalEpoch = 0;
+  function clearRemoval() {
+    removalEpoch++;
+    if (removalToken) window.companion['conversation-delete-cancel']({ token: removalToken }).catch(() => {});
+    removalToken = null; removalReview.hidden = true; removalReview.replaceChildren(); removalStatus.textContent = '';
+  }
+  async function reviewRemoval(id, requestId, resume = false, publication) {
+    clearRemoval();
+    const epoch = removalEpoch;
+    try {
+      const review = await window.companion['conversation-request-remove-preview']({ id, requestId, resume, publication });
+      if (epoch !== removalEpoch) { await window.companion['conversation-delete-cancel']({ token: review.token }); return; }
+      removalToken = review.token;
+      const scope = document.createElement('p'), cancel = document.createElement('button'), confirm = document.createElement('button');
+      scope.textContent = `${resume && !review.unpublished ? 'Resume the confirmed removal of' : 'Remove'} stored request ${requestId}, including its question, reply and approved context package. Other requests and saved writing remain. Exports, archives, independent quotations and previous provider submissions can retain copies.${review.retainedCopies.length ? ' Requests with stored copies in this conversation: ' + review.retainedCopies.join(', ') + '.' : ''}`;
+      removalReview.append(scope);
+      const fields = [['Question', review.request.question], ['Reply', review.request.reply], ['Stored approved context package', review.request.package.text], ...review.copies.map(copy => [`Remove reviewed request staging file ${copy.name}`, copy.text])];
+      for (const [title, value] of fields) {
+        const label = document.createElement('label'), field = document.createElement('textarea');
+        label.textContent = title; field.readOnly = true; field.value = value; label.append(field); removalReview.append(label);
+      }
+      cancel.textContent = 'Cancel request removal'; cancel.onclick = clearRemoval;
+      confirm.textContent = 'Confirm local request removal';
+      confirm.onclick = async () => {
+        confirm.disabled = true;
+        try {
+          const record = await window.companion['conversation-request-remove-confirm']({ token: review.token });
+          if (epoch !== removalEpoch) return;
+          showConversation(record);
+          recoveryList.replaceChildren();
+          removalStatus.textContent = 'Selected request removed from local conversation history.';
+        } catch (error) { if (epoch === removalEpoch) removalStatus.textContent = error.message; }
+        finally { confirm.disabled = false; }
+      };
+      removalReview.append(confirm, cancel); removalReview.hidden = false;
+      confirm.focus();
+    } catch (error) { if (epoch === removalEpoch) removalStatus.textContent = error.message; }
+  }
+  recovery.onclick = async () => {
+    const epoch = viewEpoch;
+    recovery.disabled = true;
+    try {
+      const records = await window.companion['conversation-request-remove-pending']();
+      if (epoch !== viewEpoch) return;
+      recoveryList.replaceChildren();
+      if (!records.length) recoveryList.textContent = 'No pending stored request removals.';
+      for (const record of records) {
+        const row = document.createElement('p'), resume = document.createElement('button');
+        row.textContent = record.warning || `Conversation ${record.id}, request ${record.requestId}.`;
+        resume.textContent = record.publication ? 'Review prepared request removal' : 'Review confirmed request removal'; resume.disabled = !record.canResume;
+        resume.onclick = () => reviewRemoval(record.id, record.requestId, true, record.publication);
+        row.append(' ', resume); recoveryList.append(row);
+      }
+    } catch (error) { if (epoch === viewEpoch) removalStatus.textContent = error.message; }
+    finally { recovery.disabled = false; }
+  };
   const historyRevision = record => JSON.stringify({ requests: record.requests, storageWarning: record.storageWarning });
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
   function choices() {
@@ -28,6 +90,8 @@
     if (select.value !== (conversationId || '')) select.value = conversationId || '';
   }
   function resetView() {
+    clearRemoval();
+    recoveryList.replaceChildren();
     retireFind(); viewEpoch++; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
     excludedHistory.clear(); restoredHistory.clear(); restoredSources.clear(); excluded.clear(); selections = []; all = [];
     historySelections.clear(); byId('history-search-results').replaceChildren(); byId('history-selected').replaceChildren(); byId('history-search-status').textContent = '';
@@ -52,7 +116,7 @@
   function showConversation(record) {
     const firstDisplay = !displayedHistory;
     const revision = historyRevision(record);
-    if (revision !== displayedHistory) { invalidateConversation(); displayedHistory = revision; }
+    if (revision !== displayedHistory) { clearRemoval(); invalidateConversation(); displayedHistory = revision; }
     conversationId = record.id; draftMode = false; retained.set(record.id, record); choices();
     byId('conversation-brief').value = record.brief.version; byId('conversation-brief').disabled = true;
     if (firstDisplay) {
@@ -63,6 +127,7 @@
       for (const key of scope.excludedSources.map(scopeKey)) if (!restored.has(key)) excluded.add(key);
       for (const id of scope.excludedHistory) if (!restoredHistory.has(id)) excludedHistory.add(id);
     }
+    for (const id of record.removedRequests || []) { excludedHistory.delete(id); restoredHistory.delete(id); }
     byId('conversation-error').textContent = record.storageWarning || '';
     byId('conversation-history').replaceChildren();
     for (const request of record.requests) {
@@ -70,6 +135,9 @@
       article.dataset.requestId = request.id;
       state.textContent = `${request.status}${request.status === 'completed' ? '' : ' — incomplete'} · ${request.evidence || 'provider evidence unavailable'} · ${request.id}${request.error ? ` · ${request.error}` : ''}`;
       question.textContent = request.question; reply.textContent = request.reply; article.append(state, question, reply); byId('conversation-history').append(article);
+      const remove = document.createElement('button'); remove.textContent = 'Preview local request removal';
+      remove.disabled = request.status === 'inProgress' || !!record.storageWarning;
+      remove.onclick = () => reviewRemoval(record.id, request.id); article.append(remove);
       if (request.reply) {
         const draft = document.createElement('button'); draft.textContent = 'Draft saved idea';
         draft.onclick = () => window.dispatchEvent(new CustomEvent('companion-idea-draft', { detail: { conversationId: record.id, requestId: request.id } }));
@@ -319,6 +387,15 @@
     resetView();
   });
   window.addEventListener('companion-vault-configured', () => { switchingVault = false; restoreConversation(); });
+  window.addEventListener('companion-review-stored-request', async ({ detail }) => {
+    const epoch = viewEpoch;
+    if (!retained.has(detail.id)) await restoreConversation();
+    if (epoch !== viewEpoch) return;
+    const record = retained.get(detail.id);
+    if (record && conversationId !== record.id) { resetView(); showConversation(record); }
+    await reviewRemoval(detail.id, detail.requestId);
+    if (removalReview.hidden && removalStatus.textContent) removalStatus.scrollIntoView();
+  });
   restoreConversation();
   setInterval(restoreConversation, 300);
 })();

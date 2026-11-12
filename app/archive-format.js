@@ -4,6 +4,9 @@ const { generations } = require('./source-generations');
 const { sourceExcerptsValid } = require('./source-excerpts');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
+const canonicalRequestRemovalStage = name => typeof name === 'string' && name.startsWith('.request-removal-') && name.endsWith('.tmp') && uuid(name.slice('.request-removal-'.length, -'.tmp'.length));
+const requestRemovalStageName = name => typeof name === 'string' && canonicalRequestRemovalStage(name.toLowerCase());
+const archivePendingName = name => typeof name === 'string' && (/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,140}\.pending$/.test(name) || requestRemovalStageName(name));
 const fail = () => { throw Error('History contains unsupported data. Preserve local files for repair; archive export was blocked.'); };
 function object(value, fields) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !fields.includes(key))) fail();
@@ -45,13 +48,17 @@ function packageRecord(value) {
     }
   }
 }
+function validRemovedRequests(ids) {
+  return Array.isArray(ids) && ids.every(uuid) && new Set(ids).size === ids.length;
+}
 function conversation(value) {
-  object(value, ['schema', 'id', 'vault', 'brief', 'createdAt', 'scope', 'requests', 'archiveBinding', 'generation']);
+  object(value, ['schema', 'id', 'vault', 'brief', 'createdAt', 'scope', 'requests', 'archiveBinding', 'generation', 'removedRequests']);
   if (value.schema !== 1 || !uuid(value.id) || typeof value.createdAt !== 'string' || !Array.isArray(value.requests)) fail();
   root(value.vault); pin(value.brief); if (value.scope) scope(value.scope);
   if (value.generation !== undefined && value.generation !== null && !uuid(value.generation)) fail();
   if (value.archiveBinding !== undefined) mapping(value.archiveBinding);
-  const ids = new Set();
+  if (value.removedRequests !== undefined && !validRemovedRequests(value.removedRequests)) fail();
+  const ids = new Set(value.removedRequests);
   for (const request of value.requests) {
     object(request, ['id', 'question', 'speculation', 'package', 'status', 'reply', 'startedAt', 'completedAt', 'usage', 'usageEvidence', 'messages', 'threadId', 'turnId', 'model', 'evidence', 'error']);
     if (!uuid(request.id) || ids.has(request.id) || typeof request.question !== 'string' || typeof request.reply !== 'string' || typeof request.speculation !== 'boolean' || !['completed', 'failed', 'interrupted', 'cancelled', 'inProgress'].includes(request.status)) fail();
@@ -85,7 +92,7 @@ function coverage(value) {
   const names = new Set();
   for (const item of value.omitted) {
     object(item, ['name', 'sha256', 'bytes', 'kind']);
-    if (typeof item.name !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,140}\.pending$/.test(item.name) || names.has(item.name) || !/^[a-f0-9]{64}$/.test(item.sha256) || !Number.isSafeInteger(item.bytes) || item.bytes < 0 || item.bytes > 128 * 1024 * 1024 || !['validated-conversation', 'unknown-data'].includes(item.kind)) fail();
+    if (!archivePendingName(item.name) || names.has(item.name) || !/^[a-f0-9]{64}$/.test(item.sha256) || !Number.isSafeInteger(item.bytes) || item.bytes < 0 || item.bytes > 128 * 1024 * 1024 || !['validated-conversation', 'unknown-data'].includes(item.kind)) fail();
     names.add(item.name);
   }
   return value;
@@ -167,6 +174,10 @@ function archiveRecord(value) {
 }
 module.exports.parseArchive = parseArchive;
 module.exports.archiveRecord = archiveRecord;
+module.exports.validRemovedRequests = validRemovedRequests;
+module.exports.requestRemovalStageName = requestRemovalStageName;
+module.exports.canonicalRequestRemovalStage = canonicalRequestRemovalStage;
+module.exports.archivePendingName = archivePendingName;
 module.exports.inactiveIntent = inactiveIntent;
 module.exports.inactiveCoverage = inactiveCoverage;
 module.exports.codexHints = codexHints;

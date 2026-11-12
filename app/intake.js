@@ -86,8 +86,16 @@ class Intake {
   async publishJournal(file, value) {
     await this.vault.contained(this.dir);
     const stage = path.join(this.dir, `journal-${randomUUID()}.stage`);
-    await fs.writeFile(stage, JSON.stringify(value), { flag: 'wx', flush: true });
-    await fs.link(stage, file); await fs.unlink(stage);
+    const guard = this.vault.publicationFolders(this.dir).guard;
+    const proof = await writeStage(stage, JSON.stringify(value), guard);
+    verifyAbsentSync(file, guard);
+    verifyStageSync(stage, guard, proof);
+    local.linkSync(stage, file);
+    verifyStageSync(stage, guard, proof, 2);
+    verifyStageSync(file, guard, proof, 2);
+    local.unlinkSync(stage);
+    verifyStageSync(file, guard, proof);
+    return proof;
   }
   async locked(work, admit) {
     if (!admit) await this.setup();
@@ -264,8 +272,8 @@ class Intake {
           }
           if (error.intakeConflict || error.intakeDeferred) {
             const transaction = JSON.parse(await fs.readFile(path.join(this.dir, 'transaction.json'), 'utf8'));
-            if (error.intakeDeferred) await this.defer(transaction, ledger, error.message);
-            else await this.archiveConflict(transaction, ledger, error.message, error.intakeConflictProof);
+            if (error.intakeDeferred) await this.defer(transaction, ledger, error.message, error.intakeJournalProof);
+            else await this.archiveConflict(transaction, ledger, error.message, { ...error.intakeConflictProof, expectedJournal: error.intakeJournalProof });
           }
           ledger.outcomes[key] = { status: 'held', reason: error.code ? 'Publication failed. Preserve the vault and retry Check now after fixing file access.' : error.message, locator: draft.locator, checkedAt: now };
           await this.save(ledger);
@@ -319,16 +327,19 @@ class Intake {
     // The durable journal owns these verified bytes after this check. Recovery
     // uses that local copy without reopening the producer.
     await guard();
-    const journal = path.join(this.dir, 'transaction.json'), journalGuard = this.vault.publicationFolders(this.dir).guard;
-    await this.publishJournal(journal, transaction);
-    const { bytes, proof } = readExactSync(journal, journalGuard);
-    if (!bytes.equals(Buffer.from(JSON.stringify(transaction)))) throw Error('Intake journal changed after publication. All files were preserved.');
+    const journal = path.join(this.dir, 'transaction.json');
+    const proof = await this.publishJournal(journal, transaction);
     await this.vault.checkpoint('intake-journaled');
-    if (externalConflict) {
-      this.ordinaryPublicationControls(transaction, ledger, proof)?.();
-      throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
+    try {
+      if (externalConflict) {
+        this.ordinaryPublicationControls(transaction, ledger, proof)?.();
+        throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
+      }
+      await this.finish(transaction, ledger, proof);
+    } catch (error) {
+      if (error.intakeDeferred || error.intakeConflict) error.intakeJournalProof = proof;
+      throw error;
     }
-    await this.finish(transaction, ledger, proof);
   }
   destination(capture) {
     if (!capture.relative) return path.join(this.vault.root, 'Captures', capture.file);
@@ -1398,16 +1409,25 @@ class Intake {
   }
   async defer(tx, ledger, reason, expectedJournal) {
     this.validateTransaction(tx);
-    const name = pendingName(tx), journal = path.join(this.dir, 'transaction.json');
+    const name = pendingName(tx), journal = path.join(this.dir, 'transaction.json'), remaining = path.join(this.dir, name);
+    const alias = this.ordinaryJournalAlias(ledger, tx, remaining, expectedJournal);
     ledger.pending[tx.sourceHash] = { journal: name, reason, key: tx.key };
     ledger.outcomes[tx.key] = { status: 'held', reason, locator: tx.revision.locator, sourceHash: tx.sourceHash, pendingRevision: tx.revision.id };
-    await this.save(ledger, expectedJournal?.verify);
-    if (expectedJournal) {
-      this.retireOrdinaryJournalAlias(journal, path.join(this.dir, name), expectedJournal);
-      return;
-    }
-    try { await fs.link(journal, path.join(this.dir, name)); } catch (error) { if (error.code !== 'EEXIST' || await read(journal) !== await read(path.join(this.dir, name))) throw Error('Deferred intake journal conflicts. Preserve both files for repair.'); }
-    await fs.unlink(journal);
+    await this.save(ledger, alias.verify);
+    this.retireOrdinaryJournalAlias(journal, remaining, alias);
+  }
+  ordinaryJournalAlias(ledger, tx, remaining, expected) {
+    const observed = expected?.verify ? expected : this.ordinaryRecoveryJournal(ledger, tx);
+    const changed = () => Error('The intake journal or its known alias changed. Recovery files were preserved.');
+    if (!observed || observed.digest !== hash(JSON.stringify(tx)) || ![1, 2].includes(observed.links)) throw changed();
+    if (expected && (!sameProofIdentity(expected, observed) || expected.digest !== observed.digest)) throw changed();
+    const verify = () => {
+      observed.verify();
+      if (observed.links === 2) verifyStageSync(remaining, observed.guard, observed, 2);
+      else verifyAbsentSync(remaining, observed.guard, changed);
+    };
+    verify();
+    return { ...observed, verify };
   }
   retireOrdinaryJournalAlias(journal, remaining, expected) {
     const { guard, links } = expected;
@@ -1442,7 +1462,12 @@ class Intake {
       this.validateTransaction(tx); if (tx.sourceHash !== sourceHash || pending.journal !== pendingName(tx)) throw Error('Deferred intake identity does not match its journal.');
       // Every retry has the same active recovery seam as first publication.
       // A crash while turning a pending item into a conflict remains recoverable.
-      await fs.link(file, path.join(this.dir, 'transaction.json'));
+      const active = path.join(this.dir, 'transaction.json');
+      verifyAbsentSync(active, guard);
+      verifyStageSync(file, guard, proof);
+      local.linkSync(file, active);
+      verifyStageSync(file, guard, proof, 2);
+      verifyStageSync(active, guard, proof, 2);
       try {
         await this.finish(tx, ledger, proof);
       }
@@ -1453,7 +1478,7 @@ class Intake {
             // before replacing the pending pointer, even before its new link.
             await this.archiveConflict(tx, ledger, error.message, { mode: precommitConflict, journalProof: proof, guard, rollback: error.intakeConflictProof?.rollback });
           }
-          else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
+          else if (error.intakeDeferred) await this.defer(tx, ledger, error.message, proof);
           else throw error;
         }
       }
@@ -1572,6 +1597,7 @@ class Intake {
     const reason = exactJournal && message.endsWith(conflictPause) ? message : message + conflictPause;
     const archive = heldName(tx), journal = path.join(this.dir, 'transaction.json');
     const held = path.join(this.dir, archive);
+    const ordinaryAlias = exactJournal ? null : this.ordinaryJournalAlias(ledger, tx, held, retained?.expectedJournal);
     let holdJournal, witness;
     if (exactJournal) {
       const guard = retained?.guard || this.vault.publicationFolders(this.dir).guard;
@@ -1635,7 +1661,7 @@ class Intake {
     delete ledger.pending[tx.sourceHash];
     if (ledger.captures[tx.sourceHash]) ledger.captures[tx.sourceHash].conflict = reason;
     ledger.outcomes[tx.key] = { status: 'held', reason, locator: tx.revision.locator, sourceHash: tx.sourceHash, pendingRevision: tx.revision.id };
-    await this.save(ledger, holdJournal?.verify || retained?.expectedJournal?.verify);
+    await this.save(ledger, holdJournal?.verify || ordinaryAlias.verify);
     if (holdJournal) {
       this.storage.guardSync();
       holdJournal.verify();
@@ -1643,11 +1669,7 @@ class Intake {
       holdJournal.publish();
       return;
     }
-    if (retained?.expectedJournal) this.retireOrdinaryJournalAlias(journal, held, retained.expectedJournal);
-    else {
-      try { await fs.link(journal, held); } catch (error) { if (error.code !== 'EEXIST' || await read(journal) !== await read(held)) throw Error('Conflict archive already exists with different content. All files were preserved for repair.'); }
-      await fs.unlink(journal);
-    }
+    this.retireOrdinaryJournalAlias(journal, held, ordinaryAlias);
   }
   async archivePrecommitConflict(tx, ledger, message, journalProof, guard) {
     await this.archiveConflict(tx, ledger, message, { mode: precommitConflict, journalProof, guard });
@@ -1700,10 +1722,15 @@ class Intake {
       const content = noteText(capture, revision), resolution = randomUUID();
       const key = Object.entries(ledger.outcomes).find(([, item]) => item.revision === revisionId)?.[0] || `${randomUUID()}:selection`;
       const tx = { schema: 1, resolution, retainOnly: content === current, key, sourceHash, capture, revision, content, previous: current, previousHash: hash(current), backup: `${id}-${revisionId}.before-${resolution}.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
-      await this.publishJournal(path.join(this.dir, 'transaction.json'), tx);
+      const journal = path.join(this.dir, 'transaction.json');
+      const proof = await this.publishJournal(journal, tx);
       await this.vault.checkpoint('intake-journaled');
-      try { await this.finish(tx, ledger); }
-      catch (error) { if (error.intakeDeferred) await this.defer(tx, ledger, error.message); else if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message, error.intakeConflictProof); throw error; }
+      try { await this.finish(tx, ledger, proof); }
+      catch (error) {
+        if (error.intakeDeferred) await this.defer(tx, ledger, error.message, proof);
+        else if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message, { ...error.intakeConflictProof, expectedJournal: proof });
+        throw error;
+      }
     });
   }
   async title(id, title) {
