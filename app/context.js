@@ -100,7 +100,7 @@ class Context {
     const metadata = match && YAML.parse(match[1]);
     if (metadata && typeof metadata === 'object' && (Object.hasOwn(metadata, 'companion_id') || ['capture', 'annotation', 'saved_idea', 'project_brief', 'conversation_transcript'].includes(metadata.artifact_type))) throw Error('Managed artifact metadata cannot bypass context eligibility through note inclusion.');
     const note = { key: `note:${digest(file)}`, title: path.basename(file), text, provenance: `Explicit vault note ${path.basename(file)}; sha256 ${digest(text)}; user selected; not independently verified`, digest: digest(text) };
-    return { note, verify: () => verifyStageSync(file, guard, proof) };
+    return { note, proof, size: bytes.length, verify: () => verifyStageSync(file, guard, proof) };
   }
   async note(file) {
     return (await this.readExplicitNote(file)).note;
