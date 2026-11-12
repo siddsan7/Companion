@@ -1,8 +1,10 @@
 const { test, expect, _electron: electron } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { randomUUID } = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 const { installArchives } = require('../app/archives');
 const { hash } = require('../app/archive-format');
 const { Conversations } = require('../app/conversations');
@@ -195,43 +197,41 @@ for (const phase of ['pending', 'connected']) {
 }
 
 for (const target of ['linked stage', 'initial receipt', 'final schedule']) {
-  test(`archive cadence detects a substituted ${target} when its proof handle closes`, async () => {
+  test(`archive cadence preserves a substituted ${target} at publication`, async () => {
     const fixture = await reconnectFixture();
     const review = await fixture.preview();
-    const receipt = `${fixture.scheduleFile}.initial-publication.json`;
+    const receipt = `${fixture.scheduleFile}.first-publication`;
     const foreignBytes = `Independent writing substituted for the ${target}.\n`;
-    const originalOpen = fs.open;
-    let linkedStageReads = 0, substitution;
+    const open = fs.open, link = local.linkSync;
+    let substitution;
+    const replace = file => {
+      const original = local.readFileSync(file, 'utf8'), parked = `${file}.original-fixture`;
+      local.renameSync(file, parked);
+      local.writeFileSync(file, foreignBytes, { flag: 'wx' });
+      substitution = { file, parked, original };
+    };
+    local.linkSync = (source, destination) => {
+      link(source, destination);
+      if (destination !== fixture.scheduleFile) return;
+      // A real schedule link has finished, before proof or cleanup of either peer.
+      if (target === 'linked stage') replace(source);
+      if (target === 'initial receipt') replace(receipt);
+    };
     fs.open = async (file, flags, ...args) => {
-      const handle = await originalOpen(file, flags, ...args);
-      if (typeof flags !== 'number' || typeof file !== 'string' || path.dirname(file) !== root) return handle;
+      const handle = await open(file, flags, ...args);
+      if (target !== 'final schedule' || typeof flags !== 'number' || file !== fixture.scheduleFile) return handle;
       const close = handle.close.bind(handle);
       handle.close = async () => {
         await close();
-        if (substitution) return;
-        let replace = false;
-        if (target === 'linked stage' && /^\.archive-reconnect-.+\.pending$/.test(path.basename(file))) {
-          const leaf = await fs.lstat(file);
-          // The first read proves the pair. The second authorizes stage cleanup.
-          replace = leaf.nlink === 2 && ++linkedStageReads === 2;
-        }
-        if (target === 'initial receipt') replace = file === receipt;
-        if (target === 'final schedule' && file === fixture.scheduleFile && fixture.calls.includes('enable')) {
-          replace = JSON.parse(await readOptional(file)).archiveReconnect.status === 'connected';
-        }
-        if (!replace) return;
-        const original = await readOptional(file), parked = `${file}.original-fixture`;
-        await fs.rename(file, parked);
-        await fs.writeFile(file, foreignBytes, { flag: 'wx' });
-        substitution = { file, parked, original };
+        if (!substitution && fixture.calls.includes('enable') && JSON.parse(await readOptional(file)).archiveReconnect.status === 'connected') replace(file);
       };
       return handle;
     };
     let outcome;
     try { outcome = await fixture.confirm(review).then(value => ({ value }), error => ({ error: error.message })); }
-    finally { fs.open = originalOpen; }
+    finally { fs.open = open; local.linkSync = link; }
 
-    expect(substitution, 'the replacement happened after the real proof read').toBeDefined();
+    expect(substitution, 'the replacement happened after actual publication').toBeDefined();
     expect(await readOptional(substitution.file), 'independent writing was preserved').toBe(foreignBytes);
     expect(await readOptional(substitution.parked)).toBe(substitution.original);
     expect(outcome.error, 'the operation refused to report an unproved publication').toBeTruthy();
@@ -242,6 +242,7 @@ for (const target of ['linked stage', 'initial receipt', 'final schedule']) {
       expect(fixture.calls.filter(action => action === 'enable')).toHaveLength(1);
     } else {
       expect(JSON.parse(await readOptional(fixture.scheduleFile))).toMatchObject({ mode: 'disabled', archiveReconnect: { status: 'pending' } });
+      expect((await fs.stat(fixture.scheduleFile)).nlink).toBe(2);
       expect(fixture.calls).not.toContain('enable');
       expect(await readOptional(fixture.taskFile)).toBeNull();
     }
@@ -511,6 +512,118 @@ for (const boundary of ['receipt write', 'receipt link']) test(`interrupted firs
     expect(await readOptional(receipt)).toBeNull();
   } finally { if (app) await app.close(); }
 });
+
+for (const boundary of ['receipt write', 'receipt link', 'schedule link']) {
+  test(`a process exit at first cadence ${boundary} allows explicit enable on restart`, async () => {
+    const vault = new Vault(path.join(root, 'vault'), 'Companion');
+    await vault.setup();
+    const producer = path.join(root, 'producer');
+    await fs.mkdir(producer);
+    await new Intake(vault).connect(producer, false, anchor);
+    const file = path.join(root, 'schedule.json'), task = path.join(root, 'scheduler-task.json');
+    const legacyReceipt = `${file}.initial-publication.json`, receipt = `${file}.first-publication`;
+    const child = spawnSync(process.execPath, ['-e', `
+      const local = require('node:fs'), path = require('node:path');
+      const { Schedule } = require('./app/schedule'), { Vault } = require('./app/vault');
+      const [root, file, anchor, boundary, legacyReceipt, receipt] = process.argv.slice(1);
+      const open = local.promises.open, link = local.linkSync;
+      local.promises.open = async (name, flag, ...args) => {
+        const handle = await open(name, flag, ...args);
+        if (flag !== 'wx') return handle;
+        if (boundary === 'receipt write' && (name === legacyReceipt || path.basename(name).startsWith('.first-receipt-'))) process.exit(71);
+        if (boundary === 'receipt link' && name === legacyReceipt) {
+          const close = handle.close.bind(handle);
+          handle.close = async () => { await close(); process.exit(71); };
+        }
+        return handle;
+      };
+      local.linkSync = (from, to) => {
+        link(from, to);
+        if (boundary === 'receipt link' && to === receipt || boundary === 'schedule link' && to === file) process.exit(71);
+      };
+      new Schedule(file, new Vault(path.join(root, 'vault'), 'Companion'), { testRoot: root })
+        .control('enable', anchor).catch(error => { console.error(error); process.exitCode = 1; });
+    `, root, file, anchor, boundary, legacyReceipt, receipt], { encoding: 'utf8', timeout: 20000 });
+    expect(child.error).toBeUndefined();
+    expect(child.status, child.stderr).toBe(71);
+    expect(await readOptional(task)).toBeNull();
+    const interrupted = await readOptional(file);
+    if (boundary === 'schedule link') {
+      expect(interrupted).toBeTruthy();
+      expect((await fs.stat(file)).nlink).toBe(2);
+    } else expect(interrupted).toBeNull();
+
+    const restarted = new Schedule(file, vault, { testRoot: root });
+    const state = await restarted.control('enable', now);
+    expect(state).toMatchObject({ mode: 'enabled', anchor: interrupted ? anchor : now });
+    if (interrupted) expect(state.id).toBe(JSON.parse(interrupted).id);
+    expect(JSON.parse(await readOptional(task)).name).toBe(`Companion-${state.id}`);
+    expect((await fs.stat(file)).nlink).toBe(1);
+    expect(await readOptional(receipt)).toBeNull();
+    expect(await readOptional(legacyReceipt)).toBeNull();
+  });
+}
+
+for (const format of ['current', 'legacy']) {
+  test(`desktop restart recovers a ${format} first cadence link before showing task repair`, async () => {
+    test.setTimeout(60000);
+    const vault = new Vault(path.join(root, 'vault'), 'Companion');
+    await vault.setup();
+    const producer = path.join(root, 'producer');
+    await fs.mkdir(producer);
+    await new Intake(vault).connect(producer, false, anchor);
+    const settings = path.join(root, 'settings.json'), file = path.join(root, 'schedule.json');
+    const task = path.join(root, 'scheduler-task.json');
+    const receipt = format === 'current' ? `${file}.first-publication` : `${file}.initial-publication.json`;
+    await fs.writeFile(settings, JSON.stringify({ vault: vault.vault, parent: 'Companion' }));
+    await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ ...clock(), now: anchor }));
+    const launch = () => electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+    let app;
+    try {
+      if (format === 'current') {
+        app = await launch();
+        const page = await app.firstWindow();
+        await app.evaluate((_, file) => {
+          const local = process.getBuiltinModule('node:fs');
+          const link = local.linkSync;
+          local.linkSync = (source, destination) => {
+            link(source, destination);
+            if (destination === file) process.kill(process.pid, 'SIGKILL');
+          };
+        }, file);
+        const exited = new Promise(resolve => app.process().once('exit', (code, signal) => resolve({ code, signal })));
+        const enable = page.getByRole('button', { name: 'Enable daily intake', exact: true });
+        await expect(enable).toBeEnabled();
+        await enable.click().catch(() => {});
+        expect(await exited).not.toEqual({ code: 0, signal: null });
+        app = null;
+      } else {
+        const stage = `schedule-${randomUUID()}.tmp`, stagePath = path.join(root, stage);
+        const bytes = JSON.stringify({ schema: 1, id: randomUUID(), anchor, vault: vault.vault, parent: 'Companion', mode: 'enabled', launchBinding: 1 });
+        await fs.writeFile(stagePath, bytes, { flag: 'wx', flush: true });
+        const stat = await fs.stat(stagePath, { bigint: true });
+        await fs.writeFile(receipt, JSON.stringify({ schema: 1, stage, proof: { dev: String(stat.dev), ino: String(stat.ino), digest: hash(bytes) } }), { flag: 'wx', flush: true });
+        await fs.link(stagePath, file);
+      }
+      const before = JSON.parse(await readOptional(file));
+      expect(await readOptional(receipt)).toBeTruthy();
+      expect((await fs.stat(file)).nlink).toBe(2);
+      expect(await readOptional(task)).toBeNull();
+
+      app = await launch();
+      const page = await app.firstWindow();
+      const state = await page.evaluate(() => window.companion.state());
+      expect(state).toMatchObject({ location: vault.root, schedule: { id: before.id, anchor, mode: 'enabled', effective: null } });
+      expect((await fs.stat(file)).nlink).toBe(1);
+      expect(await readOptional(receipt)).toBeNull();
+      expect(await readOptional(task)).toBeNull();
+      await expect(page.getByLabel('Daily intake schedule')).toContainText('Task missing');
+      await page.getByRole('button', { name: 'Repair daily intake', exact: true }).click();
+      await expect(page.getByLabel('Daily intake schedule')).not.toContainText('Task missing');
+      expect(JSON.parse(await readOptional(task)).name).toBe(`Companion-${before.id}`);
+    } finally { if (app) await app.close(); }
+  });
+}
 
 test('daily intake controls cannot enable a new vault from the old displayed schedule', async () => {
   const vaultFolder = path.join(root, 'vault');

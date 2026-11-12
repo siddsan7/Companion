@@ -192,6 +192,11 @@ test('a moved and renamed Experiment Proposal keeps its saved idea identity and 
   const packageText = page.getByLabel('Actual context package', { exact: true });
   await expect(packageText).toHaveValue(new RegExp(`Saved idea ${proposal.id};`));
   await expect(packageText).toHaveValue(new RegExp(`${signal}: compare two practice queues`));
+  const related = [...proposal.bytes.toString('utf8').matchAll(/\[[^\]]+\]\((Companion\/[^)]+\.md)\)/g)];
+  expect(related).toHaveLength(2);
+  const targets = related.map(([, href]) => path.join(path.dirname(proposal.vault), decodeURIComponent(href)));
+  expect(targets.map(file => path.basename(path.dirname(file))).sort()).toEqual(['Briefs', 'Captures']);
+  for (const target of targets) expect((await fs.stat(target)).isFile()).toBe(true);
   expect(await fs.readFile(moved)).toEqual(proposal.bytes);
   await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
 });
@@ -482,6 +487,14 @@ test('a completed conversation result becomes a standalone saved idea only after
   await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
   const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
   const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  const links = [...proposed.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].map(match => match[1]);
+  const resolved = links.map(link => path.resolve(path.dirname(vault), decodeURIComponent(link)));
+  const capture = Object.keys(originals).find(file => path.dirname(file) === path.join(vault, 'Captures'));
+  const pinned = Object.keys(originals).find(file => /^approved-1-.*\.md$/.test(path.basename(file)));
+  expect(capture).toBeDefined();
+  expect(pinned).toBeDefined();
+  expect(resolved).toEqual(expect.arrayContaining([capture, pinned]));
+  expect(links.every(link => link.startsWith('Companion/') && link.endsWith('.md') && !link.includes(' '))).toBe(true);
   await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
   await expect(page.locator('#idea-status')).toContainText('Saved idea');
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
@@ -500,6 +513,38 @@ test('a completed conversation result becomes a standalone saved idea only after
   await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
   expect((await fs.readdir(ideas)).filter(name => name.endsWith('.md'))).toHaveLength(1);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+});
+
+test('moving an approved brief requires reviewing the changed saved idea link', async () => {
+  test.setTimeout(60000);
+  await completedConversation();
+  const [name] = (await fs.readdir(path.join(root, 'conversations'))).filter(name => name.endsWith('.json'));
+  const record = JSON.parse(await fs.readFile(path.join(root, 'conversations', name), 'utf8'));
+  const input = {
+    conversationId: record.id, requestId: record.requests[0].id,
+    title: 'A reviewed practice queue observation', explanation: 'A delayed revisit may be worth testing.', limitations: 'The outcome is unverified.'
+  };
+  const preview = () => page.evaluate(input => window.companion['idea-preview'](input), input);
+  const confirm = operation => page.evaluate(operation => window.companion['idea-confirm']({ operation }), operation);
+  const original = await preview();
+  const briefDirectory = path.join(root, 'vault', 'Companion', 'Briefs');
+  const [briefName] = (await fs.readdir(briefDirectory)).filter(name => /^approved-1-.*\.md$/.test(name));
+  const from = path.join(briefDirectory, briefName), bytes = await fs.readFile(from);
+  const folder = path.join(root, 'vault', 'Reviewed briefs (current)'), moved = path.join(folder, 'MyTune approval.md');
+  await fs.mkdir(folder);
+  await fs.rename(from, moved);
+
+  await expect(confirm(original.operation)).rejects.toThrow(/retained proposal or supporting context changed/i);
+  await expect(fs.lstat(original.destination)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await fs.readFile(moved)).toEqual(bytes);
+
+  const updated = await preview();
+  expect(updated.operation).not.toBe(original.operation);
+  expect(updated.text).toContain('[Approved brief version 1](Reviewed%20briefs%20%28current%29/MyTune%20approval.md)');
+  expect(updated.text).not.toContain(briefName);
+  await confirm(updated.operation);
+  expect(await fs.readFile(updated.destination, 'utf8')).toBe(updated.text);
+  expect(await fs.readFile(moved)).toEqual(bytes);
 });
 
 test('an Experiment Proposal requires all five fields before preview and explicit save', async () => {

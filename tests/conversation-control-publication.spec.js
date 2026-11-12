@@ -1,5 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
@@ -89,7 +90,7 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
     createdAt: '2026-11-08T12:00:00Z', requests: []
   };
   const attempts = [], checkpoints = [];
-  const originalRename = fs.rename;
+  const rename = local.renameSync, open = fs.open;
   const holdAt = restoring ? 'archive-restore-before-active' : 'conversation-delete-after-tombstone';
   let holder;
   const store = new Conversations({ dataRoot: root, getVault: () => record.vault, checkpoint: async name => {
@@ -104,7 +105,7 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
   const control = path.join(controlDirectory, `${id}.json`);
   const independent = path.join(root, 'independent.md');
   const independentBytes = 'Independent fixture writing\n';
-  let refused;
+  let refused, change;
   try {
     store.safeDirectory(true);
     await fs.writeFile(independent, independentBytes, { flag: 'wx' });
@@ -118,25 +119,25 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
       expect(preview.targets).toEqual([`${id}.json`]);
     }
 
-    // Observe only the exact control replacement and call the native rename on every attempt.
-    fs.rename = async (source, destination) => {
+    // Each attempt still makes the real Windows rename call. Hold the next
+    // retry's first read until the independent writer finishes after refusal.
+    fs.open = async (...args) => { await change; return open(...args); };
+    local.renameSync = (source, destination) => {
       if (destination !== control || path.dirname(source) !== controlDirectory || !/^[a-f0-9-]{36}\.pending$/.test(path.basename(source))) {
-        return originalRename(source, destination);
+        return rename(source, destination);
       }
       try {
-        await originalRename(source, destination);
+        rename(source, destination);
         attempts.push({ source, destination, code: null });
       } catch (error) {
         attempts.push({ source, destination, code: error.code, syscall: error.syscall });
         if (attempts.length === 1 && sharingRefusals.includes(error.code)) {
-          const baseline = await fs.readFile(control);
-          const staged = await fs.readFile(source);
-          const stat = await fs.lstat(source, { bigint: true });
+          const baseline = local.readFileSync(control), staged = local.readFileSync(source);
+          const stat = local.lstatSync(source, { bigint: true });
           refused = { source, baseline, staged, dev: stat.dev, ino: stat.ino, at: performance.now() };
           if (changeAfterRefusal) {
             holder.release();
-            await holder.awaitRelease();
-            await changeAfterRefusal({ control, recordFile, baseline, restoration });
+            change = holder.awaitRelease().then(() => changeAfterRefusal({ control, recordFile, baseline, restoration }));
           }
         }
         throw error;
@@ -144,7 +145,7 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
     };
     const outcome = await store.controls.confirm(preview.token, operation).then(result => ({ result }), error => ({ error }));
     const afterRefusalMs = refused ? Math.round(performance.now() - refused.at) : null;
-    fs.rename = originalRename;
+    local.renameSync = rename; fs.open = open;
     holder?.release();
     if (holder) await holder.closed;
 
@@ -165,7 +166,7 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
     expect(await fs.readFile(independent, 'utf8')).toBe(independentBytes);
     await verify({ attempts, outcome, refused, control, recordFile, store, id, scope, afterRefusalMs, restoration });
   } finally {
-    fs.rename = originalRename;
+    local.renameSync = rename; fs.open = open;
     holder?.release();
     if (holder) await holder.closed;
     const current = await fs.lstat(root, { bigint: true });
@@ -267,3 +268,103 @@ test.describe('Windows conversation control publication', () => {
     });
   });
 });
+
+async function deletionFixture(checkpoint, verify) {
+  const temp = await fs.realpath(os.tmpdir());
+  const root = await fs.mkdtemp(path.join(temp, 'companion-control-publication-'));
+  const identity = await fs.lstat(root, { bigint: true });
+  const id = randomUUID();
+  const record = {
+    schema: 1, id, scope: { version: randomUUID(), excludedSources: [], excludedHistory: [] },
+    vault: { root }, brief: { id: randomUUID(), version: 1, digest: 'a'.repeat(64) },
+    createdAt: '2026-11-08T12:00:00Z', requests: []
+  };
+  const store = new Conversations({ dataRoot: root, getVault: () => record.vault, checkpoint });
+  try {
+    store.safeDirectory(true);
+    const file = path.join(store.directory, `${id}.json`), control = path.join(store.directory, '.control', `${id}.json`);
+    const bytes = Buffer.from(JSON.stringify(record));
+    await fs.writeFile(file, bytes, { flag: 'wx' });
+    await verify({ store, record, file, control, bytes, preview: await store.controls.preview(id) });
+  } finally {
+    const current = await fs.lstat(root, { bigint: true });
+    if (path.dirname(root) !== temp || await fs.realpath(root) !== root || current.isSymbolicLink() || current.dev !== identity.dev || current.ino !== identity.ino) {
+      throw Error('The disposable deletion fixture changed identity. Preserve it for review.');
+    }
+    await fs.rm(root, { recursive: true });
+  }
+}
+
+for (const change of ['equal-byte inode replacement', 'in-place raw-byte edit']) {
+  test(`confirmed conversation deletion preserves an ${change} after the final payload read`, async () => {
+    let armed = false;
+    await deletionFixture(async name => { if (name === 'conversation-delete-after-tombstone') armed = true; },
+      async ({ store, file, control, bytes, preview }) => {
+        const open = fs.open, parked = `${file}.original`;
+        let reads = 0, injected = false;
+        fs.open = async (name, ...args) => {
+          const handle = await open(name, ...args);
+          if (name !== file || !armed || ++reads !== 2) return handle;
+          const close = handle.close.bind(handle);
+          handle.close = async () => {
+            await close();
+            if (change === 'equal-byte inode replacement') {
+              await fs.rename(file, parked);
+              await fs.writeFile(file, bytes, { flag: 'wx' });
+            } else await fs.writeFile(file, withBom(bytes));
+            injected = true;
+          };
+          return handle;
+        };
+        let outcome;
+        try { outcome = await store.controls.confirm(preview.token).catch(error => error); }
+        finally { fs.open = open; }
+        expect(injected).toBe(true);
+        expect(outcome).toBeInstanceOf(Error);
+        expect(await fs.readFile(file)).toEqual(change === 'in-place raw-byte edit' ? withBom(bytes) : bytes);
+        if (change === 'equal-byte inode replacement') expect(await fs.readFile(parked)).toEqual(bytes);
+        expect(JSON.parse(await fs.readFile(control)).phase).toBe('deleting');
+      });
+  });
+}
+
+test('confirmed conversation deletion preserves a raw-byte edit made before the final payload read', async () => {
+  let edit;
+  await deletionFixture(async name => { if (name === 'conversation-delete-after-tombstone') await edit(); },
+    async ({ store, file, control, bytes, preview }) => {
+      edit = () => fs.writeFile(file, withBom(bytes));
+      await expect(store.controls.confirm(preview.token)).rejects.toThrow(/deletion target changed/i);
+      expect(await fs.readFile(file)).toEqual(withBom(bytes));
+      expect(JSON.parse(await fs.readFile(control)).phase).toBe('deleting');
+    });
+});
+
+for (const addition of ['a same-ID pending payload', 'a first-publication receipt']) {
+  test(`conversation deletion leaves authority incomplete when ${addition} arrives during final stage preparation`, async () => {
+    await deletionFixture(async () => {}, async ({ store, record, file, control, bytes, preview }) => {
+      const additionFile = addition === 'a same-ID pending payload' ? path.join(store.directory, `${randomUUID()}.pending`) : `${file}.first-publication`;
+      const content = addition === 'a same-ID pending payload' ? bytes : Buffer.from('Independent first-publication receipt bytes');
+      const open = fs.open;
+      let injected = false;
+      fs.open = async (name, flag, ...args) => {
+        const handle = await open(name, flag, ...args);
+        if (flag !== 'wx' || path.dirname(name) !== path.dirname(control) || !name.endsWith('.pending')) return handle;
+        const close = handle.close.bind(handle);
+        handle.close = async () => {
+          await close();
+          if (JSON.parse(await fs.readFile(name)).phase !== 'deleted') return;
+          await fs.writeFile(additionFile, content, { flag: 'wx' });
+          injected = true;
+        };
+        return handle;
+      };
+      let outcome;
+      try { outcome = await store.controls.confirm(preview.token).catch(error => error); }
+      finally { fs.open = open; }
+      expect(injected).toBe(true);
+      expect(outcome).toBeInstanceOf(Error);
+      expect(await fs.readFile(additionFile)).toEqual(content);
+      expect(JSON.parse(await fs.readFile(control))).toMatchObject({ id: record.id, phase: 'deleting' });
+    });
+  });
+}

@@ -8,7 +8,7 @@ const { Intake } = require('./intake');
 const { intakeLock } = require('./intake-lock');
 const { TaskScheduler } = require('./task-scheduler');
 const { Vault } = require('./vault');
-const { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, verifyPeers, validProof } = require('./staged-publication');
+const { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, validProof, verifyAbsentSync, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication } = require('./staged-publication');
 const DAY = 86400000;
 const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const stagingName = /^\.archive-reconnect-[a-f0-9-]{36}\.pending$|^schedule-[a-f0-9-]{36}\.tmp$/;
@@ -60,7 +60,13 @@ class Schedule {
     if (!state || state.schema !== 1 || !uuid.test(state.id) || !Number.isFinite(Date.parse(state.anchor)) || typeof state.vault !== 'string' || !path.isAbsolute(state.vault) || typeof state.parent !== 'string' || !['enabled', 'paused', 'disabled'].includes(state.mode) || !Number.isInteger(state.handledSlot || 0) || (state.handledSlot || 0) < 0 || state.launchBinding !== undefined && state.launchBinding !== 1) throw Error('Unsupported daily intake settings. Preserve them for repair.');
     return { state, proof: file.proof };
   }
-  async load() { return (await this.snapshot())?.state || null; }
+  async load() {
+    const guard = this.directoryGuard();
+    if (initialPublicationPending(this.file, guard) || statIfPresent(this.legacyReceipt, guard)) {
+      return this.change(async locked => (await this.snapshot(locked))?.state || null);
+    }
+    return (await this.snapshot(guard))?.state || null;
+  }
   async assertConfiguration(settingsPath) {
     const file = await optionalExact(settingsPath, this.directoryGuard());
     let selected;
@@ -70,15 +76,15 @@ class Schedule {
     } catch { throw settingsChanged(); }
     if (!this.vault || !samePath(selected.root, this.vault.root)) throw settingsChanged();
   }
-  get initialReceipt() { return `${this.file}.initial-publication.json`; }
-  async settleInitial(guard) {
-    const receipt = await optionalExact(this.initialReceipt, guard);
+  get legacyReceipt() { return `${this.file}.initial-publication.json`; }
+  async settleLegacyReceipt(guard) {
+    const receipt = await optionalExact(this.legacyReceipt, guard);
     if (!receipt) return;
     let intent;
     try { intent = JSON.parse(receipt.bytes); } catch { throw scheduleChanged(); }
     if (!intent || intent.schema !== 1 || typeof intent.stage !== 'string' || !stagingName.test(intent.stage) || !validProof(intent.proof)) throw scheduleChanged();
     const stage = path.join(path.dirname(this.file), intent.stage);
-    const receiptGuard = () => { verifyStageSync(this.initialReceipt, guard, receipt.proof); };
+    const receiptGuard = () => { verifyStageSync(this.legacyReceipt, guard, receipt.proof); };
     const destination = statIfPresent(this.file, receiptGuard);
     if (destination?.nlink === 2n) {
       const linked = () => { verifyStageSync(this.file, receiptGuard, intent.proof, 2); };
@@ -91,12 +97,15 @@ class Schedule {
       this.requireCurrent(destination ? intent.proof : null, guard);
       if (statIfPresent(stage, guard)) throw scheduleChanged();
     };
-    await removeOwned(this.initialReceipt, settled, receipt.proof);
+    await removeOwned(this.legacyReceipt, settled, receipt.proof);
   }
   async change(work) {
     return intakeLock(path.dirname(this.file), async () => {
       const guard = this.directoryGuard();
-      await this.settleInitial(guard);
+      if (initialPublicationPending(this.file, guard)) {
+        verifyAbsentSync(this.legacyReceipt, guard, scheduleChanged);
+        recoverInitialPublication(this.file, guard, stagingName);
+      } else await this.settleLegacyReceipt(guard);
       return work(guard);
     });
   }
@@ -113,7 +122,6 @@ class Schedule {
     const name = archive ? `.archive-reconnect-${randomUUID()}.pending` : `schedule-${randomUUID()}.tmp`;
     const stage = path.join(path.dirname(this.file), name);
     const proof = await writeStage(stage, JSON.stringify(state, null, 2), guard);
-    let receipt;
     const lastLook = () => {
       verifyStageSync(stage, guard, proof);
       this.requireCurrent(expected, guard);
@@ -121,23 +129,12 @@ class Schedule {
     };
     try {
       if (!expected) {
-        await assertSelected();
-        lastLook();
-        receipt = await writeStage(this.initialReceipt, JSON.stringify({ schema: 1, stage: name, proof }), guard);
-        await assertSelected();
-        const receiptGuard = () => { verifyStageSync(this.initialReceipt, guard, receipt); };
-        receiptGuard();
-        lastLook();
-        local.linkSync(stage, this.file);
-        const linked = () => { verifyStageSync(this.file, receiptGuard, proof, 2); };
-        await verifyPeers(stage, this.file, receiptGuard, proof);
-        await removeOwned(stage, linked, proof, 2);
-        await verifyStage(this.file, receiptGuard, proof);
-        const settled = () => {
-          this.requireCurrent(proof, guard);
-          if (statIfPresent(stage, guard)) throw scheduleChanged();
-        };
-        await removeOwned(this.initialReceipt, settled, receipt);
+        await publishReplacement(stage, this.file, guard, proof, null, {
+          beforeAttempt: assertSelected,
+          conflict: scheduleChanged,
+          stageName: stagingName,
+          verifyRelated: () => verifyAbsentSync(this.legacyReceipt, guard, scheduleChanged)
+        });
       } else {
         const deadline = performance.now() + 1000;
         let delay = 15;
@@ -155,7 +152,9 @@ class Schedule {
         await verifyStage(this.file, guard, proof);
       }
     } finally {
-      if (!receipt) await removeOwned(stage, guard, proof).catch(() => {});
+      try {
+        if (expected || !initialPublicationPending(this.file, guard)) removeStageIfPresentSync(stage, guard, proof);
+      } catch { /* Preserve a stage whose ownership cannot be proved. */ }
     }
     verifyStageSync(this.file, guard, proof);
     return proof;

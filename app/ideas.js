@@ -18,6 +18,9 @@ const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const decode = bytes => new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+const captureIdOf = dep => dep.captureId || (dep.key.startsWith('capture:') ? dep.key.slice(8) : null);
+const markdownPath = (from, to) => path.relative(from, to).split(path.sep)
+  .map(segment => encodeURIComponent(segment).replace(/[()]/g, character => character === '(' ? '%28' : '%29')).join('/');
 function metadata(text) {
   const front = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
   return front && YAML.parse(front[1]);
@@ -258,14 +261,20 @@ class Ideas {
     }
     return citations.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   }
-  async supportSnapshot({ vault, record, request }) {
-    const context = await this.conversations.getContext(), corpus = await context.corpus();
+  async supportSnapshot({ vault, record, request }, linkNotes) {
+    const context = await this.conversations.getContext();
+    const captureRelationshipIds = linkNotes ? new Set(request.package.dependencies.map(captureIdOf).filter(Boolean)) : undefined;
+    const corpus = await context.corpus({ captureRelationshipIds });
     const ledgerFile = path.join(vault.root, '.intake', 'ledger.json');
     const ledger = JSON.parse((await this.readFile(vault, ledgerFile, this.parents(vault, [ledgerFile]))).text);
-    const state = [], warnings = []; let unavailable = false;
+    const state = [], warnings = [], captureNotes = new Map(); let unavailable = false;
     for (const dep of request.package.dependencies) {
       const source = corpus.all.find(item => item.key === dep.key), excluded = record.scope?.excludedSources.some(key => scopeKey(key) === scopeKey(dep.key)) || false;
-      const captureId = dep.captureId || (dep.key.startsWith('capture:') ? dep.key.slice(8) : null);
+      const captureId = captureIdOf(dep);
+      const note = corpus.captureRelationships?.get(captureId);
+      if (note && !excluded && (sameEvidence(source, dep) || corpus.manual.some(choice => sameEvidence(choice, dep)))) {
+        captureNotes.set(captureId, note);
+      }
       const entries = captureId ? Object.entries(ledger.captures).filter(([, item]) => item.id === captureId) : [];
       const entry = entries.length === 1 ? entries[0] : null, capture = entry?.[1];
       const authorityKey = captureId || dep.key;
@@ -288,7 +297,20 @@ class Ideas {
       }
       for (const warning of source?.warnings || []) warnings.push(warning);
     }
-    return { state, warnings, unavailable };
+    return { state, warnings, unavailable, captureNotes };
+  }
+  markdownRelationship(vault, { file, digest, ...relationship }, collectCheck) {
+    if (path.extname(file).toLowerCase() !== '.md') return null;
+    const parents = this.parents(vault, [file]);
+    const guard = () => {
+      this.guard(vault, parents);
+      if (this.getVault() !== vault) throw Error('The selected vault changed. Review the saved idea again.');
+    };
+    const { proof } = readExactSync(file, guard);
+    if (proof.digest !== digest) throw Error('A related Markdown note changed. Review the saved idea again.');
+    const binding = { file, proof, ...relationship };
+    collectCheck?.({ ...binding, verify: () => verifyStageSync(file, guard, proof) });
+    return binding;
   }
   async preview(input, identity) {
     const { vault, record, request } = await this.origin(input);
@@ -303,12 +325,22 @@ class Ideas {
     if (kind === 'experiment_proposal') for (const [key, label] of Object.entries(experimentLabels)) {
       if (typeof experiment[key] !== 'string' || !experiment[key].trim()) throw Error(`Enter the experiment ${label} before previewing.`);
     }
-    const brief = await new Briefs(vault).pinned(record.brief.version);
+    const briefs = new Briefs(vault), brief = await briefs.pinned(record.brief.version);
     if (brief.id !== record.brief.id || brief.digest !== record.brief.digest) throw Error('The exact conversation brief is unavailable.');
-    const support = await this.supportSnapshot({ vault, record, request });
+    const linkNotes = !identity || identity.relationshipBindings !== undefined;
+    const support = await this.supportSnapshot({ vault, record, request }, linkNotes);
+    const relationshipBindings = linkNotes ? [
+      ...[...support.captureNotes].map(([captureId, note]) => this.markdownRelationship(vault, {
+        ...note, captureId, label: `Capture note ${captureId}`
+      }, identity?.verifyRelationship)),
+      this.markdownRelationship(vault, {
+        file: path.resolve(briefs.dir, brief.file), digest: brief.digest, label: `Approved brief version ${brief.version}`
+      }, identity?.verifyRelationship)
+    ].filter(Boolean) : undefined;
+    const reviewedLinks = linkNotes ? { relationshipBindings } : {};
     // An unchanged proposal keeps the same immutable identity and creation instant
     // when the user cancels and reviews it again. Confirmation never regenerates it.
-    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, scope: record.scope, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment, citations, supportState: support.state }));
+    const proposalKey = hash(JSON.stringify({ vault: vault.root, conversation: record.id, request: request.id, package: request.package, reply: request.reply, status: request.status, scope: record.scope, brief: record.brief, title: input.title, explanation: input.explanation, limitations: input.limitations, kind, experiment, citations, supportState: support.state, ...reviewedLinks }));
     const retained = !identity && [...this.previews.values()].find(preview => preview.proposalKey === proposalKey && !this.removal.fenced(vault, preview.id));
     if (retained) {
       this.removal.allow(vault, retained.id);
@@ -325,12 +357,13 @@ class Ideas {
     const disclosure = citations.length ? 'Supporting references were explicitly selected and checked against exact admitted revisions and their selected passages in the retained package. These references do not establish sentence-level support for the explanation. Claims are not independently verified.' : 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
     const experimentText = kind === 'experiment_proposal' ? `\n# Experiment Proposal\n\n${Object.entries(experimentLabels).map(([key, label]) => `## ${label}\n\n${experiment[key]}`).join('\n\n')}\n` : '';
     const citationText = citations.map(anchor => `Capture ${anchor.capture_id}; exact revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}; evidence ${anchor.evidence_id}; ${anchor.evidence_kind}; time ${anchor.start_seconds ?? 'unknown'}–${anchor.end_seconds ?? 'unknown'} seconds.\n\n${anchor.excerpt}\n\nExcerpt sha256 ${anchor.excerpt_sha256}.`).join('\n\n');
-    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\n${support.warnings.join('\n')}\n\n${citationText}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
     const slug = fields.title.replace(/[^a-zA-Z0-9 -]/g, '').trim().slice(0, 55) || 'Idea';
     const destination = path.join(vault.root, 'Ideas', `${slug}--${id}.md`);
+    const related = relationshipBindings?.map(({ file, label }) => `[${label}](${markdownPath(vault.vault, file)})`).join('\n\n');
+    const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\n${support.warnings.join('\n')}\n\n${citationText}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\n${related ? related + '\n\n' : ''}Conversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;
     this.guard(vault);
     const referenceBindings = (input.referenceIds || []).map(referenceId => ({ referenceId, ...structuredClone(this.references.get(referenceId)) }));
-    const preview = { schema: 1, operation, id, vault: vault.root, destination, text, digest: hash(text), proposalKey, warnings: [disclosure, ...support.warnings], input: structuredClone(input), referenceBindings, supportState: support.state };
+    const preview = { schema: 1, operation, id, vault: vault.root, destination, text, digest: hash(text), proposalKey, warnings: [disclosure, ...support.warnings], input: structuredClone(input), referenceBindings, supportState: support.state, ...reviewedLinks };
     if (identity && (identity.text !== text || identity.destination !== destination || identity.proposalKey !== proposalKey)) throw Error('The retained proposal or supporting context changed. Review a new preview before saving; retained writing was preserved.');
     if (this.previews.size >= 64) this.previews.delete(this.previews.keys().next().value);
     this.previews.set(operation, preview);
@@ -464,13 +497,14 @@ class Ideas {
       if (staged.text !== preview.text) throw Error('Saved idea stage conflict. The proposal was preserved.');
       await this.checkpoint('idea-before-publication');
       this.removal.allow(vault, preview.id);
-      const citationChecks = [];
+      const citationChecks = [], relationshipChecks = [];
       const currentPreview = await this.preview(preview.input, {
         ...preview, createdAt: metadata(preview.text).created_at,
-        verifyCitation: check => citationChecks.push(check)
+        verifyCitation: check => citationChecks.push(check),
+        verifyRelationship: check => relationshipChecks.push(check)
       });
       if (currentPreview.operation !== operation || currentPreview.text !== preview.text || currentPreview.destination !== preview.destination) throw Error('Idea context changed. Retained proposed content was preserved; review a fresh preview before saving.');
-      const captureIds = new Set(citationChecks.map(check => check.captureId));
+      const captureIds = new Set([...citationChecks, ...relationshipChecks].map(check => check.captureId).filter(Boolean));
       const inventory = await scanIdeas(vault, { captureIds }), claims = inventory.claims.get(preview.id) || [];
       const freshLinks = local.lstatSync(stage).nlink;
       if (![1, 2].includes(freshLinks)) throw Error('Saved idea stage has unknown linked copies. No destination was created.');
@@ -482,6 +516,12 @@ class Ideas {
         for (const { captureId, files, verify } of citationChecks) {
           const current = [...(inventory.captureClaims.get(captureId) || [])].sort();
           if (JSON.stringify(current) !== JSON.stringify(files)) throw Error('Current citation capture identity changed. The proposal and all copies were preserved.');
+          verify();
+        }
+        for (const { captureId, claims, verify } of relationshipChecks) {
+          if (captureId && JSON.stringify([...(inventory.captureClaims.get(captureId) || [])].sort()) !== JSON.stringify(claims)) {
+            throw Error('A related capture identity changed. Review the saved idea again.');
+          }
           verify();
         }
       }

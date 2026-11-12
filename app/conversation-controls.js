@@ -5,12 +5,19 @@ const { createHash, randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { setTimeout: wait } = require('node:timers/promises');
 const { conversation } = require('./archive-format');
-const { writeStage, verifyStage, verifyStageSync, verifyAbsentSync, removeLinkedStage } = require('./staged-publication');
+const { readExactSync, writeStage, verifyStage, verifyStageSync, verifyAbsentSync, removeLinkedStage, initialPublicationPending } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const fields = (value, allowed) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => allowed.includes(key));
 const rawProof = ({ owned, rawDigest }) => ({ dev: owned.dev, ino: owned.ino, digest: rawDigest });
+const pendingName = name => uuid(name.slice(0, -'.pending'.length));
+const deletionChanged = () => Error('Conversation deletion targets or authority changed. Recovery remains blocked.');
+
+function pendingRecord(text) {
+  try { return conversation(JSON.parse(text)); }
+  catch { throw Error('Unknown or damaged pending history remains preserved; deletion recovery is blocked.'); }
+}
 
 // Local controls are authority, not archived conversation content. Never infer consent from absence.
 class ConversationControls {
@@ -38,9 +45,20 @@ class ConversationControls {
       const after = await fs.lstat(file, { bigint: true });
       if (!same(before, after) || after.nlink !== BigInt(links)) throw Error('Conversation deletion file identity changed.');
       const owned = { name: path.basename(file), sha256: hash(text), dev: String(after.dev), ino: String(after.ino), bytes: Buffer.byteLength(text, 'utf8') };
-      if (expected && JSON.stringify(owned) !== JSON.stringify(expected)) throw Error('Conversation deletion target changed. Preserve it and preview again.');
-      return { text, stat: after, owned, rawDigest: exactBytes ? hash(bytes) : undefined };
+      const { rawSha256, ...expectedOwned } = expected || {};
+      const rawDigest = exactBytes || rawSha256 !== undefined ? hash(bytes) : undefined;
+      if (expected && (JSON.stringify(owned) !== JSON.stringify(expectedOwned) || rawSha256 !== undefined && rawDigest !== rawSha256)) {
+        throw Error('Conversation deletion target changed. Preserve it and preview again.');
+      }
+      return { text, stat: after, owned, rawDigest };
     } finally { await handle.close(); }
+  }
+  async deletionFile(file, parent, target) {
+    // Old manifests hashed decoded text. Only delete when those bytes also
+    // match the raw file, since the old proof cannot distinguish a BOM edit.
+    const expected = target && { ...target, rawSha256: target.rawSha256 ?? target.sha256 };
+    const exact = await this.file(file, parent, expected, 1, false, true);
+    return { ...exact, owned: { ...exact.owned, rawSha256: exact.rawDigest } };
   }
   validate(value, id) {
     const fail = () => { throw Error('Conversation control is unknown or corrupt. Preserve all writing; ordinary history access is blocked.'); };
@@ -48,13 +66,14 @@ class ConversationControls {
     if (value.restoration !== undefined && (!fields(value.restoration, ['archiveId', 'recordDigest']) || !uuid(value.restoration.archiveId) || typeof value.restoration.recordDigest !== 'string' || !/^[a-f0-9]{64}$/.test(value.restoration.recordDigest))) fail();
     if (value.phase === 'restoring' && !value.restoration) fail();
     if (!fields(value.scope, ['excludedSources', 'excludedHistory']) || !Array.isArray(value.scope.excludedSources) || value.scope.excludedSources.some(key => typeof key !== 'string') || !Array.isArray(value.scope.excludedHistory) || value.scope.excludedHistory.some(key => !uuid(key)) || !Array.isArray(value.targets)) fail();
-    const names = new Set();
+    const names = new Set(), deletion = ['deleting', 'deleted'].includes(value.phase);
     for (const target of value.targets) {
-      if (!fields(target, ['name', 'sha256', 'dev', 'ino', 'bytes']) || typeof target.name !== 'string' || !/^[a-f0-9-]{36}\.(json|pending)$/.test(target.name) || !uuid(target.name.split('.')[0]) || names.has(target.name) || typeof target.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(target.sha256) || typeof target.dev !== 'string' || typeof target.ino !== 'string' || !Number.isSafeInteger(target.bytes) || target.bytes < 0) fail();
+      if (!fields(target, ['name', 'sha256', 'dev', 'ino', 'bytes', 'rawSha256']) || typeof target.name !== 'string' || !/^[a-f0-9-]{36}\.(json|pending)$/.test(target.name) || !uuid(target.name.split('.')[0]) || names.has(target.name) || typeof target.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(target.sha256) || typeof target.dev !== 'string' || typeof target.ino !== 'string' || !Number.isSafeInteger(target.bytes) || target.bytes < 0) fail();
+      if (Object.hasOwn(target, 'rawSha256') && (!deletion || typeof target.rawSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(target.rawSha256))) fail();
       names.add(target.name);
       if (target.name.endsWith('.json') && target.name !== `${id}.json`) fail();
     }
-    if (['deleting', 'deleted'].includes(value.phase) && !names.has(`${id}.json`)) fail();
+    if (deletion && !names.has(`${id}.json`)) fail();
     if (value.phase === 'restoring') {
       const stage = value.targets.find(target => target.name.endsWith('.pending')), destination = value.targets.find(target => target.name === `${id}.json`);
       if (value.targets.length !== 2 || !stage || !destination || stage.sha256 !== value.restoration.recordDigest || ['sha256', 'dev', 'ino', 'bytes'].some(key => stage[key] !== destination[key])) fail();
@@ -143,7 +162,7 @@ class ConversationControls {
       assertSelection();
       verifyStageSync(file, guard, current);
       verifyStageSync(stage, guard, staged);
-      try { await fs.rename(stage, file); }
+      try { local.renameSync(stage, file); }
       catch (error) {
         const remaining = deadline - performance.now();
         if (!retry || error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code) || remaining <= 0) throw error;
@@ -158,7 +177,6 @@ class ConversationControls {
         continue;
       }
       // Verify the exact publication. Leave any unexpected files for inspection.
-      await verifyStage(file, guard, staged);
       verifyStageSync(file, guard, staged);
       return;
     }
@@ -183,7 +201,7 @@ class ConversationControls {
       local.linkSync(stage, file);
       await removeLinkedStage(stage, file, guard, staged, assertSelection);
     }
-    if (publication) await publication.check();
+    if (publication?.check) await publication.check();
     verifyStageSync(file, guard, staged);
     this.known.add(marker.id);
     publication?.commit();
@@ -193,11 +211,11 @@ class ConversationControls {
     if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve the unsaved reply or finish the active request before deleting this conversation.');
     const record = await this.store.readStored(id), parent = this.store.safeDirectory();
     if (record.vault.root !== this.store.getVault()?.root) throw Error('Conversation belongs to another vault.');
-    const target = await this.file(path.join(this.store.directory, `${id}.json`), parent);
+    const target = await this.deletionFile(path.join(this.store.directory, `${id}.json`), parent);
     const targets = [target.owned], pending = [];
     for (const name of await fs.readdir(this.store.directory)) if (name.endsWith('.pending')) {
-      if (!/^[a-f0-9-]{36}\.pending$/.test(name) || !uuid(name.slice(0, -8))) throw Error('Unknown pending history requires separate inspection before deletion.');
-      const staged = await this.file(path.join(this.store.directory, name), parent);
+      if (!pendingName(name)) throw Error('Unknown pending history requires separate inspection before deletion.');
+      const staged = await this.deletionFile(path.join(this.store.directory, name), parent);
       let candidate; try { candidate = JSON.parse(staged.text); } catch { throw Error('Unknown pending history remains preserved; deletion is blocked.'); }
       try { conversation(candidate); }
       catch { throw Error('Unknown or damaged pending history remains preserved; deletion is blocked.'); }
@@ -223,16 +241,14 @@ class ConversationControls {
     if (this.store.unsaved.has(id) || this.store.running.has(id)) throw Error('Preserve unsaved writing or finish the active request before deletion recovery.');
     const parent = this.store.safeDirectory(false, expectedParent), remaining = [];
     for (const target of marker.targets) {
-      try { await this.file(path.join(this.store.directory, target.name), parent, target); remaining.push(target.name); }
+      try { await this.deletionFile(path.join(this.store.directory, target.name), parent, target); remaining.push(target.name); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
     // Newly arrived or damaged stages were never covered by the retained deletion consent.
     for (const name of await fs.readdir(this.store.directory)) if (name.endsWith('.pending')) {
-      if (!/^[a-f0-9-]{36}\.pending$/.test(name) || !uuid(name.slice(0, -8))) throw Error('Unknown pending history remains preserved; deletion recovery is blocked.');
+      if (!pendingName(name)) throw Error('Unknown pending history remains preserved; deletion recovery is blocked.');
       const staged = await this.file(path.join(this.store.directory, name), parent);
-      let candidate;
-      try { candidate = conversation(JSON.parse(staged.text)); }
-      catch { throw Error('Unknown or damaged pending history remains preserved; deletion recovery is blocked.'); }
+      const candidate = pendingRecord(staged.text);
       if (candidate.id === id && (!marker.targets.some(target => target.name === name) || candidate.vault.root !== this.store.getVault()?.root)) throw Error('New or ambiguous pending history remains preserved. It was not part of the confirmed deletion manifest.');
     }
     return { recovery: true, id, marker, remaining };
@@ -336,14 +352,17 @@ class ConversationControls {
       return { token, id, generation: snapshot.marker.generation, archiveId: snapshot.marker.restoration.archiveId, targets: snapshot.marker.targets.map(target => target.name), text: snapshot.text };
     });
   }
-  async restorationMarkerGuard(marker, guard) {
+  async markerGuard(marker, guard, changed) {
     guard();
     const directory = this.guard(), control = path.join(directory.directory, `${marker.id}.json`);
     const saved = await this.file(control, directory, null, 1, true, true);
-    if (JSON.stringify(JSON.parse(saved.text)) !== JSON.stringify(marker)) throw Error('Restoration authority changed. Preserve the exact payload for review.');
+    if (JSON.stringify(JSON.parse(saved.text)) !== JSON.stringify(marker)) throw changed();
     const controlProof = rawProof(saved);
     const controlGuard = () => { guard(); this.guard(false, directory.stat); };
     return () => { verifyStageSync(control, controlGuard, controlProof); };
+  }
+  async restorationMarkerGuard(marker, guard) {
+    return this.markerGuard(marker, guard, () => Error('Restoration authority changed. Preserve the exact payload for review.'));
   }
   async finishRestoration(snapshot) {
     const { marker, vaultRoot } = snapshot;
@@ -383,24 +402,48 @@ class ConversationControls {
     this.store.tokens.clear();
     return { id: marker.id, generation: active.generation };
   }
+  verifyDeletionComplete(marker, guard) {
+    if (this.store.unsaved.has(marker.id) || this.store.running.has(marker.id)) throw deletionChanged();
+    for (const target of marker.targets) {
+      verifyAbsentSync(path.join(this.store.directory, target.name), guard, deletionChanged);
+    }
+    if (initialPublicationPending(path.join(this.store.directory, `${marker.id}.json`), guard)) throw deletionChanged();
+    for (const name of local.readdirSync(this.store.directory)) if (name.endsWith('.pending')) {
+      if (!pendingName(name)) throw deletionChanged();
+      const { bytes } = readExactSync(path.join(this.store.directory, name), guard);
+      const candidate = pendingRecord(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+      if (candidate.id === marker.id) throw deletionChanged();
+    }
+    guard();
+  }
   async finish(marker) {
-    await this.settlePublication(marker);
+    const parent = this.store.safeDirectory(), vaultRoot = this.store.getVault()?.root;
+    const guard = () => {
+      this.store.safeDirectory(false, parent);
+      if (this.store.getVault()?.root !== vaultRoot) throw deletionChanged();
+    };
+    await this.settlePublication(marker, guard);
+    const verifyMarker = await this.markerGuard(marker, guard, deletionChanged);
     this.store.tokens.clear();
     await this.store.checkpoint('conversation-delete-after-tombstone');
-    const current = await this.recoverySnapshot(marker.id), parent = this.store.safeDirectory();
-    if (JSON.stringify(current.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion authority changed. Preserve remaining writing.');
+    const current = await this.recoverySnapshot(marker.id, parent);
+    if (JSON.stringify(current.marker) !== JSON.stringify(marker)) throw deletionChanged();
     for (const target of marker.targets) if (current.remaining.includes(target.name)) {
       const file = path.join(this.store.directory, target.name);
-      await this.file(file, parent, target); this.store.safeDirectory(false, parent); await fs.unlink(file);
+      const exact = await this.deletionFile(file, parent, target);
+      verifyMarker();
+      verifyStageSync(file, guard, rawProof(exact));
+      local.unlinkSync(file);
       await this.store.checkpoint('conversation-delete-after-unlink');
     }
-    // Verify no unknown or changed target appeared while completing the exact manifest.
-    const verifyComplete = async () => {
+    const verifyComplete = () => this.verifyDeletionComplete(marker, guard);
+    const beforeReplace = () => { verifyMarker(); verifyComplete(); };
+    const revalidate = async () => {
       const after = await this.recoverySnapshot(marker.id, parent);
-      if (after.remaining.length || JSON.stringify(after.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion targets or authority changed. Recovery remains blocked.');
+      if (after.remaining.length || JSON.stringify(after.marker) !== JSON.stringify(marker)) throw deletionChanged();
     };
-    await verifyComplete();
-    const completed = await this.put({ ...marker, phase: 'deleted' }, marker, verifyComplete);
+    await revalidate();
+    const completed = await this.put({ ...marker, phase: 'deleted' }, marker, revalidate, beforeReplace, { commit: verifyComplete });
     this.store.unsaved.delete(marker.id); return { id: marker.id, generation: completed.generation };
   }
   async confirm(token, kind = 'deletion') {

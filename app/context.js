@@ -136,8 +136,8 @@ class Context {
     await this.changeScope(current => [...new Set([...current, ...files])], validate);
   }
   async exclude(key) { await this.changeScope(current => current.filter(file => `note:${digest(file)}` !== key)); }
-  async corpus() {
-    const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned());
+  async corpus({ captureRelationshipIds } = {}) {
+    const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned(captureRelationshipIds));
     return this.corpusFromSources(sources);
   }
   conflictChoices(note, capture, sourceHash, ledger, intake, observed, sourceGenerations) {
@@ -178,7 +178,7 @@ class Context {
     } catch { /* A missing or changed snapshot never becomes a selection. */ }
     return choices;
   }
-  async sourceCorpusOwned() {
+  async sourceCorpusOwned(captureRelationshipIds) {
     const intake = new Intake(this.vault), ledger = await intake.info();
     const observed = intake.storage.expected;
     const notes = await this.vault.list(), issues = [], all = [], manualChoices = [], eligible = new Map(), histories = new Map();
@@ -217,9 +217,11 @@ class Context {
       } catch (error) { issues.push(`Evidence unavailable: ${note.title}; ${error.message}`); }
     }
     if (!intake.storage.matches(await intake.storage.view(), observed)) throw Error('Intake ledger changed during context discovery. Retry against the current authority.');
-    return { intake, ledger, observed, issues, all, manualChoices, eligible, histories };
+    const capturePaths = captureRelationshipIds && new Map(notes.filter(note => captureRelationshipIds.has(note.id))
+      .map(note => [note.id, { file: note.file, digest: digest(note.content) }]));
+    return { intake, ledger, observed, issues, all, manualChoices, eligible, histories, capturePaths };
   }
-  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories }) {
+  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories, capturePaths }) {
     const included = [];
     const annotationGroups = new Map();
     for (const annotation of await intake.annotations()) {
@@ -270,7 +272,7 @@ class Context {
     }
     this.ideaEligibility(this.vault);
     let ideas;
-    const captureIds = new Set(manualChoices.map(({ source }) => source.captureId));
+    const captureIds = new Set([...manualChoices.map(({ source }) => source.captureId), ...(capturePaths?.keys() || [])]);
     try { ideas = await scanIdeas(this.vault, { captureIds }); }
     catch (error) { issues.push(error.message); }
     for (const [id, claims] of ideas?.claims || []) {
@@ -331,7 +333,15 @@ class Context {
       catch { issues.push(`Unavailable manual choice ${source.title}; its exact file changed.`); }
     }
     intake.storage.guardSync(observed);
-    return { all: available.filter(source => !duplicates.has(source.key)).map(normalized), manual, issues, included };
+    const result = { all: available.filter(source => !duplicates.has(source.key)).map(normalized), manual, issues, included };
+    if (capturePaths) {
+      result.captureRelationships = new Map();
+      for (const [id, note] of capturePaths) {
+        const claims = ideas?.captureClaims.get(id);
+        if (claims?.includes(note.file)) result.captureRelationships.set(id, { ...note, claims: [...claims].sort() });
+      }
+    }
+    return result;
   }
   async discover({ question }) {
     const state = await this.corpus(), terms = [...new Set(question.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [])];
