@@ -1,0 +1,112 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "clip_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "pipeline_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "channels": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "audio": {
+          "enum": [
+            "available",
+            "empty",
+            "failed"
+          ]
+        },
+        "ocr": {
+          "enum": [
+            "available",
+            "empty",
+            "failed"
+          ]
+        },
+        "vision": {
+          "enum": [
+            "available",
+            "empty",
+            "failed"
+          ]
+        }
+      },
+      "required": [
+        "audio",
+        "ocr",
+        "vision"
+      ]
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "transcript",
+              "ocr",
+              "visual_description"
+            ]
+          },
+          "start_seconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "end_seconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "review_flag": {
+            "enum": [
+              "normal",
+              "uncertain"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "start_seconds",
+          "end_seconds",
+          "text",
+          "review_flag"
+        ]
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "clip_id",
+    "duration_seconds",
+    "pipeline_version",
+    "channels",
+    "truncated",
+    "evidence"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

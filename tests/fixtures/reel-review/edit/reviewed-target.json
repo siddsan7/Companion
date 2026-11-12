@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "title": "Authored synthetic corrected review",
+  "status": "partial",
+  "claims": [
+    {
+      "id": "c1",
+      "text": "Authored synthetic review fixture only.",
+      "attribution": "narration",
+      "evidence_ids": [
+        "a1"
+      ]
+    }
+  ],
+  "steps": [],
+  "conflicts": [],
+  "unknowns": [
+    {
+      "text": "OCR and vision unavailable.",
+      "basis": "missing_channel",
+      "evidence_ids": []
+    }
+  ],
+  "omissions": []
+}

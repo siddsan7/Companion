@@ -1,0 +1,15 @@
+# Ticket 13: late adjacent recovery copy during mixed deletion
+
+Root accepts the independent P1 candidate finding in Temp `companion-mixed13-safety-audit.md` for measured reproduction. Product baseline is mixed helper be5e7f0, whose first full five-origin journey passed. This plan precedes an isolated fresh fixer worktree. Root owns runtime/Git; fixer edits/tests/syntax only.
+
+`inspectDeletion` returns into mixed inspection before the ordinary `inspectManualPeers` call. The mixed scanner parses captures and raw-scans Intake/Revisions, so it can miss selected `.md.pending` and `.md.title-transaction.json` files that arrive after consent. The existing adjacent-peer guard remains authoritative; do not create a different ownership parser or authorize extra copies.
+
+## First test, then minimum fix
+
+Create the same actual held five-origin X/wholeY family using public UI, writer checkpoints and actual main exit; preserve all facts/producers. Publicly preview and confirm, pausing at existing capture-deletion-authorized before any retention stage or source unlink. Copy the ACTUAL current buffer to a NEW ordinary selected `<capture>.md.pending` path. Record exact copy/original identities and bytes, committed authority and producer facts. This is explicitly controlled newly arriving evidence, not a manufactured writer/admission.
+
+Release and wait for the real terminal UI result. Save resulting state before asserting. Required behavior: stable deleting HOLD naming changed recovery scope, no original source unlink, no new writing publication, exact changed-scope copy and all five origins/producer/authority facts retained. Never adopt or purge the arriving copy through the old token. Expected baseline RED is completed purge despite the new copy; record the actual reached failure. Do not change production before root observes it.
+
+After actual RED, reuse the SAME existing adjacent-peer guard inside fresh mixed inspection, so it applies before each stage/link/receipt/cleanup and origin mutation, including automatic continuation. Calling it only after publication is too late. A narrow lazy internal export/call is acceptable if it preserves the existing module owner and avoids a second scanner. Keep ordinary and pending-title exact exemptions unchanged; mixed five-origin scope has no authorized title sidecars. Preserve loaded-ledger CAS, annotation fences, parent checks, original-G proof, strict current rendering and two-output barrier. No generic alias ownership, new mutex, new consent scope, semantic erasure or source reconstruction.
+
+Run unchanged regression to GREEN, then first mixed happy path and relevant existing adjacent-title/pending controls on the composed candidate. Independent non-author source review and merger approval precede preserving integration into the mixed helper; later full mixed Standards/Spec, lifecycle/crash gates and whole-ticket review remain mandatory. Fix and tests must be separate meaningful commits with existing author identity and actual dates. No live sign-in, inference or deployment.

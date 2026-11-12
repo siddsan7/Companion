@@ -1,0 +1,5 @@
+# Store resumable conversations separately from vault notes
+
+The user accepted a local application-data store for resumable conversations, with explicit transcript export to the vault. Deliberately saved ideas, project briefs, and revision snapshots remain in the vault. This reduces conversational clutter but means a vault backup alone does not preserve chat history.
+
+Conversation deletion is independent of saved ideas, and history has no automatic expiry. A manual local history archive includes conversations, settings, and vault identity metadata but excludes sign-in credentials. Restore validates compatibility and previews conflicts without silently overwriting existing state; another installation requires explicit vault and task reconnection. Model turns use fresh provider threads and locally assembled context. See D13, D17, D18, and D35–D38 in [the decision record](../decisions-and-tradeoffs.md). Storage format is a reversible implementation choice. Restore and actual provider behavior require verification.

@@ -1,0 +1,21 @@
+# Ticket 13: repair inspection completion
+
+Actual missing-canonical evidence after the Find correction showed old repair controls actionable during Refresh's current repair read. The submitted token belonged to the earlier copy inventory; real native busy refused the choice before token comparison. Exact kernel acquisition was not instrumented. See OS Temp `companion-ticket13-current-find-repair-order-analysis-20261110.md` and committed plan `.brain/plan-ticket13-proposal-repair-completion.md`.
+
+One parameterized desktop/file regression covers real `state` delivery and real `vault-repairs` delivery. It creates an actual imported capture and duplicate with independent writing, renders initial choices, changes the duplicate bytes, then holds the genuine current handler result. Earlier choices must be unavailable until fresh rows publish. After release, the user explicitly chooses from the fresh inventory; original and independent copy bytes remain exact. Only response delivery is controlled: actual handlers run once, results/errors are unchanged, and finally restores/releases the gate. Default30s/expect5s budgets, timers, backend refusal and native locks remain.
+
+Root authors this bounded repair vertical in a separate worktree from the active brief configuration checks. Baseline RED is pending before any repair implementation. Both read intervals matter: disabling only inside repairs leaves the earlier state await uncovered. Current error must preserve last view text with obsolete actions unavailable, permit explicit Refresh, and not automatically retry a mutation or accept a stale token. Overlapping reads need current ownership through state, repairs, error and completion. No source/model/readiness bypass or new global/native queue is proposed.
+
+
+## Actual repair baseline RED
+
+Both real delivery intervals reached their held gate and FAILED the original5s disabled-choice assertion: 2failed/0pass/0skip/exit1/15159ms at stagedtreec78057888dd85a5d36b0dc231b01f3783b0844c6. The old Use-this-file choice remained ENABLED during state delivery and during vault-repairs delivery at tests/repair.spec.js:64. Later fresh-token selection/byte checks were not reached; finally released/restored handlers and existing cleanup completed. Raw Temp/companion-ticket13-repair-completion-red-two-20261110; runner33999 completed/copied. app source unchanged; this is actual UI product RED, not native-source/guard failure or a full-gate pass. Independent preservation of validated Brief/Context branches and smallest repair UI correction follow.
+
+
+## Repair correction and bounded verification
+
+Refresh now retires all previous repair buttons BEFORE stateawait. Local refreshEpoch plus configurationEpoch owns state/repair publication, error and finally. Late errors carry a read-only ownership predicate checked again by generic action reporting; obsolete responses/errors cannot overwrite newer UI. Current completion settles aria-busy while old buttons remain disabled on error. Fresh owned rows alone create enabled actions. Every repair handler guards its original read ownership; conflict transfer snapshots text before its digest await and rechecks ownership before dispatch. Same-vault error text remains inspectable. No retry, queue, native/source authority or timer changes.
+
+UNCHANGED two delayed-inspection controls ALLPASSED2/0skip/exit0/4609ms at stagedtree55e632db7ac25c224c87a2434fa49292fb048404. Raw Temp/companion-ticket13-repair-completion-green-two-20261110. Independent bounded review APPROVED this correction with no blockers, recommending actual overlapping-refresh success/error coverage before complete acceptance: Temp/companion-ticket13-repair-completion-bounded-review-20261110.md.
+
+Composed original-three gate at SAMEtree completed FAILED2pass/1fail/0skip/exit1/14408ms: previously failing missingcanonical annotation passed4.4s and originalContextbriefversion passed2.5s. Mixed-retention receipted-output case still failed second held-check setup6.2s (lastCheck01 remained instead of02), before intended source-unlink boundary. Raw Temp/companion-ticket13-ui-composed-original-three-20261110; runner97979 completed/copied. This separate setup failure needs actual check/Refresh phase evidence; no cause or completepass is claimed. Temporary observers remain and must be removed separately before clean gates.

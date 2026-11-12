@@ -1,0 +1,595 @@
+const { test, expect, _electron: electron } = require('@playwright/test');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
+const { createHash } = require('node:crypto');
+const YAML = require('yaml');
+const fixture = require('./fixtures/reel-draft/example.json');
+let root, app, page;
+const sourceHash = 'a'.repeat(64);
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const fields = bytes => YAML.parse(bytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)[1]);
+
+test.beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-older-title-')); });
+test.afterEach(async () => { if (app) await app.close(); app = null; await fs.rm(root, { recursive: true, force: true }); });
+async function artifact(name, attempt) {
+  const folder = path.join(root, 'producer', name); await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(path.join(folder, 'run.json'), JSON.stringify({ job_id: 'b'.repeat(64), attempt_id: attempt.repeat(32), started_utc: '2026-11-01T10:00:00Z', input_sha256: sourceHash, input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed' }));
+  await fs.writeFile(path.join(folder, 'evidence.json'), JSON.stringify({ ...fixture.input, clip_id: 'b'.repeat(64) }));
+  await fs.writeFile(path.join(folder, 'first-pass-target.json'), JSON.stringify(fixture.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(folder, 'notes.md'));
+}
+async function launch() {
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-08T06:59:00Z', timezone: 'America/Phoenix' }));
+  app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  page = await app.firstWindow();
+  await expect(page.locator('#timezone')).toContainText('America/Phoenix');
+}
+async function files(folder, prefix = '') {
+  const result = {};
+  for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
+    const relative = prefix + entry.name, file = path.join(folder, entry.name);
+    if (entry.isDirectory()) Object.assign(result, await files(file, relative + '/'));
+    else result[relative] = (await fs.readFile(file)).toString('base64');
+  }
+  return result;
+}
+async function absent(paths) {
+  for (const file of paths) expect(await fs.access(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(false);
+}
+
+async function normalOlderTitleWriter(testInfo, evidenceName) {
+  await artifact('first', '1');
+  const firstProducer = await files(path.join(root, 'producer', 'first'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const first = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), captureA = first.captures[sourceHash], revisionA = captureA.currentRevision;
+  const current = path.join(base, 'Captures', captureA.file), snapshotA = path.join(base, 'Revisions', revisionA + '.json');
+  const originalA = await fs.readFile(current), snapshotABytes = await fs.readFile(snapshotA);
+  const title = 'Guarded older A: [literal] "title" & complete?';
+  await page.getByLabel('Display title', { exact: true }).fill(title);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const titledA = await fs.readFile(current);
+  const backupNames = (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(captureA.file + '.before-title-'));
+  expect(backupNames).toHaveLength(1);
+  const adjacentA = path.join(path.dirname(current), backupNames[0]);
+  expect(await fs.readFile(adjacentA)).toEqual(originalA);
+  await artifact('second', '2');
+  const producerBytes = await files(path.join(root, 'producer'));
+  expect(await files(path.join(root, 'producer', 'first'))).toEqual(firstProducer);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const ledgerBytes = await fs.readFile(ledgerFile), ledger = JSON.parse(ledgerBytes), captureB = ledger.captures[sourceHash], revisionB = captureB.currentRevision;
+  expect(revisionB).not.toBe(revisionA);
+  expect(captureB).toMatchObject({ id: captureA.id, file: captureA.file, capturedAt: captureA.capturedAt, title });
+  expect(captureB.revisions.slice().sort()).toEqual([revisionA, revisionB].sort());
+  expect(Object.keys(ledger.attempts)).toHaveLength(2);
+  for (const [identity, admission] of Object.entries(first.attempts)) expect(ledger.attempts[identity]).toEqual(admission);
+  expect(ledger.admissions).toEqual(first.admissions);
+  const snapshotB = path.join(base, 'Revisions', revisionB + '.json'), terminalA = path.join(intake, captureA.id + '-' + revisionB + '.before.md');
+  const currentBytes = await fs.readFile(current), targets = [current, snapshotA, snapshotB, adjacentA, terminalA], observations = [];
+  for (const file of targets) {
+    const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    observations.push({ file, sha256: sha256(bytes), length: bytes.length, dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink), isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() });
+  }
+  await fs.writeFile(testInfo.outputPath(evidenceName + '-writer.json'), JSON.stringify({ origin: 'Normal draft A, public title Save, normal same-hash distinct-attempt B. No journal, admission, source-copy or cache edits.', revisionA, revisionB, attempts: ledger.attempts, admissions: ledger.admissions || {}, observations }, null, 2));
+  expect(new Set(observations.map(item => item.dev + ':' + item.ino)).size).toBe(5);
+  for (const item of observations) expect({ isFile: item.isFile, isSymbolicLink: item.isSymbolicLink, nlink: item.nlink }).toEqual({ isFile: true, isSymbolicLink: false, nlink: '1' });
+  expect(await fs.readFile(terminalA)).toEqual(titledA);
+  expect(fields(titledA)).toMatchObject({ companion_id: captureA.id, capture_type: 'reel_import', captured_at: captureA.capturedAt, source_hash: sourceHash, source_revision: revisionA, title });
+  expect(fields(currentBytes)).toMatchObject({ companion_id: captureA.id, capture_type: 'reel_import', captured_at: captureA.capturedAt, source_hash: sourceHash, source_revision: revisionB, title });
+  expect(captureB.currentHash).toBe(sha256(currentBytes));
+  expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  for (const revision of [revisionA, revisionB]) {
+    const admission = Object.values(ledger.attempts).filter(item => item.revision === revision);
+    expect(admission).toHaveLength(1);
+    expect(admission[0]).toMatchObject({ captureId: captureA.id, sourceHash, snapshotHash: sha256(await fs.readFile(path.join(base, 'Revisions', revision + '.json'))) });
+  }
+  expect((await fs.readdir(intake)).sort()).toEqual([path.basename(terminalA), 'ledger.json'].sort());
+  expect((await fs.readdir(path.dirname(current))).sort()).toEqual([captureA.file, path.basename(adjacentA)].sort());
+  expect((await fs.readdir(path.join(base, 'Revisions'))).sort()).toEqual([revisionA + '.json', revisionB + '.json'].sort());
+  await absent([current + '.pending', current + '.title-transaction.json', path.join(intake, 'title-intent.json'), path.join(intake, 'transaction.json')]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  return { base, intake, ledgerFile, ledgerBytes, ledger, captureA, revisionA, revisionB, current, terminalA, targets, observations, producerBytes };
+}
+
+test('older imported title deletion reviews five actual source files from two normal admissions without replay', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  await artifact('first', '1');
+  const firstProducer = await files(path.join(root, 'producer', 'first'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), captures = path.join(base, 'Captures');
+  const ledgerFile = path.join(intake, 'ledger.json'), readLedger = async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  const original = await readLedger(), captureA = original.captures[sourceHash], revisionA = captureA.currentRevision;
+  const current = path.join(captures, captureA.file), snapshotA = path.join(base, 'Revisions', revisionA + '.json');
+  const originalA = await fs.readFile(current), snapshotABytes = await fs.readFile(snapshotA), originalFields = fields(originalA);
+  const admittedA = Object.values(original.attempts).filter(item => item.revision === revisionA);
+  expect(admittedA).toHaveLength(1);
+  expect(admittedA[0]).toMatchObject({ captureId: captureA.id, sourceHash, snapshotHash: sha256(snapshotABytes) });
+  expect(originalFields).toMatchObject({ companion_id: captureA.id, capture_type: 'reel_import', captured_at: captureA.capturedAt, source_hash: sourceHash, source_revision: revisionA });
+  const title = 'Older A title: [literal] "quote" & complete?';
+  await page.getByLabel('Display title', { exact: true }).fill(title);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const titledA = await fs.readFile(current), named = await readLedger();
+  expect(fields(titledA)).toEqual({ ...originalFields, title });
+  const sourceBody = bytes => bytes.toString('utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n\r?\n#[^\r\n]*\r?\n/, '');
+  expect(sourceBody(titledA)).toBe(sourceBody(originalA));
+  expect(named.attempts).toEqual(original.attempts); expect(named.admissions).toEqual(original.admissions);
+  expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  const adjacentNames = (await fs.readdir(captures)).filter(name => name.startsWith(captureA.file + '.before-title-'));
+  expect(adjacentNames).toHaveLength(1);
+  expect(adjacentNames[0]).toMatch(/\.md\.before-title-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.bak$/);
+  const adjacentA = path.join(captures, adjacentNames[0]);
+  expect(await fs.readFile(adjacentA)).toEqual(originalA);
+  const residue = [current + '.pending', current + '.title-transaction.json', path.join(intake, 'title-intent.json'), path.join(intake, 'transaction.json')];
+  await absent(residue);
+  await artifact('second', '2');
+  const producerBytes = await files(path.join(root, 'producer'));
+  expect(await files(path.join(root, 'producer', 'first'))).toEqual(firstProducer);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const completed = await readLedger(), captureB = completed.captures[sourceHash], revisionB = captureB.currentRevision;
+  const snapshotB = path.join(base, 'Revisions', revisionB + '.json'), currentB = await fs.readFile(current);
+  const intakeNames = await fs.readdir(intake), captureNames = await fs.readdir(captures), snapshotNames = await fs.readdir(path.join(base, 'Revisions'));
+  const beforeNames = intakeNames.filter(name => name.endsWith('.before.md'));
+  const observedFiles = [current, ...captureNames.filter(name => name.startsWith(captureA.file + '.before-title-')).map(name => path.join(captures, name)), ...snapshotNames.map(name => path.join(base, 'Revisions', name)), ...beforeNames.map(name => path.join(intake, name))];
+  const observations = [];
+  for (const file of observedFiles) {
+    const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    observations.push({ file, sha256: sha256(bytes), length: bytes.length, dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink), isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() });
+  }
+  // Save literal writer evidence before count assumptions or any deletion preview.
+  await fs.writeFile(testInfo.outputPath('actual-older-title-writer.json'), JSON.stringify({ revisionA, revisionB, admittedA: admittedA[0], attempts: completed.attempts, admissions: completed.admissions || {}, intakeNames, captureNames, snapshotNames, originalAHash: sha256(originalA), titledAHash: sha256(titledA), currentBHash: sha256(currentB), observations }, null, 2));
+  expect(revisionB).not.toBe(revisionA);
+  expect(captureB).toMatchObject({ id: captureA.id, file: captureA.file, capturedAt: captureA.capturedAt, title, currentHash: sha256(currentB) });
+  expect(captureB.revisions.slice().sort()).toEqual([revisionA, revisionB].sort());
+  expect(fields(currentB)).toEqual({ ...originalFields, title, source_revision: revisionB, imported_at: JSON.parse(await fs.readFile(snapshotB, 'utf8')).importedAt });
+  expect(currentB).not.toEqual(titledA);
+  expect(Object.keys(completed.attempts)).toHaveLength(2);
+  expect(completed.attempts[admittedA[0].identity]).toEqual(admittedA[0]);
+  expect(completed.admissions).toEqual(original.admissions);
+  const admittedB = Object.values(completed.attempts).filter(item => item.revision === revisionB);
+  expect(admittedB).toHaveLength(1);
+  expect(admittedB[0].identity).not.toBe(admittedA[0].identity);
+  expect(admittedB[0]).toMatchObject({ captureId: captureA.id, sourceHash, snapshotHash: sha256(await fs.readFile(snapshotB)) });
+  expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  expect(beforeNames).toEqual([captureA.id + '-' + revisionB + '.before.md']);
+  const terminalA = path.join(intake, beforeNames[0]);
+  expect(await fs.readFile(terminalA)).toEqual(titledA);
+  expect(fields(await fs.readFile(terminalA)).source_revision).toBe(revisionA);
+  expect(await fs.readFile(adjacentA)).toEqual(originalA);
+  expect(observations).toHaveLength(5);
+  expect(new Set(observations.map(item => item.dev + ':' + item.ino)).size).toBe(5);
+  for (const item of observations) expect({ isFile: item.isFile, isSymbolicLink: item.isSymbolicLink, nlink: item.nlink }).toEqual({ isFile: true, isSymbolicLink: false, nlink: '1' });
+  expect(intakeNames.slice().sort()).toEqual(['ledger.json', beforeNames[0]].sort());
+  await absent(residue);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  const targets = [current, snapshotA, snapshotB, adjacentA, terminalA];
+  const relative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+  const before = await files(base);
+  const raw = await page.evaluate(async id => { try { return { preview: await window.captureDeletion.preview({ id }) }; } catch (error) { return { error: error.message }; } }, captureA.id);
+  await fs.writeFile(testInfo.outputPath('actual-older-title-raw-preview.json'), JSON.stringify(raw, null, 2));
+  expect(await files(base)).toEqual(before);
+  expect(raw.error, 'Actual completed older-title writer must receive a source-only preview').toBeUndefined();
+  expect(raw.preview.targets.slice().sort()).toEqual(targets.map(relative).sort());
+  expect(raw.preview.revisions).toBe(2);
+  await page.evaluate(token => window.captureDeletion.cancel({ token }), raw.preview.token);
+  expect(await files(base)).toEqual(before);
+  const preview = page.getByLabel('Capture deletion preview');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible(); await expect(preview).toContainText('2 revision snapshots');
+  expect((await preview.locator('p').allTextContents()).filter(text => text.startsWith('Remove: ')).sort()).toEqual(targets.map(file => 'Remove: ' + relative(file)).sort());
+  expect(await files(base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = await readLedger(), authority = deleted.sourceAuthority[captureA.id];
+  expect(authority.phase).toBe('deleted'); expect(authority.inventoryVersion).toBe(2);
+  expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(relative).sort());
+  expect(authority.targets.find(item => item.file === relative(terminalA)).kind).toBe('source-backup');
+  expect(authority.titleProofs).toEqual([{ before: relative(adjacentA), after: relative(terminalA), snapshot: relative(snapshotA), revisionId: revisionA, sourceGeneration: admittedA[0].sourceGeneration || null }]);
+  expect(authority.titleProofs[0].sourceGeneration).not.toBe(authority.generation);
+  expect(JSON.stringify(authority)).not.toContain(title);
+  expect(deleted.attempts).toEqual(completed.attempts); expect(deleted.admissions).toEqual(completed.admissions);
+  expect(deleted.suppressed).toContain(sourceHash);
+  await absent([...targets, ...residue]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = await readLedger();
+  expect(restarted.sourceAuthority[captureA.id]).toEqual(authority);
+  expect(restarted.attempts).toEqual(completed.attempts); expect(restarted.admissions).toEqual(completed.admissions);
+  await absent([...targets, ...residue]);
+  expect(await fs.readdir(captures)).toEqual([]); expect(await fs.readdir(path.join(base, 'Revisions'))).toEqual([]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
+test('older imported title deletion holds BODY writing in its actual incoming-B before-file containing titled A', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const state = await normalOlderTitleWriter(testInfo, 'older-title-terminal-body');
+  const beforeEdit = await files(state.base), originalBytes = await fs.readFile(state.terminalA), originalStat = await fs.lstat(state.terminalA, { bigint: true });
+  const body = Buffer.from('\nOLDERTERMINALINDEPENDENTBODY My authored interpretation exists only in this actual retained titled-A file.\n', 'utf8');
+  await fs.appendFile(state.terminalA, body);
+  const editedBytes = await fs.readFile(state.terminalA), editedStat = await fs.lstat(state.terminalA, { bigint: true });
+  expect(editedBytes).toEqual(Buffer.concat([originalBytes, body]));
+  expect(editedStat.dev).toBe(originalStat.dev); expect(editedStat.ino).toBe(originalStat.ino); expect(editedStat.nlink).toBe(1n);
+  const before = await files(state.base), relative = path.relative(state.base, state.terminalA).split(path.sep).join('/');
+  expect(before).toEqual({ ...beforeEdit, [relative]: editedBytes.toString('base64') });
+  expect(await fs.readFile(state.ledgerFile)).toEqual(state.ledgerBytes);
+  const raw = await page.evaluate(async id => { try { return { preview: await window.captureDeletion.preview({ id }) }; } catch (error) { return { error: error.message }; } }, state.captureA.id);
+  await fs.writeFile(testInfo.outputPath('older-title-terminal-body-result.json'), JSON.stringify({ control: 'Only append independent BODY writing to the actual ordinary incoming-B before-file containing titled A; ledger/admissions/snapshots/current untouched.', file: state.terminalA, payloadRevision: state.revisionA, incomingNameRevision: state.revisionB, originalSha256: sha256(originalBytes), editedSha256: sha256(editedBytes), originalIdentity: { dev: String(originalStat.dev), ino: String(originalStat.ino) }, raw }, null, 2));
+  expect(raw.error).toContain('Title recovery contains changed or unsupported writing');
+  expect(raw.preview).toBeUndefined();
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(state.base)).toEqual(before);
+  expect(await fs.readFile(state.ledgerFile)).toEqual(state.ledgerBytes);
+  const retained = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8'));
+  expect(retained).toEqual(state.ledger);
+  expect(retained.attempts).toEqual(state.ledger.attempts); expect(retained.admissions).toEqual(state.ledger.admissions);
+  expect(retained.sourceAuthority).toEqual(state.ledger.sourceAuthority); expect(retained.suppressed).toEqual(state.ledger.suppressed);
+  for (const observation of state.observations) {
+    const stat = await fs.lstat(observation.file, { bigint: true });
+    expect({ dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) }).toEqual({ dev: observation.dev, ino: observation.ino, nlink: '1' });
+  }
+  expect(await fs.readFile(state.terminalA)).toEqual(editedBytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(state.producerBytes);
+});
+
+test('older imported title proof cannot waive canonical current-B BODY checks after a controlled currentHash cache edit', async ({}, testInfo) => {
+  test.setTimeout(120000);
+  const state = await normalOlderTitleWriter(testInfo, 'older-title-current-body');
+  const beforeEdit = await files(state.base), originalBytes = await fs.readFile(state.current), originalStat = await fs.lstat(state.current, { bigint: true });
+  const body = Buffer.from('\nCURRENTBINDEPENDENTBODY My authored interpretation was appended to current B after both normal admissions.\n', 'utf8');
+  await fs.appendFile(state.current, body);
+  const editedBytes = await fs.readFile(state.current), editedStat = await fs.lstat(state.current, { bigint: true });
+  expect(editedBytes).toEqual(Buffer.concat([originalBytes, body]));
+  expect(editedStat.dev).toBe(originalStat.dev); expect(editedStat.ino).toBe(originalStat.ino); expect(editedStat.nlink).toBe(1n);
+  // Explicit corruption control: pass the earlier cached-hash check so this
+  // test reaches the current canonical renderer despite the valid older A proof.
+  // Immutable producer facts and revision snapshots are never rewritten.
+  const controlled = JSON.parse(state.ledgerBytes);
+  controlled.captures[sourceHash].currentHash = sha256(editedBytes);
+  expect(controlled).toEqual({ ...state.ledger, captures: { ...state.ledger.captures, [sourceHash]: { ...state.ledger.captures[sourceHash], currentHash: sha256(editedBytes) } } });
+  const controlledLedgerBytes = Buffer.from(JSON.stringify(controlled, null, 2), 'utf8');
+  await fs.writeFile(state.ledgerFile, controlledLedgerBytes);
+  const before = await files(state.base), currentRelative = path.relative(state.base, state.current).split(path.sep).join('/'), ledgerRelative = path.relative(state.base, state.ledgerFile).split(path.sep).join('/');
+  expect(before).toEqual({ ...beforeEdit, [currentRelative]: editedBytes.toString('base64'), [ledgerRelative]: controlledLedgerBytes.toString('base64') });
+  const raw = await page.evaluate(async id => { try { return { preview: await window.captureDeletion.preview({ id }) }; } catch (error) { return { error: error.message }; } }, state.captureA.id);
+  await fs.writeFile(testInfo.outputPath('older-title-current-body-result.json'), JSON.stringify({ control: 'Normal writer state first; append BODY to actual current B, then change ONLY cached captures[sourceHash].currentHash to that edited SHA. This cache edit is controlled corruption, not real producer or title writer output. Immutable attempts/admissions and both literal snapshots remain unchanged.', current: state.current, currentRevision: state.revisionB, olderProofRevision: state.revisionA, originalSha256: sha256(originalBytes), editedSha256: sha256(editedBytes), originalCachedCurrentHash: state.ledger.captures[sourceHash].currentHash, controlledCachedCurrentHash: controlled.captures[sourceHash].currentHash, originalIdentity: { dev: String(originalStat.dev), ino: String(originalStat.ino) }, raw }, null, 2));
+  // This exact later inventory refusal distinguishes the canonical guard from
+  // CaptureDeletion's initial currentHash refusal and source-title edge failures.
+  expect(raw.error).toContain('Source recovery inventory contains changed or unsupported writing');
+  expect(raw.preview).toBeUndefined();
+  await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+  expect(await files(state.base)).toEqual(before);
+  expect(await fs.readFile(state.ledgerFile)).toEqual(controlledLedgerBytes);
+  const retained = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8'));
+  expect(retained).toEqual(controlled);
+  expect(retained.attempts).toEqual(state.ledger.attempts); expect(retained.admissions).toEqual(state.ledger.admissions);
+  expect(retained.sourceAuthority).toEqual(state.ledger.sourceAuthority); expect(retained.suppressed).toEqual(state.ledger.suppressed);
+  for (const observation of state.observations) {
+    const stat = await fs.lstat(observation.file, { bigint: true });
+    expect({ dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink) }).toEqual({ dev: observation.dev, ino: observation.ino, nlink: '1' });
+  }
+  expect(await fs.readFile(state.current)).toEqual(editedBytes);
+  expect(await files(path.join(root, 'producer'))).toEqual(state.producerBytes);
+});
+
+test('normal A-title B-title C intake deletion proves both older admission groups and preserves canonical current C', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  const state = await normalOlderTitleWriter(testInfo, 'older-title-multiple-initial');
+  const currentB = await fs.readFile(state.current), fieldsB = fields(currentB), snapshotB = path.join(state.base, 'Revisions', state.revisionB + '.json');
+  const terminalABytes = await fs.readFile(state.terminalA);
+  const snapshotsBeforeC = {};
+  for (const revision of [state.revisionA, state.revisionB]) snapshotsBeforeC[revision] = await fs.readFile(path.join(state.base, 'Revisions', revision + '.json'));
+  const priorAdjacentNames = new Set((await fs.readdir(path.dirname(state.current))).filter(name => name.startsWith(state.captureA.file + '.before-title-')));
+  const titleB = 'Second B title: [beta] "literal" & ready?';
+  await page.getByLabel('Display title', { exact: true }).fill(titleB);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  await expect(page.getByRole('heading', { name: titleB, exact: true })).toBeVisible();
+  const titledB = await fs.readFile(state.current), added = (await fs.readdir(path.dirname(state.current))).filter(name => name.startsWith(state.captureA.file + '.before-title-') && !priorAdjacentNames.has(name));
+  expect(added).toHaveLength(1);
+  const adjacentB = path.join(path.dirname(state.current), added[0]);
+  expect(await fs.readFile(adjacentB)).toEqual(currentB);
+  expect(fields(titledB)).toEqual({ ...fieldsB, title: titleB });
+  const sourceBody = bytes => bytes.toString('utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n\r?\n#[^\r\n]*\r?\n/, '');
+  expect(sourceBody(titledB)).toBe(sourceBody(currentB));
+  const afterTitle = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8'));
+  expect(afterTitle.attempts).toEqual(state.ledger.attempts); expect(afterTitle.admissions).toEqual(state.ledger.admissions);
+  expect(await files(path.join(root, 'producer'))).toEqual(state.producerBytes);
+  await artifact('third', '3');
+  const producerBytes = await files(path.join(root, 'producer'));
+  for (const name of ['first', 'second']) {
+    const prefix = name + '/';
+    expect(Object.fromEntries(Object.entries(producerBytes).filter(([file]) => file.startsWith(prefix)))).toEqual(Object.fromEntries(Object.entries(state.producerBytes).filter(([file]) => file.startsWith(prefix))));
+  }
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await expect(page.getByRole('heading', { name: titleB, exact: true })).toBeVisible();
+  const completed = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8')), captureC = completed.captures[sourceHash], revisionC = captureC.currentRevision;
+  const snapshotC = path.join(state.base, 'Revisions', revisionC + '.json'), terminalB = path.join(state.intake, state.captureA.id + '-' + revisionC + '.before.md');
+  const captureNames = await fs.readdir(path.dirname(state.current)), snapshotNames = await fs.readdir(path.join(state.base, 'Revisions')), intakeNames = await fs.readdir(state.intake);
+  const actualPaths = [...captureNames.map(name => path.join(path.dirname(state.current), name)), ...snapshotNames.map(name => path.join(state.base, 'Revisions', name)), ...intakeNames.filter(name => name !== 'ledger.json').map(name => path.join(state.intake, name))], observations = [];
+  for (const file of actualPaths) {
+    const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    observations.push({ file, sha256: sha256(bytes), length: bytes.length, dev: String(stat.dev), ino: String(stat.ino), nlink: String(stat.nlink), isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() });
+  }
+  // Observe the real completed three-admission writer before freezing counts.
+  await fs.writeFile(testInfo.outputPath('actual-older-title-multiple-writer.json'), JSON.stringify({ origin: 'Normal A import/title, normal B import/title, normal C import; no manufactured recovery, admission, journal or cache edits.', revisionA: state.revisionA, revisionB: state.revisionB, revisionC, attempts: completed.attempts, admissions: completed.admissions || {}, captureNames, snapshotNames, intakeNames, observations }, null, 2));
+  expect(new Set([state.revisionA, state.revisionB, revisionC]).size).toBe(3);
+  expect(observations).toHaveLength(8);
+  expect(new Set(observations.map(item => item.dev + ':' + item.ino)).size).toBe(8);
+  for (const item of observations) expect({ isFile: item.isFile, isSymbolicLink: item.isSymbolicLink, nlink: item.nlink }).toEqual({ isFile: true, isSymbolicLink: false, nlink: '1' });
+  for (const prior of state.observations.filter(item => item.file !== state.current)) expect(observations.find(item => item.file === prior.file)).toEqual(prior);
+  expect(captureC).toMatchObject({ id: state.captureA.id, file: state.captureA.file, capturedAt: state.captureA.capturedAt, title: titleB });
+  expect(captureC.revisions.slice().sort()).toEqual([state.revisionA, state.revisionB, revisionC].sort());
+  expect(Object.keys(completed.attempts)).toHaveLength(3);
+  for (const [identity, admission] of Object.entries(state.ledger.attempts)) expect(completed.attempts[identity]).toEqual(admission);
+  expect(completed.admissions).toEqual(state.ledger.admissions);
+  for (const [revision, bytes] of Object.entries(snapshotsBeforeC)) expect(await fs.readFile(path.join(state.base, 'Revisions', revision + '.json'))).toEqual(bytes);
+  const admissionC = Object.values(completed.attempts).filter(item => item.revision === revisionC);
+  expect(admissionC).toHaveLength(1);
+  expect(admissionC[0]).toMatchObject({ captureId: state.captureA.id, sourceHash, snapshotHash: sha256(await fs.readFile(snapshotC)) });
+  expect(await fs.readFile(state.terminalA)).toEqual(terminalABytes);
+  expect(fields(await fs.readFile(state.terminalA)).source_revision).toBe(state.revisionA);
+  expect(await fs.readFile(terminalB)).toEqual(titledB);
+  expect(fields(await fs.readFile(terminalB)).source_revision).toBe(state.revisionB);
+  const currentC = await fs.readFile(state.current);
+  expect(fields(currentC)).toEqual({ ...fieldsB, title: titleB, source_revision: revisionC, imported_at: JSON.parse(await fs.readFile(snapshotC, 'utf8')).importedAt });
+  expect(captureC.currentHash).toBe(sha256(currentC));
+  const adjacentA = state.targets.find(file => path.basename(file).startsWith(state.captureA.file + '.before-title-'));
+  const snapshotA = path.join(state.base, 'Revisions', state.revisionA + '.json'), targets = [state.current, snapshotA, snapshotB, snapshotC, adjacentA, adjacentB, state.terminalA, terminalB];
+  expect(actualPaths.slice().sort()).toEqual(targets.slice().sort());
+  expect(intakeNames.slice().sort()).toEqual([path.basename(state.terminalA), path.basename(terminalB), 'ledger.json'].sort());
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  const relative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/'), before = await files(state.base);
+  const raw = await page.evaluate(async id => { try { return { preview: await window.captureDeletion.preview({ id }) }; } catch (error) { return { error: error.message }; } }, state.captureA.id);
+  await fs.writeFile(testInfo.outputPath('actual-older-title-multiple-raw-preview.json'), JSON.stringify(raw, null, 2));
+  expect(await files(state.base)).toEqual(before);
+  expect(raw.error).toBeUndefined(); expect(raw.preview.targets.slice().sort()).toEqual(targets.map(relative).sort()); expect(raw.preview.revisions).toBe(3);
+  await page.evaluate(token => window.captureDeletion.cancel({ token }), raw.preview.token);
+  expect(await files(state.base)).toEqual(before);
+  const preview = page.getByLabel('Capture deletion preview');
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await expect(preview).toBeVisible(); await expect(preview).toContainText('3 revision snapshots');
+  expect((await preview.locator('p').allTextContents()).filter(text => text.startsWith('Remove: ')).sort()).toEqual(targets.map(file => 'Remove: ' + relative(file)).sort());
+  expect(await files(state.base)).toEqual(before);
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+  await expect(preview).toBeHidden(); expect(await files(state.base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const deleted = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8')), authority = deleted.sourceAuthority[state.captureA.id];
+  const proofs = [
+    { before: relative(adjacentA), after: relative(state.terminalA), snapshot: relative(snapshotA), revisionId: state.revisionA, sourceGeneration: Object.values(completed.attempts).find(item => item.revision === state.revisionA).sourceGeneration || null },
+    { before: relative(adjacentB), after: relative(terminalB), snapshot: relative(snapshotB), revisionId: state.revisionB, sourceGeneration: Object.values(completed.attempts).find(item => item.revision === state.revisionB).sourceGeneration || null }
+  ].sort((left, right) => left.before < right.before ? -1 : left.before > right.before ? 1 : 0);
+  expect(authority.phase).toBe('deleted'); expect(authority.inventoryVersion).toBe(2);
+  expect(authority.targets.map(item => item.file).sort()).toEqual(targets.map(relative).sort());
+  expect(authority.titleProofs).toEqual(proofs);
+  expect(authority.titleProofs.some(item => item.revisionId === revisionC)).toBe(false);
+  expect(authority.recovery).toEqual([]); expect(authority.recoveryPointers).toEqual([]);
+  expect(JSON.stringify(authority)).not.toContain(titleB); expect(JSON.stringify(authority)).not.toContain(fieldsB.title);
+  expect(deleted.attempts).toEqual(completed.attempts); expect(deleted.admissions).toEqual(completed.admissions);
+  expect(deleted.suppressed).toContain(sourceHash); await absent(targets);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8'));
+  expect(restarted.sourceAuthority[state.captureA.id]).toEqual(authority);
+  expect(restarted.attempts).toEqual(completed.attempts); expect(restarted.admissions).toEqual(completed.admissions);
+  await absent(targets);
+  expect(await fs.readdir(path.dirname(state.current))).toEqual([]); expect(await fs.readdir(path.join(state.base, 'Revisions'))).toEqual([]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
+
+test('restored-generation older title proof recovers after an actual first unlink and main-process exit without source omissions', async ({}, testInfo) => {
+  test.setTimeout(150000);
+  await artifact('first', '1');
+  const firstProducer = await files(path.join(root, 'producer', 'first'));
+  await launch();
+  await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
+  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Vault ready.');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.join(root, 'producer'));
+  await page.getByRole('checkbox', { name: 'Scan existing drafts now', exact: true }).check();
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
+  const readLedger = async () => JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
+  const seed = await readLedger(), seedCapture = seed.captures[sourceHash], id = seedCapture.id;
+  const seedSnapshot = path.join(base, 'Revisions', seedCapture.currentRevision + '.json');
+  expect(Object.keys(seed.attempts)).toHaveLength(1);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  const seedDeleted = await readLedger();
+  await absent([seedSnapshot]);
+  await page.getByRole('button', { name: 'Review suppressed captures', exact: true }).click();
+  const restoration = page.getByLabel('Source restoration');
+  await restoration.getByLabel('Selected producer artifact folder', { exact: true }).fill(path.join(root, 'producer', 'first'));
+  await restoration.getByRole('button', { name: 'Preview source restoration', exact: true }).click();
+  await expect(restoration).toContainText('Only this selected producer artifact');
+  expect(await readLedger()).toEqual(seedDeleted);
+  await restoration.getByRole('button', { name: 'Confirm source restoration', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source restored');
+  const restored = await readLedger(), captureA = restored.captures[sourceHash], revisionA = captureA.currentRevision, generationG = restored.sourceAuthority[id].generation;
+  expect(restored.sourceAuthority[id].phase).toBe('active');
+  expect(generationG).toMatch(/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/);
+  expect(generationG).not.toBe(seedDeleted.sourceAuthority[id].generation);
+  expect(revisionA).not.toBe(seedCapture.currentRevision);
+  expect(captureA).toMatchObject({ id, capturedAt: seedCapture.capturedAt, file: seedCapture.file });
+  expect(captureA.revisions).toEqual([revisionA]);
+  expect(restored.attempts).toEqual(seed.attempts);
+  const admissionA = restored.admissions[revisionA];
+  expect(admissionA).toMatchObject({ revision: revisionA, captureId: id, sourceHash, sourceGeneration: generationG, identity: Object.keys(seed.attempts)[0], fingerprint: Object.values(seed.attempts)[0].fingerprint });
+  expect(restored.sourceAuthority[id].history).toEqual([seedDeleted.sourceAuthority[id]]);
+  await absent([seedSnapshot]);
+  const current = path.join(base, 'Captures', captureA.file), snapshotA = path.join(base, 'Revisions', revisionA + '.json');
+  const originalA = await fs.readFile(current), snapshotABytes = await fs.readFile(snapshotA);
+  expect(sha256(snapshotABytes)).toBe(admissionA.snapshotHash);
+  const title = 'Restored older A: [literal] "title" & survivor?';
+  await page.getByLabel('Display title', { exact: true }).fill(title);
+  await page.getByRole('button', { name: 'Save title', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Title saved.');
+  await expect(page.getByRole('heading', { name: title, exact: true })).toBeVisible();
+  const titledA = await fs.readFile(current), titleLedger = await readLedger();
+  expect(fields(titledA)).toEqual({ ...fields(originalA), title });
+  const sourceBody = bytes => bytes.toString('utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n\r?\n#[^\r\n]*\r?\n/, '');
+  expect(sourceBody(titledA)).toBe(sourceBody(originalA));
+  expect(titleLedger.attempts).toEqual(seed.attempts); expect(titleLedger.admissions).toEqual(restored.admissions);
+  const adjacentNames = (await fs.readdir(path.dirname(current))).filter(name => name.startsWith(captureA.file + '.before-title-'));
+  expect(adjacentNames).toHaveLength(1);
+  const adjacentA = path.join(path.dirname(current), adjacentNames[0]);
+  expect(await fs.readFile(adjacentA)).toEqual(originalA);
+  await artifact('second', '2');
+  const producerBytes = await files(path.join(root, 'producer'));
+  expect(await files(path.join(root, 'producer', 'first'))).toEqual(firstProducer);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const completed = await readLedger(), captureB = completed.captures[sourceHash], revisionB = captureB.currentRevision;
+  expect(revisionB).not.toBe(revisionA);
+  expect(captureB).toMatchObject({ id, file: captureA.file, capturedAt: captureA.capturedAt, title });
+  expect(captureB.revisions.slice().sort()).toEqual([revisionA, revisionB].sort());
+  expect(completed.sourceAuthority[id].generation).toBe(generationG);
+  expect(completed.sourceAuthority[id].history).toEqual(restored.sourceAuthority[id].history);
+  expect(Object.keys(completed.attempts)).toHaveLength(2);
+  for (const [identity, attempt] of Object.entries(seed.attempts)) expect(completed.attempts[identity]).toEqual(attempt);
+  expect(completed.admissions[revisionA]).toEqual(admissionA);
+  const admissionB = completed.admissions[revisionB];
+  expect(admissionB).toMatchObject({ revision: revisionB, captureId: id, sourceHash, sourceGeneration: generationG });
+  expect(admissionB.identity).not.toBe(admissionA.identity);
+  expect(completed.attempts[admissionB.identity]).toEqual(admissionB);
+  const snapshotB = path.join(base, 'Revisions', revisionB + '.json'), terminalA = path.join(intake, id + '-' + revisionB + '.before.md');
+  expect(sha256(await fs.readFile(snapshotB))).toBe(admissionB.snapshotHash);
+  expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+  expect(await fs.readFile(terminalA)).toEqual(titledA);
+  expect(fields(await fs.readFile(terminalA)).source_revision).toBe(revisionA);
+  const currentB = await fs.readFile(current);
+  expect(fields(currentB)).toEqual({ ...fields(originalA), title, source_revision: revisionB, imported_at: JSON.parse(await fs.readFile(snapshotB, 'utf8')).importedAt });
+  expect(captureB.currentHash).toBe(sha256(currentB));
+  const targets = [current, snapshotA, snapshotB, adjacentA, terminalA], relative = file => path.relative(path.join(root, 'vault'), file).split(path.sep).join('/');
+  const observations = [];
+  for (const file of targets) {
+    const bytes = await fs.readFile(file), stat = await fs.lstat(file, { bigint: true });
+    observations.push({ file: relative(file), sha256: sha256(bytes), dev: String(stat.dev), ino: String(stat.ino), bytes: String(bytes.length), nlink: String(stat.nlink), isFile: stat.isFile(), isSymbolicLink: stat.isSymbolicLink() });
+  }
+  await fs.writeFile(testInfo.outputPath('older-title-restored-writer.json'), JSON.stringify({ origin: 'Public seed deletion, explicit identical producer restoration to fresh A/G, public A title, normal distinct-attempt B. No source omissions or admission edits.', revisionA, revisionB, generationG, originalSeedAttempts: seed.attempts, completedAttempts: completed.attempts, completedAdmissions: completed.admissions, observations }, null, 2));
+  expect(new Set(observations.map(item => item.dev + ':' + item.ino)).size).toBe(5);
+  for (const item of observations) expect({ nlink: item.nlink, isFile: item.isFile, isSymbolicLink: item.isSymbolicLink }).toEqual({ nlink: '1', isFile: true, isSymbolicLink: false });
+  expect((await fs.readdir(intake)).sort()).toEqual([path.basename(terminalA), 'ledger.json'].sort());
+  expect((await fs.readdir(path.dirname(current))).sort()).toEqual([captureA.file, path.basename(adjacentA)].sort());
+  expect((await fs.readdir(path.join(base, 'Revisions'))).sort()).toEqual([revisionA + '.json', revisionB + '.json'].sort());
+  await absent([seedSnapshot, current + '.pending', current + '.title-transaction.json', path.join(intake, 'title-intent.json'), path.join(intake, 'transaction.json')]);
+  const before = await files(base);
+  const raw = await page.evaluate(async captureId => { try { return { preview: await window.captureDeletion.preview({ id: captureId }) }; } catch (error) { return { error: error.message }; } }, id);
+  await fs.writeFile(testInfo.outputPath('older-title-restored-raw-preview.json'), JSON.stringify(raw, null, 2));
+  expect(raw.error).toBeUndefined(); expect(raw.preview.targets.slice().sort()).toEqual(targets.map(relative).sort()); expect(raw.preview.revisions).toBe(2);
+  expect(await files(base)).toEqual(before);
+  await page.evaluate(token => window.captureDeletion.cancel({ token }), raw.preview.token);
+  expect(await files(base)).toEqual(before);
+  await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+  const reviewBeforeExit = page.getByLabel('Capture deletion preview');
+  await expect(reviewBeforeExit).toBeVisible(); await expect(reviewBeforeExit).toContainText('2 revision snapshots');
+  expect((await reviewBeforeExit.locator('p').allTextContents()).filter(text => text.startsWith('Remove: ')).sort()).toEqual(targets.map(file => 'Remove: ' + relative(file)).sort());
+  expect(await files(base)).toEqual(before);
+  const firstRelative = raw.preview.targets[0], firstFile = path.join(root, 'vault', firstRelative), observer = path.join(root, 'older-title-first-native-unlink.json'), faults = path.join(root, 'faults.json');
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), nativeUnlink = io.unlinkSync;
+    const exact = paths.resolve(options.firstFile).toLowerCase();
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
+      if (typeof file === 'string' && paths.resolve(file).toLowerCase() === exact) {
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, exactFirstFile: options.firstFile, nativeUnlinkReturned: true, controlledSourceOmissions: [] }, null, 2), 'utf8');
+      }
+      return result;
+    };
+  }, { firstFile, observer });
+  await fs.writeFile(faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+  await reviewBeforeExit.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('capture-deletion-unlinked');
+  const nativeObservation = JSON.parse(await fs.readFile(observer, 'utf8'));
+  expect(nativeObservation).toEqual({ mainPid: await app.evaluate(() => process.pid), exactFirstFile: firstFile, nativeUnlinkReturned: true, controlledSourceOmissions: [] });
+  const authorized = await readLedger(), authority = authorized.sourceAuthority[id], expectedProof = { before: relative(adjacentA), after: relative(terminalA), snapshot: relative(snapshotA), revisionId: revisionA, sourceGeneration: generationG };
+  expect(authority.phase).toBe('deleting'); expect(authority.inventoryVersion).toBe(2);
+  expect(authority.generation).not.toBe(generationG);
+  expect(authority.originGenerations).toEqual([{ captureId: id, generation: generationG }]);
+  expect(authority.titleProofs).toEqual([expectedProof]);
+  expect(JSON.stringify(authority)).not.toContain(title);
+  expect(authority.targets.map(item => item.file)).toEqual(raw.preview.targets);
+  expect(authority.history).toEqual(completed.sourceAuthority[id].history);
+  expect(authorized.attempts).toEqual(completed.attempts); expect(authorized.admissions).toEqual(completed.admissions); expect(authorized.suppressed).toContain(sourceHash);
+  const missing = [], surviving = [];
+  for (const target of authority.targets) {
+    const file = path.join(root, 'vault', target.file), original = observations.find(item => item.file === target.file);
+    let stat; try { stat = await fs.lstat(file, { bigint: true }); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (!stat) { missing.push({ file: target.file, kind: target.kind }); continue; }
+    expect(stat.isFile()).toBe(true); expect(stat.isSymbolicLink()).toBe(false); expect(stat.nlink).toBe(1n);
+    expect({ dev: String(stat.dev), ino: String(stat.ino), bytes: String(stat.size), sha256: sha256(await fs.readFile(file)) }).toEqual({ dev: original.dev, ino: original.ino, bytes: original.bytes, sha256: original.sha256 });
+    surviving.push({ file: target.file, kind: target.kind });
+  }
+  expect(missing).toEqual([{ file: firstRelative, kind: authority.targets[0].kind }]); expect(surviving).toHaveLength(4);
+  await fs.copyFile(observer, testInfo.outputPath('older-title-first-native-unlink.json'));
+  await fs.writeFile(testInfo.outputPath('older-title-first-unlink-survivors.json'), JSON.stringify({ generationG, deletingGenerationH: authority.generation, proof: expectedProof, missing, surviving, controlledSourceOmissions: [] }, null, 2));
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid), processEvidence = { boundary: 'capture-deletion-unlinked', wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
+  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  processEvidence.wrapperExit = await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
+  await fs.writeFile(testInfo.outputPath('older-title-first-unlink-main-processes.json'), JSON.stringify(processEvidence, null, 2), 'utf8'); app = null;
+  await absent([firstFile, seedSnapshot]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  await fs.writeFile(faults, '{}'); await launch();
+  await expect.poll(async () => (await readLedger()).sourceAuthority[id].phase).toBe('deleted');
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const recovered = await readLedger();
+  expect(recovered.sourceAuthority[id]).toEqual({ ...authority, phase: 'deleted' });
+  expect(recovered.sourceAuthority[id].titleProofs).toEqual([expectedProof]);
+  expect(recovered.attempts).toEqual(completed.attempts); expect(recovered.admissions).toEqual(completed.admissions); expect(recovered.suppressed).toEqual(authorized.suppressed);
+  await absent([...targets, seedSnapshot]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await app.close(); app = null; await launch();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+  await expect(page.locator('#captures article')).toHaveCount(0);
+  const restarted = await readLedger();
+  expect(restarted.sourceAuthority[id]).toEqual(recovered.sourceAuthority[id]);
+  expect(restarted.attempts).toEqual(completed.attempts); expect(restarted.admissions).toEqual(completed.admissions);
+  await absent([...targets, seedSnapshot]);
+  expect(await fs.readdir(path.dirname(current))).toEqual([]); expect(await fs.readdir(path.join(base, 'Revisions'))).toEqual([]);
+  expect(await files(path.join(root, 'producer'))).toEqual(producerBytes);
+});
