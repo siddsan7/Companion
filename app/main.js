@@ -184,16 +184,16 @@ app.whenReady().then(async () => {
     const selected = vault, now = clock().now;
     if (!selected) throw Error('Choose a vault first.');
     const selectedSchedule = schedule(selected);
-    const result = await orderVaultWork(selected, () => work(new Intake(selected), now));
-    return selectedSchedule.record(result);
+    return orderVaultWork(selected, () => work(new Intake(selected), now,
+      (result, verifyLatest) => selectedSchedule.record(result, verifyLatest)));
   }
-  ipcMain.handle('connect-drafts', (_, { folder, scan }) => intakeRequest((intake, now) => intake.connect(folder, scan, now)));
-  ipcMain.handle('connect-reviews', (_, { folder, scan }) => intakeRequest((intake, now) => intake.connect(folder, scan, now, 'review')));
+  ipcMain.handle('connect-drafts', (_, { folder, scan }) => intakeRequest((intake, now, onComplete) => intake.connect(folder, scan, now, 'draft', onComplete)));
+  ipcMain.handle('connect-reviews', (_, { folder, scan }) => intakeRequest((intake, now, onComplete) => intake.connect(folder, scan, now, 'review', onComplete)));
   ipcMain.handle('reconnect-source', (_, { location, ...input }) => intakeRequest(intake => {
     if (intake.vault.root !== location) throw Error('Vault selection changed. Refresh and try again.');
     return intake.reconnect(input);
   }));
-  ipcMain.handle('check-intake', () => intakeRequest((intake, now) => intake.reconcile({ trigger: 'manual', now })));
+  ipcMain.handle('check-intake', () => intakeRequest((intake, now, onComplete) => intake.reconcile({ trigger: 'manual', now, onComplete })));
   ipcMain.handle('add-annotation', async (_, input) => new Intake(vault).addAnnotation(input, clock().now));
   ipcMain.handle('choose-identity', async (_, input) => new Intake(vault).chooseIdentity(input));
   ipcMain.handle('retry-annotation-link', async (_, input) => new Intake(vault).retryLink(input));

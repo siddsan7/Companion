@@ -130,7 +130,11 @@ archiveRestore.onclick = async () => {
     if (result.preservedMetadata) archiveRestoreSummary.textContent += ` Preserved ${result.preservedMetadata} inert settings records. Active settings and task/provider connections were not changed.`;
     await showArchiveIntents();
   } catch (error) { archiveRestoreSummary.textContent = error.message.replace(/^Error invoking remote method '[^']+': Error: /, ''); archiveInspection = null; }
-  finally { archiveInspect.disabled = false; updateArchiveMatchControls(); }
+  finally {
+    archiveInspect.disabled = false;
+    updateArchiveMatchControls();
+    await refreshRestorationRecovery();
+  }
 };
 async function showArchiveIntents() {
   try {

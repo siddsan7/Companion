@@ -267,25 +267,27 @@ class Briefs {
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
   }
   async managedClaim(version, name, guard, receipt) {
-    const file = path.join(this.dir, name);
     try {
-      const { bytes, proof } = await readExact(file, guard);
-      const data = metadata(bytes);
-      const recordedVersion = data?.record?.version;
-      const valid = approvedMetadata(data, recordedVersion);
-      const checksumClaim = checksumName.test(name);
-      const checksumMatches = name === `approved-${version}-${proof.digest}.md`;
-      if (!checksumClaim && valid && recordedVersion !== version) return null;
-      const owner = data?.managed_parent;
-      const foreign = valid && validParent(owner) && !parentMatches(owner, this.managedParent) &&
-        receipt?.id !== data.record.id && (!checksumClaim || checksumMatches);
-      if (foreign) return null;
-      const readableRename = !checksumClaim && receipt &&
-        receipt.id === data?.record?.id && receipt.digest === proof.digest;
-      if ((!checksumMatches && !readableRename) || !valid || recordedVersion !== version ||
-          owner !== undefined && (!receipt || !parentMatches(owner, this.managedParent))) throw integrityError(name);
-      return { file, proof, data, guard };
+      const exact = await readExact(path.join(this.dir, name), guard);
+      return this.managedClaimFromExact(version, name, guard, receipt, exact);
     } catch (error) { throw Error(integrityError(name).message, { cause: error }); }
+  }
+  managedClaimFromExact(version, name, guard, receipt, { bytes, proof }) {
+    const data = metadata(bytes);
+    const recordedVersion = data?.record?.version;
+    const valid = approvedMetadata(data, recordedVersion);
+    const checksumClaim = checksumName.test(name);
+    const checksumMatches = name === `approved-${version}-${proof.digest}.md`;
+    if (!checksumClaim && valid && recordedVersion !== version) return null;
+    const owner = data?.managed_parent;
+    const foreign = valid && validParent(owner) && !parentMatches(owner, this.managedParent) &&
+      receipt?.id !== data.record.id && (!checksumClaim || checksumMatches);
+    if (foreign) return null;
+    const readableRename = !checksumClaim && receipt &&
+      receipt.id === data?.record?.id && receipt.digest === proof.digest;
+    if ((!checksumMatches && !readableRename) || !valid || recordedVersion !== version ||
+        owner !== undefined && (!receipt || !parentMatches(owner, this.managedParent))) throw integrityError(name);
+    return { file: path.join(this.dir, name), proof, data, guard };
   }
   receiptValue(version, id, digest) {
     return { schema: 1, parent: this.managedParent, id, version, digest };
@@ -441,31 +443,54 @@ class Briefs {
     };
     return lockHeld ? reserve() : withBriefMutation(this.vault.root, reserve);
   }
+  *approvalFiles(directory, canonicalFiles) {
+    const guard = this.folderGuard(directory);
+    guard();
+    const children = local.readdirSync(directory, { withFileTypes: true });
+    guard();
+    for (const child of children) {
+      if (privateStores.has(child.name.toLowerCase()) || child.isSymbolicLink()) continue;
+      const file = path.join(directory, child.name);
+      if (child.isDirectory()) yield* this.approvalFiles(file, canonicalFiles);
+      else if (child.isFile() && /\.md$/i.test(child.name) && !canonicalFiles.has(file)) yield { file, guard };
+    }
+  }
+  approvalClaim(bytes, ids) {
+    let data;
+    try { data = metadata(bytes); } catch { return null; }
+    return data?.record?.kind === 'approved' && ids.has(data.record.id) ? data : null;
+  }
   async scanApprovalClaims(ids, canonicalFiles) {
     const claims = new Map();
     if (!ids.size) return claims;
-    const visit = async (directory, guard) => {
-      guard();
-      const children = await fs.readdir(directory, { withFileTypes: true });
-      guard();
-      for (const child of children) {
-        if (privateStores.has(child.name.toLowerCase()) || child.isSymbolicLink()) continue;
-        const file = path.join(directory, child.name);
-        if (child.isDirectory()) await visit(file, this.folderGuard(file));
-        else if (child.isFile() && /\.md$/i.test(child.name) && !canonicalFiles.has(file)) {
-          const stat = await fs.lstat(file, { bigint: true });
-          if (!stat.isFile() || stat.isSymbolicLink()) continue;
-          const { bytes, proof } = await readExact(file, guard, Number(stat.nlink));
-          let data;
-          try { data = metadata(bytes); } catch { continue; }
-          if (data?.record?.kind !== 'approved' || !ids.has(data.record.id)) continue;
-          if (!claims.has(data.record.id)) claims.set(data.record.id, []);
-          claims.get(data.record.id).push({ file, proof, data, guard, links: Number(stat.nlink) });
-        }
-      }
-    };
-    await visit(this.vault.vault, this.folderGuard(this.vault.vault));
+    for (const { file, guard } of this.approvalFiles(this.vault.vault, canonicalFiles)) {
+      const stat = await fs.lstat(file, { bigint: true });
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      const links = Number(stat.nlink), { bytes, proof } = await readExact(file, guard, links);
+      const data = this.approvalClaim(bytes, ids);
+      if (!data) continue;
+      if (!claims.has(data.record.id)) claims.set(data.record.id, []);
+      claims.get(data.record.id).push({ file, proof, data, guard, links });
+    }
     return claims;
+  }
+  verifyApprovalClaims(version, candidate, receipt, guard) {
+    guard();
+    const entry = versionEntries(local.readdirSync(this.dir)).get(version);
+    guard();
+    if (entry?.pending.length) throw integrityError(entry.pending.join(', '));
+    for (const name of entry?.canonical || []) {
+      const file = path.join(this.dir, name);
+      if (file === candidate.file) continue;
+      if (this.managedClaimFromExact(version, name, guard, receipt, readExactSync(file, guard))) throw duplicateError();
+    }
+    const ids = new Set([receipt.id]);
+    for (const { file, guard: fileGuard } of this.approvalFiles(this.vault.vault, new Set([candidate.file]))) {
+      const stat = local.lstatSync(file, { bigint: true });
+      if (!stat.isFile() || stat.isSymbolicLink()) continue;
+      const { bytes } = readExactSync(file, fileGuard, Number(stat.nlink));
+      if (this.approvalClaim(bytes, ids)) throw duplicateError();
+    }
   }
   async approvedInventory(index, onlyVersion, lockHeld) {
     const { reservation } = index;
@@ -526,6 +551,7 @@ class Briefs {
         verifyStageSync(file, candidate.guard, proof);
         const verify = () => {
           guard();
+          this.verifyApprovalClaims(version, candidate, receipt, index.guard);
           reservation.requireAvailable(file);
           verifyStageSync(receipt.file, index.guard, receipt.proof);
           verifyStageSync(file, candidate.guard, proof);
@@ -699,11 +725,21 @@ class Briefs {
     return this.state(true);
     });
   }
-  async pinned(version, observe) {
+  async approval(version) {
     if (!Number.isSafeInteger(version) || version < 1) throw Error('Approved brief version unavailable.');
-    const { records: [record], approvals } = await this.readStore({ onlyVersion: version });
-    if (!record) throw Error('Approved brief version unavailable.');
-    observe?.(approvals.get(version).verify);
+    const { approvals } = await this.readStore({ onlyVersion: version });
+    const approval = approvals.get(version);
+    if (!approval?.record) throw Error('Approved brief version unavailable.');
+    return approval;
+  }
+  async exactApproval(pin) {
+    const { record, verify } = await this.approval(pin.version);
+    if (record.id !== pin.id || record.digest !== pin.digest) throw Error('Approved brief pin changed.');
+    return verify;
+  }
+  async pinned(version, observe) {
+    const { record, verify } = await this.approval(version);
+    observe?.(verify);
     return { ...record, issues: await this.outdated(record) };
   }
   async pins(observe) {

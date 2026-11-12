@@ -187,7 +187,9 @@ class Comparisons {
       } else await this.replace(stage, destination, staged, expected.proof, guard);
       retired = true;
       verifyStageSync(destination, guard, staged);
-      this.durable.set(record.id, { directory, proof: staged });
+      const owned = { directory, proof: staged };
+      this.durable.set(record.id, owned);
+      return owned;
     } finally {
       if (!retired && !linked) {
         for (const [file, proof] of [[receipt, receiptProof], [stage, staged]]) if (proof) {
@@ -310,8 +312,14 @@ class Comparisons {
       if (!slot || slot.status !== 'pending' || JSON.stringify(record.generationPin) !== JSON.stringify(approved.snapshot.pin) || JSON.stringify(await this.build(record, slot)) !== JSON.stringify(approved.snapshot)) throw Error('Comparison conditions changed. Review the current package again.');
       Object.assign(slot, { status: 'inProgress', startedAt: this.clock().now, completedAt: null, requested: approved.snapshot.pin.requested, effective: null, messages: [], usage: null, usageEvidence: 'Usage unavailable: no valid matching provider update was observed.', elapsedMs: null, elapsedBoundary: 'Monotonic local elapsed time from before preflight to provider terminal handling, including intermediate persistence; excludes initial intent and final publication, not pure generation time.' });
       this.running.add(record.id);
-      try { await this.write(record); }
+      let intent;
+      try { intent = await this.write(record); }
       catch (error) { this.running.delete(record.id); throw error; }
+      const verifyIntent = () => {
+        try {
+          verifyStageSync(path.join(this.directory, `${record.id}.json`), () => this.safeDirectory(false, intent.directory), intent.proof);
+        } catch (error) { throw Error('Durable comparison slot changed. No request was sent.', { cause: error }); }
+      };
       const started = performance.now();
       try {
         await this.provider.preflight(); await this.checkpoint('comparison-before-dispatch');
@@ -319,6 +327,7 @@ class Comparisons {
           if (JSON.stringify(await this.build(record, slot, observe)) !== JSON.stringify(approved.snapshot)) throw Error('Comparison context, settings or proof changed before dispatch. No request was sent.');
         };
         await revalidate();
+        verifyIntent();
         const result = await this.provider.turn(slot.package.text, { comparisonPin: slot.requested, capacityBinding: approved.snapshot.pin.binding,
           beforeStart: async () => {
             await this.checkpoint('comparison-before-turn-start');
@@ -327,9 +336,10 @@ class Comparisons {
             return () => {
               try { for (const guard of guards) guard(); }
               catch (error) { throw Error('Pinned approved brief or its selected inputs changed or are unavailable. No request was sent.', { cause: error }); }
+              verifyIntent();
             };
           },
-          onState: async snapshot => { Object.assign(slot, snapshot); await this.write(record); }
+          onState: async snapshot => { Object.assign(slot, snapshot); intent = await this.write(record); }
         });
         Object.assign(slot, result, { status: 'completed' });
       } catch (error) { slot.status = error.terminalStatus || 'failed'; slot.error = error.message; }

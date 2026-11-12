@@ -273,9 +273,12 @@ test('changed comparison proof during thread preflight blocks turn start while c
   await expect(page.getByRole('status')).toContainText('Capture saved.');
 });
 
-for (const late of [false, true]) test(late ?
-  'changed pinned brief input during final provider evidence prevents comparison turn start' :
-  'changed pinned brief input before comparison dispatch starts no provider thread or turn', async () => {
+for (const [title, late, change] of [
+  ['changed pinned brief input before comparison dispatch starts no provider thread or turn', false, 'source'],
+  ['changed pinned brief input during final provider evidence prevents comparison turn start', true, 'source'],
+  ['a duplicate approved brief during final provider evidence prevents comparison turn start', true, 'approval'],
+  ['a replaced durable comparison slot during final provider evidence prevents turn start', true, 'slot']
+]) test(title, async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
@@ -311,17 +314,34 @@ for (const late of [false, true]) test(late ?
     await fs.writeFile(release, 'finish final comparison package rebuild');
     await expect.poll(() => fs.readFile(held, 'utf8').catch(() => '')).toBe('held');
   }
-  try { await fs.appendFile(path.join(root, 'README.md'), '\nA newly supplied constraint requires a fresh brief review.\n', 'utf8'); }
-  finally { await fs.writeFile(late ? resume : release, 'release', 'utf8'); }
-  await expect(page.locator('#comparison-slots article').first()).toContainText('failed');
-  await expect(page.locator('#comparison-slots article').first()).toContainText('Pinned approved brief or its selected inputs changed');
+  const historyFile = path.join(root, 'comparisons', `${pinned.id}.json`);
+  let replacement;
+  try {
+    if (change === 'slot') {
+      const current = await savedComparison();
+      current.slots.find(slot => slot.status === 'inProgress').startedAt = '2026-11-08T12:00:00Z';
+      replacement = JSON.stringify(current, null, 2);
+      await fs.rename(historyFile, path.join(root, 'retained original comparison.json'));
+      await fs.writeFile(historyFile, replacement, { flag: 'wx' });
+    } else if (change === 'approval') {
+      const vault = path.join(root, 'vault'), briefs = path.join(vault, 'Companion', 'Briefs');
+      const approved = (await fs.readdir(briefs)).find(name => name.startsWith('approved-1-'));
+      await fs.copyFile(path.join(briefs, approved), path.join(vault, 'Copied approved brief.md'));
+    } else await fs.appendFile(path.join(root, 'README.md'), '\nA newly supplied constraint requires a fresh brief review.\n', 'utf8');
+  } finally { await fs.writeFile(late ? resume : release, 'release', 'utf8'); }
+  const first = page.locator('#comparison-slots article').first();
+  await expect(first).toContainText(change === 'slot' ? 'interrupted' : 'failed');
+  await expect(first).toContainText(change === 'slot' ? /durable.*slot/i : 'Pinned approved brief or its selected inputs changed');
   const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
   expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(late ? 1 : 0);
   expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(0);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
-  const saved = await savedComparison();
-  expect(saved.brief).toEqual(pinned.brief);
-  expect(saved.slots.filter(slot => slot.status === 'failed')).toHaveLength(1);
+  if (change === 'slot') expect(await fs.readFile(historyFile, 'utf8')).toBe(replacement);
+  else {
+    const saved = await savedComparison();
+    expect(saved.brief).toEqual(pinned.brief);
+    expect(saved.slots.filter(slot => slot.status === 'failed')).toHaveLength(1);
+  }
   await page.getByLabel('Thought or link', { exact: true }).fill('Capture survives stale comparison brief inputs.');
   await page.getByRole('button', { name: 'Save capture', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Capture saved.');

@@ -114,7 +114,7 @@ class Intake {
     await this.setup();
     try { return await this.locked(async () => { await this.syncMoves(); return this.load(); }); } catch (error) { if (error.message.includes('already running')) return this.load(); throw error; }
   }
-  async connect(folder, scan, now, kind = 'draft') {
+  async connect(folder, scan, now, kind = 'draft', onComplete) {
     await this.locked(async () => {
       const ledger = await this.load();
       const selected = await selectProducerRoot(folder, this.vault.root);
@@ -123,7 +123,7 @@ class Intake {
       ledger.sources.push({ id: randomUUID(), ...selected, kind, connectedAt: now, firstScan: !!scan });
       await this.save(ledger);
     });
-    if (scan) return this.reconcile({ trigger: 'first-scan', now });
+    if (scan) return this.reconcile({ trigger: 'first-scan', now, onComplete });
   }
   async reconnect({ id, folder, kind, identity, epoch, replacement }) {
     await this.locked(async () => {
@@ -217,7 +217,7 @@ class Intake {
     }
     return keys;
   }
-  async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit } = {}) {
+  async reconcile({ trigger = 'manual', now = new Date().toISOString(), admit, onComplete } = {}) {
     return this.locked(async () => {
       let identityScanComplete = true;
       try { await this.syncMoves(); }
@@ -282,7 +282,10 @@ class Intake {
       }
       ledger.lastCheck = { at: now, trigger, status: ledger.sources.some(x => x.error) ? 'error' : Object.values(ledger.outcomes).some(x => x.status === 'held') ? 'held' : 'complete' };
       if (ledger.lastCheck.status === 'complete') ledger.lastSuccess = { at: now, trigger };
-      await this.save(ledger); return ledger;
+      await this.save(ledger);
+      // Publish cadence diagnostics before another check can replace this terminal result.
+      if (onComplete) await onComplete(ledger, () => this.storage.guardSync());
+      return ledger;
     }, admit);
   }
   async admit(ledger, draft, key, now, guard) {

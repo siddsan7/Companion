@@ -276,6 +276,60 @@ test('scheduled and manual checks share the native lock and publish one source r
   expect(scheduled.anchor).toBe('2026-11-08T06:59:00.000Z');
 });
 
+test('a finishing manual check cannot overwrite the due worker result', async () => {
+  test.setTimeout(60000);
+  await launch(); await setup();
+  const schedule = page.getByLabel('Daily intake schedule');
+  await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+  await app.evaluate(({ app: mainApp }) => {
+    const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
+    const { Schedule } = load('./schedule');
+    const record = Schedule.prototype.record;
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    const boundary = globalThis.manualSchedulePublication = { entered: false, release };
+    Schedule.prototype.record = async function (...args) {
+      Schedule.prototype.record = record;
+      boundary.entered = true;
+      await held;
+      return record.call(this, ...args);
+    };
+  });
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  const scheduleFile = path.join(root, 'schedule.json');
+  let due;
+  try {
+    await expect.poll(() => app.evaluate(() => globalThis.manualSchedulePublication.entered)).toBe(true);
+    await fs.rename(path.join(root, 'producer'), path.join(root, 'unavailable'));
+    await clock('2026-11-09T07:00:00Z');
+    due = await worker();
+    expect(due.code).toBe(1);
+  } finally { await app.evaluate(() => globalThis.manualSchedulePublication.release()); }
+  await expect(page.getByRole('button', { name: 'Check now', exact: true })).toBeEnabled();
+  if (due.output.includes('already running')) expect((await worker()).code).toBe(1);
+  const terminal = JSON.parse(await fs.readFile(scheduleFile));
+  expect(terminal).toMatchObject({
+    anchor: '2026-11-08T06:59:00.000Z', handledSlot: 1,
+    worker: { at: '2026-11-09T07:00:00Z', trigger: 'scheduled', status: 'error' }
+  });
+  expect(terminal.workerError).toMatch(/missing or unreadable/i);
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(schedule).toContainText('Worker: error');
+  expect((await worker()).code).toBe(0);
+  expect(JSON.parse(await fs.readFile(scheduleFile))).toEqual(terminal);
+
+  await fs.rename(path.join(root, 'unavailable'), path.join(root, 'producer'));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('manual · complete');
+  const retried = JSON.parse(await fs.readFile(scheduleFile));
+  expect(retried).toMatchObject({
+    anchor: terminal.anchor, handledSlot: terminal.handledSlot,
+    worker: { trigger: 'manual', status: 'complete' }
+  });
+  expect(retried.workerError).toBeUndefined();
+});
+
 test('daily intake reports a real worker exit as interrupted and keeps the admitted slot consumed', async () => {
   test.setTimeout(60000);
   await launch(); await setup(); await artifact();

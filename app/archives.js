@@ -221,7 +221,7 @@ class Archives {
       const current = await this.snapshot({ locked: true, assertSelection });
       assertSelection();
       if (canonical(current) !== canonical(matched.snapshot)) throw Error('Current history or settings changed. Inspect and preview again; nothing was restored.');
-      await this.validatePins(reviewed.archive, matched.sourceRoot, vault);
+      const briefProofs = await this.validatePins(reviewed.archive, matched.sourceRoot, vault);
       assertSelection();
       const plan = this.restorePlan(reviewed.archive, current, matched.sourceRoot, matched.root, reviewed.allocations);
       if (canonical(plan) !== canonical(matched.plan)) throw Error('Local restoration generations or retained exclusions changed. Preview the matched restore again.');
@@ -246,7 +246,8 @@ class Archives {
           assertSelection();
           const record = structuredClone(original);
           for (const request of record.requests) if (request.status === 'inProgress') Object.assign(request, { status: 'interrupted', error: 'Imported active request is incomplete. Retry requires fresh context review; nothing was replayed.' });
-          await this.publishAddition(record, plan.transitions.find(transition => transition.id === record.id), assertSelection, () => restored++);
+          await this.publishAddition(record, plan.transitions.find(transition => transition.id === record.id),
+            assertSelection, briefProofs.get(record.id), () => restored++);
         }
         assertSelection();
         if (noteFiles.length) await this.includeReviewedNotes(noteFiles, matched, count => { restoredNotes = count; });
@@ -324,12 +325,20 @@ class Archives {
     });
   }
   async validatePins(archive, sourceRoot, vault) {
+    const briefs = new Briefs(vault), versions = new Map(), proofs = new Map();
+    const unavailable = cause => Error('Exact archived brief pin is unavailable in the selected vault. Select its separate vault backup.', { cause });
     try {
       for (const record of archive.payload.conversations.filter(record => record.vault.root === sourceRoot)) {
-        const pins = await new Briefs(vault).records(record.brief.version);
-        if (!pins.some(pin => pin.id === record.brief.id && pin.version === record.brief.version && pin.digest === record.brief.digest)) throw Error('Pin mismatch.');
+        const { id, version, digest } = record.brief;
+        const key = `${id}:${version}:${digest}`;
+        if (!versions.has(key)) versions.set(key, await briefs.exactApproval(record.brief));
+        const verify = versions.get(key);
+        proofs.set(record.id, () => {
+          try { verify(); } catch (error) { throw unavailable(error); }
+        });
       }
-    } catch { throw Error('Exact archived brief pin is unavailable in the selected vault. Select its separate vault backup; nothing was restored.'); }
+    } catch (error) { throw Error(`${unavailable(error).message} Nothing was restored.`, { cause: error }); }
+    return proofs;
   }
   async pendingInventory(names) {
     const records = []; let total = 0;
@@ -522,7 +531,7 @@ class Archives {
       });
     });
   }
-  async publishGenerationAddition(record, transition, assertSelection, committed) {
+  async publishGenerationAddition(record, transition, assertSelection, verifyBrief, committed) {
     const controls = this.history.controls, directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
     const guard = () => this.history.safeDirectory(false, directory);
     const selected = () => { assertSelection(); guard(); };
@@ -556,6 +565,7 @@ class Archives {
     await controls.file(stage, directory, staged.owned);
     verifyMarker();
     verifyStageSync(stage, selected, proof);
+    verifyBrief();
     local.linkSync(stage, destination);
     guard();
     await this.checkpoint('archive-restore-after-link');
@@ -573,6 +583,7 @@ class Archives {
       () => controls.verifyRestorationComplete(marker, directory), () => {
         verifyMarker();
         verifySettled();
+        verifyBrief();
       }, {
         check: () => controls.check(record),
         commit: () => {
@@ -581,20 +592,20 @@ class Archives {
         }
       });
   }
-  async publishAddition(record, transition, assertSelection, committed) {
-    if (transition) return this.publishGenerationAddition(record, transition, assertSelection, committed);
+  async publishAddition(record, transition, assertSelection, verifyBrief, committed) {
+    if (transition) return this.publishGenerationAddition(record, transition, assertSelection, verifyBrief, committed);
     const directory = this.history.safeDirectory(), destination = path.join(this.history.directory, `${record.id}.json`);
     const stage = path.join(this.history.directory, `archive-${randomUUID()}.pending`);
     const guard = () => this.history.safeDirectory(false, directory);
     try {
-      await this.publishFile(stage, destination, JSON.stringify(record, null, 2), guard, { assertSelection, committed: () => {
+      await this.publishFile(stage, destination, JSON.stringify(record, null, 2), guard, { assertSelection, verifyRelated: verifyBrief, committed: () => {
         committed();
         // Imported capacity bindings and provider IDs cannot approve dispatch.
         for (const [token, approval] of this.history.tokens) if (approval.input.conversationId === record.id) this.history.tokens.delete(token);
       } });
     } catch (error) { if (error.code === 'EEXIST') throw Error('A conversation appeared during restore. It was not replaced.'); throw error; }
   }
-  async publishFile(stage, destination, text, guard, { assertSelection = () => {}, checkpoint, committed = () => {} } = {}) {
+  async publishFile(stage, destination, text, guard, { assertSelection = () => {}, checkpoint, verifyRelated = () => {}, committed = () => {} } = {}) {
     let staged, linked = false;
     try {
       assertSelection();
@@ -602,6 +613,7 @@ class Archives {
       if (checkpoint) await this.checkpoint(checkpoint);
       await verifyStage(stage, guard, staged);
       verifyStageSync(stage, () => { assertSelection(); guard(); }, staged);
+      verifyRelated();
       local.linkSync(stage, destination);
       linked = true;
       await verifyPeers(stage, destination, guard, staged);
