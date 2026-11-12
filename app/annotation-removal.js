@@ -135,9 +135,11 @@ async function inventory(vault, intake, ledger, id, captureId) {
     if (name === 'link-intent.json' || /^link-[a-f0-9-]{36}\.json$/.test(name)) {
       let object; try { object = JSON.parse(value.text); } catch {}
       const fields = ['schema', 'id', 'file', 'before', 'content', 'relative'];
+      if (object && Object.hasOwn(object, 'previous')) fields.push('previous');
       if (object && Object.hasOwn(object, 'stageProof')) fields.push('stageProof');
       if (object && Object.hasOwn(object, 'originalProof')) fields.push('originalProof');
       if (!strict(object, fields) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      if (fields.includes('previous') && typeof object.previous !== 'string') throw changed();
       if (fields.includes('stageProof') && (!validProof(object.stageProof) || Object.keys(object.stageProof).length !== 3 ||
           object.stageProof.digest !== hash(object.content))) throw changed();
       if (fields.includes('originalProof') && (!validProof(object.originalProof) || Object.keys(object.originalProof).length !== 3 ||
@@ -149,7 +151,7 @@ async function inventory(vault, intake, ledger, id, captureId) {
       if (reservedPath(vault, reserved, destination)) throw changed();
       await vault.contained(path.dirname(destination));
       const before = parseAnnotation(object.before), after = parseAnnotation(object.content); if (!before || !after || after.id !== id || after.captureId !== before.captureId) throw changed(); bind(before);
-      if (sourceLink(object.before, object.relative) !== object.content) throw changed();
+      if (sourceLink(object.before, object.relative, object.previous) !== object.content) throw changed();
       if (name !== 'link-intent.json' && name !== `link-${object.id}.json`) throw changed();
       links.set(object.id, object); candidates.push({ ...value, kind: 'relationship-journal' }); continue;
     }
@@ -203,7 +205,8 @@ async function inventory(vault, intake, ledger, id, captureId) {
   const scope = { captureId, root, targets, directories: [...directories.values()].sort((a, b) => a.file < b.file ? -1 : 1) };
   return { scope, verifyReserved: reserved.verify };
 }
-function verifyRemovalComplete(vault, intake, id, authority, guard, ledgerStage) {
+function verifyRemovalScope(vault, intake, id, authority, guard, remaining = [], ledgerStage) {
+  const reviewed = new Map(remaining.map(target => [target.file, target]));
   const inspect = (folder, visit) => {
     const { guard: folderGuard } = ordinaryDirectories([folder], changed().message);
     const check = () => { guard(); folderGuard(); };
@@ -222,7 +225,7 @@ function verifyRemovalComplete(vault, intake, id, authority, guard, ledgerStage)
     if (ignoredFolder(entry.name)) return;
     if (entry.isSymbolicLink()) throw changed();
     if (entry.isDirectory()) visit(file);
-    else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+    else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md') && !reviewed.has(rel(vault, file))) {
       const content = text(file, check);
       if (parseAnnotation(content)?.id === id || declaredAnnotationIds(content).includes(id)) throw changed();
     }
@@ -230,9 +233,14 @@ function verifyRemovalComplete(vault, intake, id, authority, guard, ledgerStage)
   visit(vault.vault);
   inspect(intake.dir, (entry, file, check) => {
     if (entry.name === 'ledger.json' || file === ledgerStage) return;
-    if (!entry.isFile() || entry.isSymbolicLink() || entry.name === heldAnnotationIntent(id) || text(file, check).includes(id)) throw changed();
+    if (!entry.isFile() || entry.isSymbolicLink()) throw changed();
+    if (!reviewed.has(rel(vault, file)) && (entry.name === heldAnnotationIntent(id) || text(file, check).includes(id))) throw changed();
   });
-  for (const target of authority.targets) verifyAbsentSync(path.join(vault.vault, target.file), guard, changed);
+  for (const target of authority.targets) {
+    const survivor = reviewed.get(target.file);
+    if (survivor) verifyRemovalTarget(vault, target, survivor.peers, guard, changed);
+    else verifyAbsentSync(path.join(vault.vault, target.file), guard, changed);
+  }
 }
 class AnnotationRemoval {
   constructor({ getVault, clearApprovals }) { Object.assign(this, { getVault, clearApprovals }); this.previews = new Map(); }
@@ -333,15 +341,17 @@ class AnnotationRemoval {
       if (!expected || ['sha256', 'dev', 'ino', 'bytes'].some(key => actual[key] !== expected[key]) || actual.links !== expected.peers.length || !intake.storage.matches(await intake.storage.view())) throw changed();
       intake.storage.guardSync();
       current.verifyReserved();
+      verifyRemovalScope(vault, intake, id, authority, guard, current.targets);
       verifyRemovalTarget(vault, target, expected.peers, guard, changed);
       local.unlinkSync(path.join(vault.vault, target.file)); await vault.checkpoint('annotation-removal-unlinked');
     }
     const final = await verify();
     if (final.targets.length) throw changed();
     authority.phase = 'removed';
+    if (ledger.annotationLinks) delete ledger.annotationLinks[id];
     await intake.save(ledger, ledgerStage => {
       final.verifyReserved();
-      verifyRemovalComplete(vault, intake, id, authority, guard, ledgerStage);
+      verifyRemovalScope(vault, intake, id, authority, guard, [], ledgerStage);
     });
     return true;
   }

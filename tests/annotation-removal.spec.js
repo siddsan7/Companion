@@ -202,6 +202,41 @@ test('annotation removal preserves a late same-identity copy at ledger completio
   expect(ledger.annotationRemovals[id].phase).toBe('removing');
 });
 
+test('annotation removal preserves reviewed writing when a copy arrives during the last ledger read', async () => {
+  const base = await importedCapture();
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation', { exact: true }).fill('Reviewed independent annotation writing.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved.');
+  const annotations = path.join(base, 'Annotations'), [name] = (await fs.readdir(annotations)).filter(item => item.endsWith('.md'));
+  const selected = path.join(annotations, name), bytes = await fs.readFile(selected, 'utf8'), id = path.basename(name, '.md');
+  const copy = path.join(annotations, 'Late independent annotation.md'), independent = bytes + '\nLate independent writing.\n';
+  const ledgerFile = path.join(base, '.intake', 'ledger.json');
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  await page.getByLabel('Annotation removal review', { exact: true }).getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const preview = page.getByLabel('Annotation removal preview', { exact: true });
+  await expect(preview).toContainText(id);
+  await app.evaluate((_electron, options) => {
+    const local = process.getBuiltinModule('fs'), io = local.promises;
+    const open = io.open;
+    io.open = function (file, flags, ...rest) {
+      if (file === options.ledgerFile && flags === 'r') {
+        const caller = new Error().stack.split('\n').find(line => line.includes('annotation-removal.js'));
+        if (caller?.includes('AnnotationRemoval.finish')) {
+          io.open = open;
+          local.writeFileSync(options.copy, options.independent, { flag: 'wx' });
+        }
+      }
+      return open.call(this, file, flags, ...rest);
+    };
+  }, { ledgerFile, copy, independent });
+  await preview.getByRole('button', { name: 'Confirm annotation removal', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation removal scope changed');
+  expect(await fs.readFile(copy, 'utf8')).toBe(independent);
+  expect(await fs.readFile(selected, 'utf8')).toBe(bytes);
+  expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).annotationRemovals[id].phase).toBe('removing');
+});
+
 for (const relationship of ['unchanged', 'externally edited']) test(`annotation relationship repair preserves a replaced intake ledger and holds ${relationship} writing`, async () => {
   test.setTimeout(90000);
   const base = await importedCapture(), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');

@@ -370,7 +370,10 @@ test('custom annotation headers preserve user-owned Source links after the first
     await app.close(); app = null; await launch();
     await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
     await expect(page.getByLabel('Source inspection')).toContainText('User-owned footer.');
-    expect(await fs.readFile(file, 'utf8')).toBe(content);
+    const expected = index === 0
+      ? content.replace('](../Captures/', '](../../Companion/Captures/')
+      : content;
+    expect(await fs.readFile(file, 'utf8')).toBe(expected);
   }
 });
 
@@ -446,6 +449,72 @@ test('verified moves keep stable capture identity and repair annotation links be
   expect((await fs.readdir(path.join(base, 'Revisions'))).filter(x => x.endsWith('.json'))).toHaveLength(2);
   await app.close(); app = null; await launch();
   await expect(page.locator('#captures article')).toHaveCount(1);
+});
+
+test('Refresh repairs only the exact generated annotation link when a capture moves', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  for (const writing of ['Independent commentary.', 'A deliberately edited source link.']) {
+    await page.getByLabel('New annotation').fill(writing);
+    await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Annotation saved');
+  }
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures'), annotations = path.join(base, 'Annotations');
+  const [name] = (await fs.readdir(captures)).filter(file => file.endsWith('.md'));
+  const original = path.join(captures, name), moved = path.join(root, 'vault', 'Projects', 'Moved source.md');
+  const currentLink = `Source: [Capture](../Captures/${encodeURIComponent(name)})`;
+  const edited = new Map();
+  for (const name of (await fs.readdir(annotations)).filter(file => file.endsWith('.md'))) {
+    const file = path.join(annotations, name), before = await fs.readFile(file, 'utf8');
+    const generated = before.includes('Independent commentary.');
+    const content = generated ? before.replace('# Annotation', '# My commentary') + '\nMy added writing.\n'
+      : before.replace(currentLink, 'Source: [Capture](my-chosen-source.md)');
+    expect(content).not.toBe(before);
+    await fs.writeFile(file, content);
+    edited.set(file, { content, generated });
+  }
+  const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+  const open = page.getByRole('button', { name: 'Open in Obsidian', exact: true });
+  await refresh.click();
+  await expect(open).toBeEnabled();
+  for (const [file, { content }] of edited) expect(await fs.readFile(file, 'utf8')).toBe(content);
+
+  await fs.mkdir(path.dirname(moved), { recursive: true }); await fs.rename(original, moved);
+  await refresh.click();
+  await expect(open).toBeEnabled();
+  for (const [file, { content, generated }] of edited) {
+    const expected = generated ? content.replace(currentLink, 'Source: [Capture](../../Projects/Moved%20source.md)') : content;
+    expect(await fs.readFile(file, 'utf8')).toBe(expected);
+  }
+});
+
+test('an annotation created after a capture move preserves a link edited to the now independent original path', async () => {
+  await artifact(); await launch(); await setup(); await connect(true);
+  const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures');
+  const [name] = (await fs.readdir(captures)).filter(file => file.endsWith('.md'));
+  const original = path.join(captures, name), moved = path.join(root, 'vault', 'Projects', 'Moved source.md');
+  await fs.mkdir(path.dirname(moved), { recursive: true }); await fs.rename(original, moved);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('New annotation').fill('Independent annotation after capture movement.');
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved');
+  const annotations = path.join(base, 'Annotations');
+  const [note] = (await fs.readdir(annotations)).filter(file => file.endsWith('.md'));
+  const file = path.join(annotations, note), bytes = await fs.readFile(file, 'utf8');
+  const generated = 'Source: [Capture](../../Projects/Moved%20source.md)';
+  expect(bytes).toContain(generated);
+  const userLink = `Source: [Capture](../Captures/${encodeURIComponent(name)})`;
+  const edited = bytes.replace(generated, userLink);
+  const independent = 'The author now uses the former capture path for independent writing.\n';
+  await fs.writeFile(original, independent, { flag: 'wx' });
+  await fs.writeFile(file, edited);
+
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  expect(await fs.readFile(file, 'utf8')).toBe(edited);
+  expect(await fs.readFile(original, 'utf8')).toBe(independent);
 });
 
 test('Open in Obsidian waits for Browse Refresh before opening a moved capture', async () => {

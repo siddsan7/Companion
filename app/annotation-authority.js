@@ -7,6 +7,16 @@ const kinds = ['annotation-note', 'annotation-intent', 'annotation-stage', 'rela
 const activeAnnotationIntent = 'annotation-intent.json';
 const heldAnnotationIntent = id => `annotation-${id}.held.json`;
 const isAnnotationIntent = name => name === activeAnnotationIntent || /^annotation-[a-f0-9-]{36}\.held\.json$/.test(name);
+function validateAnnotationLinks(ledger) {
+  const links = ledger.annotationLinks;
+  if (links === undefined) return;
+  const invalid = () => Error('Annotation relationship authority needs repair.');
+  if (!links || !fields(links, Object.keys(links))) throw invalid();
+  for (const [id, link] of Object.entries(links)) {
+    if (!uuid(id) || !fields(link, ['captureId', 'target']) || !uuid(link.captureId) || typeof link.target !== 'string' ||
+        !link.target.split('/').every(part => /^(?:[a-zA-Z0-9_.!~*'()-]|%[0-9A-F]{2})+$/.test(part))) throw invalid();
+  }
+}
 function validateAnnotationRemovals(ledger) {
   if (ledger.annotationRemovals !== undefined && !fields(ledger.annotationRemovals, Object.keys(ledger.annotationRemovals || {}))) throw Error('Annotation removal authority needs repair.');
   for (const [id, value] of Object.entries(ledger.annotationRemovals || {})) {
@@ -46,4 +56,4 @@ function annotationRemoved(ledger, id) { validateAnnotationRemovals(ledger); ret
 function assertAnnotationPublication(ledger, id) {
   if (!uuid(id) || annotationRemoved(ledger, id)) throw Object.assign(Error('This annotation identity was removed. Old writing cannot be published again; author new writing with a new identity.'), { code: 'ANNOTATION_REMOVED' });
 }
-module.exports = { validateAnnotationRemovals, assertAnnotationPublication, annotationRemoved, activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent };
+module.exports = { validateAnnotationLinks, validateAnnotationRemovals, assertAnnotationPublication, annotationRemoved, activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent };

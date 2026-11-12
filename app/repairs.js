@@ -1,6 +1,6 @@
 const fs = require('node:fs/promises');
 const native = require('node:fs');
-const { assertAnnotationPublication, annotationRemoved, validateAnnotationRemovals, activeAnnotationIntent, heldAnnotationIntent } = require('./annotation-authority');
+const { assertAnnotationPublication, annotationRemoved, validateAnnotationLinks, validateAnnotationRemovals, activeAnnotationIntent, heldAnnotationIntent } = require('./annotation-authority');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { setTimeout: wait } = require('node:timers/promises');
@@ -15,7 +15,7 @@ async function annotationAuthority(intake) {
   const view = await intake.storage.view();
   if (!intake.storage.matches(view)) throw Error('Intake ledger changed during this operation. Refresh before retrying; the changed authority was preserved.');
   const ledger = view.text === null ? {} : JSON.parse(view.text);
-  validateAuthority(ledger); validateAnnotationRemovals(ledger); return ledger;
+  validateAuthority(ledger); validateAnnotationRemovals(ledger); validateAnnotationLinks(ledger); return ledger;
 }
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
@@ -53,14 +53,45 @@ function admittedOutputHold(intake, ledger, sourceHash) {
   const admission = revisionAdmission(ledger, block.incomingRevision);
   return !!admission && admission.sourceHash === sourceHash && admission.captureId === ledger.captures[sourceHash]?.id;
 }
-function sourceLink(content, relative) {
+function relationshipLine(content, editedHeading) {
   const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
-  if (!frontmatter) return content;
-  // End metadata at its first delimiter before examining the independent body.
+  if (!frontmatter) return null;
   const body = content.slice(frontmatter[0].length);
-  return frontmatter[0] + body.replace(/^(\r?\n# Annotation\r?\n\r?\n)Source: \[Capture\]\([^\r\n]*\)(?=\r?\n|$)/, (_, header) => header + 'Source: [Capture](' + urlPath(relative) + ')');
+  const line = body.match(editedHeading
+    ? /^(\r?\n#{1,6} [^\r\n]+\r?\n\r?\n)Source: \[Capture\]\(([^\r\n]*)\)(?=\r?\n|$)/
+    : /^(\r?\n# Annotation\r?\n\r?\n)Source: \[Capture\]\(([^\r\n]*)\)(?=\r?\n|$)/);
+  return line && { prefix: frontmatter[0] + line[1], target: line[2], end: frontmatter[0].length + line[0].length };
+}
+function sourceLink(content, relative, previous) {
+  const line = relationshipLine(content, previous !== undefined);
+  if (!line || previous !== undefined && line.target !== previous) return content;
+  return line.prefix + 'Source: [Capture](' + urlPath(relative) + ')' + content.slice(line.end);
 }
 function install(Intake, { hash, read, noteText, acceptedOutcome }) {
+  function knownLink(intake, ledger, annotation, capture, previousCapture, currentCapture, previousLink) {
+    const target = relationshipLine(annotation.content, true)?.target;
+    if (target === undefined) return;
+    const known = ledger.annotationLinks?.[annotation.id];
+    if (known) return known.captureId === capture.id && known.target === target ? target : undefined;
+    const origin = path.join(intake.vault.root, 'Annotations');
+    const original = path.join(intake.vault.root, 'Captures', capture.file);
+    if (target === previousLink) return target;
+    for (const file of new Set([previousCapture, original])) {
+      if (target === urlPath(path.relative(origin, file)) &&
+          (path.relative(file, currentCapture) === '' || !native.lstatSync(file, { throwIfNoEntry: false }))) return target;
+    }
+  }
+  function rememberLink(ledger, { id, captureId }, target) {
+    const prior = ledger.annotationLinks?.[id];
+    if (prior?.captureId === captureId && prior.target === target) return false;
+    ledger.annotationLinks ||= {};
+    ledger.annotationLinks[id] = { captureId, target };
+    return true;
+  }
+  async function persistInitialLink(intake, ledger, id, captureId, content, verify) {
+    const target = relationshipLine(content, false)?.target;
+    if (target && rememberLink(ledger, { id, captureId }, target)) await intake.save(ledger, verify);
+  }
   async function writeOwnedIntentStage(file, intent, guard) {
     guard();
     const handle = await fs.open(file, 'wx');
@@ -75,14 +106,14 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       return { identity, proof: { ...identity, digest: hash(bytes) } };
     } finally { await handle.close(); }
   }
-  async function publishLinkIntent(intake, annotation, relative, content) {
+  async function publishLinkIntent(intake, annotation, relative, content, previous) {
     const guard = intake.vault.publicationFolders(path.dirname(annotation.file)).guard;
     intake.storage.guardSync();
     const original = readExactSync(annotation.file, guard);
     if (!original.bytes.equals(Buffer.from(annotation.content))) throw Error('Annotation changed before relationship repair. Its writing was preserved.');
     await intake.publishJournal(path.join(intake.dir, 'link-intent.json'), {
       schema: 1, id: randomUUID(), file: path.relative(intake.vault.vault, annotation.file),
-      before: annotation.content, content, relative, originalProof: original.proof
+      before: annotation.content, content, relative, previous, originalProof: original.proof
     });
   }
   Intake.prototype.syncMoves = async function () {
@@ -135,16 +166,19 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       }
       if (matches.length !== 1) continue;
       const note = matches[0];
+      const previousCapture = this.destination(capture);
       capture.relative = path.relative(this.vault.vault, note.file);
       reserved.verify();
       await this.detachRestoredBackup(note, sourceHash, capture, ledger);
       await this.ownedFile(note.file, [], 'Moved capture');
       for (const annotation of annotations.filter(item => item.captureId === capture.id)) {
         if (!annotationPaths.has(annotation.file) || ledger.linkHolds?.[annotation.id]) continue;
-        const relative = path.relative(path.dirname(annotation.file), note.file), content = sourceLink(annotation.content, relative);
+        const previous = knownLink(this, ledger, annotation, capture, previousCapture, note.file);
+        if (previous === undefined) continue;
+        const relative = path.relative(path.dirname(annotation.file), note.file), content = sourceLink(annotation.content, relative, previous);
         if (content === annotation.content) continue;
         reserved.verify();
-        await publishLinkIntent(this, annotation, relative, content);
+        await publishLinkIntent(this, annotation, relative, content, previous);
         await this.vault.checkpoint('link-intent-published');
         await this.finishLink(ledger);
       }
@@ -195,7 +229,8 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     });
   };
   Intake.prototype.finishLink = async function (ledger) {
-    const journal = path.join(this.dir, 'link-intent.json'), baseline = this.storage.expected;
+    const journal = path.join(this.dir, 'link-intent.json');
+    let baseline = this.storage.expected;
     const ordinary = this.vault.publicationFolders(this.dir).guard;
     const journalInfo = native.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
     if (!journalInfo) return;
@@ -204,12 +239,14 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     const journalRecord = readExactSync(journal, ordinary, journalLinks);
     let bytes = journalRecord.bytes.toString('utf8'), journalProof = journalRecord.proof;
     const intent = JSON.parse(bytes), uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
-    if (intent.schema !== 1 || !uuid.test(intent.id) || typeof intent.before !== 'string' || typeof intent.content !== 'string' || typeof intent.relative !== 'string' || intent.content !== sourceLink(intent.before, intent.relative) || !parseAnnotation(intent.before) || bytes !== JSON.stringify(intent)) throw Error('Invalid relationship repair journal. Files were preserved.');
+    if (intent.schema !== 1 || !uuid.test(intent.id) || typeof intent.before !== 'string' || typeof intent.content !== 'string' || typeof intent.relative !== 'string' ||
+        Object.hasOwn(intent, 'previous') && typeof intent.previous !== 'string' ||
+        intent.content !== sourceLink(intent.before, intent.relative, intent.previous) || !parseAnnotation(intent.before) || bytes !== JSON.stringify(intent)) throw Error('Invalid relationship repair journal. Files were preserved.');
     if (Object.hasOwn(intent, 'stageProof') && (!validProof(intent.stageProof) || Object.keys(intent.stageProof).length !== 3 ||
         intent.stageProof.digest !== hash(intent.content))) throw Error('Invalid relationship stage proof. Files were preserved.');
     if (Object.hasOwn(intent, 'originalProof') && (!validProof(intent.originalProof) || Object.keys(intent.originalProof).length !== 3 ||
         intent.originalProof.digest !== hash(intent.before))) throw Error('Invalid original relationship proof. Files were preserved.');
-    const annotationId = parseAnnotation(intent.before).id, authority = await annotationAuthority(this);
+    const annotation = parseAnnotation(intent.before), annotationId = annotation.id, authority = await annotationAuthority(this);
     if (annotationRemoved(authority, annotationId)) return { held: true, removed: true };
     const file = this.destination({ relative: intent.file }), backup = path.join(this.dir, 'link-' + intent.id + '.before.md'), stage = path.join(this.dir, 'link-' + intent.id + '.stage');
     const archive = path.join(this.dir, `link-${intent.id}.json`), parent = this.vault.publicationFolders(path.dirname(file)).guard;
@@ -381,9 +418,18 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         verifyStageSync(stage, guard, outputProof, 2);
         native.unlinkSync(stage);
       }
-      verifyAbsentSync(stage, guard);
-      verifyStageSync(file, guard, outputProof);
-      verifyIntent();
+      const verifyPublished = () => {
+        verifyIntent();
+        verifyAbsentSync(stage, guard);
+        verifyStageSync(file, guard, outputProof);
+        verifyStageSync(backup, guard, backupProof);
+      };
+      verifyPublished();
+      const target = urlPath(intent.relative);
+      if (rememberLink(authority, annotation, target)) await this.save(authority, verifyPublished);
+      baseline = this.storage.expected;
+      if (ledger) rememberLink(ledger, annotation, target);
+      verifyPublished();
       native.unlinkSync(journal);
     } catch (error) {
       if (!error.annotationLinkConflict && error.code !== 'STAGING_CHANGED') throw error;
@@ -469,10 +515,12 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       if (matches.length !== 1) throw Error('Annotation is missing or ambiguous. Restore or resolve it before retrying.');
       const annotation = matches[0], capture = Object.values(ledger.captures).find(item => item.id === annotation.captureId);
       if (!capture || capture.removed || capture.identityIssue) throw Error('Restore or resolve the linked capture before retrying this relationship.');
-      const relative = path.relative(path.dirname(annotation.file), this.destination(capture)), content = sourceLink(annotation.content, relative);
+      const destination = this.destination(capture), relative = path.relative(path.dirname(annotation.file), destination);
+      const previous = knownLink(this, ledger, annotation, capture, destination, destination, intent.previous ?? relationshipLine(intent.before, false)?.target);
+      const content = previous === undefined ? annotation.content : sourceLink(annotation.content, relative, previous);
       delete ledger.linkHolds[id];
       if (content !== annotation.content) {
-        await publishLinkIntent(this, annotation, relative, content);
+        await publishLinkIntent(this, annotation, relative, content, previous);
         await this.finishLink(ledger);
       }
       await this.save(ledger); return { held: !!ledger.linkHolds[id] };
@@ -533,7 +581,8 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     return note;
   };
   Intake.prototype.finishAnnotation = async function () {
-    const journal = path.join(this.dir, activeAnnotationIntent), baseline = this.storage.expected;
+    const journal = path.join(this.dir, activeAnnotationIntent);
+    let baseline = this.storage.expected;
     const ordinary = this.vault.publicationFolders(this.dir).guard;
     const info = native.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
     if (!info) return;
@@ -621,9 +670,15 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       verifyPair();
       native.unlinkSync(stage);
     }
-    verifyIntent();
-    verifyAbsentSync(stage, guard);
-    verifyStageSync(file, guard, proof);
+    const verifyPublished = () => {
+      verifyIntent();
+      verifyAbsentSync(stage, guard);
+      verifyStageSync(file, guard, proof);
+    };
+    verifyPublished();
+    await persistInitialLink(this, authority, intent.id, intent.captureId, intent.annotation, verifyPublished);
+    baseline = this.storage.expected;
+    verifyPublished();
     native.unlinkSync(journal);
   };
   Intake.prototype.repairs = async function () {
@@ -839,11 +894,18 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       verifyStageSync(file, guard, intent.annotationProof, staged ? 2 : 1);
       return staged;
     };
-    const retireRecordedAnnotation = () => {
-      this.storage.guardSync();
-      verifyStageSync(intentFile, guard, intentProof);
-      verifyAbsentSync(archivedIntent, guard);
-      if (verifyRecordedAnnotation()) native.unlinkSync(stage);
+    const retireRecordedAnnotation = async (verifyRelated = () => {}) => {
+      const verify = () => {
+        this.storage.guardSync();
+        verifyRelated();
+        verifyStageSync(intentFile, guard, intentProof);
+        verifyAbsentSync(archivedIntent, guard);
+        return verifyRecordedAnnotation();
+      };
+      verify();
+      const authority = await annotationAuthority(this);
+      await persistInitialLink(this, authority, intent.annotationId, tx.capture.id, intent.annotation, verify);
+      if (verify()) native.unlinkSync(stage);
       verifyStageSync(file, guard, intent.annotationProof);
       native.unlinkSync(intentFile);
     };
@@ -979,7 +1041,10 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         try { verifyRecordedAnnotation(); }
         catch (error) { if (error.code === 'STAGING_CHANGED') return preserveAcceptedAnnotation(); throw error; }
       }
-      return retireRecordedAnnotation();
+      return retireRecordedAnnotation(() => {
+        verifyAbsentSync(journal, guard);
+        if (intent.sourceProof) verifyAbsentSync(sourceStage, guard);
+      });
     }
     let verifyRetainedHold;
     const hold = async error => {
@@ -1134,9 +1199,11 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     if (removed) return { held: true, removed: true };
     const retireRepair = async () => {
       if (freshRepair) {
-        this.storage.guardSync();
-        guard();
-        freshRepair.verify();
+        const verify = () => { this.storage.guardSync(); guard(); freshRepair.verify(); };
+        verify();
+        const authority = await annotationAuthority(this);
+        await persistInitialLink(this, authority, intent.annotationId, tx.capture.id, intent.annotation, verify);
+        verify();
         freshRepair.retireAnnotation();
         native.unlinkSync(intentFile);
         return;
