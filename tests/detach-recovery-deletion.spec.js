@@ -92,7 +92,9 @@ test('ordinary restart finishes actual restored-backup detach before complete so
   expect(tx.sourceHash).toBe(sourceHash); expect(tx.capture.id).toBe(capture.id);
   expect(tx.revision.id).not.toBe(capture.currentRevision);
   expect(await exists(current)).toBe(false);
-  await fs.copyFile(incoming, outside); await fs.unlink(incoming); await fs.link(outside, incoming);
+  const incomingIdentity = await fs.lstat(incoming, { bigint: true });
+  await fs.link(incoming, outside);
+  expect(await fs.lstat(outside, { bigint: true })).toMatchObject({ dev: incomingIdentity.dev, ino: incomingIdentity.ino, nlink: 2n });
   await fs.writeFile(path.join(root, 'release.txt'), 'continue'); const bridgeResult = await checking;
 
   const conflicted = JSON.parse(await fs.readFile(ledgerFile, 'utf8')), archive = path.join(intake, conflicted.blocks[sourceHash].journal);
@@ -108,7 +110,8 @@ test('ordinary restart finishes actual restored-backup detach before complete so
   expect(conflicted.captures[sourceHash].revisions).toEqual(capture.revisions);
   await app.close(); app = null;
   // Remove only the controlled outside alias. The actual writer pair stays intact.
-  await fs.unlink(outside); expect((await fs.stat(incoming)).nlink).toBe(1);
+  await fs.unlink(outside);
+  expect(await fs.lstat(incoming, { bigint: true })).toMatchObject({ dev: incomingIdentity.dev, ino: incomingIdentity.ino, nlink: 1n });
   await fs.unlink(path.join(root, 'release.txt'));
   await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-restored-backup-cleaned' }));
   await launch(); await checkpoint('intake-restored-backup-cleaned');
