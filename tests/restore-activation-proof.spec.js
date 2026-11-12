@@ -1194,9 +1194,9 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '', c
       process.exit(77);
     };
     if (boundary === 'pending-retry-link') {
-      const link = fs.link;
-      fs.link = async (from, to) => {
-        await link(from, to);
+      const link = native.linkSync;
+      native.linkSync = (from, to) => {
+        link(from, to);
         if (from === pending && to === shared) process.exit(77);
       };
     }
