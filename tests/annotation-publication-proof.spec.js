@@ -564,7 +564,7 @@ for (const state of ['withdrawn', 'replaced', 'edited']) test(`ordinary transfer
     witness = await exactTransfer(context);
     throw interrupted;
   });
-  const { vault, intake, input, sourceHash, destination, local, older, olderBytes } = context;
+  const { vault, intake, input, sourceHash, destination, ledgerFile, local, older, olderBytes } = context;
   await expect(intake.resolveConflict(input, later)).rejects.toBe(interrupted);
   const { journal, intent, note, stage, original } = witness;
   const replacement = state === 'replaced', edited = state === 'edited';
@@ -608,8 +608,38 @@ for (const state of ['withdrawn', 'replaced', 'edited']) test(`ordinary transfer
   await fs.rename(backup, preservedBackup);
   await fs.rename(older, preservedConflict);
   const preview = await deletion.preview(intent.tx.capture.id);
+  expect(preview.targets).not.toContain(path.relative(vault.vault, backup).split(path.sep).join('/'));
   expect(preview.dependents).toContainEqual(expect.objectContaining({ id: intent.annotationId, text: intent.annotation }));
-  await deletion.confirm(preview.token);
+  if (state === 'withdrawn') {
+    const foreign = 'Independent writing without source metadata.\n';
+    const preservedIdentity = await identity(preservedBackup);
+    restarted.vault.checkpoint = async boundary => {
+      if (boundary === 'capture-deletion-authorized') await fs.writeFile(backup, foreign, { flag: 'wx' });
+    };
+    await expect(deletion.confirm(preview.token)).rejects.toMatchObject({ code: 'SOURCE_FILE_CHANGED' });
+    expect(await fs.readFile(backup, 'utf8')).toBe(foreign);
+    expect(await fs.readFile(destination, 'utf8')).toBe(intent.tx.content);
+
+    const heldLedger = JSON.parse(await fs.readFile(ledgerFile));
+    const id = intent.tx.capture.id, authority = heldLedger.sourceAuthority[id];
+    expect(authority.phase).toBe('deleting');
+    const backupRecord = heldLedger.retainedIntakeBackups[intent.tx.backup];
+    expect(backupRecord).toMatchObject({ sourceHash });
+    expect(backupRecord).toEqual(ledger.retainedIntakeBackups[intent.tx.backup]);
+    await fs.writeFile(backup, local);
+    const recreatedIdentity = await identity(backup);
+    expect(recreatedIdentity.ino).not.toBe(preservedIdentity.ino);
+    const operation = { id, operationId: authority.operationId };
+    await expect(deletion.resume(operation)).rejects.toMatchObject({ code: 'SOURCE_FILE_CHANGED' });
+    expect(await fs.readFile(backup)).toEqual(local);
+    expect(await identity(backup)).toEqual(recreatedIdentity);
+
+    await fs.unlink(backup);
+    await deletion.resume(operation);
+    const completedLedger = JSON.parse(await fs.readFile(ledgerFile));
+    expect(completedLedger.retainedIntakeBackups?.[intent.tx.backup]).toBeUndefined();
+    expect(await identity(preservedBackup)).toEqual(preservedIdentity);
+  } else await deletion.confirm(preview.token);
   expect(await readOptional(destination)).toBeNull();
   expect(await fs.readFile(held)).toEqual(heldBytes);
   expect((await readOptional(stage))?.toString('utf8') || null).toBe(edited ? null : intent.annotation);

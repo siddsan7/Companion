@@ -61,13 +61,18 @@ function retainedBackups(ledger, sourceHash) {
   return Object.entries(ledger.retainedIntakeBackups || {}).filter(([, record]) => record.sourceHash === sourceHash);
 }
 
-function verifyRetainedBackups(backups, directory, targets, generation) {
+function omittedRetainedBackups(backups, directory, targets, generation) {
+  const omitted = [];
   for (const [name, record] of backups) {
-    const target = targets.find(item => item.kind === 'source-backup' && item.file === directory + '/' + name);
-    if (record.generation !== generation || !target || target.peers || !matchesProof({ ...target, digest: target.sha256 }, record.proof)) {
+    const file = directory + '/' + name;
+    const target = targets.find(item => item.file === file);
+    if (record.generation !== generation || target && (target.kind !== 'source-backup' || target.peers ||
+        !matchesProof({ ...target, digest: target.sha256 }, record.proof))) {
       throw Error('Retained intake backup does not match the confirmed source deletion. Recovery files were preserved.');
     }
+    if (!target) omitted.push(file);
   }
+  return omitted;
 }
 
 function retireBackups(ledger, sourceHash) {
@@ -76,4 +81,4 @@ function retireBackups(ledger, sourceHash) {
   else delete ledger.retainedIntakeBackups;
 }
 
-module.exports = { validateStageRecords, stageRecord, pendingJournalProof, retireStageRecords, matchesProof, retainedBackups, verifyRetainedBackups, retireBackups };
+module.exports = { validateStageRecords, stageRecord, pendingJournalProof, retireStageRecords, matchesProof, retainedBackups, omittedRetainedBackups, retireBackups };

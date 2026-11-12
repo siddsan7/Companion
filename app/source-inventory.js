@@ -289,7 +289,7 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
   if (pending) initial = pending.targets;
   const authority = ledger.sourceAuthority?.[capture.id];
   const generation = authority?.phase === 'active' ? authority.generation : null;
-  const completedBackups = new Map(retainedBackups(ledger, sourceHash)), observedBackups = new Set();
+  const completedBackups = new Map(retainedBackups(ledger, sourceHash));
   const matchesCompletedBackup = (name, value) => {
     const completed = completedBackups.get(name);
     return !completed || completed.generation === generation && value.nlink === 1 && matchesProof(fileProof(value.target), completed.proof);
@@ -304,7 +304,6 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     if (pending?.titleRecovery.intent === relative(intake, path.join(intake.dir, name))) continue;
     const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
     if (!matchesCompletedBackup(name, value)) fail();
-    if (completedBackups.has(name)) observedBackups.add(name);
     const held = independent.get(name);
     if (held) {
       if (held.nlink !== value.nlink || ['dev', 'ino', 'sha256'].some(key => held.target[key] !== value.target[key])) fail();
@@ -316,7 +315,6 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     if (!mentions(value.bytes, capture.id, sourceHash)) continue;
     entries.push({ name, file, value, text: text(value.bytes) });
   }
-  if (observedBackups.size !== completedBackups.size) fail();
   for (const entry of entries.filter(item => item.name === 'transaction.json' || /^(?:conflict|pending)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.name))) {
     const tx = JSON.parse(entry.text);
     // publishJournal writes JSON.stringify(tx); conflict/pending archives link
