@@ -3,7 +3,8 @@ const path = require('node:path');
 const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
-const { generations } = require('./source-generations');
+const { checkIdeaEnvelope } = require('./idea-envelope');
+const publication = require('./idea-publication');
 const { scanIdeas } = require('./idea-inventory');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -12,42 +13,6 @@ const keys = (value, fields) => value && typeof value === 'object' && !Array.isA
 const sorted = values => values.every((value, index) => !index || values[index - 1] < value);
 const metadata = text => YAML.parse(text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1] || 'null');
 const held = () => { throw Error('Saved idea removal is held. The exact managed scope or ownership changed; preserve the files and inspect a fresh scope.'); };
-
-// Removal recognizes only the writer's known envelopes. Unknown nested fields
-// may be independent writing and cannot inherit the selected note's consent.
-function checkEnvelopes(value) {
-  const shape = (item, required, optional = []) => item && typeof item === 'object' && !Array.isArray(item) && required.every(key => Object.hasOwn(item, key)) && Object.keys(item).every(key => required.includes(key) || optional.includes(key));
-  const text = item => typeof item === 'string';
-  const texts = item => Array.isArray(item) && item.every(text);
-  const sha = item => text(item) && /^[a-f0-9]{64}$/.test(item);
-  const copies = item => Array.isArray(item) && item.every(copy => keys(copy, ['file', 'hash']) && text(copy.file) && sha(copy.hash));
-  const identity = item => text(item) && (uuid(item) || /^annotation:[a-f0-9-]{36}$/.test(item) && uuid(item.slice(11)));
-  const choice = item => item === null || keys(item, ['file', 'copies']) && text(item.file) && copies(item.copies);
-  const issue = item => item === null || item && (
-    item.kind === 'duplicate' && keys(item, ['kind', 'id', 'reason', 'files', 'token']) && copies(item.files) ||
-    item.kind === 'missing' && keys(item, ['kind', 'id', 'sourceHash', 'reason', 'token']) && sha(item.sourceHash)
-  ) && identity(item.id) && text(item.reason) && sha(item.token);
-  const input = value.input, experimentFields = ['hypothesis', 'borrowed_mechanism', 'project_application', 'smallest_test', 'observable_result'];
-  if (!shape(input, ['conversationId', 'requestId', 'title', 'explanation', 'limitations'], ['kind', 'experiment', 'referenceIds']) || !uuid(input.conversationId) || !uuid(input.requestId) || !['title', 'explanation', 'limitations'].every(key => text(input[key])) || Object.hasOwn(input, 'kind') && !['observation', 'failed_analogy', 'experiment_proposal'].includes(input.kind) || Object.hasOwn(input, 'experiment') && (!keys(input.experiment, experimentFields) || !experimentFields.every(key => text(input.experiment[key]))) || Object.hasOwn(input, 'referenceIds') && (!Array.isArray(input.referenceIds) || !input.referenceIds.every(uuid))) held();
-  if (!texts(value.warnings) || !Array.isArray(value.referenceBindings) || !Array.isArray(value.supportState)) held();
-  for (const binding of value.referenceBindings) {
-    if (!keys(binding, ['referenceId', 'conversationId', 'requestId', 'anchor', 'label']) || ![binding.referenceId, binding.conversationId, binding.requestId].every(uuid) || !text(binding.label)) held();
-    const anchor = binding.anchor;
-    if (!keys(anchor, ['kind', 'capture_id', 'revision_id', 'snapshot_sha256', 'evidence_id', 'evidence_kind', 'start_seconds', 'end_seconds', 'excerpt', 'excerpt_sha256']) || anchor.kind !== 'imported_evidence' || !uuid(anchor.capture_id) || !uuid(anchor.revision_id) || !sha(anchor.snapshot_sha256) || !text(anchor.evidence_id) || !text(anchor.evidence_kind) || !text(anchor.excerpt) || !sha(anchor.excerpt_sha256) || ![anchor.start_seconds, anchor.end_seconds].every(time => time === null || typeof time === 'number' && Number.isFinite(time))) held();
-  }
-  for (const state of value.supportState) {
-    if (!shape(state, ['key', 'originalDigest', 'currentDigest', 'excluded', 'authority', 'warnings'], ['originalSourceGenerations', 'currentSourceGenerations']) || !text(state.key) || !sha(state.originalDigest) || state.currentDigest !== null && !sha(state.currentDigest) || typeof state.excluded !== 'boolean' || !texts(state.warnings)) held();
-    // Legacy six-field records retain their absence; inspecting removal never
-    // supplies a generation or repairs historical attribution.
-    try {
-      if (Object.hasOwn(state, 'originalSourceGenerations')) generations(state.originalSourceGenerations);
-      if (Object.hasOwn(state, 'currentSourceGenerations') && state.currentSourceGenerations !== null) generations(state.currentSourceGenerations);
-    } catch { held(); }
-    const authority = state.authority, captured = ['sourceHash', 'file', 'currentRevision', 'currentHash', 'removed', 'rejected', 'supportEligible', 'conflict', 'pending', 'blocked', 'suppressed'];
-    if (!shape(authority, ['identityChoice', 'identityIssue'], captured) || !choice(authority.identityChoice) || !issue(authority.identityIssue)) held();
-    if (captured.some(key => Object.hasOwn(authority, key)) && (!keys(authority, ['identityChoice', 'identityIssue', ...captured]) || !sha(authority.sourceHash) || !text(authority.file) || !uuid(authority.currentRevision) || !sha(authority.currentHash) || !captured.slice(4).every(key => typeof authority[key] === 'boolean'))) held();
-  }
-}
 
 // This store owns only explicit saved-idea removal. It never reads Conversation
 // or Context, and never reconstructs writing from an intent during recovery.
@@ -118,8 +83,7 @@ class IdeasRemoval {
         if (!keys(value, ['schema', 'operation', 'id', 'digest', 'dev', 'ino'])) held();
         receipts.push({ file, loaded, value }); continue;
       }
-      if (!keys(value, ['schema', 'operation', 'id', 'vault', 'destination', 'text', 'digest', 'proposalKey', 'warnings', 'input', 'referenceBindings', 'supportState'])) held();
-      checkEnvelopes(value);
+      checkIdeaEnvelope(value, vault, held);
       let fields; try { fields = metadata(value.text); } catch { held(); }
       if (value.vault !== vault.root || typeof value.text !== 'string' || digest(value.text) !== value.digest || !fields || fields.artifact_type !== 'saved_idea' || fields.schema_version !== 1 || fields.companion_id !== id || path.dirname(value.destination || '') !== path.join(vault.root, 'Ideas') || !path.basename(value.destination).endsWith(`--${id}.md`) || value.input?.conversationId !== fields.origin?.conversation_id || value.input?.requestId !== fields.origin?.request_id) held();
       intents.set(value.operation, value); add(file, 'intent', value.operation, loaded);
@@ -136,9 +100,22 @@ class IdeasRemoval {
       add(claim.file, 'note', null, loaded);
     }
     for (const value of intents.values()) {
-      const stage = path.join(directory, `${value.operation}.md.pending`);
+      const files = publication.locations(vault, value.operation), { stage } = files;
+      const guard = () => { this.ideas.guard(vault, parents); if (this.ideas.getVault() !== vault) held(); };
+      const owner = found.get(files.intent).loaded;
+      const proof = { dev: String(owner.stat.dev), ino: String(owner.stat.ino), digest: digest(owner.bytes) };
+      const controls = [];
+      for (const kind of ['prepared', 'attempt']) {
+        const control = publication.readControl(files[kind], guard, value, proof);
+        if (!control) continue;
+        const loaded = this.read(vault, files[kind], parents);
+        if (!publication.sameProof(control.proof, { dev: String(loaded.stat.dev), ino: String(loaded.stat.ino), digest: digest(loaded.bytes) })) held();
+        controls.push(control.stage);
+        add(files[kind], kind, value.operation, loaded);
+      }
       if (this.exists(stage)) {
         const loaded = this.read(vault, stage, parents); if (loaded.text !== value.text) held();
+        if (controls.some(proof => !publication.sameProof(proof, { dev: String(loaded.stat.dev), ino: String(loaded.stat.ino), digest: digest(loaded.bytes) }))) held();
         add(stage, 'stage', value.operation, loaded);
       }
     }
@@ -156,8 +133,16 @@ class IdeasRemoval {
       const value = intents.get(receipt.value.operation); if (!value) held();
       this.ideas.checkReceipt(receipt.value, value);
       const note = found.get(value.destination);
-      if (note && (note.loaded.stat.dev.toString() !== receipt.value.dev || note.loaded.stat.ino.toString() !== receipt.value.ino)) held();
+      const owned = inventory.publications.get(id);
+      if (owned?.repairIssue || owned?.repair?.pending) held();
+      const identity = owned?.repair?.note || receipt.value;
+      if (note && (note.loaded.stat.dev.toString() !== identity.dev || note.loaded.stat.ino.toString() !== identity.ino)) held();
       if (!note && !confirmed) held();
+      for (const repair of owned?.repair?.receipts || []) {
+        const loaded = this.read(vault, repair.file, parents);
+        if (!publication.sameProof(repair.proof, { dev: String(loaded.stat.dev), ino: String(loaded.stat.ino), digest: digest(loaded.bytes) })) held();
+        add(repair.file, 'link-repair', value.operation, loaded);
+      }
       add(receipt.file, 'receipt', value.operation, receipt.loaded);
     }
     // Before a first confirmation, a note must be the recorded publication or
@@ -182,7 +167,7 @@ class IdeasRemoval {
     // it separate from the content-free scope cached and committed as authority.
     if (writing) for (const file of files) {
       const item = found.get(this.absolute(vault, file.path));
-      if (item.kind === 'receipt') continue;
+      if (['receipt', 'prepared', 'attempt', 'link-repair'].includes(item.kind)) continue;
       writing.push({ path: item.file, kind: item.kind, text: item.kind === 'intent' ? intents.get(item.operation).text : item.loaded.text });
     }
     inventory.check();
@@ -199,12 +184,14 @@ class IdeasRemoval {
       if (!current || current.dev.toString() !== parent.dev || current.ino.toString() !== parent.ino) held();
     }
     for (const file of value.files) {
-      if (!keys(file, ['path', 'kind', 'operation', 'sha256', 'size', 'dev', 'ino', 'peers']) || !['note', 'intent', 'stage', 'receipt'].includes(file.kind) || !/^[a-f0-9]{64}$/.test(file.sha256) || ![file.size, file.dev, file.ino].every(decimal) || !Array.isArray(file.peers) || !file.peers.includes(file.path) || !sorted(file.peers) || file.peers.length > 2) held();
+      if (!keys(file, ['path', 'kind', 'operation', 'sha256', 'size', 'dev', 'ino', 'peers']) || !['note', 'intent', 'stage', 'receipt', 'prepared', 'attempt', 'link-repair'].includes(file.kind) || !/^[a-f0-9]{64}$/.test(file.sha256) || ![file.size, file.dev, file.ino].every(decimal) || !Array.isArray(file.peers) || !file.peers.includes(file.path) || !sorted(file.peers) || file.peers.length > 2) held();
       const absolute = this.absolute(vault, file.path);
       if (file.kind === 'note') {
         if (file.operation !== null || path.dirname(absolute) !== path.join(vault.root, 'Ideas') || !path.basename(absolute).endsWith(`--${id}.md`)) held();
+      } else if (file.kind === 'link-repair') {
+        if (!uuid(file.operation) || path.dirname(absolute) !== path.join(vault.root, '.ideas') || !new RegExp(`^${file.operation}\\.links-[1-9][0-9]*\\.json$`).test(path.basename(absolute))) held();
       } else {
-        const suffix = { intent: 'intent.json', stage: 'md.pending', receipt: 'published.json' }[file.kind];
+        const suffix = { intent: 'intent.json', stage: 'md.pending', receipt: 'published.json', prepared: 'prepared.json', attempt: 'attempt.json' }[file.kind];
         if (!uuid(file.operation) || absolute !== path.join(vault.root, '.ideas', `${file.operation}.${suffix}`)) held();
       }
       for (const peer of file.peers) {
@@ -286,8 +273,9 @@ class IdeasRemoval {
     }
     await this.ideas.checkpoint('idea-removal-after-marker');
     this.checkAuthority(vault, authority); await this.checkScope(vault, authority.value);
-    const priority = { stage: 0, note: 1, receipt: 2, intent: 3 };
-    for (const target of [...authority.value.files].sort((a, b) => priority[a.kind] - priority[b.kind])) {
+    const priority = { stage: 0, note: 1, 'link-repair': 2, receipt: 3, attempt: 4, prepared: 5, intent: 6 };
+    const repairOrdinal = file => Number(/\.links-([1-9][0-9]*)\.json$/.exec(file.path)?.[1] || 0);
+    for (const target of [...authority.value.files].sort((a, b) => priority[a.kind] - priority[b.kind] || repairOrdinal(b) - repairOrdinal(a))) {
       this.checkAuthority(vault, authority);
       const remaining = await this.checkScope(vault, authority.value);
       if (!remaining.files.some(file => file.path === target.path)) continue;

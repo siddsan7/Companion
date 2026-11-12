@@ -5,7 +5,9 @@ const YAML = require('yaml');
 const { createHash } = require('node:crypto');
 const { uuid } = require('./source-authority');
 const { comparable, storeName } = require('./legacy-capture-ownership');
-const { ordinaryDirectories, verifyAbsentSync } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, verifyAbsentSync } = require('./staged-publication');
+const { checkIdeaEnvelope } = require('./idea-envelope');
+const linkRepair = require('./idea-link-repair');
 const { parse: parseCapture } = require('./vault');
 
 const decode = new TextDecoder('utf-8', { fatal: true });
@@ -105,7 +107,7 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
     const stat = await fs.lstat(file, { bigint: true });
     if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n) return null;
     const bytes = await inspect(file, stat, handle => readBytes(file, stat, handle));
-    try { return JSON.parse(decode.decode(bytes)); } catch { return null; }
+    try { return { value: JSON.parse(decode.decode(bytes)), proof: { dev: String(stat.dev), ino: String(stat.ino), digest: sha256(bytes) } }; } catch { return null; }
   }
 
   async function publishedIdeas() {
@@ -113,12 +115,21 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
     let stat;
     try { stat = await fs.lstat(directory, { bigint: true }); }
     catch (error) { if (error.code === 'ENOENT') return; throw error; }
-    const files = new Set((await entries(directory, stat)).filter(entry => entry.isFile()).map(entry => entry.name));
+    const children = await entries(directory, stat), names = children.map(entry => entry.name);
+    const files = new Set(children.filter(entry => entry.isFile()).map(entry => entry.name));
+    const guard = ordinaryDirectories([root, managed, directory], changed(directory).message).guard;
+    const readRepair = (file, links) => {
+      const before = local.lstatSync(file, { bigint: true });
+      const exact = readExactSync(file, guard, links);
+      stable(file, before, local.lstatSync(file, { bigint: true }));
+      observe(file, before);
+      return exact;
+    };
     for (const name of files) {
       if (!name.endsWith('.published.json')) continue;
       const operation = name.slice(0, -'.published.json'.length);
       if (!uuid(operation)) continue;
-      const receipt = await journal(path.join(directory, name));
+      const saved = await journal(path.join(directory, name)), receipt = saved?.value;
       if (!uuid(receipt?.id)) continue;
       const duplicate = publications.has(receipt.id);
       publications.set(receipt.id, null);
@@ -126,7 +137,7 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
         ![receipt.dev, receipt.ino].every(value => typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value))) continue;
       const intentName = `${operation}.intent.json`;
       if (!files.has(intentName)) continue;
-      const intent = await journal(path.join(directory, intentName));
+      const loaded = await journal(path.join(directory, intentName)), intent = loaded?.value;
       if (!intent || intent.schema !== 1 || intent.operation !== operation || intent.id !== receipt.id || intent.vault !== vault.root ||
         typeof intent.destination !== 'string' || path.dirname(intent.destination) !== ideas || !path.basename(intent.destination).endsWith(`--${receipt.id}.md`) ||
         typeof intent.text !== 'string' || intent.digest !== receipt.digest || sha256(intent.text) !== receipt.digest) continue;
@@ -134,7 +145,29 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
       const metadata = front && parseHeader(front[1]);
       if (metadata?.artifact_type !== 'saved_idea' || metadata.schema_version !== 1 || metadata.companion_id !== receipt.id ||
         !uuid(metadata.origin?.conversation_id) || !uuid(metadata.origin?.request_id) || metadata.origin.conversation_id !== intent.input?.conversationId || metadata.origin.request_id !== intent.input?.requestId) continue;
-      publications.set(receipt.id, { identity: `${receipt.dev}:${receipt.ino}`, destination: intent.destination });
+      const base = { dev: receipt.dev, ino: receipt.ino, digest: receipt.digest };
+      let repair, repairIssue, pendingOutput;
+      if (Object.hasOwn(intent, 'relationshipBindings')) {
+        try {
+          checkIdeaEnvelope(intent, vault, () => { throw linkRepair.changed(); });
+          repair = linkRepair.history(vault, intent, { note: base, proof: saved.proof }, names, readRepair);
+        } catch (error) { repairIssue = error.message; }
+      }
+      if (repair?.pending && !repair.pending.staged && !repair.pending.committed) {
+        const { destination, after } = repair.pending.data;
+        try {
+          const folders = [root];
+          for (const segment of path.relative(root, path.dirname(destination)).split(path.sep).filter(Boolean)) folders.push(path.join(folders.at(-1), segment));
+          const outputGuard = ordinaryDirectories(folders, changed(destination).message).guard;
+          const before = local.lstatSync(destination, { bigint: true });
+          readExactSync(destination, outputGuard, 1, after);
+          stable(destination, before, local.lstatSync(destination, { bigint: true }));
+          observe(destination, before);
+          pendingOutput = { destination, identity: `${after.dev}:${after.ino}` };
+        } catch { /* An absent or changed candidate does not grant ownership. */ }
+      }
+      const note = repair?.note || base;
+      publications.set(receipt.id, { identity: `${note.dev}:${note.ino}`, destination: intent.destination, intent, intentProof: loaded.proof, receiptProof: saved.proof, repair, repairIssue, pendingOutput });
     }
   }
 
@@ -182,10 +215,12 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
       // Editors may replace the file at its recorded destination. This grants
       // read access only. Removal verifies the original publication identity.
       const recordedDestination = publications.get(id)?.destination === file;
-      const owned = !isReserved && (retainedIds.includes(id) || recordedDestination || localIdea && isIdea && !publications.has(id));
+      const pending = publications.get(id)?.pendingOutput;
+      const repairPending = !!pending && pending.destination === file && pending.identity === inode(stat);
+      const owned = !isReserved && (retainedIds.includes(id) || recordedDestination || repairPending || localIdea && isIdea && !publications.has(id));
       const savedIdea = owned && isIdea && metadata.schema_version === 1 && rawId === id;
       const content = savedIdea ? decode.decode(captureBytes ?? await readBytes(file, stat, handle)) : undefined;
-      record(id, { file, stat, relevant: owned || localIdea && isReserved && isIdea || publications.has(id), savedIdea, ...(savedIdea ? { content, metadata } : {}) });
+      record(id, { file, stat, relevant: owned || localIdea && isReserved && isIdea || publications.has(id), savedIdea, repairPending, ...(savedIdea ? { content, metadata } : {}) });
     });
   }
 
@@ -233,7 +268,7 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
     if (error.code) throw unavailable(error.path || root, 'An ordinary vault entry could not be read.');
     throw error;
   }
-  return { claims, captureClaims, check, relative };
+  return { claims, captureClaims, publications, check, relative };
 }
 
 module.exports = { scanIdeas };

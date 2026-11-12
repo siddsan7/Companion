@@ -101,11 +101,25 @@ async function inventory(vault, intake, ledger, id, captureId) {
     if (!entry.isFile() || entry.isSymbolicLink()) throw changed();
     const value = await leaf(vault, file); entries.set(entry.name, value);
   }
+  // A repair can also retain a source-stage copy. Report the known mixed
+  // ownership before classifying its other files as an unrecognized scope.
+  const repairName = /^repair(?:-intent|-[a-f0-9-]{36})\.json$/;
+  for (const [name, value] of entries) {
+    if (!repairName.test(name) || !value.text.includes(id)) continue;
+    let repair;
+    try { repair = JSON.parse(value.text); intake.validateRepairIntent(repair); } catch { continue; }
+    const note = parseAnnotation(repair.annotation);
+    if (note?.id === id && repair.annotationId === id && (!captureId || note.captureId === captureId) &&
+        value.raw.equals(Buffer.from(JSON.stringify(repair))) && (!repair.intentIdentity ||
+        repair.intentIdentity.dev === value.dev && repair.intentIdentity.ino === value.ino)) {
+      throw Error('This annotation remains in mixed source repair data. Preserve and split that repair before selecting annotation removal.');
+    }
+  }
   const links = new Map();
   let publication, publicationRecord, heldPublication;
   for (const [name, value] of entries) {
     if (name !== heldAnnotationIntent(id) && !value.text.includes(id)) continue;
-    if (/^repair(?:-intent|-[a-f0-9-]{36})\.json$/.test(name)) throw Error('This annotation remains in mixed source repair data. Preserve and split that repair before selecting annotation removal.');
+    if (repairName.test(name)) throw changed();
     if (isAnnotationIntent(name)) {
       const { intent, note } = readStandaloneIntent(intake, name, value);
       bind(note);

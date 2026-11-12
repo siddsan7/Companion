@@ -138,6 +138,18 @@
         article.append(title, open); byId('saved-ideas').append(article);
         const remove = document.createElement('button'); remove.textContent = 'Preview saved idea removal'; remove.disabled = note.unavailable;
         remove.onclick = () => previewRemoval(note.id); article.append(remove);
+        if (note.repairLinks) {
+          const repair = document.createElement('button'); repair.textContent = 'Repair saved idea links';
+          repair.onclick = async () => {
+            repair.disabled = true;
+            try {
+              const result = await window.companion['idea-repair-links'](note.id);
+              if (owner === vaultEpoch) byId('idea-status').textContent = result.repaired ? 'Saved idea links repaired.' : 'No verified target moves need link repair.';
+            } catch (error) { if (owner === vaultEpoch) byId('idea-status').textContent = error.message; }
+            finally { repair.disabled = false; }
+          };
+          article.append(repair);
+        }
         if (note.reviewSupport) {
           const warning = document.createElement('p'); warning.textContent = `Review support. ${note.supportWarnings.join(' ')} Independent writing remains available; this inspection does not rewrite it.`; article.append(warning);
         }
@@ -164,7 +176,8 @@
       for (const proposal of proposals) {
         const article = document.createElement('article'), title = document.createElement('h3'), resume = document.createElement('button');
         title.textContent = proposal.title; resume.textContent = 'Resume proposed idea';
-        if (proposal.cleanup) { const state = document.createElement('p'); state.textContent = 'The note is already published. Resume to review and explicitly finish local staging cleanup.'; article.append(state); }
+        if (proposal.held) { const state = document.createElement('p'); state.textContent = 'Publication ownership is held. Resume to inspect the retained proposal.'; article.append(state); }
+        else if (proposal.cleanup) { const state = document.createElement('p'); state.textContent = 'The note is already published. Resume to review and explicitly finish local staging cleanup.'; article.append(state); }
         else if (proposal.hasPublication) { const state = document.createElement('p'); state.textContent = 'The note is already published. Resume to acknowledge it and finish local staging cleanup.'; article.append(state); }
         resume.onclick = async () => {
           const owner = beginEditorLoad(); byId('idea-status').textContent = 'Loading retained proposal…';

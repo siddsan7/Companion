@@ -9,6 +9,16 @@ const { readNoteScope, changeNoteScope } = require('./note-scope');
 const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyAbsentSync, verifyPeers, verifyPeersSync, removeStage, removeLinkedStage, firstPublicationSuffix } = require('./staged-publication');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const comparableRoot = root => process.platform === 'win32' ? path.normalize(root).toLowerCase() : path.normalize(root);
+function bindingRoot(binding) {
+  if (!binding || !path.isAbsolute(binding.vault) || path.isAbsolute(binding.parent)) return null;
+  const root = path.resolve(binding.vault, binding.parent), relative = path.relative(binding.vault, root);
+  return relative && !path.isAbsolute(relative) && !relative.split(path.sep).includes('..') ? root : null;
+}
+function scheduleBelongsTo(intent, sourceRoot) {
+  const originalRoot = bindingRoot(intent);
+  return !!originalRoot && comparableRoot(originalRoot) === comparableRoot(sourceRoot);
+}
 class Archives {
   constructor(options) { Object.assign(this, options); this.review = null; }
   guard() { this.history.safeDirectory(false, this.directory); }
@@ -87,8 +97,14 @@ class Archives {
         scheduleIntent = { schema: 1, id: state.id, anchor: state.anchor, vault: state.vault, parent: state.parent, mode: state.mode, reconnectRequired: true };
         fingerprints[scheduleFile] = scheduleRead.digest;
       }
-      const roots = [...new Set([...conversations.map(record => record.vault.root), ...(settings ? [path.resolve(settings.vault, settings.parent)] : [])])].sort();
-      const vaultBindings = roots.map(managedRoot => ({ managedRoot, vault: settings && managedRoot === path.resolve(settings.vault, settings.parent) ? settings.vault : null, parent: settings && managedRoot === path.resolve(settings.vault, settings.parent) ? settings.parent : null, matchingRequired: true, pins: conversations.filter(record => record.vault.root === managedRoot).map(record => record.brief) }));
+      const settingsRoot = settings && path.resolve(settings.vault, settings.parent), scheduleRoot = bindingRoot(scheduleIntent);
+      const roots = new Set(conversations.map(record => record.vault.root));
+      if (settingsRoot) roots.add(settingsRoot);
+      if (scheduleRoot && ![...roots].some(root => comparableRoot(root) === comparableRoot(scheduleRoot))) roots.add(scheduleRoot);
+      const vaultBindings = [...roots].sort().map(managedRoot => {
+        const binding = managedRoot === settingsRoot ? settings : scheduleRoot && comparableRoot(managedRoot) === comparableRoot(scheduleRoot) ? scheduleIntent : null;
+        return { managedRoot, vault: binding?.vault ?? null, parent: binding?.parent ?? null, matchingRequired: true, pins: conversations.filter(record => record.vault.root === managedRoot).map(record => record.brief) };
+      });
       const payload = { settings, contextScopes, scheduleIntent, vaultBindings, conversations };
       this.guard();
       if (Buffer.byteLength(canonical(payload)) > LIMIT) throw Error('History archive exceeds the 128 MiB limit.');
@@ -428,10 +444,14 @@ class Archives {
     const inherited = (archive.payload.settings?.inactiveScheduleIntents || []).map(original => {
       const record = structuredClone(inactiveIntent(original));
       // Only this explicitly matched former destination may become usable in the new installation.
-      if (record.targetRoot === sourceRoot) record.targetRoot = targetRoot;
+      if (record.targetRoot === sourceRoot && scheduleBelongsTo(record.intent, record.sourceRoot)) record.targetRoot = targetRoot;
       return record;
     });
-    return [...inherited, ...(archive.payload.scheduleIntent ? [{ schema: 1, archiveId: archive.id, sourceRoot, targetRoot, intent: archive.payload.scheduleIntent }] : [])];
+    const intent = archive.payload.scheduleIntent;
+    if (scheduleBelongsTo(intent, sourceRoot)) {
+      inherited.push({ schema: 1, archiveId: archive.id, sourceRoot, targetRoot, intent });
+    }
+    return inherited;
   }
   async state() { return this.history.lock(async () => { this.directory = this.history.safeDirectory(); return { inactiveIntents: await this.inactiveIntents(), codexHints: await this.inactiveCodexHints() }; }); }
   async reconnectPreview(input) {
@@ -446,7 +466,7 @@ class Archives {
         await assertSelection();
         if (input?.targetRoot !== vault.root) throw Error('Select exactly one imported cadence matched to the current vault.');
         const intents = (await this.inactiveIntents()).filter(record => record.archiveId === input.archiveId &&
-          record.sourceRoot === input.sourceRoot && record.targetRoot === input.targetRoot);
+          record.sourceRoot === input.sourceRoot && record.targetRoot === input.targetRoot && scheduleBelongsTo(record.intent, record.sourceRoot));
         if (intents.length !== 1) throw Error('Select exactly one imported cadence matched to the current vault.');
         const imported = intents[0], prior = await schedule.snapshot(guard), existing = prior?.state;
         if (existing && (!existing.archiveReconnect || existing.archiveReconnect.archiveId !== imported.archiveId || existing.archiveReconnect.sourceRoot !== imported.sourceRoot || existing.archiveReconnect.targetRoot !== imported.targetRoot || existing.archiveReconnect.intentId !== imported.intent.id || !schedule.matches(existing))) throw Error('Current daily intake settings belong to another schedule. Preserve them and resolve that schedule explicitly before reconnection.');
