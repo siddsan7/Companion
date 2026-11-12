@@ -67,6 +67,97 @@ test('a fresh intake conflict never retires an equal-byte replacement of its ori
   expect((await readJson(ledgerFile)).attempts).toEqual(baseline.attempts);
 });
 
+for (const kind of ['snapshot', 'capture']) for (const equal of [false, true]) {
+  test(`fresh intake preserves an unowned ${kind} stage with ${equal ? 'equal' : 'different'} bytes`, async ({}, testInfo) => {
+    const producer = testInfo.outputPath('producer');
+    let stage, destination, bytes, original;
+    const { vault, intake } = await setup(testInfo, async boundary => {
+      if (boundary !== 'intake-journaled') return;
+      const tx = await readJson(path.join(intake.dir, 'transaction.json'));
+      stage = path.join(intake.dir, tx.revision.id + (kind === 'snapshot' ? '.snapshot.stage' : '.stage'));
+      destination = kind === 'snapshot' ? path.join(vault.root, 'Revisions', tx.revision.id + '.json') : intake.destination(tx.capture);
+      bytes = equal ? kind === 'snapshot' ? JSON.stringify(tx.revision, null, 2) : tx.content : 'Independent writing at a reserved stage.\n';
+      await fs.writeFile(stage, bytes, { flag: 'wx' });
+      original = await fs.lstat(stage, { bigint: true });
+    });
+    await writeDraft(producer);
+    const result = await intake.connect(producer, true, now);
+    expect(original, 'the independent file occupied the stage after the journal was published').toBeDefined();
+    expect(await readOptional(stage)).toBe(bytes);
+    expect(await readOptional(destination)).toBeNull();
+    expect(result.lastCheck.status).toBe('held');
+    expect(Object.values(result.attempts)).toHaveLength(0);
+    const retained = await fs.lstat(stage, { bigint: true });
+    expect([retained.dev, retained.ino, retained.nlink]).toEqual([original.dev, original.ino, 1n]);
+  });
+}
+
+test('fresh intake refuses an equal-byte snapshot stage replacement after the exclusive write closes', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), displaced = testInfo.outputPath('created-snapshot.json');
+  let stage, destination, replacement;
+  const { vault, intake } = await setup(testInfo, async boundary => {
+    if (boundary !== 'intake-journaled') return;
+    const tx = await readJson(path.join(intake.dir, 'transaction.json'));
+    stage = path.join(intake.dir, tx.revision.id + '.snapshot.stage');
+    destination = path.join(vault.root, 'Revisions', tx.revision.id + '.json');
+  });
+  await writeDraft(producer);
+  const { open, writeFile } = fs;
+  async function replace() {
+    const bytes = await fs.readFile(stage);
+    await fs.rename(stage, displaced);
+    await writeFile(stage, bytes, { flag: 'wx' });
+    replacement = await fs.lstat(stage, { bigint: true });
+  }
+  fs.open = async (file, flag, ...args) => {
+    const handle = await open(file, flag, ...args);
+    if (file === stage && flag === 'wx') {
+      const close = handle.close.bind(handle);
+      handle.close = async () => { await close(); await replace(); };
+    }
+    return handle;
+  };
+  fs.writeFile = async (file, content, options) => {
+    await writeFile(file, content, options);
+    if (file === stage && options?.flag === 'wx') await replace();
+  };
+  let result;
+  try { result = await intake.connect(producer, true, now); }
+  finally { fs.open = open; fs.writeFile = writeFile; }
+
+  expect(replacement, 'the exact creation boundary was reached').toBeDefined();
+  expect(await readOptional(destination)).toBeNull();
+  expect(await fs.readFile(stage)).toEqual(await fs.readFile(displaced));
+  const retained = await fs.lstat(stage, { bigint: true });
+  expect([retained.dev, retained.ino, retained.nlink]).toEqual([replacement.dev, replacement.ino, 1n]);
+  expect(result.lastCheck.status).toBe('held');
+  expect(Object.values(result.attempts)).toHaveLength(0);
+});
+
+for (const kind of ['snapshot', 'capture']) test(`fresh intake holds an equal-byte ${kind} at its final path without the writer's stage identity`, async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer');
+  let stage, destination, foreign, bytes;
+  const { vault, intake } = await setup(testInfo, async boundary => {
+    if (boundary !== `intake-${kind}-staged`) return;
+    const tx = await readJson(path.join(intake.dir, 'transaction.json'));
+    stage = path.join(intake.dir, tx.revision.id + (kind === 'snapshot' ? '.snapshot.stage' : '.stage'));
+    destination = kind === 'snapshot' ? path.join(vault.root, 'Revisions', tx.revision.id + '.json') : intake.destination(tx.capture);
+    bytes = await fs.readFile(stage);
+    await fs.writeFile(destination, bytes, { flag: 'wx' });
+    foreign = await fs.lstat(destination, { bigint: true });
+  });
+  await writeDraft(producer);
+  const result = await intake.connect(producer, true, now);
+
+  expect(foreign, 'the independent file occupied the final path before linking').toBeDefined();
+  expect(result.lastCheck.status).toBe('held');
+  expect(Object.values(result.attempts)).toHaveLength(0);
+  expect(await fs.readFile(stage)).toEqual(bytes);
+  expect(await fs.readFile(destination)).toEqual(bytes);
+  const retained = await fs.lstat(destination, { bigint: true });
+  expect([retained.dev, retained.ino, retained.nlink]).toEqual([foreign.dev, foreign.ino, 1n]);
+});
+
 for (const kind of ['snapshot', 'capture']) test(`intake holds changed ${kind} stage bytes before publishing their final path`, async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
   const replacement = `Independent writing at the ${kind} stage.\n`;
