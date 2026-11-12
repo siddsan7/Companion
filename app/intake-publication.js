@@ -4,10 +4,13 @@ const { uuid } = require('./source-authority');
 const roles = ['snapshotStage', 'captureStage', 'backup'];
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const exactProof = proof => validProof(proof) && Object.keys(proof).length === 3;
+const pendingName = /^pending-([a-f0-9-]{36})(?:-([a-f0-9-]{36}))?\.json$/;
 const backupName = /^([a-f0-9-]{36})-([a-f0-9-]{36})\.before(?:-([a-f0-9-]{36}))?\.md$/;
 const validRole = (role, proof) => role === 'detach'
   ? proof && Object.keys(proof).length === 2 && exactProof(proof.intent) && exactProof(proof.stage)
   : roles.includes(role) && exactProof(proof);
+const validRecordField = (record, key) => key === 'sourceHash' || key === 'journal' ||
+  (key === 'pending' ? typeof record.pending === 'string' && pendingName.test(record.pending) : validRole(key, record[key]));
 const matchesProof = (proof, expected) => !!proof && !!expected &&
   proof.dev === expected.dev && proof.ino === expected.ino && proof.digest === expected.digest;
 
@@ -16,8 +19,7 @@ function validateStageRecords(ledger) {
   if (records !== undefined && (!records || typeof records !== 'object' || Array.isArray(records) ||
       Object.entries(records).some(([digest, record]) => !record || !sha(record.sourceHash) ||
         !exactProof(record.journal) || digest !== record.journal.digest ||
-        Object.keys(record).some(key => key !== 'sourceHash' && key !== 'journal' &&
-          !validRole(key, record[key]))))) {
+        !Object.keys(record).every(key => validRecordField(record, key))))) {
     throw Error('Invalid intake stage ownership. Recovery files were preserved.');
   }
   const backups = ledger.retainedIntakeBackups;
@@ -38,6 +40,14 @@ function stageRecord(ledger, sourceHash, journal) {
     throw Error('Intake stage ownership no longer matches the exact journal. Recovery files were preserved.');
   }
   return record;
+}
+
+function pendingJournalProof(ledger, sourceHash, name) {
+  const records = Object.values(ledger.intakeStageRecords || {}).filter(record => record.pending === name);
+  if (records.length > 1 || records[0] && records[0].sourceHash !== sourceHash) {
+    throw Error('Deferred intake journal ownership is ambiguous. Preserve .intake for repair.');
+  }
+  return records[0]?.journal;
 }
 
 function retireStageRecords(ledger, remove) {
@@ -66,4 +76,4 @@ function retireBackups(ledger, sourceHash) {
   else delete ledger.retainedIntakeBackups;
 }
 
-module.exports = { validateStageRecords, stageRecord, retireStageRecords, matchesProof, retainedBackups, verifyRetainedBackups, retireBackups };
+module.exports = { validateStageRecords, stageRecord, pendingJournalProof, retireStageRecords, matchesProof, retainedBackups, verifyRetainedBackups, retireBackups };

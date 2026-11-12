@@ -367,29 +367,52 @@ for (const boundary of ['held ledger rename', 'held journal link', 'edited journ
   expect(await readOptional(pending)).toBeNull();
 });
 
-async function exitDuringOrdinaryIntake(vault, producer, boundary) {
+async function exitDuringOrdinaryIntake(vault, producer, boundary, selection) {
   const script = `
     const path = require('node:path');
-    const [app, directory, producer, now, boundary] = process.argv.slice(1);
+    const [app, directory, producer, now, boundary, selection] = process.argv.slice(1);
     const { Vault } = require(path.join(app, 'vault'));
     const { Intake } = require(path.join(app, 'intake'));
     const vault = new Vault(directory, 'Companion', { checkpoint: name => {
       if (name === boundary) process.exit(77);
     } });
-    if (boundary === 'journal-linked') {
+    if (boundary === 'journal-linked' || boundary === 'pending-linked') {
       const local = require('node:fs'), link = local.linkSync;
       const journal = path.join(vault.root, '.intake', 'transaction.json');
       local.linkSync = function (from, to) {
         const result = link.call(this, from, to);
-        if (to === journal) process.exit(77);
+        if (to === journal && (boundary === 'journal-linked' || path.basename(from).startsWith('pending-'))) process.exit(77);
         return result;
       };
     }
-    new Intake(vault).connect(producer, true, now).catch(error => {
+    if (boundary === 'snapshot-stage-flushed' || boundary === 'capture-stage-flushed') {
+      const fs = require('node:fs/promises'), open = fs.open;
+      fs.open = async function (file, flags, ...args) {
+        const handle = await open.call(this, file, flags, ...args);
+        const name = path.basename(file);
+        const selected = boundary === 'snapshot-stage-flushed'
+          ? /^[a-f0-9-]{36}[.]snapshot[.]stage$/.test(name) : /^[a-f0-9-]{36}[.]stage$/.test(name);
+        if (flags === 'wx' && selected) {
+          const sync = handle.sync.bind(handle);
+          handle.sync = async () => {
+            await sync();
+            await handle.close();
+            process.exit(77);
+          };
+        }
+        return handle;
+      };
+    }
+    const intake = new Intake(vault);
+    const work = boundary === 'pending-linked' ? intake.reconcile({ now })
+      : selection ? intake.selectCurrent(...JSON.parse(selection))
+      : intake.connect(producer, true, now);
+    work.catch(error => {
       console.error(error);
       process.exitCode = 1;
     });`;
-  const child = spawn(process.execPath, ['-e', script, path.resolve(__dirname, '../app'), vault.vault, producer, now, boundary], {
+  const child = spawn(process.execPath, ['-e', script, path.resolve(__dirname, '../app'), vault.vault, producer, now, boundary,
+    ...(selection ? [JSON.stringify(selection)] : [])], {
     stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
   });
   let stderr = '';
@@ -400,6 +423,168 @@ async function exitDuringOrdinaryIntake(vault, producer, boundary) {
   });
   expect(exit, stderr).toEqual({ code: 77, signal: null });
 }
+
+for (const role of ['snapshot', 'capture']) test(`first intake resumes after moving aside an unproved ${role} stage flushed before process exit`, async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), originalStage = testInfo.outputPath('preserved.stage');
+  const { vault, intake, ledgerFile } = await setup(testInfo);
+  await writeDraft(producer);
+  await exitDuringOrdinaryIntake(vault, producer, role + '-stage-flushed');
+  const active = path.join(intake.dir, 'transaction.json'), journalBytes = await fs.readFile(active);
+  const tx = JSON.parse(journalBytes);
+  const stage = path.join(intake.dir, tx.revision.id + (role === 'snapshot' ? '.snapshot.stage' : '.stage'));
+  const destination = intake.destination(tx.capture), before = await readJson(ledgerFile);
+  const bytes = await fs.readFile(stage), identity = await fs.lstat(stage, { bigint: true });
+  expect(before.intakeStageRecords?.[hash(journalBytes)]?.[role + 'Stage']).toBeUndefined();
+  expect(bytes.toString('utf8')).toBe(role === 'snapshot' ? JSON.stringify(tx.revision, null, 2) : tx.content);
+  expect(await readOptional(destination)).toBeNull();
+  await writeDraft(producer, 'z-independent', '3', 'c');
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const held = await restarted.reconcile({ now: later });
+  expect(held.lastCheck.status).toBe('held');
+  expect(held.attempts[tx.revision.identity]).toBeUndefined();
+  expect(held.captures[tx.sourceHash]).toBeUndefined();
+  expect(Object.values(held.captures)).toHaveLength(1);
+  expect(held.pending[tx.sourceHash]?.reason).toMatch(/move.*aside.*Check now/i);
+  const journal = path.join(intake.dir, held.pending[tx.sourceHash].journal);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect(await readOptional(active)).toBeNull();
+  expect(await fs.readFile(stage)).toEqual(bytes);
+  expect((await fs.lstat(stage, { bigint: true })).ino).toBe(identity.ino);
+
+  await fs.rename(stage, originalStage);
+  const completed = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
+  expect(completed.lastCheck.status).toBe('complete');
+  expect(completed.attempts[tx.revision.identity]?.revision).toBe(tx.revision.id);
+  expect(completed.captures[tx.sourceHash].currentRevision).toBe(tx.revision.id);
+  expect(completed.pending[tx.sourceHash]).toBeUndefined();
+  expect(await readOptional(journal)).toBeNull();
+  expect(await readOptional(stage)).toBeNull();
+  expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
+  expect(await fs.readFile(originalStage)).toEqual(bytes);
+  expect((await fs.lstat(originalStage, { bigint: true })).ino).toBe(identity.ino);
+});
+
+test('an equal-byte replacement of one deferred intake journal preserves the hold and allows independent Check now intake', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), originalJournal = testInfo.outputPath('preserved-pending.json');
+  let busy = false;
+  const { vault, intake } = await setup(testInfo, boundary => {
+    if (busy && boundary === 'intake-before-move') throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+  });
+  await writeDraft(producer);
+  const original = await intake.connect(producer, true, now), [sourceHash] = Object.keys(original.captures);
+  const destination = intake.destination(original.captures[sourceHash]), previous = await fs.readFile(destination);
+  await writeDraft(producer, 'second', '2');
+  busy = true;
+  const deferred = await intake.reconcile({ now: later });
+  busy = false;
+  expect(deferred.lastCheck.status).toBe('held');
+  const pending = deferred.pending[sourceHash], file = path.join(intake.dir, pending.journal);
+  const bytes = await fs.readFile(file), tx = JSON.parse(bytes), old = await fs.lstat(file, { bigint: true });
+  await fs.rename(file, originalJournal);
+  await fs.writeFile(file, bytes, { flag: 'wx' });
+  const replacement = await fs.lstat(file, { bigint: true });
+  expect(replacement.ino).not.toBe(old.ino);
+  await writeDraft(producer, 'z-independent', '3', 'c');
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const checked = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
+  expect(checked.lastCheck.status).toBe('held');
+  expect(checked.pending[sourceHash]).toMatchObject({ journal: pending.journal, key: pending.key });
+  expect(checked.pending[sourceHash].reason).toMatch(/journal.*restore.*Check now/i);
+  expect(checked.outcomes[pending.key]).toMatchObject({ status: 'held', reason: checked.pending[sourceHash].reason });
+  expect(checked.captures[sourceHash]).toEqual(deferred.captures[sourceHash]);
+  expect(checked.attempts[Object.keys(original.attempts)[0]]).toEqual(Object.values(original.attempts)[0]);
+  expect(checked.attempts[tx.revision.identity]).toBeUndefined();
+  expect(Object.values(checked.attempts)).toHaveLength(2);
+  expect(Object.values(checked.captures)).toHaveLength(2);
+  expect(await fs.readFile(destination)).toEqual(previous);
+  expect(await readOptional(path.join(intake.dir, 'transaction.json'))).toBeNull();
+  expect(await fs.readFile(file)).toEqual(bytes);
+  expect(await fs.readFile(originalJournal)).toEqual(bytes);
+  expect((await fs.lstat(file, { bigint: true })).ino).toBe(replacement.ino);
+  expect((await fs.lstat(originalJournal, { bigint: true })).ino).toBe(old.ino);
+
+  const movedReplacement = testInfo.outputPath('replacement-pending.json');
+  await fs.rename(file, movedReplacement);
+  await fs.rename(originalJournal, file);
+  const completed = await restarted.reconcile({ now: '2026-11-11T06:59:00.000Z' });
+  expect(completed.lastCheck.status).toBe('complete');
+  expect(completed.attempts[tx.revision.identity]?.revision).toBe(tx.revision.id);
+  expect(completed.pending[sourceHash]).toBeUndefined();
+  expect(await readOptional(file)).toBeNull();
+  expect(await fs.readFile(movedReplacement)).toEqual(bytes);
+  expect((await fs.lstat(movedReplacement, { bigint: true })).ino).toBe(replacement.ino);
+});
+
+test('reviewed selection resumes after moving aside an unproved stage for the exact admitted snapshot', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), aside = testInfo.outputPath('preserved.stage');
+  const { vault, intake, ledgerFile } = await setup(testInfo);
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await intake.connect(producer, true, now, 'review');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(producer, 'edit'), { recursive: true });
+  const ready = await intake.reconcile({ now: later }), [sourceHash, capture] = Object.entries(ready.captures)[0];
+  const revision = capture.reviewChoices.find(id => id !== capture.currentRevision);
+  const snapshot = path.join(vault.root, 'Revisions', revision + '.json');
+  const original = await fs.readFile(snapshot), identity = await fs.lstat(snapshot, { bigint: true });
+  await exitDuringOrdinaryIntake(vault, producer, 'snapshot-stage-flushed', [capture.id, revision, later]);
+  const journal = path.join(intake.dir, 'transaction.json'), journalBytes = await fs.readFile(journal);
+  const stage = path.join(intake.dir, revision + '.snapshot.stage'), staged = await fs.lstat(stage, { bigint: true });
+  expect(await fs.readFile(stage)).toEqual(original);
+  expect(staged.ino).not.toBe(identity.ino);
+  expect((await readJson(ledgerFile)).intakeStageRecords?.[hash(journalBytes)]?.snapshotStage).toBeUndefined();
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const held = await restarted.reconcile({ now: '2026-11-10T06:59:00.000Z' });
+  expect(held.pending[sourceHash]?.reason).toMatch(/move.*aside.*Check now/i);
+  expect(held.captures[sourceHash]).toEqual(capture);
+  expect(held.attempts).toEqual(ready.attempts);
+  expect(await fs.readFile(stage)).toEqual(original);
+  expect((await fs.lstat(stage, { bigint: true })).ino).toBe(staged.ino);
+  await fs.rename(stage, aside);
+
+  const completed = await restarted.reconcile({ now: '2026-11-11T06:59:00.000Z' });
+  expect(completed.lastCheck.status).toBe('complete');
+  expect(completed.captures[sourceHash].currentRevision).toBe(revision);
+  expect(completed.attempts).toEqual(ready.attempts);
+  expect(completed.pending[sourceHash]).toBeUndefined();
+  expect(await fs.readFile(snapshot)).toEqual(original);
+  expect((await fs.lstat(snapshot, { bigint: true })).ino).toBe(identity.ino);
+  expect(await fs.readFile(aside)).toEqual(original);
+  expect((await fs.lstat(aside, { bigint: true })).ino).toBe(staged.ino);
+});
+
+test('startup preserves an edited deferred journal pair after the retry links its active alias and exits', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer');
+  let busy = false;
+  const { vault, intake, ledgerFile } = await setup(testInfo, boundary => {
+    if (busy && boundary === 'intake-before-move') throw Object.assign(Error('Fixture capture is busy.'), { code: 'EACCES' });
+  });
+  await writeDraft(producer);
+  const original = await intake.connect(producer, true, now), [sourceHash] = Object.keys(original.captures);
+  await writeDraft(producer, 'second', '2');
+  busy = true;
+  const deferred = await intake.reconcile({ now: later });
+  const active = path.join(intake.dir, 'transaction.json'), pending = path.join(intake.dir, deferred.pending[sourceHash].journal);
+  const before = await fs.readFile(pending), identity = await fs.lstat(pending, { bigint: true });
+  await exitDuringOrdinaryIntake(vault, producer, 'pending-linked');
+  expect(await fs.readFile(active)).toEqual(before);
+  const tx = JSON.parse(before);
+  tx.revision.locator += '-edited';
+  const edited = JSON.stringify(tx), ledger = await fs.readFile(ledgerFile), destination = intake.destination(original.captures[sourceHash]);
+  const priorCapture = await fs.readFile(destination);
+  await fs.writeFile(active, edited);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await expect(restarted.reconcile({ now: later })).rejects.toThrow(/journal.*changed|journal.*proof/i);
+  expect(await fs.readFile(ledgerFile)).toEqual(ledger);
+  for (const file of [active, pending]) {
+    const retained = await fs.lstat(file, { bigint: true });
+    expect([retained.dev, retained.ino, retained.nlink]).toEqual([identity.dev, identity.ino, 2n]);
+    expect(await fs.readFile(file, 'utf8')).toBe(edited);
+  }
+  expect(await fs.readFile(destination)).toEqual(priorCapture);
+});
 
 for (const role of ['snapshot', 'capture', 'no foreign stage']) {
   test(`ordinary intake restart after journaling with ${role === 'no foreign stage' ? role : 'an equal-byte foreign ' + role + ' stage'}`, async ({}, testInfo) => {
@@ -418,7 +603,8 @@ for (const role of ['snapshot', 'capture', 'no foreign stage']) {
     const result = await restarted.reconcile({ now: later });
     if (foreign) {
       expect.soft(result.attempts[tx.revision.identity]).toBeUndefined();
-      expect.soft(result.blocks[tx.sourceHash]?.incomingRevision).toBe(tx.revision.id);
+      expect.soft(result.pending[tx.sourceHash]?.journal).toBe(`pending-${tx.revision.id}.json`);
+      expect.soft(result.pending[tx.sourceHash]?.reason).toMatch(/move.*aside.*Check now/i);
       expect.soft(await readOptional(destination)).toBeNull();
       expect.soft(await readOptional(stage)).toBe(bytes);
       const retained = await fs.lstat(stage, { bigint: true });
