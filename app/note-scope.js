@@ -26,7 +26,7 @@ async function read(file, guard) {
   if (value?.schema !== 1 || !Array.isArray(value.files) || value.files.some(file => typeof file !== 'string' || !path.isAbsolute(file))) {
     throw Error('Invalid explicit note scope. Preserve settings for repair.');
   }
-  return { value, digest: proof.digest, proof };
+  return { value, digest: proof.digest, proof, verify: () => verifyStageSync(file, guard, proof) };
 }
 
 function absent(file, guard, message) {

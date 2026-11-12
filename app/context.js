@@ -136,9 +136,16 @@ class Context {
     await this.changeScope(current => [...new Set([...current, ...files])], validate);
   }
   async exclude(key) { await this.changeScope(current => current.filter(file => `note:${digest(file)}` !== key)); }
-  async corpus({ captureRelationshipIds, includeIdeaInventory = false } = {}) {
-    const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned(captureRelationshipIds));
-    return this.corpusFromSources(sources, includeIdeaInventory);
+  async corpus({ captureRelationshipIds, includeIdeaInventory = false, dispatch } = {}) {
+    const proofs = dispatch && { ...dispatch, files: new Map() };
+    const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned(captureRelationshipIds, proofs));
+    return this.corpusFromSources(sources, includeIdeaInventory, proofs);
+  }
+  dispatchFile(file, digest) {
+    const guard = this.vault.publicationFolders(path.dirname(file)).guard;
+    const { proof } = readExactSync(file, guard);
+    if (proof.digest !== digest) throw Error('Selected source changed during context discovery.');
+    return () => verifyStageSync(file, guard, proof);
   }
   conflictChoices(note, capture, sourceHash, ledger, intake, observed, sourceGenerations) {
     const block = ledger.blocks[sourceHash], localHash = digest(note.content);
@@ -178,7 +185,7 @@ class Context {
     } catch { /* A missing or changed snapshot never becomes a selection. */ }
     return choices;
   }
-  async sourceCorpusOwned(captureRelationshipIds) {
+  async sourceCorpusOwned(captureRelationshipIds, proofs) {
     const intake = new Intake(this.vault), ledger = await intake.info();
     const observed = intake.storage.expected;
     const notes = await this.vault.list(), issues = [], all = [], manualChoices = [], eligible = new Map(), histories = new Map();
@@ -193,6 +200,7 @@ class Context {
         const origin = note.type === 'link' ? metadata.provenance === 'user-supplied excerpt; webpage not verified' ? 'user-supplied excerpt; webpage not verified' : 'user-supplied link; webpage not fetched or verified' : 'user capture';
         const source = { key: `capture:${note.id}`, captureId: note.id, title: note.title, text: body(note.content), provenance: `Capture ${note.id}; content sha256 ${digest(note.content)}; ${origin}`, digest: digest(note.content) };
         Object.assign(source, generationFields(sourceGenerations)); source.provenance += generationProvenance(source);
+        if (proofs?.dependencies.get(source.key) === source.digest) proofs.files.set(source.key, this.dispatchFile(note.file, source.digest));
         all.push(source); eligible.set(note.id, source); continue;
       }
       try {
@@ -210,9 +218,15 @@ class Context {
         }
         const inspected = await intake.inspect(note.id, { annotations: false }), revision = inspected.revisions.find(item => item.id === capture.currentRevision);
         if (!revision || revision.captureId !== capture.id || revision.sourceHash !== sourceHash || revision.supportEligible === false || revision.humanReview === 'reject' || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') throw Error('current revision is unavailable or rejected');
-        const provenance = importedProvenance(note.id, revision, revisionAdmission(ledger, revision.id)?.snapshotHash);
+        const snapshotHash = revisionAdmission(ledger, revision.id)?.snapshotHash;
+        const provenance = importedProvenance(note.id, revision, snapshotHash);
         const source = { key: `capture:${note.id}`, captureId: note.id, revisionId: revision.id, title: note.title, text: revision.text, provenance, digest: digest(provenance + revision.text), linked: inspected.links.map(link => link.related?.id).filter(Boolean) };
         Object.assign(source, generationFields(sourceGenerations)); source.provenance += generationProvenance(source);
+        if (proofs?.dependencies.get(source.key) === source.digest) {
+          const capture = this.dispatchFile(note.file, digest(note.content));
+          const snapshot = this.dispatchFile(path.join(this.vault.root, 'Revisions', `${revision.id}.json`), snapshotHash);
+          proofs.files.set(source.key, () => { capture(); snapshot(); });
+        }
         all.push(source); eligible.set(note.id, source); histories.set(note.id, inspected.revisions);
       } catch (error) { issues.push(`Evidence unavailable: ${note.title}; ${error.message}`); }
     }
@@ -221,7 +235,7 @@ class Context {
       .map(note => [note.id, { file: note.file, digest: digest(note.content) }]));
     return { intake, ledger, observed, issues, all, manualChoices, eligible, histories, capturePaths };
   }
-  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories, capturePaths }, includeIdeaInventory) {
+  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories, capturePaths }, includeIdeaInventory, proofs) {
     const included = [];
     const annotationGroups = new Map();
     for (const annotation of await intake.annotations()) {
@@ -249,12 +263,18 @@ class Context {
         // Fix the first metadata boundary before checking it; later links are user writing.
         const frontmatter = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
         const text = content.slice(frontmatter[0].length).replace(/^\r?\n# Annotation\r?\n\r?\nSource: \[Capture\]\([^\r\n]*\)(?:\r?\n|$)/, '').trim();
-        all.push({ key, title: `Annotation ${id}`, text, provenance: `Independent user annotation ${id}; content sha256 ${digest(content)}; unversioned capture association ${captureId}; original source revision unknown`, digest: digest(content + eligible.get(captureId).digest), associated: captureId, ...generationFields(recordedGenerations) });
-        all.at(-1).provenance += generationProvenance(all.at(-1));
+        const source = { key, title: `Annotation ${id}`, text, provenance: `Independent user annotation ${id}; content sha256 ${digest(content)}; unversioned capture association ${captureId}; original source revision unknown`, digest: digest(content + eligible.get(captureId).digest), associated: captureId, ...generationFields(recordedGenerations) };
+        if (proofs?.dependencies.get(key) === source.digest) proofs.files.set(key, this.dispatchFile(annotation.file, digest(content)));
+        source.provenance += generationProvenance(source);
+        all.push(source);
       } catch (error) { issues.push(`Annotation unavailable: ${id}; ${error.message}`); }
     }
-    const approvedVersions = new Set();
-    for (const { version, pin, error } of await new Briefs(this.vault).pins()) {
+    const approvedVersions = new Set(), briefs = new Briefs(this.vault);
+    const observeBrief = proofs && ((version, digest, verify) => {
+      const key = `brief:${version}`;
+      if (proofs.dependencies.get(key) === digest) proofs.files.set(key, verify);
+    });
+    for (const { version, pin, error } of await briefs.pins(observeBrief)) {
       try {
         if (error) throw error;
         // Managed captures used as project documents must not re-enter as opaque quotations.
@@ -266,14 +286,17 @@ class Context {
           const snapshot = pin.sources[ref.source];
           return `Project source ${ref.source + 1}; sha256 ${snapshot.sha256}; lines ${ref.start}-${ref.end}\n${snapshot.text.split(/\r?\n/).slice(ref.start - 1, ref.end).join('\n')}`;
         }).join('\n')}`).join('\n\n');
-        all.push({ key: `brief:${version}`, briefVersion: version, title: `Approved brief version ${version}`, text: excerpts, provenance: `Approved brief version ${version}; exact approval sha256 ${pin.digest}; reviewed project context; user edits are not independent verification.${pin.issues.length ? ' Warning: brief input changed or unavailable; retained approved evidence.' : ''}`, digest: pin.digest, warnings: pin.issues.length ? [`Approved brief input changed or unavailable for version ${version}; retained evidence is used.`] : [] });
+        const key = `brief:${version}`;
+        all.push({ key, briefVersion: version, title: `Approved brief version ${version}`, text: excerpts, provenance: `Approved brief version ${version}; exact approval sha256 ${pin.digest}; reviewed project context; user edits are not independent verification.${pin.issues.length ? ' Warning: brief input changed or unavailable; retained approved evidence.' : ''}`, digest: pin.digest, warnings: pin.issues.length ? [`Approved brief input changed or unavailable for version ${version}; retained evidence is used.`] : [] });
         approvedVersions.add(version);
       } catch (error) { issues.push(`Approved brief version ${version} unavailable: ${error.message}`); }
     }
     this.ideaEligibility(this.vault);
     let ideas;
     const captureIds = new Set([...manualChoices.map(({ source }) => source.captureId), ...(capturePaths?.keys() || [])]);
-    try { ideas = await scanIdeas(this.vault, { captureIds }); }
+    const selectedKeys = proofs ? [...proofs.dependencies.keys()] : [];
+    const watchCaptureNamespace = selectedKeys.some(key => /^(?:capture|annotation|conflict-local):/.test(key));
+    try { ideas = await scanIdeas(this.vault, { captureIds, watchCaptureNamespace }); }
     catch (error) { issues.push(error.message); }
     for (const [id, claims] of ideas?.claims || []) {
       const claim = claims.find(item => item.relevant);
@@ -303,13 +326,24 @@ class Context {
           if (!pin || metadata.project_brief.id !== pin.id || metadata.project_brief.version !== pin.version || metadata.project_brief.digest !== pin.digest) throw Error('exact project brief dependency is unavailable');
         }
         const dependencyText = metadata.source_dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact imported revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}`).join('; ');
-        all.push({ key: `idea:${metadata.companion_id}`, title: metadata.title || `Saved idea ${metadata.companion_id}`, text: body(content), provenance: `Saved idea ${metadata.companion_id}; user interpretation, not independently verified; content sha256 ${digest(content)}; dependencies: ${dependencyText || 'explicitly independent user writing'}${project === undefined ? '' : `; approved project brief version ${project}`}`, digest: digest(content + associatedIds.map(id => eligible.get(id).digest).join('') + (project === undefined ? '' : all.find(item => item.key === `brief:${project}`).digest)), associatedIds, projectVersion: project, ...generationFields(unionGenerations(associatedIds.map(id => eligible.get(id)))) });
-        all.at(-1).provenance += generationProvenance(all.at(-1));
+        const source = { key: `idea:${metadata.companion_id}`, title: metadata.title || `Saved idea ${metadata.companion_id}`, text: body(content), provenance: `Saved idea ${metadata.companion_id}; user interpretation, not independently verified; content sha256 ${digest(content)}; dependencies: ${dependencyText || 'explicitly independent user writing'}${project === undefined ? '' : `; approved project brief version ${project}`}`, digest: digest(content + associatedIds.map(id => eligible.get(id).digest).join('') + (project === undefined ? '' : all.find(item => item.key === `brief:${project}`).digest)), associatedIds, projectVersion: project, ...generationFields(unionGenerations(associatedIds.map(id => eligible.get(id)))) };
+        if (proofs?.dependencies.get(source.key) === source.digest) {
+          const ids = new Set(metadata.source_dependencies.map(dependency => dependency.revision_id).filter(Boolean));
+          const revisions = [...ids].map(id => this.dispatchFile(path.join(this.vault.root, 'Revisions', `${id}.json`), revisionAdmission(ledger, id)?.snapshotHash));
+          proofs.files.set(source.key, () => { for (const verify of revisions) verify(); });
+        }
+        source.provenance += generationProvenance(source);
+        all.push(source);
       } catch (error) { issues.push(`Saved idea unavailable: ${ideas.relative(claim.file)}; ${error.message}`); }
     }
-    for (const file of await this.scope()) {
+    const noteScope = await readNoteScope(this.scopeFile, { assertSelection: this.assertSelection });
+    for (const file of noteScope?.value.files || []) {
       const key = `note:${digest(file)}`; included.push({ key, file });
-      try { all.push(await this.note(file)); } catch (error) { issues.push(`Unavailable explicit note ${path.basename(file)}: ${error.message}`); }
+      try {
+        const { note, verify } = await this.readExplicitNote(file);
+        if (proofs?.dependencies.get(key) === note.digest) proofs.files.set(key, () => { noteScope.verify(); verify(); });
+        all.push(note);
+      } catch (error) { issues.push(`Unavailable explicit note ${path.basename(file)}: ${error.message}`); }
     }
     if (!intake.storage.matches(await intake.storage.view(), observed)) throw Error('Intake ledger changed during context discovery. Retry against the current authority.');
     this.ideaEligibility(this.vault);
@@ -328,11 +362,27 @@ class Context {
       try {
         const claims = ideas?.captureClaims.get(source.captureId);
         if (claims?.length !== 1 || comparable(claims[0]) !== comparable(file)) throw Error('Capture identity changed.');
-        verify(); manual.push(normalized(source));
+        verify();
+        if (proofs?.dependencies.get(source.key) === source.digest) proofs.files.set(source.key, verify);
+        manual.push(normalized(source));
       }
       catch { issues.push(`Unavailable manual choice ${source.title}; its exact file changed.`); }
     }
     intake.storage.guardSync(observed);
+    proofs?.observe(() => {
+      this.assertSelection();
+      intake.storage.guardSync(observed);
+      if (watchCaptureNamespace || selectedKeys.some(key => key.startsWith('idea:'))) {
+        if (!ideas) throw Error('Selected context identity is unavailable.');
+        ideas.check();
+      }
+      for (const key of selectedKeys) {
+        if (key.startsWith('idea:')) this.ideaEligibility(this.vault, key.slice(5));
+        const verify = proofs.files.get(key);
+        if (!verify) throw Error('Selected context authority is unavailable.');
+        verify();
+      }
+    });
     const result = { all: available.filter(source => !duplicates.has(source.key)).map(normalized), manual, issues, included };
     if (includeIdeaInventory) result.ideaInventory = ideas;
     if (capturePaths) {
@@ -373,10 +423,10 @@ class Context {
     this.approvals.set(approval, { root: this.vault.root, key, digest: expected, text, label, ...generationFields(sourceGenerations) });
     return { approval, text, label };
   }
-  async preview({ question, selections, excludedSources = [] }) {
+  async preview({ question, selections, excludedSources = [] }, dispatch) {
     await this.vault.checkpoint('context-before-preview-read');
     if (!Array.isArray(excludedSources) || excludedSources.some(key => typeof key !== 'string')) throw Error('Invalid explicit package exclusions.');
-    const { all: eligible, manual } = await this.corpus(), all = [...eligible, ...manual], excluded = new Set(excludedSources.map(scopeKey)), omissions = [];
+    const { all: eligible, manual } = await this.corpus({ dispatch }), all = [...eligible, ...manual], excluded = new Set(excludedSources.map(scopeKey)), omissions = [];
     const dependencies = source => [...[source.associated, ...(source.associatedIds || []), source.conflictChoice && source.captureId].filter(Boolean).map(id => `capture:${id}`), ...(source.projectVersion === undefined ? [] : [`brief:${source.projectVersion}`])];
     for (const [token, approval] of this.approvals) {
       const source = all.find(item => item.key === approval.key);
