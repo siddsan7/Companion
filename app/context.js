@@ -18,6 +18,10 @@ function importedProvenance(id, revision, snapshotHash) {
   const uncertainty = revision.uncertainty || {};
   return `Imported capture ${id}; exact imported revision ${revision.id}; snapshot sha256 ${snapshotHash}; Processing: ${revision.processing || revision.run?.state || 'unknown'}; Extraction: ${revision.extraction || 'unknown'}; Human review: ${revision.humanReview}; Uncertainty: ${Array.isArray(uncertainty.uncertainEvidence) ? uncertainty.uncertainEvidence.length : 'unknown'} flagged extracts; sampling capped: ${uncertainty.truncated === true ? 'yes' : uncertainty.truncated === false ? 'no' : 'unknown'}. Claims are not independently verified.${revision.synthetic === true || revision.run?.input_kind === 'synthetic_fixture' ? ' Authored synthetic fixture; not real source evidence.' : ''}`;
 }
+function importedConflictEvidence(id, revision, snapshotHash, localHash) {
+  const provenance = `${importedProvenance(id, revision, snapshotHash)} Explicitly selected retained revision; unresolved local conflict. Local changes were not included.`;
+  return { provenance, digest: digest(provenance + revision.text + localHash) };
+}
 // Direct Context callers still honor durable removal. The desktop supplies the
 // Ideas store's stronger guard, including its observed directory identity.
 function rawIdeaEligibility(vault, id) {
@@ -168,9 +172,8 @@ class Context {
       const revision = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
       if (hash !== admission.snapshotHash || revision.id !== revisionId || revision.captureId !== capture.id || revision.sourceHash !== sourceHash ||
           revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview) || typeof revision.text !== 'string') return choices;
-      const provenance = `${importedProvenance(capture.id, revision, hash)} Explicitly selected retained revision; unresolved local conflict. Local changes were not included.`;
-      add({ key: `capture:${capture.id}`, conflictChoice: 'imported', conflictContentHash: localHash, revisionId, title: `Imported revision (conflict): ${note.title}`, text: revision.text,
-        provenance, digest: digest(provenance + revision.text + localHash) }, () => { local.verify(); verify(); });
+      add({ key: `capture:${capture.id}`, conflictChoice: 'imported', revisionId, title: `Imported revision (conflict): ${note.title}`, text: revision.text,
+        ...importedConflictEvidence(capture.id, revision, hash, localHash) }, () => { local.verify(); verify(); });
     } catch { /* A missing or changed snapshot never becomes a selection. */ }
     return choices;
   }
@@ -422,4 +425,4 @@ function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvid
   });
   return { store, clearApprovals: () => approvals.clear() };
 }
-module.exports = { Context, installContext, validateDependencies };
+module.exports = { Context, installContext, validateDependencies, importedConflictEvidence };

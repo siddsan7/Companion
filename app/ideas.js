@@ -10,6 +10,8 @@ const { IdeasRemoval } = require('./ideas-removal');
 const { scanIdeas } = require('./idea-inventory');
 const { generations, sameEvidence, sameGenerations, scopeKey } = require('./source-generations');
 const { Intake } = require('./intake');
+const { importedConflictEvidence } = require('./context');
+const { comparable } = require('./legacy-capture-ownership');
 const { readExactSync, verifyStageSync } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -173,10 +175,10 @@ class Ideas {
     const unavailable = capture.removed || capture.rejected || capture.supportEligible === false || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.pending?.[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash || authority && authority.phase !== 'active';
     // Only the exact imported revision explicitly selected in the retained request
     // may be cited while the original local conflict is still present.
-    const explicitConflict = !unavailable && offering?.key === `capture:${captureId}` && /^[a-f0-9]{64}$/.test(offering.conflictContentHash) && capture.currentRevision === revisionId &&
+    const mayCiteConflict = !unavailable && offering?.key === `capture:${captureId}` && capture.currentRevision === revisionId &&
       sameGenerations(offering, { sourceGenerations: authority ? [{ captureId, generation: authority.generation }] : [] }) &&
       (block ? block.outputHold === undefined && !!capture.conflict && block.reason === capture.conflict : !capture.conflict);
-    if (unavailable || (capture.conflict || block) && !explicitConflict) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
+    if (unavailable || (capture.conflict || block) && !mayCiteConflict) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
     if (revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview)) warnings.push('The cited revision is ineligible as supporting evidence.');
     let offeringProof;
     if (offering) {
@@ -190,7 +192,7 @@ class Ideas {
       let note;
       if (matches.length === 1 && !choice?.copies.some(copy => copy.file === files[0].file)) note = matches[0];
       else if (choice && files.some(file => file.file === choice.file) && JSON.stringify(files.filter(file => file.file !== choice.file)) === JSON.stringify(choice.copies)) note = matches.find(note => path.relative(vault.vault, note.file) === choice.file);
-      if (!note || explicitConflict && (matches.length !== 1 || note.file !== intake.destination(capture))) throw Error('Resolve the canonical capture identity before citing evidence.');
+      if (!note) throw Error('Resolve the canonical capture identity before citing evidence.');
       const verifyAuthority = () => {
         intake.storage.guardSync();
         reserved.verify();
@@ -202,7 +204,10 @@ class Ideas {
         const links = match === note ? 1 : local.lstatSync(match.file).nlink;
         const { bytes, proof } = readExactSync(match.file, guard, links);
         const currentHash = hash(decode(bytes));
-        if (match === note && currentHash !== capture.currentHash && (!explicitConflict || currentHash !== offering.conflictContentHash)) throw Error('Current capture was changed outside Companion.');
+        if (match === note && (currentHash !== capture.currentHash || capture.conflict || block)) {
+          if (!mayCiteConflict || matches.length !== 1 || comparable(path.resolve(note.file)) !== comparable(path.resolve(intake.destination(capture))) ||
+              importedConflictEvidence(captureId, revision, snapshotHash, currentHash).digest !== offering.digest) throw Error('Current capture was changed outside Companion.');
+        }
         if (currentHash !== hash(match.content)) throw Error('A capture identity copy changed after inspection. Review the identity before citing evidence.');
         return { file: match.file, guard, proof, links };
       });

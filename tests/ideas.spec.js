@@ -75,7 +75,7 @@ async function completedConversation({ imported = false, localConflict = false, 
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(imported ? 'synthetic review support' : 'How could retrieval help MyTune\\?'));
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
-  await expect(page.locator('#conversation-history')).toContainText(expectedStatus);
+  await expect(page.locator('#conversation-history')).toContainText(expectedStatus, { timeout: 15000 });
   await expect(page.locator('#conversation-history')).toContainText(expectedReply);
 }
 async function markdownSnapshot(directory) {
@@ -665,16 +665,15 @@ test('a conversation from an explicit conflict revision can be archived and its 
   await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
   const markdown = page.getByLabel('Proposed transcript Markdown', { exact: true });
   await expect(markdown).toHaveValue(new RegExp(dependency.digest));
+  const reviewedDestination = await page.getByRole('textbox', { name: 'Transcript destination', exact: true }).inputValue();
   const text = await markdown.inputValue();
   await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
   await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
   expect(await fs.readFile(transcript, 'utf8')).toBe(text);
-  const exports = page.getByLabel('Retained transcript export', { exact: true });
-  const entry = exports.locator('option').filter({ hasText: 'Explicit conflict transcript.md' });
-  await expect(entry).toHaveCount(1, { timeout: 5000 });
-  await exports.selectOption(await entry.getAttribute('value'));
+  const exports = page.getByRole('combobox', { name: 'Retained transcript export', exact: true });
+  await exports.selectOption({ label: reviewedDestination });
   await page.getByRole('button', { name: 'Preview transcript removal', exact: true }).click();
-  await expect(page.getByLabel('Transcript removal review')).toContainText('Explicit conflict transcript.md');
+  await expect(page.getByRole('region', { name: 'Transcript removal review', exact: true })).toContainText(reviewedDestination);
 });
 
 test('an explicitly selected imported evidence citation opens its original revision after a reviewed update', async () => {

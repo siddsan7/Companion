@@ -242,7 +242,7 @@ class Conversations {
     const dependencies = new Map();
     const addDependency = source => {
       if (dependencies.has(source.key)) { if (!sameEvidence(dependencies.get(source.key), source)) throw Error('Source dependency authority conflicts.'); return; }
-      dependencies.set(source.key, { key: source.key, digest: source.digest, ...generationFields(source.sourceGenerations), ...(source.captureId ? { captureId: source.captureId } : {}), ...(source.revisionId ? { revisionId: source.revisionId } : {}), ...(source.conflictContentHash ? { conflictContentHash: source.conflictContentHash } : {}) });
+      dependencies.set(source.key, { key: source.key, digest: source.digest, ...generationFields(source.sourceGenerations), ...(source.captureId ? { captureId: source.captureId } : {}), ...(source.revisionId ? { revisionId: source.revisionId } : {}) });
       for (const key of [...[source.associated, ...(source.associatedIds || [])].filter(Boolean).map(id => `capture:${id}`), ...(source.projectVersion ? [`brief:${source.projectVersion}`] : [])]) {
         const parent = all.find(item => item.key === key); if (!parent) throw Error('Selected source dependency is unavailable.'); addDependency(parent);
       }
