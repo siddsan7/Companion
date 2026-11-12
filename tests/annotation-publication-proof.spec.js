@@ -9,6 +9,7 @@ const { Intake } = require('../app/intake');
 const { AnnotationRemoval } = require('../app/annotation-removal');
 const { CaptureDeletion } = require('../app/capture-deletion');
 const { Conversations } = require('../app/conversations');
+const { holdReadSharing, sharingRefusals } = require('./fixtures/windows-sharing');
 const draft = require('./fixtures/reel-draft/example.json');
 
 const now = '2026-11-08T06:59:00.000Z';
@@ -409,11 +410,87 @@ test('ordinary transfer restart holds an annotation withdrawn before the source 
   expect(await restarted.repairs()).toContainEqual(expect.objectContaining({ sourceHash }));
 });
 
+function watchRepairIntentRenames(journal, afterRefusal) {
+  const rename = native.renameSync, attempts = [];
+  native.renameSync = (from, to) => {
+    if (to !== journal || path.dirname(from) !== path.dirname(journal) || !/^repair-intent-[a-f0-9-]{36}\.tmp$/.test(path.basename(from))) {
+      return rename(from, to);
+    }
+    const stage = native.lstatSync(from, { bigint: true });
+    const attempt = { from, dev: stage.dev, ino: stage.ino };
+    attempts.push(attempt);
+    try { rename(from, to); }
+    catch (error) {
+      attempt.code = error.code;
+      attempt.syscall = error.syscall;
+      if (attempts.length === 1 && error.syscall === 'rename' && sharingRefusals.includes(error.code)) afterRefusal(from);
+      throw error;
+    }
+    const published = native.lstatSync(to, { bigint: true });
+    attempt.published = { dev: published.dev, ino: published.ino };
+  };
+  return { attempts, restore: () => { native.renameSync = rename; } };
+}
+
+for (const failure of ['persistent', 'stage replaced']) test(`transfer annotation proof stops after a ${failure} Windows rename refusal`, async ({}, testInfo) => {
+  test.skip(process.platform !== 'win32', 'Requires a real Windows FileShare.Read handle that refuses replacement.');
+  let journal, holder, before, started;
+  const { intake, sourceHash, destination, local, input, ledgerFile } = await ordinaryConflict(testInfo, async boundary => {
+    if (boundary !== 'repair-intent-published') return;
+    before = await fs.readFile(journal);
+    holder = holdReadSharing(journal);
+    await holder.ready();
+  });
+  journal = path.join(intake.dir, 'repair-intent.json');
+  const parked = testInfo.outputPath('displaced-repair-intent.tmp');
+  const watch = watchRepairIntentRenames(journal, from => {
+    started = performance.now();
+    if (failure === 'stage replaced') {
+      native.renameSync(from, parked);
+      native.copyFileSync(parked, from, native.constants.COPYFILE_EXCL);
+      holder.release();
+    }
+  });
+  let error;
+  try { error = await intake.resolveConflict(input, later).catch(error => error); }
+  finally {
+    watch.restore();
+    holder?.release();
+    if (holder) await holder.closed;
+  }
+  expect(holder?.proof.exit).toEqual({ code: 0, signal: null });
+  expect(watch.attempts[0]?.syscall).toBe('rename');
+  expect(sharingRefusals).toContain(watch.attempts[0]?.code);
+  expect(await fs.readFile(journal)).toEqual(before);
+  expect(await fs.readFile(destination)).toEqual(local);
+  const { annotationId, annotation, tx } = JSON.parse(before);
+  const annotationStage = path.join(intake.dir, `annotation-${annotationId}.stage`);
+  expect(await fs.readFile(annotationStage, 'utf8')).toBe(annotation);
+  expect(JSON.parse(await fs.readFile(ledgerFile)).attempts[tx.revision.identity]).toBeUndefined();
+  expect(JSON.parse(await fs.readFile(ledgerFile)).blocks[sourceHash]).toBeDefined();
+  if (failure === 'stage replaced') {
+    expect(error?.code).toBe('STAGING_CHANGED');
+    expect(watch.attempts).toHaveLength(1);
+    expect(await fs.readFile(watch.attempts[0].from)).toEqual(await fs.readFile(parked));
+  } else {
+    expect(sharingRefusals).toContain(error?.code);
+    expect(watch.attempts.length).toBeGreaterThan(1);
+    expect(performance.now() - started).toBeLessThan(5000);
+    expect(watch.attempts.every(attempt => attempt.from === watch.attempts[0].from && sharingRefusals.includes(attempt.code))).toBe(true);
+  }
+});
+
 test('ordinary transfer restart restores its prior capture when the published annotation is withdrawn', async ({}, testInfo) => {
   const interrupted = Error('Stopped at the exact ordinary pre-admission publication.');
   const displaced = testInfo.outputPath('withdrawn-after-interruption.md');
-  let context, witness;
+  let context, witness, holder, watch;
   context = await ordinaryConflict(testInfo, async boundary => {
+    if (boundary === 'intake-moved' && context && process.platform === 'win32' && !holder) {
+      const journal = path.join(context.intake.dir, 'repair-intent.json');
+      holder = holdReadSharing(journal);
+      await holder.ready();
+      watch = watchRepairIntentRenames(journal, () => holder.release());
+    }
     if (boundary !== 'intake-published' || !context) return;
     witness = await exactTransfer(context);
     const shared = path.join(context.intake.dir, 'transaction.json');
@@ -421,7 +498,21 @@ test('ordinary transfer restart restores its prior capture when the published an
     throw interrupted;
   });
   const { vault, intake, producer, sourceHash, destination, ledgerFile, local, localIdentity, block, older, olderBytes, olderIdentity, input } = context;
-  await expect(intake.resolveConflict(input, later)).rejects.toBe(interrupted);
+  try { await expect(intake.resolveConflict(input, later)).rejects.toBe(interrupted); }
+  finally {
+    watch?.restore();
+    holder?.release();
+    if (holder) await holder.closed;
+  }
+  if (process.platform === 'win32') {
+    expect(holder?.proof.exit).toEqual({ code: 0, signal: null });
+    const { attempts } = watch;
+    expect(attempts[0]?.syscall).toBe('rename');
+    expect(sharingRefusals).toContain(attempts[0]?.code);
+    expect(attempts.length).toBeGreaterThan(1);
+    expect(attempts.every(attempt => attempt.from === attempts[0].from && attempt.dev === attempts[0].dev && attempt.ino === attempts[0].ino)).toBe(true);
+    expect(attempts.at(-1).published).toEqual({ dev: attempts[0].dev, ino: attempts[0].ino });
+  }
   expect(witness).toBeDefined();
   const { intent, note, stage, original, journal, bytes } = witness;
   const backup = path.join(intake.dir, intent.tx.backup);

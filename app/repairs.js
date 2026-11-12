@@ -20,7 +20,7 @@ async function annotationAuthority(intake) {
 
 const urlPath = relative => relative.split(path.sep).map(encodeURIComponent).join('/');
 const reservedIdentityReason = 'A preserved file at a held restoration path claims this identity. Review the preserved file and refresh before editing or choosing a copy.';
-const relationshipRenameRefused = error => process.platform === 'win32' && error.syscall === 'rename' && ['EPERM', 'EBUSY', 'EACCES'].includes(error.code);
+const intentRenameRefused = error => process.platform === 'win32' && error.syscall === 'rename' && ['EPERM', 'EBUSY', 'EACCES'].includes(error.code);
 function archiveExactIntent(journal, archive, guard, proof) {
   guard();
   if (!native.lstatSync(archive, { throwIfNoEntry: false })) {
@@ -299,7 +299,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
           try { native.renameSync(replacement, journal); break; }
           catch (error) {
             const remaining = deadline - performance.now();
-            if (!relationshipRenameRefused(error) || remaining <= 0) throw error;
+            if (!intentRenameRefused(error) || remaining <= 0) throw error;
             refusal = error;
             await wait(Math.min(delay, remaining));
             delay = Math.min(delay * 2, 100);
@@ -389,7 +389,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
           }
           try { await recordStage(outputProof); }
           catch (error) {
-            if (error.code !== 'STAGING_CHANGED' && !relationshipRenameRefused(error)) throw error;
+            if (error.code !== 'STAGING_CHANGED' && !intentRenameRefused(error)) throw error;
             restoreOriginal();
             throw changed('The relationship proof could not be saved. Existing writing was preserved.');
           }
@@ -1152,14 +1152,26 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       const updated = await writeOwnedIntentStage(replacement, { ...intent, [field]: proof }, guard);
       const replacementProof = updated.proof;
       try {
-        guardPrecommit();
-        verifyStageSync(replacement, guard, replacementProof);
-        verifyStageSync(intentFile, guard, intentProof);
-        verifyAbsentSync(intentStage, guard);
-        verifyAbsentSync(archivedIntent, guard);
-        verifyConflict?.();
-        verifyFiles();
-        native.renameSync(replacement, intentFile);
+        const deadline = performance.now() + 1000;
+        let delay = 15, refusal;
+        for (;;) {
+          if (refusal && performance.now() >= deadline) throw refusal;
+          guardPrecommit();
+          verifyStageSync(replacement, guard, replacementProof);
+          verifyStageSync(intentFile, guard, intentProof);
+          verifyAbsentSync(intentStage, guard);
+          verifyAbsentSync(archivedIntent, guard);
+          verifyConflict?.();
+          verifyFiles();
+          try { native.renameSync(replacement, intentFile); break; }
+          catch (error) {
+            const remaining = deadline - performance.now();
+            if (!intentRenameRefused(error) || remaining <= 0) throw error;
+            refusal = error;
+            await wait(Math.min(delay, remaining));
+            delay = Math.min(delay * 2, 100);
+          }
+        }
         verifyStageSync(intentFile, guard, replacementProof);
         intentProof = replacementProof;
         intent[field] = proof;
