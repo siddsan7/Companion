@@ -98,7 +98,7 @@ async function leaf(intake, file, kind) {
   let text; try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); } catch { fail(); }
   return { bytes, text, target: { file: relative(intake, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), kind } };
 }
-async function inventory(intake, ledger, capture, revisions, initial) {
+async function inventory(intake, ledger, capture, revisions, initial, matchesCompletedBackup) {
   const currentTarget = initial.find(item => item.kind === 'capture');
   if (!currentTarget) fail();
   const currentFile = path.join(intake.vault.vault, currentTarget.file), prefix = path.basename(currentFile) + '.before-title-';
@@ -132,7 +132,9 @@ async function inventory(intake, ledger, capture, revisions, initial) {
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (!name.startsWith(capture.id + '-') || !name.includes('.before')) continue;
     const file = path.join(intake.dir, name), incoming = backupRevision(relative(intake, file), relative(intake, intake.dir), capture.id);
-    const value = await leaf(intake, file, 'source-backup'); value.note = validNote(value.text);
+    const value = await leaf(intake, file, 'source-backup');
+    if (!matchesCompletedBackup(name, { ...value, nlink: 1 })) fail();
+    value.note = validNote(value.text);
     const group = groups.get(value.note.revisionId);
     if (group) {
       admitted(ledger, capture, afterSource, incoming, generation ?? null);

@@ -9,7 +9,7 @@ const pendingTitle = require('./pending-title');
 const { activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent } = require('./annotation-authority');
 const { requiredDirectories } = require('./source-recovery');
 const { ordinaryDirectories } = require('./staged-publication');
-const { stageRecord, matchesProof, retireStageRecords } = require('./intake-publication');
+const { stageRecord, matchesProof, retireStageRecords, retainedBackups, retireBackups } = require('./intake-publication');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -287,8 +287,15 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
   if (ledger.acceptedCleanup?.sourceHash === sourceHash) fail();
   const pending = await pendingTitle.inventory(intake, ledger, capture, sourceHash, revisions, initial);
   if (pending) initial = pending.targets;
-  const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial); initial = titles.targets;
-  const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
+  const authority = ledger.sourceAuthority?.[capture.id];
+  const generation = authority?.phase === 'active' ? authority.generation : null;
+  const completedBackups = new Map(retainedBackups(ledger, sourceHash)), observedBackups = new Set();
+  const matchesCompletedBackup = (name, value) => {
+    const completed = completedBackups.get(name);
+    return !completed || completed.generation === generation && value.nlink === 1 && matchesProof(fileProof(value.target), completed.proof);
+  };
+  const titles = await sourceTitle.inventory(intake, ledger, capture, revisions, initial, matchesCompletedBackup);
+  const targets = new Map(titles.targets.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
   const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
   if (!current || !pending && !titles.verifiedCurrent && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
   const entries = [], independent = await independentAnnotationHolds(intake, capture.id, sourceHash);
@@ -296,6 +303,8 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     if (name === 'ledger.json') continue;
     if (pending?.titleRecovery.intent === relative(intake, path.join(intake.dir, name))) continue;
     const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
+    if (!matchesCompletedBackup(name, value)) fail();
+    if (completedBackups.has(name)) observedBackups.add(name);
     const held = independent.get(name);
     if (held) {
       if (held.nlink !== value.nlink || ['dev', 'ino', 'sha256'].some(key => held.target[key] !== value.target[key])) fail();
@@ -307,6 +316,7 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     if (!mentions(value.bytes, capture.id, sourceHash)) continue;
     entries.push({ name, file, value, text: text(value.bytes) });
   }
+  if (observedBackups.size !== completedBackups.size) fail();
   for (const entry of entries.filter(item => item.name === 'transaction.json' || /^(?:conflict|pending)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.name))) {
     const tx = JSON.parse(entry.text);
     // publishJournal writes JSON.stringify(tx); conflict/pending archives link
@@ -346,7 +356,8 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
       if (entry.name !== path.posix.basename(proven.target.file) || !entry.value.bytes.equals(proven.bytes) || entry.value.nlink !== 1 || ['file', 'sha256', 'dev', 'ino', 'bytes'].some(key => entry.value.target[key] !== proven.target[key])) fail();
       observedTitleBackups.add(proven.target.file); targets.set(proven.target.file, proven.target); continue;
     }
-    if (!new RegExp(`^${capture.id}-[a-f0-9-]{36}\\.before(?:-[a-f0-9-]{36})?\\.md$`).test(entry.name)) fail();
+    const backup = /^([a-f0-9-]{36})-([a-f0-9-]{36})\.before(?:-([a-f0-9-]{36}))?\.md$/.exec(entry.name);
+    if (!backup || backup[1] !== capture.id || !revisions.has(backup[2]) || backup[3] !== undefined && !uuid(backup[3])) fail();
     const { parse } = require('./vault'), { noteText } = require('./intake'); const note = parse(entry.text);
     if (!note || note.id !== capture.id || ![...revisions.values()].some(revision => entry.value.bytes.equals(Buffer.from(noteText({ ...capture, title: note.title, capturedAt: note.capturedAt }, revision), 'utf8'))) || entry.value.nlink !== 1) fail();
     targets.set(relative(intake, entry.file), { ...entry.value.target, kind: 'source-backup' });
@@ -422,6 +433,7 @@ function inspectPointers(ledger, authority) {
 }
 function retirePointers(ledger, authority) {
   retireStageRecords(ledger, record => record.sourceHash === authority.sourceHash);
+  retireBackups(ledger, authority.sourceHash);
   if (authority.mixedRecovery) return require('./mixed-deletion').retirePointers(ledger, authority);
   inspectPointers(ledger, authority);
   const capture = ledger.captures[authority.sourceHash];

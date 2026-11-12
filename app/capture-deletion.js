@@ -8,6 +8,7 @@ const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
 const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
+const { retainedBackups, verifyRetainedBackups } = require('./intake-publication');
 const { parse, restorationReadRefused, matchesRestorationFile } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf, removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const sourceInventory = require('./source-inventory');
@@ -67,6 +68,8 @@ class CaptureDeletion {
       imported = mixed || await sourceInventory.inventory(intake, ledger, capture, sourceHash, revisions, targets);
       if (!mixed && hash(notes[0].content) !== capture.currentHash && !imported.titleRecovery) throw changed();
       targets = imported.targets;
+      verifyRetainedBackups(retainedBackups(ledger, sourceHash), relative(vault, intake.dir), targets,
+        ledger.sourceAuthority?.[id]?.generation ?? null);
     } else {
       manualTitles = await manualTitle.inventory(intake, ledger, manual, targets); targets = manualTitles.targets;
     }
@@ -392,6 +395,8 @@ async function inspectDeletion(intake, ledger, id) {
   await inspectAdjacentTitlePrefix(vault, authority.targets);
   const capture = ledger.captures[authority.sourceHash];
   if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
+  if (!authority.manual) verifyRetainedBackups(retainedBackups(ledger, authority.sourceHash), relative(vault, intake.dir),
+    authority.targets, authority.originGenerations?.[0]?.generation ?? null);
   if (authority.mixedRecovery) return mixedDeletion.inspect(intake, ledger, id);
   if (manualTitle.explicit(authority)) manualTitle.validate(authority, id);
   else sourceTitle.inspectProofs(intake, ledger, authority);
