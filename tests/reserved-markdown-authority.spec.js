@@ -1,7 +1,7 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { createHash, randomUUID } = require('node:crypto');
+const { randomUUID } = require('node:crypto');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { AnnotationRemoval } = require('../app/annotation-removal');
@@ -19,7 +19,6 @@ const now = '2026-11-08T06:59:00.000Z';
 const later = '2026-11-09T06:59:00.000Z';
 const sourceHash = 'a'.repeat(64);
 const execute = promisify(execFile);
-const digest = value => createHash('sha256').update(value).digest('hex');
 const identity = async file => {
   const { dev, ino } = await fs.lstat(file, { bigint: true });
   return [dev, ino];
@@ -121,7 +120,7 @@ for (const claim of ['reserved claim', 'new ordinary duplicate', 'new ordinary d
     references: proposed.sections.map(section => section.references
       .map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
   }, now);
-  const { id: briefId, version, digest: briefDigest } = approved.approved[0];
+  const { version } = approved.approved[0];
   const ledger = await intake.load(), cited = ledger.captures['c'.repeat(64)], unaffected = ledger.captures['d'.repeat(64)];
   const citedFile = intake.destination(cited), citedBytes = await fs.readFile(citedFile);
   const citedIdentity = await identity(citedFile), duplicate = path.join(vault.vault, 'New capture claim.md');
@@ -131,27 +130,24 @@ for (const claim of ['reserved claim', 'new ordinary duplicate', 'new ordinary d
   const originalCited = testInfo.outputPath('original-cited-before-confirm.md'), displacedReplacement = testInfo.outputPath('prior-reserved-replacement.md');
   const source = (await context.corpus()).all.find(item => item.captureId === cited.id && item.revisionId === cited.currentRevision);
   expect(source).toBeDefined();
-  const conversationId = randomUUID(), requestId = randomUUID(), reply = 'A possible training exercise inspired by the source.';
-  const conversations = {
-    read: async id => {
-      expect(id).toBe(conversationId);
-      return record;
-    },
-    getContext: async () => context
-  };
-  const ideas = installIdeas({ ipcMain: { handle() {} }, getVault: () => vault, conversations, clock: () => ({ now }), checkpoint: async () => {} });
+  const reply = 'A possible training exercise inspired by the source.';
+  const getVault = () => vault, clock = () => ({ now }), checkpoint = async () => {};
+  const conversations = new Conversations({
+    dataRoot: testInfo.outputPath('history'), getVault, getContext: async () => context, clock, checkpoint,
+    provider: { preflight: async () => {}, turn: async () => ({ reply }) }
+  });
+  const previewedPackage = await conversations.preview({
+    question: 'What practice exercise does this source suggest?', briefVersion: version, speculation: false,
+    selections: [{ key: source.key, digest: source.digest, ...(source.sourceGenerations ? { sourceGenerations: source.sourceGenerations } : {}) }]
+  });
+  const record = await conversations.send({ packageId: previewedPackage.packageId });
+  const [request] = record.requests;
+  expect(request).toMatchObject({ status: 'completed', reply });
+  const conversationId = record.id, requestId = request.id;
+  const ideas = installIdeas({ ipcMain: { handle() {} }, getVault, conversations, clock, checkpoint });
   const current = await ideas.revision(vault, cited.id, cited.currentRevision, true);
   const evidence = current.revision.evidence.evidence[0];
   expect(evidence.text).toBeTruthy();
-  const packageText = `${source.provenance}\n${current.revision.text}\n${evidence.text}`.replace(/\r\n?/g, '\n');
-  const dependency = {
-    key: source.key, digest: source.digest, captureId: cited.id, revisionId: cited.currentRevision,
-    ...(source.sourceGenerations ? { sourceGenerations: source.sourceGenerations } : {})
-  };
-  const record = {
-    id: conversationId, vault: { root: vault.root }, brief: { id: briefId, version, digest: briefDigest }, scope: { excludedSources: [] },
-    requests: [{ id: requestId, status: 'completed', reply, package: { text: packageText, digest: digest(packageText), dependencies: [dependency] } }]
-  };
   const offered = await ideas.draft({ conversationId, requestId });
   const chosen = offered.references.find(reference => reference.excerpt === evidence.text);
   expect(chosen).toBeDefined();

@@ -443,35 +443,40 @@ test('two managed parents in the same vault keep their saved ideas and Context s
   await fs.writeFile(firstFile, legacy(firstId, firstLegacy), { flag: 'wx' });
   await fs.writeFile(secondFile, legacy(secondId, secondLegacy), { flag: 'wx' });
 
+  const question = page.getByLabel('Context question', { exact: true });
+  const manual = page.getByLabel('Manual context source', { exact: true });
+  const selectedContext = page.locator('#context-selected');
+  const packageText = page.getByLabel('Actual context package', { exact: true });
+  await question.fill(signal);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
+  await manual.selectOption(`idea:${firstId}`);
+  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  await expect(selectedContext).toContainText(firstLegacy);
+  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
+  await expect(packageText).toHaveValue(new RegExp(`Saved idea ${firstId};`));
+
   await page.getByLabel('Parent folder', { exact: true }).fill(path.basename(other));
-  await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+  const useFolder = page.getByRole('button', { name: 'Use this folder', exact: true });
+  await useFolder.click();
+  await expect(selectedContext.locator('article')).toHaveCount(0);
+  await expect(packageText).toHaveValue('');
+  await expect(question).toHaveValue('');
   await expect(page.locator('#location')).toHaveText(other);
+  await expect(useFolder).toBeEnabled();
   const saved = page.locator('#saved-ideas');
   await expect(saved.getByRole('heading', { name: secondLegacy, exact: true })).toBeVisible();
   await expect.soft(saved.getByRole('heading', { name: oldTitle, exact: true })).toHaveCount(0, { timeout: 1000 });
   await expect.soft(saved.getByRole('heading', { name: firstLegacy, exact: true })).toHaveCount(0, { timeout: 1000 });
 
-  await page.getByLabel('Context question', { exact: true }).fill(signal);
+  await question.fill(signal);
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
   await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
   const results = page.locator('#context-results');
   await expect(results.getByRole('heading', { name: secondLegacy, exact: true })).toBeVisible();
   await expect.soft(results.getByRole('heading', { name: firstLegacy, exact: true })).toHaveCount(0, { timeout: 1000 });
-  const manual = page.getByLabel('Manual context source', { exact: true });
   await manual.selectOption(`idea:${secondId}`);
   await expect.soft(manual.getByRole('option', { name: firstLegacy, exact: true })).toHaveCount(0, { timeout: 1000 });
-  await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
-  await page.getByRole('button', { name: 'Preview context', exact: true }).click();
-  const packageText = page.getByLabel('Actual context package', { exact: true });
-  // The prior draft still contains a source from the first parent. It must
-  // fail closed; an explicit new conversation starts from the current parent.
-  await expect(page.locator('#context-error')).toContainText('Selected evidence changed or is unavailable.');
-  await expect(packageText).toHaveValue('');
-  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
-  await page.getByLabel('Context question', { exact: true }).fill(signal);
-  await page.getByRole('button', { name: 'Find context', exact: true }).click();
-  await expect(page.getByText('Context search complete.', { exact: true })).toBeVisible();
-  await manual.selectOption(`idea:${secondId}`);
   await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
   await page.getByRole('button', { name: 'Preview context', exact: true }).click();
   try {
@@ -485,7 +490,10 @@ test('two managed parents in the same vault keep their saved ideas and Context s
       JSON.stringify({ failure: error.message, contextError, contextSummary, selected, currentLocation, selectedOption }, null, 2));
     throw error;
   }
+  await expect(selectedContext.locator('article')).toHaveCount(1);
+  await expect(selectedContext).toContainText(secondLegacy);
   await expect(packageText).not.toHaveValue(new RegExp(firstId));
+  await expect(packageText).not.toHaveValue(new RegExp(proposal.id));
   expect(await fs.readFile(proposal.destination)).toEqual(proposal.bytes);
   expect(await fs.readFile(firstFile, 'utf8')).toBe(legacy(firstId, firstLegacy));
   expect(await fs.readFile(secondFile, 'utf8')).toBe(legacy(secondId, secondLegacy));

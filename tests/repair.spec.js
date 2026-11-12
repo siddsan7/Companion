@@ -457,7 +457,7 @@ test('Refresh repairs only the exact generated annotation link when a capture mo
   for (const writing of ['Independent commentary.', 'A deliberately edited source link.']) {
     await page.getByLabel('New annotation').fill(writing);
     await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
-    await expect(page.getByRole('status')).toContainText('Annotation saved');
+    await expect(page.locator('#source-details pre').filter({ hasText: writing })).toBeVisible();
   }
   const base = path.join(root, 'vault', 'Companion'), captures = path.join(base, 'Captures'), annotations = path.join(base, 'Annotations');
   const [name] = (await fs.readdir(captures)).filter(file => file.endsWith('.md'));
@@ -473,6 +473,7 @@ test('Refresh repairs only the exact generated annotation link when a capture mo
     await fs.writeFile(file, content);
     edited.set(file, { content, generated });
   }
+  expect([...edited.values()].map(({ generated }) => generated).sort()).toEqual([false, true]);
   const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
   const open = page.getByRole('button', { name: 'Open in Obsidian', exact: true });
   await refresh.click();

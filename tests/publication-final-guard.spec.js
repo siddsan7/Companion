@@ -256,6 +256,18 @@ test('capture cannot report recoverable cleanup when its recovery lock changes d
   expect((await fs.lstat(file)).nlink).toBe(2);
 });
 
+async function approvedBriefPin(root, vault) {
+  const readme = path.join(root, 'README.md');
+  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
+  const briefs = new Briefs(vault), { proposed } = await briefs.propose([readme], now);
+  const { approved: [brief] } = await briefs.approve({
+    id: proposed.id, digest: proposed.digest,
+    sections: proposed.sections.map(section => section.text),
+    references: proposed.sections.map(section => section.references.map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+  }, now);
+  return { id: brief.id, version: brief.version, digest: brief.digest };
+}
+
 async function restoringConversation(root, vault, linked) {
   const history = new Conversations({ dataRoot: root, getVault: () => vault, clock: () => ({ now }), checkpoint: async () => {} });
   const id = randomUUID(), generation = randomUUID(), archiveId = randomUUID();
@@ -265,7 +277,7 @@ async function restoringConversation(root, vault, linked) {
   const scope = { version: randomUUID(), excludedSources: [], excludedHistory: [] };
   const record = {
     schema: 1, id, generation, scope, vault: { root: vault.root },
-    brief: { id: randomUUID(), version: 1, digest: 'a'.repeat(64) }, createdAt: now, requests: []
+    brief: await approvedBriefPin(root, vault), createdAt: now, requests: []
   };
   const payload = Buffer.from(JSON.stringify(record));
   await history.lock(async () => {
@@ -334,18 +346,10 @@ test('restoration recovery keeps a replacement control stage out of the first ac
 });
 
 async function matchedGenerationArchive({ root, vault }) {
-  const readme = path.join(root, 'README.md');
-  await fs.writeFile(readme, '# MyTune\n\nA guitar practice tutor.\n');
-  const briefs = new Briefs(vault), { proposed } = await briefs.propose([readme], now);
-  const { approved: [brief] } = await briefs.approve({
-    id: proposed.id, digest: proposed.digest,
-    sections: proposed.sections.map(section => section.text),
-    references: proposed.sections.map(section => section.references.map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
-  }, now);
   const id = randomUUID(), scope = { version: randomUUID(), excludedSources: [], excludedHistory: [] };
   const record = {
     schema: 1, id, scope, vault: { root: vault.root }, createdAt: now, requests: [],
-    brief: { id: brief.id, version: brief.version, digest: brief.digest }
+    brief: await approvedBriefPin(root, vault)
   };
   let beforeActive = false;
   const archive = await archiveExport(root, vault, {

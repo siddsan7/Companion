@@ -314,7 +314,7 @@ async function payload(intake, authority, plan) {
   const output = plan.payloadKind === 'repair-annotation' ? result : wholeTemplate(plan, path.posix.basename(authority.mixedRecovery.current, '.md'), result);
   if (hash(output) !== plan.outputSha256 || String(Buffer.byteLength(output)) !== plan.outputBytes) fail('retention template ' + plan.annotationId); return output;
 }
-async function publish(intake, ledger, id) {
+async function publish(intake, ledger, id, verifyRetainedBackupAbsence) {
   const authority = ledger.sourceAuthority[id];
   if (authority.phase !== 'deleting') return;
   const guard = removalParentGuard(intake.vault, authority.directories);
@@ -329,10 +329,14 @@ async function publish(intake, ledger, id) {
         await inspect(intake, ledger, id);
         // Exclusive creation: a pre-receipt stage cannot be adopted by byte equality.
         let proof;
+        verifyRetainedBackupAbsence();
         try { proof = await writeStage(stagePath, output, guard); }
         catch (error) { if (error.code === 'EEXIST') fail(plan.stage + ' already exists without a receipt'); throw error; }
         const owned = { dev: proof.dev, ino: proof.ino, sha256: proof.digest, bytes: plan.outputBytes };
-        const verify = () => verifyWritingFileSync(stagePath, guard, owned, 1);
+        const verify = () => {
+          verifyWritingFileSync(stagePath, guard, owned, 1);
+          verifyRetainedBackupAbsence();
+        };
         verify();
         if ((await require('./source-inventory').inspectTargets(intake, authority)).length !== authority.targets.length) fail('source origin changed before stage receipt');
         await scan(intake, authority, new Set([plan.stage]));
@@ -345,6 +349,7 @@ async function publish(intake, ledger, id) {
         intake.storage.guardSync();
         verifyAbsentSync(outputPath, guard);
         verifyWritingFileSync(stagePath, guard, plan.stageIdentity, 1);
+        verifyRetainedBackupAbsence();
         try { local.linkSync(stagePath, outputPath); } catch (error) { if (error.code === 'EEXIST') fail(plan.file + ' appeared before publication'); throw error; }
         await intake.vault.checkpoint('mixed-writing-after-link');
       }
@@ -355,6 +360,7 @@ async function publish(intake, ledger, id) {
       await intake.save(ledger, () => {
         verifyWritingFileSync(stagePath, guard, plan.stageIdentity, 2);
         verifyWritingFileSync(outputPath, guard, plan.publication, 2);
+        verifyRetainedBackupAbsence();
       });
     }
     await inspect(intake, ledger, id); state = await writingState(intake, plan);
@@ -363,6 +369,7 @@ async function publish(intake, ledger, id) {
       intake.storage.guardSync();
       verifyWritingFileSync(outputPath, guard, plan.publication, 2);
       verifyWritingFileSync(stagePath, guard, plan.stageIdentity, 2);
+      verifyRetainedBackupAbsence();
       local.unlinkSync(stagePath);
     }
     await inspect(intake, ledger, id);

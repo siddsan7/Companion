@@ -8,7 +8,7 @@ const { hash, readDraft } = require('./intake-producer');
 const { readReview } = require('./intake-review');
 const { sourceInspection, sourceMutation } = require('./source-mutation');
 const { validateAuthority, revisionAdmission, uuid } = require('./source-authority');
-const { retainedBackups, verifyRetainedBackups } = require('./intake-publication');
+const { retainedBackups, omittedRetainedBackups } = require('./intake-publication');
 const { parse, restorationReadRefused, matchesRestorationFile } = require('./vault');
 const { requiredDirectories, sourceParents, pendingParents, globalRecovery, held, isManualHold, manualLeaf, removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const sourceInventory = require('./source-inventory');
@@ -21,6 +21,19 @@ const { ordinaryDirectories, readExactSync, verifyAbsentSync, verifyStageSync, w
 const { comparable, storeName } = require('./legacy-capture-ownership');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 const changed = () => Object.assign(Error('Capture deletion files changed or contain unreviewed writing. Preserve them and preview the scope again.'), { code: 'SOURCE_FILE_CHANGED' });
+
+function retainedBackupGuard(intake, ledger, { sourceHash, targets, originGenerations, directories }) {
+  if (!sourceHash) return () => {};
+  const { vault } = intake;
+  // The retained ledger records bind these absent paths until deletion completes.
+  const omitted = omittedRetainedBackups(retainedBackups(ledger, sourceHash), relative(vault, intake.dir),
+    targets, originGenerations?.[0]?.generation ?? null);
+  if (!omitted.length) return () => {};
+  const guard = removalParentGuard(vault, directories);
+  return () => {
+    for (const file of omitted) verifyAbsentSync(path.join(vault.vault, file), guard, changed);
+  };
+}
 
 class CaptureDeletion {
   constructor({ getVault, conversations, clearApprovals, clock }) { Object.assign(this, { getVault, conversations, clearApprovals, clock }); this.previews = new Map(); this.restorations = new Map(); this.retries = new Map(); this.scopeReviews = new Map(); }
@@ -68,8 +81,6 @@ class CaptureDeletion {
       imported = mixed || await sourceInventory.inventory(intake, ledger, capture, sourceHash, revisions, targets);
       if (!mixed && hash(notes[0].content) !== capture.currentHash && !imported.titleRecovery) throw changed();
       targets = imported.targets;
-      verifyRetainedBackups(retainedBackups(ledger, sourceHash), relative(vault, intake.dir), targets,
-        ledger.sourceAuthority?.[id]?.generation ?? null);
     } else {
       manualTitles = await manualTitle.inventory(intake, ledger, manual, targets); targets = manualTitles.targets;
     }
@@ -97,7 +108,9 @@ class CaptureDeletion {
     const root = await fs.realpath(vault.vault);
     if (!intake.storage.matches(await intake.storage.view()) || this.getVault() !== vault) throw changed();
     reserved.verify();
-    return { id, root, managedRoot: vault.root, ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
+    const inventory = { id, root, managedRoot: vault.root, ledgerIdentity: intake.storage.expected.identity, sourceHash, capture, ...(manual ? { manual, ...(manualTitles.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: manualTitles.originGenerations, titleProofs: manualTitles.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: ledger.sourceAuthority?.[id] ? [{ captureId: id, generation: ledger.sourceAuthority[id].generation }] : [], recovery: imported.recovery, recoveryPointers: imported.recoveryPointers, observations: imported.observations, purgedProducerAttempts: ledger.sourceAuthority?.[id]?.purgedProducerAttempts || [], ...(imported.titleProofs.length ? { titleProofs: imported.titleProofs } : {}), ...(imported.titleRecovery ? { titleRecovery: imported.titleRecovery } : {}), ...(mixed ? { mixedRecovery: mixed.mixedRecovery, preservedWriting: mixed.preservedWriting, retainedWriting: mixed.retainedWriting } : {}) }), targets: targets.sort((a, b) => a.file.localeCompare(b.file)), directories: [...directories.values()].sort((a, b) => a.file.localeCompare(b.file)), annotations, dependents };
+    retainedBackupGuard(intake, ledger, inventory)();
+    return inventory;
   }
   async preview(id) {
     const vault = this.getVault();
@@ -324,7 +337,7 @@ class CaptureDeletion {
         }
         ledger.sourceAuthority[selected.id] = { generation: randomUUID(), phase: 'deleting', operationId, sourceHash: fresh.sourceHash, root: fresh.root, targets: fresh.targets, directories: fresh.directories, ...(fresh.manual ? { manual: fresh.manual, ...(fresh.inventoryVersion === 1 ? { inventoryVersion: 1, originGenerations: fresh.originGenerations, titleProofs: fresh.titleProofs } : {}) } : { inventoryVersion: 2, originGenerations: fresh.originGenerations, recovery: fresh.recovery, recoveryPointers: fresh.recoveryPointers, purgedProducerAttempts: [...purged.values()].sort((a, b) => a.identity.localeCompare(b.identity)), ...(fresh.titleProofs ? { titleProofs: fresh.titleProofs } : {}), ...(fresh.titleRecovery ? { titleRecovery: fresh.titleRecovery } : {}), ...(fresh.mixedRecovery ? { mixedRecovery: fresh.mixedRecovery, preservedWriting: fresh.preservedWriting } : {}) }), ...(ledger.sourceAuthority[selected.id]?.history ? { history: ledger.sourceAuthority[selected.id].history } : {}), ...(ledger.sourceAuthority[selected.id]?.retiredRestorations ? { retiredRestorations: ledger.sourceAuthority[selected.id].retiredRestorations } : {}) };
         if (!fresh.manual) { ledger.suppressed = [...new Set([...ledger.suppressed, fresh.sourceHash])]; ledger.captures[fresh.sourceHash].removed = true; }
-        await intake.save(ledger); this.clearApprovals(); this.previews.delete(token);
+        await intake.save(ledger, retainedBackupGuard(intake, ledger, fresh)); this.clearApprovals(); this.previews.delete(token);
         await vault.checkpoint('capture-deletion-authorized');
         await finishDeletion(intake, ledger, selected.id);
       } finally { for (const { file, proof, guard } of acquired.reverse()) await vault.release(file, proof, guard); }
@@ -395,9 +408,12 @@ async function inspectDeletion(intake, ledger, id) {
   await inspectAdjacentTitlePrefix(vault, authority.targets);
   const capture = ledger.captures[authority.sourceHash];
   if (!authority.manual && (!capture || capture.id !== id || !capture.removed || !ledger.suppressed.includes(authority.sourceHash))) throw changed();
-  if (!authority.manual) verifyRetainedBackups(retainedBackups(ledger, authority.sourceHash), relative(vault, intake.dir),
-    authority.targets, authority.originGenerations?.[0]?.generation ?? null);
-  if (authority.mixedRecovery) return mixedDeletion.inspect(intake, ledger, id);
+  const verifyRetainedBackupAbsence = retainedBackupGuard(intake, ledger, authority);
+  if (authority.mixedRecovery) {
+    const remaining = await mixedDeletion.inspect(intake, ledger, id);
+    verifyRetainedBackupAbsence();
+    return remaining;
+  }
   if (manualTitle.explicit(authority)) manualTitle.validate(authority, id);
   else sourceTitle.inspectProofs(intake, ledger, authority);
   await pendingTitle.inspect(intake, ledger, authority);
@@ -421,7 +437,9 @@ async function inspectDeletion(intake, ledger, id) {
   if (manualTitle.explicit(authority)) return manualTitle.inspect(intake, authority);
   if (authority.inventoryVersion === 2) {
     sourceInventory.inspectPointers(ledger, authority);
-    return sourceInventory.inspectTargets(intake, authority);
+    const remaining = await sourceInventory.inspectTargets(intake, authority);
+    verifyRetainedBackupAbsence();
+    return remaining;
   }
   const remaining = [];
   for (const target of authority.targets) {
@@ -444,6 +462,7 @@ async function inspectDeletion(intake, ledger, id) {
     }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
+  verifyRetainedBackupAbsence();
   return remaining;
 }
 
@@ -496,7 +515,9 @@ function deletionNamespace(intake, authority, id, guard, ledgerStage) {
 
 async function finishDeletion(intake, ledger, id) {
   const authority = ledger.sourceAuthority[id], vault = intake.vault;
-  if (authority.mixedRecovery) await mixedDeletion.publish(intake, ledger, id);
+  const verifyRetainedBackupAbsence = retainedBackupGuard(intake, ledger, authority);
+  verifyRetainedBackupAbsence();
+  if (authority.mixedRecovery) await mixedDeletion.publish(intake, ledger, id, verifyRetainedBackupAbsence);
   const remaining = await inspectDeletion(intake, ledger, id);
   const deletion = new CaptureDeletion({ getVault: () => vault });
   const extendedInventory = authority.inventoryVersion === 2 || manualTitle.explicit(authority);
@@ -519,6 +540,7 @@ async function finishDeletion(intake, ledger, id) {
     if (authority.mixedRecovery) mixedDeletion.verifyRetainedWritingSync(intake, authority, guard);
     if (namespace !== deletionNamespace(intake, authority, id, guard)) throw changed();
     verifyRemovalTarget(vault, target, peers, guard, changed);
+    verifyRetainedBackupAbsence();
     native.unlinkSync(file); await vault.checkpoint('capture-deletion-unlinked');
   }
   const namespace = deletionNamespace(intake, authority, id, guard);
@@ -532,6 +554,7 @@ async function finishDeletion(intake, ledger, id) {
     for (const target of authority.targets) for (const name of target.peers || [target.file]) verifyAbsentSync(path.join(vault.vault, name), guard, changed);
     if (namespace !== deletionNamespace(intake, authority, id, guard, stage)) throw changed();
     if (authority.mixedRecovery) mixedDeletion.verifyRetainedWritingSync(intake, authority, guard);
+    verifyRetainedBackupAbsence();
   };
   const deleted = { ...authority, phase: 'deleted' };
   await intake.save({ ...ledger, sourceAuthority: { ...ledger.sourceAuthority, [id]: deleted } }, verifyCompletion);
