@@ -396,7 +396,7 @@ test('an exact approved historical pin survives unrelated damaged records withou
   const newer = await page.evaluate(() => window.companion['brief-pin'](2));
   const dir = path.join(root, 'vault', 'Companion', 'Briefs');
   await fs.writeFile(path.join(dir, state.proposed.file), 'Damaged unrelated draft.');
-  await fs.writeFile(path.join(dir, newer.file), 'Damaged unrelated newer approval.');
+  await fs.writeFile(path.join(dir, newer.file), '---\nartifact_type: project_brief\nrecord: [\n---\n');
   await app.close(); app = null; await launch();
   const historical = await page.evaluate(() => window.companion['brief-pin'](1));
   expect(historical.digest).toBe(original.digest);
