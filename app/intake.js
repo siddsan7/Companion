@@ -9,9 +9,10 @@ const { sourceMutation } = require('./source-mutation');
 const { withTitle, captureHeading, parseAnnotation } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission, uuid } = require('./source-authority');
 const { IntakeLedger } = require('./intake-ledger');
+const { validateStageRecords, stageRecord, retireStageRecords, matchesProof } = require('./intake-publication');
 const { validateAnnotationLinks, validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
+const { ordinaryDirectories, readExact, readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -76,19 +77,20 @@ class Intake {
     const text = await this.storage.read(); if (text === null) return empty();
     let ledger; try { ledger = JSON.parse(text); } catch { throw Error('Intake ledger is unreadable. Preserve .intake and restore a vault backup before checking sources.'); }
     if (ledger.schema !== 1 || !Array.isArray(ledger.sources) || !ledger.captures || !ledger.attempts || !ledger.blocks || !ledger.pending || !ledger.outcomes || !Array.isArray(ledger.suppressed)) throw Error('Unsupported intake ledger. Preserve it for repair.');
-    validateAuthority(ledger); validateAnnotationRemovals(ledger); validateAnnotationLinks(ledger); return ledger;
+    validateAuthority(ledger); validateAnnotationRemovals(ledger); validateAnnotationLinks(ledger); validateStageRecords(ledger); return ledger;
   }
   async save(ledger, verifyRelated) {
     validateAuthority(ledger);
     validateAnnotationRemovals(ledger);
     validateAnnotationLinks(ledger);
+    validateStageRecords(ledger);
     await this.storage.replace(JSON.stringify(ledger, null, 2), verifyRelated);
   }
   async publishJournal(file, value) {
     await this.vault.contained(this.dir);
     const stage = path.join(this.dir, `journal-${randomUUID()}.stage`);
     const guard = this.vault.publicationFolders(this.dir).guard;
-    const proof = await writeStage(stage, JSON.stringify(value), guard);
+    const proof = await this.writeJournalStage(stage, value, guard, path.basename(stage));
     verifyAbsentSync(file, guard);
     verifyStageSync(stage, guard, proof);
     local.linkSync(stage, file);
@@ -97,6 +99,12 @@ class Intake {
     local.unlinkSync(stage);
     verifyStageSync(file, guard, proof);
     return proof;
+  }
+  writeJournalStage(file, value, guard, temporary) {
+    return writeStage(file, identity => {
+      if (value.publicationVersion === 1) value.journalIdentity = { ...identity, ...(temporary ? { temporary } : {}) };
+      return JSON.stringify(value);
+    }, guard);
   }
   async locked(work, admit) {
     if (!admit) await this.setup();
@@ -202,7 +210,7 @@ class Intake {
         if (!before) throw Error();
         const tx = JSON.parse(await read(journal));
         const after = await this.ownedFile(journal, [], 'Held import journal');
-        this.validateTransaction(tx);
+        this.validateTransaction(tx, before);
         this.verifyHeldTransaction(ledger, tx);
         const outcome = ledger.outcomes[tx.key];
         if (tx.sourceHash !== sourceHash || tx.revision.id !== block.incomingRevision ||
@@ -317,7 +325,7 @@ class Intake {
     const revision = { schema: 1, id: revisionId, captureId: id, importedAt: now, ...draft };
     const file = capture?.file || `${id}.md`;
     if (path.basename(file) !== file) throw Error('Invalid intake destination identity. Preserve ledger for repair.');
-    const destination = this.destination(capture || { file }), current = await read(destination);
+    const { current, previousProof } = await this.observePriorCapture(this.destination(capture || { file }));
     const externalConflict = !!capture && (current === null || hash(current) !== capture.currentHash);
     if (!capture && current !== null) throw Error('Destination already exists. Resolve its identity before intake.');
     const previousCapture = capture;
@@ -327,7 +335,7 @@ class Intake {
       if (draft.review) { capture.reviewChoices = [...new Set([...(capture.reviewChoices || []), capture.currentRevision, revisionId])]; capture.supportEligible = false; }
     }
     const content = retainOnly ? current : noteText(capture, revision); capture.currentHash = hash(content);
-    const transaction = { schema: 1, externalConflict, retainOnly, key, sourceHash: draft.sourceHash, capture, revision, content, previousHash: current === null ? null : hash(current), previous: current, backup: `${id}-${revisionId}.before.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
+    const transaction = { schema: 1, publicationVersion: 1, externalConflict, retainOnly, key, sourceHash: draft.sourceHash, capture, revision, content, previousHash: previousProof?.digest ?? null, previous: current, previousProof, backup: `${id}-${revisionId}.before.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
     // The durable journal owns these verified bytes after this check. Recovery
     // uses that local copy without reopening the producer.
     await guard();
@@ -339,7 +347,7 @@ class Intake {
         this.ordinaryPublicationControls(transaction, ledger, proof)?.();
         throw conflict('Destination changed outside Companion. Local writing and incoming source were preserved.');
       }
-      await this.finish(transaction, ledger, proof, undefined, { fresh: true });
+      await this.finish(transaction, ledger, proof);
     } catch (error) {
       if (error.intakeDeferred || error.intakeConflict) error.intakeJournalProof = proof;
       throw error;
@@ -350,14 +358,40 @@ class Intake {
     if (typeof capture.relative !== 'string' || path.isAbsolute(capture.relative) || capture.relative.split(/[\\/]/).some(part => !part || part === '.' || part === '..') || !capture.relative.endsWith('.md')) throw Error('Invalid moved capture path. Preserve intake history for repair.');
     return path.join(this.vault.vault, capture.relative);
   }
-  validateTransaction(tx) {
+  async observePriorCapture(file) {
+    const { guard } = this.vault.publicationFolders(path.dirname(file));
+    try {
+      const { bytes, proof } = await readExact(file, guard);
+      const current = bytes.toString('utf8');
+      if (hash(current) !== proof.digest) throw Error('Capture destination is not valid UTF-8. Its bytes were preserved.');
+      return { current, previousProof: proof };
+    } catch (error) {
+      if (error.code === 'ENOENT') return { current: null, previousProof: null };
+      throw error;
+    }
+  }
+  validateTransaction(tx, observedJournal) {
     const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
     try {
       this.destination(tx.capture);
+      if (Object.hasOwn(tx, 'publicationVersion')) {
+        const identity = tx.journalIdentity;
+        const hasTemporary = identity && Object.hasOwn(identity, 'temporary');
+        if (tx.publicationVersion !== 1 || tx.restoreOperation || !identity || Object.keys(identity).length !== (hasTemporary ? 3 : 2) ||
+            ![identity.dev, identity.ino].every(value => typeof value === 'string' && /^[0-9]+$/.test(value)) ||
+            hasTemporary && (typeof identity.temporary !== 'string' || !identity.temporary.startsWith('journal-') ||
+              !identity.temporary.endsWith('.stage') || !uuid.test(identity.temporary.slice(8, -6))) ||
+            (tx.previous === null ? tx.previousProof !== null : !validProof(tx.previousProof) ||
+              Object.keys(tx.previousProof).length !== 3 || tx.previousProof.digest !== tx.previousHash)) throw Error();
+      } else if (Object.hasOwn(tx, 'journalIdentity') || Object.hasOwn(tx, 'previousProof')) throw Error();
       if (tx.sourceGeneration !== undefined && !uuid.test(tx.sourceGeneration) || tx.restoreOperation !== undefined && !uuid.test(tx.restoreOperation)) throw Error();
       if (tx.keptCurrent !== undefined && (!tx.resolution || tx.retainOnly || !tx.keptCurrent.review || !uuid.test(tx.keptCurrent.id) || tx.keptCurrent.id !== tx.capture.currentRevision || tx.keptCurrent.captureId !== tx.capture.id || tx.keptCurrent.sourceHash !== tx.sourceHash || !tx.capture.revisions.includes(tx.keptCurrent.id))) throw Error();
       if (tx.schema !== 1 || typeof tx.content !== 'string' || !tx.capture || !tx.revision || !uuid.test(tx.capture.id) || !uuid.test(tx.revision.id) || !/^[a-f0-9]{64}$/.test(tx.sourceHash) || typeof tx.key !== 'string' || !uuid.test(tx.key.split(':')[0]) || tx.capture.file !== `${tx.capture.id}.md` || (tx.resolution !== undefined && !uuid.test(tx.resolution) || tx.backup !== `${tx.capture.id}-${tx.revision.id}.before${tx.resolution ? `-${tx.resolution}` : ''}.md`) || tx.capture.currentHash !== hash(tx.content) || tx.revision.captureId !== tx.capture.id || tx.revision.sourceHash !== tx.sourceHash || (tx.retainOnly ? tx.content !== tx.previous || !tx.resolution && tx.capture.currentRevision === tx.revision.id || !tx.capture.revisions.includes(tx.revision.id) : tx.content !== noteText(tx.capture, tx.keptCurrent || tx.revision)) || (tx.previous === null ? tx.previousHash !== null : typeof tx.previous !== 'string' || hash(tx.previous) !== tx.previousHash)) throw Error();
     } catch { throw Error('Invalid intake recovery journal. Files were preserved for repair.'); }
+    if (tx.publicationVersion === 1 && observedJournal &&
+        (tx.journalIdentity.dev !== String(observedJournal.dev) || tx.journalIdentity.ino !== String(observedJournal.ino))) {
+      throw Error('The intake journal identity changed. Recovery files were preserved.');
+    }
   }
   async verifiedKeptCurrent(tx, ledger) {
     const revisionId = tx.capture.currentRevision, current = ledger.captures[tx.sourceHash];
@@ -395,7 +429,7 @@ class Intake {
     }
     throw conflict(`${label}: an unexpected hardlink alias was found. All linked files were preserved.`);
   }
-  async detachRestoredBackup(note, sourceHash, capture, ledger) {
+  async detachRestoredBackup(note, sourceHash, capture, ledger, verifyRelated) {
     const file = note.file, initial = await fs.lstat(file, { bigint: true }), block = ledger.blocks[sourceHash];
     if (!block || !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) return;
     const journal = path.join(this.dir, block.journal);
@@ -403,7 +437,7 @@ class Intake {
     const { guard: guardIntake } = this.vault.publicationFolders(this.dir);
     const guard = () => { guardNote(); guardIntake(); };
     const journalInfo = await this.ownedFile(journal, [], 'Restored capture conflict journal');
-    const journalBytes = await read(journal), tx = JSON.parse(journalBytes); this.validateTransaction(tx);
+    const journalBytes = await read(journal), tx = JSON.parse(journalBytes); this.validateTransaction(tx, journalInfo);
     const journalProof = fileProof(journalInfo, journalBytes);
     const backup = path.join(this.dir, tx.backup), stage = backup + '.independent', intentFile = backup + '.detach.json';
     const intentInfo = await this.ownedFile(intentFile, [], 'Restored capture detach intent');
@@ -411,6 +445,25 @@ class Intake {
     if (initial.nlink === 1n && intentBytes === null) return;
     const valid = block.journal === `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json` && block.incomingRevision === tx.revision.id && tx.sourceHash === sourceHash && tx.capture.id === capture.id && tx.capture.file === capture.file && note.id === capture.id && note.type === 'reel_import' && this.destination(capture) === file && tx.previous !== null && tx.previousHash === capture.currentHash && note.content === tx.previous;
     if (!valid) { if (intentBytes !== null) throw Error('Invalid restored capture detach authority. All files were preserved.'); return; }
+    const currentFormat = tx.publicationVersion === 1;
+    let recorded = currentFormat ? stageRecord(ledger, sourceHash, journalProof) : undefined;
+    const originalProof = block.outputHold?.rollback?.proof;
+    const changed = () => conflict('Restored capture backup or detach authority changed. All files were preserved.');
+    if (currentFormat && (!matchesProof(originalProof, tx.previousProof) ||
+        !matchesProof(recorded?.backup, originalProof) && !matchesProof(recorded?.backup, recorded?.detach?.stage))) throw changed();
+    const saveRecord = async (updated, verify) => {
+      const intakeStageRecords = { ...ledger.intakeStageRecords, [journalProof.digest]: updated };
+      await this.save({ ...ledger, intakeStageRecords }, verify);
+      ledger.intakeStageRecords = intakeStageRecords;
+      recorded = updated;
+    };
+    const verifyOriginalPair = () => {
+      verifyRelated();
+      this.storage.guardSync();
+      verifyStageSync(journal, guard, journalProof);
+      verifyStageSync(file, guard, originalProof, 2);
+      verifyStageSync(backup, guard, originalProof, 2);
+    };
     const bytes = Buffer.from(tx.previous, 'utf8'), same = async target => (await fs.readFile(target)).equals(bytes);
     let intent, intentProof;
     if (intentBytes === null) {
@@ -419,19 +472,50 @@ class Intake {
       if (!source || !previous || source.nlink !== 2n || previous.nlink !== 2n || source.dev !== previous.dev || source.ino !== previous.ino) return;
       if (!await same(file) || !await same(backup)) throw conflict('Restored capture bytes changed. All files were preserved.');
       await this.ownedFile(stage, [], 'Independent restored capture backup');
-      try { await fs.writeFile(stage, bytes, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+      const stageChanged = () => conflict('Independent restored capture backup changed. All files were preserved.');
+      let prepared;
+      try {
+        if (currentFormat) {
+          verifyOriginalPair();
+          prepared = await writeStage(stage, bytes, guard);
+        }
+        else await fs.writeFile(stage, bytes, { flag: 'wx', flush: true });
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        if (currentFormat) throw stageChanged();
+      }
       await this.vault.checkpoint('intake-restored-backup-independent');
       const independent = await this.ownedFile(stage, [], 'Independent restored capture backup');
-      if (!independent || !await same(stage)) throw conflict('Independent restored capture backup changed. All files were preserved.');
+      if (!independent || !await same(stage)) throw stageChanged();
+      if (prepared) {
+        if (!matchesProof(fileProof(independent, bytes), prepared)) throw stageChanged();
+        verifyOriginalPair();
+        verifyStageSync(stage, guard, prepared);
+      }
       intent = { schema: 1, id: randomUUID(), sourceHash, captureId: capture.id, file: capture.relative, journal: block.journal, journalHash: hash(journalBytes), backup: tx.backup, previousHash: tx.previousHash, dev: String(source.dev), ino: String(source.ino), stageDev: String(independent.dev), stageIno: String(independent.ino) };
       intentBytes = JSON.stringify(intent);
       intentProof = await writeStage(intentFile, intentBytes, guard);
+      if (prepared) {
+        const verify = () => {
+          verifyOriginalPair();
+          verifyStageSync(stage, guard, prepared);
+          verifyStageSync(intentFile, guard, intentProof);
+        };
+        await saveRecord({ ...recorded, backup: originalProof, detach: { intent: intentProof, stage: prepared } }, verify);
+        verify();
+      }
     } else {
       intent = JSON.parse(intentBytes);
-      intentProof = fileProof(intentInfo, intentBytes);
+      if (currentFormat) {
+        intentProof = recorded?.detach?.intent;
+        if (!intentProof || intentProof.digest !== hash(intentBytes)) throw changed();
+        verifyStageSync(intentFile, guard, intentProof);
+      } else intentProof = fileProof(intentInfo, intentBytes);
     }
     const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
     if (intent.schema !== 1 || !uuid.test(intent.id) || intent.sourceHash !== sourceHash || intent.captureId !== capture.id || intent.file !== capture.relative || intent.journal !== block.journal || intent.journalHash !== hash(journalBytes) || intent.backup !== tx.backup || intent.previousHash !== tx.previousHash || ![intent.dev, intent.ino, intent.stageDev, intent.stageIno].every(value => typeof value === 'string' && /^[0-9]+$/.test(value))) throw Error('Invalid restored capture detach intent. All files were preserved.');
+    if (currentFormat && (!matchesProof(originalProof, { dev: intent.dev, ino: intent.ino, digest: intent.previousHash }) ||
+        !matchesProof(recorded.detach.stage, { dev: intent.stageDev, ino: intent.stageIno, digest: intent.previousHash }))) throw changed();
     const retained = backup + '.detached-' + intent.id;
     const identity = (info, dev, ino) => info && String(info.dev) === dev && String(info.ino) === ino;
     const authority = async () => {
@@ -571,10 +655,19 @@ class Intake {
     const current = await authority();
     await this.ownedFile(backup, [], 'Independent restored capture backup');
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
-    verifyAuthority(current, 1);
-    verifyStageSync(backup, guard, fileProof(previous, bytes));
-    verifyAbsentSync(stage, guard);
-    verifyAbsentSync(retained, guard);
+    const backupProof = fileProof(previous, bytes);
+    const verifyComplete = () => {
+      verifyRelated();
+      verifyAuthority(current, 1);
+      verifyStageSync(backup, guard, backupProof);
+      verifyAbsentSync(stage, guard);
+      verifyAbsentSync(retained, guard);
+    };
+    if (currentFormat) {
+      if (!matchesProof(recorded.detach.stage, backupProof)) throw changed();
+      if (!matchesProof(recorded.backup, backupProof)) await saveRecord({ ...recorded, backup: backupProof }, verifyComplete);
+    }
+    verifyComplete();
     local.unlinkSync(intentFile);
   }
   async publicationAuthority(tx, ledger, { verifyOnly = false, verifyRestorationControls, verifyIndependentJournal } = {}) {
@@ -632,9 +725,9 @@ class Intake {
       for (const authority of restorations) verifyImportedRestorationHold(this, authority, journal.verify);
     });
   }
-  async finish(tx, ledger, journalProof, transfer, { fresh = false } = {}) {
+  async finish(tx, ledger, journalProof, transfer, options) {
     const publication = {};
-    try { return await this.publishTransaction(tx, ledger, journalProof, publication, transfer, fresh); }
+    try { return await this.publishTransaction(tx, ledger, journalProof, publication, transfer, options); }
     catch (error) {
       if (!publication.committed && publication.transferFailure === error) {
         if (transfer?.previous) throw Object.assign(Error(error.message, { cause: error }), { intakeTransferFailed: true });
@@ -687,8 +780,9 @@ class Intake {
     local.unlinkSync(backup);
     verifyStageSync(destination, guard, previous);
   }
-  async publishTransaction(tx, ledger, journalProof, publication, transfer, fresh) {
+  async publishTransaction(tx, ledger, journalProof, publication, transfer, { priorRepair, afterProofSave } = {}) {
     this.validateTransaction(tx);
+    const currentFormat = tx.publicationVersion === 1;
     const verifyRestorationControls = this.ordinaryPublicationControls(tx, ledger, journalProof);
     const verifyIndependentJournal = validProof(journalProof) && this.isIndependentNewSource(tx, ledger) ? verifyRestorationControls : undefined;
     const verifyTransfer = () => {
@@ -735,8 +829,37 @@ class Intake {
     for (const item of [ledger.pending[tx.sourceHash], ledger.blocks[tx.sourceHash]]) if (item?.journal && /^(?:pending|conflict)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.journal)) journalPeers.push(path.join(this.dir, item.journal));
     const journalInfo = await this.ownedFile(journal, journalPeers, 'Intake transaction');
     exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
+    this.validateTransaction(tx, journalInfo);
     if (journalProof) verifyStageSync(journal, guard, journalProof, Number(journalInfo.nlink));
     publication.journalProof = journalProof || fileProof(journalInfo, journalBytes);
+    const journalIdentity = fileProof(journalInfo, journalBytes);
+    let owned = currentFormat ? stageRecord(ledger, tx.sourceHash, journalIdentity) : undefined;
+    const priorOwned = currentFormat && priorRepair && stageRecord(ledger, tx.sourceHash, priorRepair.journal);
+    const verifyJournalAuthority = () => {
+      this.storage.guardSync();
+      verifyRestorationControls?.();
+      verifyTransfer();
+      priorRepair?.verify();
+      journalProof?.freshRepair?.verify();
+      exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
+    };
+    const record = async (role, proof, verifyFile) => {
+      const updated = { sourceHash: tx.sourceHash, journal: journalIdentity, ...owned, [role]: proof };
+      const intakeStageRecords = { ...ledger.intakeStageRecords, [journalIdentity.digest]: updated };
+      const verify = () => {
+        verifyFile();
+        verifyJournalAuthority();
+      };
+      await this.save({ ...ledger, intakeStageRecords }, verify);
+      ledger.intakeStageRecords = intakeStageRecords;
+      owned = updated;
+      afterProofSave?.();
+    };
+    const verifyRecorded = (role, info, content, expected = owned?.[role]) => {
+      if (!info || !matchesProof(fileProof(info, content), expected)) {
+        throw conflict('Intake file does not match its recorded identity. Independent files and the incoming revision were preserved.');
+      }
+    };
     const verifySelectedJournal = () => {
       if (!tx.restoreOperation) return;
       if (!journalProof) throw Error('Selected restoration journal identity is unavailable. Suppression remains.');
@@ -744,28 +867,37 @@ class Intake {
       verifyStageSync(journalPeers[0], guard, journalProof, 2);
     };
     verifySelectedJournal();
-    const staged = async (file, content, peer) => {
+    const staged = async (file, content, peer, role) => {
       await checkPublication();
       const label = 'Unsafe import staging file';
       const occupied = () => conflict(`${label}: a file already occupies the reserved path. It was preserved.`);
       const existing = await this.ownedFile(file, peer, label);
       verifySelectedJournal();
       if (existing) {
-        if (fresh) throw occupied();
-        // Recovered journals lack creation identities. Resume only an exact
-        // ordinary stage or the exact pair named by the recovery journal.
+        const previous = priorOwned?.[role];
+        if (currentFormat) {
+          if (!owned?.[role] && !previous) throw occupied();
+          verifyRecorded(role, existing, content, owned?.[role] || previous);
+          if (!owned?.[role]) await record(role, previous, () => exact(file, existing, content, label, [peer]));
+        }
+        // Older transactions did not record the writer's file identity.
         exact(file, existing, content, label, [peer]);
         return existing;
       }
+      if (owned?.[role] || priorOwned?.[role]) throw conflict('Recorded import staging file disappeared. Its incoming revision was preserved.');
       try {
         const proof = await writeStage(file, content, guard);
+        if (currentFormat) await record(role, proof, () => {
+          try { verifyStageSync(file, guard, proof); }
+          catch (error) { if (error.code === 'STAGING_CHANGED') throw occupied(); throw error; }
+        });
         return { dev: BigInt(proof.dev), ino: BigInt(proof.ino), nlink: 1n };
       } catch (error) {
         if (error.code === 'EEXIST') throw occupied();
         throw error;
       }
     };
-    const snapshotProof = await staged(snapshotStage, snapshotBytes, snapshot);
+    const snapshotProof = await staged(snapshotStage, snapshotBytes, snapshot, 'snapshotStage');
     await this.vault.checkpoint('intake-snapshot-staged');
     await checkPublication();
     if (!await this.ownedFile(snapshotStage, snapshot, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
@@ -773,6 +905,7 @@ class Intake {
     this.storage.guardSync();
     verifySelectedJournal();
     exact(snapshotStage, snapshotProof, snapshotBytes, 'Revision snapshot stage', [snapshot]);
+    if (currentFormat) verifyJournalAuthority();
     let snapshotOutput;
     try {
       local.linkSync(snapshotStage, snapshot);
@@ -782,8 +915,8 @@ class Intake {
       try { existing = await fs.lstat(snapshot); } catch { throw error; }
       if (!existing.isFile() || existing.isSymbolicLink()) throw conflict('Immutable revision snapshot destination is not an ordinary file. The destination and incoming stage were preserved.');
       snapshotOutput = await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
-      if (fresh && !exactPair(snapshotOutput, snapshotProof)) {
-        const admitted = tx.resolution && revisionAdmission(ledger, tx.revision.id);
+      if (currentFormat && !exactPair(snapshotOutput, snapshotProof)) {
+        const admitted = (tx.resolution || tx.restore) && revisionAdmission(ledger, tx.revision.id);
         if (admitted?.captureId !== tx.capture.id || admitted.sourceHash !== tx.sourceHash || admitted.snapshotHash !== hash(snapshotBytes)) {
           throw conflict('Immutable revision snapshot conflicts. Existing and incoming bytes were preserved.');
         }
@@ -798,8 +931,10 @@ class Intake {
     const backupInfo = await this.ownedFile(backup, destination, 'Previous capture backup');
     let captureOutput = currentProof, captureStageProof;
     let current = await read(destination), old = await read(backup);
-    if (fresh && current === tx.content && tx.previous !== tx.content) {
-      throw conflict('External edit conflict. The new destination was preserved.');
+    if (currentFormat && current === tx.content && tx.previous !== tx.content) {
+      captureStageProof = await this.ownedFile(stage, destination, 'Imported capture stage');
+      verifyRecorded('captureStage', captureStageProof, tx.content, transfer?.output?.() || owned?.captureStage);
+      if (!exactPair(captureOutput, captureStageProof)) throw conflict('External edit conflict. The new destination was preserved.');
     }
     if (transfer) publication.restoreTransfer = () => this.restoreOrdinaryTransfer(tx,
       transfer.previous || publication.rollback?.proof, transfer.output?.(), () => {
@@ -808,7 +943,28 @@ class Intake {
         exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
       });
     const pairedBackup = transfer?.previous && backupInfo?.nlink === 2n && current === tx.previous;
-    if (transfer?.previous && old !== null && !pairedBackup) verifyStageSync(backup, guard, transfer.previous);
+    if (!currentFormat && transfer?.previous && old !== null && !pairedBackup) verifyStageSync(backup, guard, transfer.previous);
+    let backupProof = transfer?.previous || owned?.backup;
+    const verifyBackup = (info, peers) => {
+      if (currentFormat) {
+        if (!matchesProof(backupProof, tx.previousProof)) throw conflict('Previous capture backup does not match the selected capture. Both files were preserved.');
+        verifyRecorded('backup', info, tx.previous, backupProof);
+      }
+      exact(backup, info, tx.previous, 'Previous capture backup', peers);
+    };
+    if (currentFormat) {
+      if (current !== null && current === tx.previous) verifyRecorded('backup', currentProof, tx.previous, tx.previousProof);
+      if (backupInfo) {
+        if (tx.previous === null || tx.retainOnly) throw conflict('Previous capture backup occupied an unused path. Both files were preserved.');
+        verifyBackup(backupInfo, [destination]);
+        if (!transfer?.previous) publication.rollback = { proof: backupProof, directories };
+      }
+      if (current !== tx.content) {
+        const existing = await this.ownedFile(stage, destination, 'Imported capture stage');
+        const expected = transfer?.output?.() || owned?.captureStage || priorOwned?.captureStage;
+        if (existing || expected) verifyRecorded('captureStage', existing, tx.content, expected);
+      }
+    }
     if (current !== tx.content) {
       if (tx.previousHash !== null) {
         if (old === null || pairedBackup) {
@@ -824,19 +980,34 @@ class Intake {
               if (!pairedBackup) {
                 verifyStageSync(destination, guard, previous);
                 verifyAbsentSync(backup, guard, occupied);
+                if (currentFormat) verifyJournalAuthority();
                 try { local.linkSync(destination, backup); }
                 catch (error) { if (error.code === 'EEXIST') throw occupied(); throw error; }
               }
               verifyStageSync(backup, guard, previous, 2);
               verifyStageSync(destination, guard, previous, 2);
+              if (currentFormat) verifyJournalAuthority();
               local.unlinkSync(destination);
               verifyStageSync(backup, guard, previous);
               verifyAbsentSync(destination, guard);
             } else {
+              if (currentFormat) {
+                verifyRecorded('backup', captureOutput, tx.previous, tx.previousProof);
+                if (!backupProof) {
+                  backupProof = fileProof(captureOutput, tx.previous);
+                  await record('backup', backupProof, () => {
+                    verifyAbsentSync(backup, guard, occupied);
+                    exact(destination, captureOutput, tx.previous, 'Capture destination');
+                  });
+                }
+                verifyRecorded('backup', captureOutput, tx.previous, backupProof);
+              }
               verifyAbsentSync(backup, guard, occupied);
               exact(destination, captureOutput, tx.previous, 'Capture destination');
+              if (currentFormat) verifyJournalAuthority();
               local.renameSync(destination, backup);
               publication.rollback = { proof: fileProof(captureOutput, tx.previous), directories };
+              if (currentFormat) verifyBackup(publicationIdentity(captureOutput, 1n));
             }
           }
           catch (error) { if (['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw deferred('Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.'); throw error; }
@@ -849,7 +1020,9 @@ class Intake {
         try {
           let recorded = transfer.output();
           if (!recorded) {
-            recorded = await writeStage(stage, tx.content, guard);
+            recorded = priorOwned?.captureStage;
+            if (recorded) verifyStageSync(stage, guard, recorded);
+            else recorded = await writeStage(stage, tx.content, guard);
             await transfer.recordOutput(recorded, () => verifyStageSync(stage, guard, recorded));
           }
           verifyStageSync(stage, guard, recorded);
@@ -858,7 +1031,7 @@ class Intake {
           publication.transferFailure = error;
           throw error;
         }
-      } else captureStageProof = await staged(stage, tx.content, destination);
+      } else captureStageProof = await staged(stage, tx.content, destination, 'captureStage');
       await this.vault.checkpoint('intake-capture-staged');
       await checkPublication();
       if (!await this.ownedFile(stage, destination, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
@@ -866,13 +1039,14 @@ class Intake {
       verifySelectedJournal();
       exact(stage, captureStageProof, tx.content, 'Imported capture stage', [destination]);
       if (transfer?.recordOutput) verifyStageSync(stage, guard, transfer.output());
+      if (currentFormat) verifyJournalAuthority();
       try {
         local.linkSync(stage, destination);
         captureOutput = publicationIdentity(captureStageProof, 2n);
       } catch (error) {
         if (error.code !== 'EEXIST') throw error;
         captureOutput = await this.ownedFile(destination, [stage, backup], 'Capture destination');
-        if ((fresh && !exactPair(captureOutput, captureStageProof)) || await read(destination) !== tx.content) {
+        if ((currentFormat && !exactPair(captureOutput, captureStageProof)) || await read(destination) !== tx.content) {
           throw conflict('External edit conflict. The new destination was preserved.');
         }
       }
@@ -888,12 +1062,14 @@ class Intake {
       verifyStageSync(destination, guard, output, 2);
     }
     if (!tx.retainOnly && tx.previousHash !== null) {
-      outputs.push({ file: backup, info: await this.ownedFile(backup, destination, 'Previous capture backup'), content: tx.previous, label: 'Previous capture backup', peers: [destination] });
+      const info = await this.ownedFile(backup, destination, 'Previous capture backup');
+      if (currentFormat) verifyBackup(info, [destination]);
+      outputs.push({ file: backup, info, content: tx.previous, label: 'Previous capture backup', peers: [destination] });
     }
     const cleanup = [];
     const rememberStage = async (file, initial, content, peer) => {
       const info = await this.ownedFile(file, peer, 'Intake publication stage');
-      if (initial ? !exactIdentity(initial, info) : fresh && info) {
+      if (initial ? !exactIdentity(initial, info) : currentFormat && info) {
         throw conflict('Intake publication stage identity changed. All files were preserved.');
       }
       if (info) cleanup.push({ file, info, content, label: 'Intake publication stage', peers: [peer] });
@@ -1043,7 +1219,7 @@ class Intake {
       if (!original) return null;
       const { bytes } = verifyStageSync(original.file, guard, receipt.journal, journals.filter(item => item.present).length);
       const tx = JSON.parse(bytes.toString('utf8'));
-      this.validateTransaction(tx);
+      this.validateTransaction(tx, receipt.journal);
       if (tx.sourceHash !== sourceHash || tx.key !== key || tx.revision.id !== revision || (tx.resolution || null) !== resolution ||
           tx.capture.id !== capture.id || this.destination(tx.capture) !== destination || tx.restoreOperation ||
           tx.capture.currentRevision !== capture.currentRevision || tx.capture.currentHash !== receipt.capture.digest ||
@@ -1122,8 +1298,11 @@ class Intake {
     const next = { ...ledger, pending: { ...ledger.pending } };
     delete next.pending[sourceHash];
     delete next.acceptedCleanup;
+    retireStageRecords(next, record => matchesProof(record.journal, receipt.journal));
     await this.save(next, verifyJournals);
     ledger.pending = next.pending;
+    if (next.intakeStageRecords) ledger.intakeStageRecords = next.intakeStageRecords;
+    else delete ledger.intakeStageRecords;
     delete ledger.acceptedCleanup;
     verifyJournals();
     this.vault.expected.set(capture.id, capture.currentHash);
@@ -1138,6 +1317,7 @@ class Intake {
       this.storage.guardSync();
       for (const authority of publishedRestorations) verifyPublishedRestorationControls(this, authority);
     }
+    this.settleJournalWriterStage(controlled);
     if (Object.hasOwn(controlled, 'acceptedCleanup') || Object.values(controlled.pending).some(item => item?.acceptedCleanup !== undefined)) {
       const expected = this.storage.expected;
       const accepted = await this.load();
@@ -1215,6 +1395,22 @@ class Intake {
     if (tx.sourceHash === authority.sourceHash || tx.capture.id === id) return null;
     return candidate;
   }
+  settleJournalWriterStage(ledger) {
+    const journal = path.join(this.dir, 'transaction.json');
+    if (local.lstatSync(journal, { bigint: true, throwIfNoEntry: false })?.nlink !== 2n) return;
+    const { guard } = this.vault.publicationFolders(this.dir);
+    const { bytes, proof } = readExactSync(journal, guard, 2);
+    const tx = JSON.parse(bytes);
+    if (tx?.publicationVersion !== 1 || !tx.journalIdentity?.temporary) return;
+    this.validateTransaction(tx, proof);
+    const exact = this.ordinaryRecoveryJournal(ledger, tx);
+    if (!exact?.writerStage) return;
+    this.storage.guardSync();
+    exact.verify();
+    local.unlinkSync(exact.writerStage);
+    verifyAbsentSync(exact.writerStage, guard);
+    verifyStageSync(journal, guard, exact);
+  }
   ordinaryRecoveryJournal(ledger, knownPublication) {
     const journal = path.join(this.dir, 'transaction.json');
     const guard = this.vault.publicationFolders(this.dir).guard;
@@ -1230,12 +1426,14 @@ class Intake {
     const { bytes, proof } = readExactSync(journal, guard, links);
     if (knownPublication && !bytes.equals(Buffer.from(JSON.stringify(knownPublication)))) throw changed();
     const tx = JSON.parse(bytes);
-    this.validateTransaction(tx);
+    this.validateTransaction(tx, proof);
     if (tx.restoreOperation) return null;
     assertPublication(ledger, tx.capture.id, tx);
     if (!bytes.equals(Buffer.from(JSON.stringify(tx)))) throw Error('The independent intake journal is not canonical. Recovery files were preserved.');
     const pending = ledger.pending[tx.sourceHash], held = ledger.blocks[tx.sourceHash];
     const names = [journal];
+    const writerStage = tx.journalIdentity?.temporary && path.join(this.dir, tx.journalIdentity.temporary);
+    if (writerStage) names.push(writerStage);
     let repair;
     if (pending) {
       if (pending.journal !== pendingName(tx) || pending.key !== tx.key) return null;
@@ -1260,6 +1458,8 @@ class Intake {
     }
     const present = new Set(names.filter(file => local.lstatSync(file, { throwIfNoEntry: false })));
     if (present.size !== links || !present.has(journal) || links === 3 && !held?.outputHold) throw changed();
+    const initialPair = writerStage && present.has(writerStage);
+    if (initialPair && links !== 2) throw changed();
     const verify = () => {
       repair?.verifyRepair?.();
       repair?.freshRepair?.verify();
@@ -1270,7 +1470,7 @@ class Intake {
       }
     };
     verify();
-    return { ...proof, tx, links, verify, guard, ...repair };
+    return { ...proof, tx, links, verify, guard, ...(initialPair ? { writerStage } : {}), ...repair };
   }
   repairConflictWitness(ledger, tx, held, guard, pinned) {
     if (!held) return null;
@@ -1287,7 +1487,7 @@ class Intake {
       throw Error('The older held source journal changed. Recovery files were preserved.');
     }
     const old = JSON.parse(previousJournal.bytes);
-    this.validateTransaction(old);
+    this.validateTransaction(old, previousJournal.proof);
     if (old.sourceHash !== tx.sourceHash || old.capture.id !== tx.capture.id || old.revision.id !== tx.revision.id ||
         old.resolution === tx.resolution || old.key !== tx.key || !isDeepStrictEqual(old.revision, tx.revision) ||
         held.journal !== heldName(old) || !previousJournal.bytes.equals(Buffer.from(JSON.stringify(old)))) {
@@ -1312,7 +1512,7 @@ class Intake {
     if (!tx.keptCurrent) {
       const previous = path.join(this.dir, held.journal), record = readExactSync(previous, guard, 1, binding.journalProof);
       const old = JSON.parse(record.bytes);
-      this.validateTransaction(old);
+      this.validateTransaction(old, record.proof);
       if (!record.bytes.equals(Buffer.from(JSON.stringify(old))) || old.sourceHash !== tx.sourceHash ||
           old.capture.id !== tx.capture.id || old.key !== tx.key || !isDeepStrictEqual(old.revision, tx.revision) ||
           capture.conflict !== held.reason || heldName(old) !== held.journal) throw Error('The original repair conflict changed. Recovery files were preserved.');
@@ -1438,7 +1638,7 @@ class Intake {
     if (String(info.dev) !== proof.dev || String(info.ino) !== proof.ino) throw changed();
     const text = bytes.toString('utf8');
     let tx; try { tx = JSON.parse(text); } catch { throw Error('Unreadable intake recovery journal. Preserve .intake for repair before retrying.'); }
-    this.validateTransaction(tx);
+    this.validateTransaction(tx, proof);
     const ledger = await this.load();
     try { verifyStageSync(journal, guard, proof, links); }
     catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
@@ -1470,7 +1670,7 @@ class Intake {
     const { bytes, proof } = readExactSync(file, guard, Number(observed.nlink));
     if (proof.dev !== String(observed.dev) || proof.ino !== String(observed.ino)) throw changed();
     const tx = JSON.parse(bytes.toString('utf8'));
-    this.validateTransaction(tx);
+    this.validateTransaction(tx, proof);
     if (tx.restoreOperation || this.hasHeldJournal(ledger, tx) || ledger.pending[tx.sourceHash]) return;
     const priorBlock = ledger.blocks[tx.sourceHash];
     if (priorBlock && priorBlock.journal !== heldName(tx) && observed.nlink <= 2n &&
@@ -1509,6 +1709,7 @@ class Intake {
     const observed = expected?.verify ? expected : this.ordinaryRecoveryJournal(ledger, tx);
     const changed = () => Error('The intake journal or its known alias changed. Recovery files were preserved.');
     if (!observed || observed.digest !== hash(JSON.stringify(tx)) || ![1, 2].includes(observed.links)) throw changed();
+    this.validateTransaction(tx, observed);
     if (expected && (!sameProofIdentity(expected, observed) || expected.digest !== observed.digest)) throw changed();
     const verify = () => {
       observed.verify();
@@ -1548,7 +1749,7 @@ class Intake {
         tx = JSON.parse(observed.bytes);
         proof = observed.proof;
       } catch { throw Error('Deferred intake journal is unreadable. Preserve .intake for repair.'); }
-      this.validateTransaction(tx); if (tx.sourceHash !== sourceHash || pending.journal !== pendingName(tx)) throw Error('Deferred intake identity does not match its journal.');
+      this.validateTransaction(tx, proof); if (tx.sourceHash !== sourceHash || pending.journal !== pendingName(tx)) throw Error('Deferred intake identity does not match its journal.');
       // Every retry has the same active recovery seam as first publication.
       // A crash while turning a pending item into a conflict remains recoverable.
       const active = path.join(this.dir, 'transaction.json');
@@ -1635,14 +1836,23 @@ class Intake {
   }
   verifyHeldTransaction(ledger, tx) {
     const block = ledger.blocks?.[tx.sourceHash];
-    if (!block?.reason?.startsWith(outputHold) && !block?.outputHold) return;
+    if (!block?.reason?.startsWith(outputHold) && !block?.outputHold) {
+      if (tx.publicationVersion !== 1) return;
+      if (block?.journal !== heldName(tx)) throw Error('The exact held intake journal changed. All files were preserved.');
+      const { guard } = this.vault.publicationFolders(this.dir);
+      const { bytes, proof } = readExactSync(path.join(this.dir, block.journal), guard);
+      this.validateTransaction(tx, proof);
+      if (!bytes.equals(Buffer.from(JSON.stringify(tx)))) throw Error('The exact held intake journal changed. All files were preserved.');
+      return;
+    }
     const witness = block.outputHold;
     if (!this.hasHeldJournal(ledger, tx) || !this.validOutputHold(witness, pendingName(tx), tx.previousHash) ||
         witness.journal.digest !== hash(JSON.stringify(tx))) {
       throw Error('The exact held intake journal proof changed. All files were preserved.');
     }
-    const guard = this.vault.publicationFolders(this.dir).guard;
+    const { guard } = this.vault.publicationFolders(this.dir);
     verifyStageSync(path.join(this.dir, block.journal), guard, witness.journal);
+    this.validateTransaction(tx, witness.journal);
   }
   captureAccessPeers(tx) {
     return [path.join(this.dir, tx.revision.id + '.stage'), path.join(this.dir, tx.backup)];
@@ -1670,7 +1880,7 @@ class Intake {
     this.storage.guardSync();
     const { bytes } = verifyStageSync(path.join(this.dir, block.journal), guard, witness.journal);
     const tx = JSON.parse(bytes.toString('utf8'));
-    this.validateTransaction(tx);
+    this.validateTransaction(tx, witness.journal);
     if (!this.hasOutputHold(ledger, tx) || !this.validOutputHold(witness, pendingName(tx)) || tx.sourceHash !== sourceHash ||
         tx.capture.id !== capture.id || tx.capture.currentHash !== proof.digest || !samePath(this.destination(tx.capture), file) ||
         witness.journal.digest !== hash(JSON.stringify(tx))) return false;
@@ -1697,6 +1907,7 @@ class Intake {
       guard();
       const current = local.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
       if (!current || retained?.journalInfo && !exactIdentity(current, retained.journalInfo)) throw changed();
+      this.validateTransaction(tx, current);
       if (newProof) {
         const association = ledger.pending[tx.sourceHash];
         if (association && (association.journal !== pendingName(tx) || association.key !== tx.key)) throw changed();
@@ -1805,16 +2016,16 @@ class Intake {
       if (!known || bytes === null || hash(bytes) !== known.snapshotHash) throw Error('Immutable revision is missing or changed. Restore it before choosing current evidence.');
       const revision = JSON.parse(bytes);
       if (!revision.review || revision.captureId !== id || revision.sourceHash !== sourceHash) throw Error('Only a finalized reviewed revision from this capture can be chosen.');
-      const current = await read(this.destination(previous));
+      const { current, previousProof } = await this.observePriorCapture(this.destination(previous));
       if (current === null || hash(current) !== previous.currentHash) throw Error('Destination changed outside Companion. Resolve the local edit before choosing current evidence.');
       const capture = selectedCapture(previous, revision, now);
       const content = noteText(capture, revision), resolution = randomUUID();
       const key = Object.entries(ledger.outcomes).find(([, item]) => item.revision === revisionId)?.[0] || `${randomUUID()}:selection`;
-      const tx = { schema: 1, resolution, retainOnly: content === current, key, sourceHash, capture, revision, content, previous: current, previousHash: hash(current), backup: `${id}-${revisionId}.before-${resolution}.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
+      const tx = { schema: 1, publicationVersion: 1, resolution, retainOnly: content === current, key, sourceHash, capture, revision, content, previous: current, previousHash: previousProof.digest, previousProof, backup: `${id}-${revisionId}.before-${resolution}.md`, ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
       const journal = path.join(this.dir, 'transaction.json');
       const proof = await this.publishJournal(journal, tx);
       await this.vault.checkpoint('intake-journaled');
-      try { await this.finish(tx, ledger, proof, undefined, { fresh: true }); }
+      try { await this.finish(tx, ledger, proof); }
       catch (error) {
         if (error.intakeDeferred) await this.defer(tx, ledger, error.message, proof);
         else if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message, { ...error.intakeConflictProof, expectedJournal: proof });

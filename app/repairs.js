@@ -169,7 +169,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       const previousCapture = this.destination(capture);
       capture.relative = path.relative(this.vault.vault, note.file);
       reserved.verify();
-      await this.detachRestoredBackup(note, sourceHash, capture, ledger);
+      await this.detachRestoredBackup(note, sourceHash, capture, ledger, reserved.verify);
       await this.ownedFile(note.file, [], 'Moved capture');
       for (const annotation of annotations.filter(item => item.captureId === capture.id)) {
         if (!annotationPaths.has(annotation.file) || ledger.linkHolds?.[annotation.id]) continue;
@@ -194,12 +194,12 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       if (bytes === null || !known || hash(bytes) !== known.snapshotHash) throw Error('The last managed revision is unavailable or changed. Restore a vault backup; no note was recreated.');
       const revision = JSON.parse(bytes), capture = { ...previous, restoredAt: now }; delete capture.identityIssue;
       const content = noteText(capture, revision); capture.currentHash = hash(content);
-      const resolution = randomUUID(), tx = { schema: 1, restore: true, resolution, key: ledger.sources[0].id + ':restore-' + id, sourceHash: issue.sourceHash, capture, revision, content, previousHash: null, previous: null, backup: id + '-' + revision.id + '.before-' + resolution + '.md', ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
+      const resolution = randomUUID(), tx = { schema: 1, publicationVersion: 1, restore: true, resolution, key: ledger.sources[0].id + ':restore-' + id, sourceHash: issue.sourceHash, capture, revision, content, previousHash: null, previous: null, previousProof: null, backup: id + '-' + revision.id + '.before-' + resolution + '.md', ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
       if (await read(this.destination(capture)) !== null) throw Error('The destination now exists. Refresh before restoring; its content was preserved.');
-      await this.publishJournal(path.join(this.dir, 'transaction.json'), tx);
-      try { await this.finish(tx, ledger); } catch (error) {
-        if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message);
-        else if (error.intakeDeferred) await this.defer(tx, ledger, error.message);
+      const proof = await this.publishJournal(path.join(this.dir, 'transaction.json'), tx);
+      try { await this.finish(tx, ledger, proof); } catch (error) {
+        if (error.intakeConflict) await this.archiveConflict(tx, ledger, error.message, { ...error.intakeConflictProof, expectedJournal: proof });
+        else if (error.intakeDeferred) await this.defer(tx, ledger, error.message, proof);
         else throw error;
         throw Error('Restore paused after a destination change. All files were preserved.');
       }
@@ -723,7 +723,10 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       const note = await this.vault.find(current.id), file = this.destination(current);
       if (note.file !== file || note.type !== 'reel_import') throw Error('The managed capture identity changed. Refresh before resolving.');
       const localInfo = await this.ownedFile(file, [], 'Local capture'); const local = note.content;
-      if (local === null || hash(local) !== localHash) throw Error('Local writing changed. Refresh and inspect it before resolving.');
+      if (!localInfo || local === null || hash(local) !== localHash) throw Error('Local writing changed. Refresh and inspect it before resolving.');
+      const localProof = { dev: String(localInfo.dev), ino: String(localInfo.ino), digest: localHash };
+      const { guard: captureGuard } = this.vault.publicationFolders(path.dirname(file));
+      verifyStageSync(file, captureGuard, localProof);
       const capture = { ...tx.capture, id: current.id, file: current.file, relative: current.relative, capturedAt: current.capturedAt, title: note.title, revisions: [...new Set([...current.revisions, tx.revision.id])] };
       delete capture.conflict; delete capture.identityIssue;
       // A noncurrent candidate stays retained while the verified reviewed current
@@ -731,7 +734,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       const keptCurrent = tx.retainOnly || tx.keptCurrent ? await this.verifiedKeptCurrent({ capture, sourceHash }, ledger) : undefined;
       const content = noteText(capture, keptCurrent || tx.revision); capture.currentHash = hash(content);
       const id = randomUUID(), annotation = `---\ncompanion_id: ${JSON.stringify(id)}\nartifact_type: "annotation"\nschema_version: 1\ncapture_id: ${JSON.stringify(tx.capture.id)}\ncreated_at: ${JSON.stringify(now)}\n---\n\n# Annotation\n\nSource: [Capture](${urlPath(path.relative(path.join(this.vault.root, 'Annotations'), this.destination(capture)))})\n\n${text}\n`;
-      const intent = { schema: 1, sourceHash, localHash, annotationId: id, annotation, tx: { ...tx, retainOnly: false, ...(keptCurrent ? { keptCurrent } : {}), capture, content, previous: local, previousHash: localHash, externalConflict: false, resolution: id, backup: `${tx.capture.id}-${tx.revision.id}.before-${id}.md` } };
+      const intent = { schema: 1, sourceHash, localHash, annotationId: id, annotation, tx: { ...tx, retainOnly: false, ...(keptCurrent ? { keptCurrent } : {}), capture, content, previous: local, previousHash: localHash, ...(tx.publicationVersion === 1 ? { previousProof: localProof } : {}), externalConflict: false, resolution: id, backup: `${tx.capture.id}-${tx.revision.id}.before-${id}.md` } };
       const intentFile = path.join(this.dir, 'repair-intent.json');
       const { guard } = this.vault.publicationFolders(this.dir);
       if (keptCurrent) {
@@ -739,11 +742,9 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         if (!conflict) throw Error('The original repair conflict has no exact journal proof. Recovery files were preserved.');
         intent.priorConflict = { block, journalProof: conflict.proof };
       } else {
-        const captureGuard = this.vault.publicationFolders(path.dirname(file)).guard;
         const priorFile = path.join(this.dir, block.journal);
         const prior = readExactSync(priorFile, guard, 1, block.outputHold?.journal);
-        if (!prior.bytes.equals(Buffer.from(JSON.stringify(tx))) || !localInfo) throw Error('The original conflict changed. Recovery files were preserved.');
-        const localProof = { dev: String(localInfo.dev), ino: String(localInfo.ino), digest: localHash };
+        if (!prior.bytes.equals(Buffer.from(JSON.stringify(tx)))) throw Error('The original conflict changed. Recovery files were preserved.');
         this.storage.guardSync();
         verifyStageSync(file, captureGuard, localProof);
         intent.priorConflict = { block, journalProof: prior.proof };
@@ -753,7 +754,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       const sourceStage = path.join(this.dir, `journal-${id}.stage`);
       this.storage.guardSync();
       verifyConflict();
-      intent.sourceProof = await writeStage(sourceStage, JSON.stringify(intent.tx), guard);
+      intent.sourceProof = await this.writeJournalStage(sourceStage, intent.tx, guard);
       const intentStage = path.join(this.dir, `repair-intent-${id}.stage`);
       const { proof } = await writeOwnedIntentStage(intentStage, intent, guard);
       this.storage.guardSync();
@@ -772,7 +773,8 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
   };
   Intake.prototype.validateRepairIntent = function (intent) {
     const tx = intent?.tx;
-    this.validateTransaction(tx);
+    this.validateTransaction(tx, intent.sourceProof);
+    if (tx.publicationVersion === 1 && !intent.sourceProof) throw Error('Invalid repair source proof. Recovery files were preserved.');
     if (intent.schema !== 1 || intent.sourceHash !== tx.sourceHash || intent.localHash !== tx.previousHash || intent.annotationId !== tx.resolution || typeof intent.annotation !== 'string' || !intent.annotation.includes(`capture_id: ${JSON.stringify(tx.capture.id)}\n`)) throw Error('Invalid annotation repair intent. Preserve .intake for repair.');
     const exactProof = proof => validProof(proof) && Object.keys(proof).length === 3;
     const prior = intent.priorConflict;
@@ -802,7 +804,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     }
   };
   Intake.prototype.finishRepair = async function (expectedJournal) {
-    const ledgerBaseline = this.storage.expected;
+    let ledgerBaseline = this.storage.expected;
     expectedJournal?.verify();
     const intentFile = path.join(this.dir, 'repair-intent.json');
     const intentIdentity = await fs.lstat(intentFile, { bigint: true }).catch(error => {
@@ -1022,12 +1024,13 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       verifyStageSync(archive, guard, intentProof, 2);
       native.unlinkSync(intentFile);
       verifyStageSync(archive, guard, intentProof);
-      if (error) throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for explicit repair.', { cause: error }), { intakeRepairHeld: true });
+      if (error) throw Object.assign(Error('Annotation preserved. Incoming publication remains paused for repair.', { cause: error }), { intakeRepairHeld: true });
       return { held: true };
     };
     if (this.hasHeldJournal(owner, tx)) return preserveOutputHold(owner);
     const admission = activeAdmission(owner, tx.revision.identity, tx.capture.id);
-    if (admission?.revision === tx.revision.id) {
+    const priorConflict = intent.priorConflict && isDeepStrictEqual(owner.blocks[tx.sourceHash], intent.priorConflict.block);
+    if (admission?.revision === tx.revision.id && !priorConflict) {
       if (!intent.annotationProof || !isDeepStrictEqual(admission, acceptedOutcome(tx)) ||
           !isDeepStrictEqual(owner.outcomes?.[tx.key], admission) || !isDeepStrictEqual(owner.captures?.[tx.sourceHash], tx.capture)) {
         throw Error('The accepted repair has no exact annotation cleanup proof. Recovery files were preserved.');
@@ -1293,7 +1296,12 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
           expectedJournal = updated;
         };
       }
-      try { await this.finish(tx, ledger, (freshRepair || ordinaryRepair) && expectedJournal, transfer); } catch (error) {
+      const priorRepair = intent.priorConflict && { journal: intent.priorConflict.journalProof, verify: verifyConflict };
+      try {
+        await this.finish(tx, ledger, (freshRepair || ordinaryRepair) && expectedJournal, transfer, {
+          priorRepair, afterProofSave: () => { ledgerBaseline = this.storage.expected; }
+        });
+      } catch (error) {
         if (error.keptCurrentFailure) return hold(error);
         if (error.intakeOutputHeld) return preserveOutputHold(await annotationAuthority(this), error);
         if (ordinaryRepair && (error.intakeTransferFailed || error.intakeDeferred)) return holdOrdinary(error);
