@@ -68,7 +68,7 @@ class Conversations {
     const stored = await this.readStored(id);
     return this.unsaved.has(id) ? structuredClone(this.unsaved.get(id).record) : stored;
   }
-  async readStored(id, withBytes = false, directory) {
+  async readStored(id, withBytes = false, directory, check = record => this.controls.check(record)) {
     if (!uuid(id)) throw Error('Conversation identity is invalid.');
     directory ||= this.safeDirectory();
     const file = path.join(this.directory, `${id}.json`), guard = () => this.safeDirectory(false, directory);
@@ -76,7 +76,7 @@ class Conversations {
     const text = bytes.toString('utf8');
     const record = JSON.parse(text);
     if (record.schema !== 1 || record.id !== id || !Array.isArray(record.requests)) throw Error('Conversation history needs repair. Preserve the file.');
-    await this.controls.check(record);
+    await check(record, proof);
     verifyStageSync(file, guard, proof);
     return withBytes ? { record, text, proof } : record;
   }
@@ -127,7 +127,9 @@ class Conversations {
     for (const name of names) if (name.endsWith('.json')) {
       const control = await this.controls.state(name.slice(0, -5));
       if (control && control.phase !== 'active') continue;
-      let record = await this.read(name.slice(0, -5));
+      let record;
+      try { record = await this.read(name.slice(0, -5)); }
+      catch (error) { if (error.code === 'REQUEST_REMOVAL_PENDING') continue; throw error; }
       if (!this.unsaved.has(record.id) && record.requests.some(request => request.status === 'inProgress') && !this.running.has(record.id)) {
         try {
           record = await this.lock(async directory => {
@@ -156,6 +158,7 @@ class Conversations {
     const resolve = async (conversationId, requestId, expectedDigest) => {
       if (!uuid(requestId)) throw Error('historical request identity is unknown');
       const key = `${conversationId}:${requestId}`, record = await load(conversationId);
+      if (record.removedRequests?.includes(requestId)) throw Error('historical request was removed locally');
       const request = record.requests.find(item => item.id === requestId), scope = scopeOf(record);
       if (!request || record.requests.filter(item => item.id === requestId).length !== 1) throw Error('historical request is unavailable or ambiguous');
       const digest = hash(JSON.stringify({ request, brief: record.brief, scope, ...(record.generation ? { generation: record.generation } : {}) }));
@@ -280,6 +283,7 @@ class Conversations {
       const ancestors = request.package?.historyIds;
       let reason;
       if (excludedHistory.has(request.id)) reason = 'explicitly omitted from this request';
+      else if (Array.isArray(ancestors) && ancestors.some(id => prior.removedRequests?.includes(id))) reason = 'depends on a historical request removed locally';
       else if (!Array.isArray(ancestors) || ancestors.some(id => !seen.has(id))) reason = 'historical dependency attribution is unknown';
       else if (ancestors.some(id => omitted.has(id))) reason = 'depends on an explicitly omitted historical request or unavailable historical evidence';
       seen.add(request.id);
@@ -399,6 +403,9 @@ function installConversations({ ipcMain, ...options }) {
   ipcMain.handle('conversation-delete-confirm', (_, input) => store.controls.confirm(input?.token));
   ipcMain.handle('conversation-delete-pending', () => store.controls.pending());
   ipcMain.handle('conversation-delete-resume', (_, input) => store.controls.resume(input?.id));
+  ipcMain.handle('conversation-request-remove-preview', (_, input) => store.controls.previewRequest(input?.id, input?.requestId, input?.resume === true, input?.publication));
+  ipcMain.handle('conversation-request-remove-pending', () => store.controls.pendingRequests());
+  ipcMain.handle('conversation-request-remove-confirm', (_, input) => store.controls.confirm(input?.token, 'request'));
   return store;
 }
 module.exports = { Conversations, installConversations };

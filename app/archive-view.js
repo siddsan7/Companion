@@ -92,6 +92,11 @@ archiveMatchPreview.onclick = async () => {
     archiveRestoreSummary.textContent += ` Current vault configuration is kept: ${result.currentVault.vault}; managed folder ${result.currentVault.managedRoot}. Archived hints: ${result.archivedVault.vault || 'unavailable'}; managed folder ${result.archivedVault.managedRoot}. Use Choose vault to change configuration. Note inclusions change only for individually checked current text below; conversation exclusions remain authoritative.`;
     archiveRestoreSummary.textContent += ` ${result.metadataAdditions} inert settings records to preserve: ${result.metadataTypes.cadence} cadence intents, ${result.metadataTypes.codexHints} Codex reconnect hints, ${result.metadataTypes.coverage} incomplete-archive coverage records. ${result.missing === 0 ? 'No conversations will be added; current settings stay active. ' : ''}This confirmation only preserves those inactive records; task or Codex reconnection requires its separate explicit workflow. ${result.metadataConflicts} inert metadata conflicts; conflicts block restore and existing records are kept.`;
     if (result.omitted) archiveRestoreSummary.textContent += ` Incomplete archive: ${result.omitted} unresolved files omitted. Their recovery content cannot be restored from this archive.`;
+    for (const id of result.blocked) {
+      const details = document.createElement('p');
+      details.textContent = `Conversation ${id} is blocked from restoration because this archive contains a request removed locally.`;
+      archiveConflicts.append(details);
+    }
     for (const conflict of result.conflictRecords) {
       const row = document.createElement('div'), details = document.createElement('p'), label = document.createElement('label'), select = document.createElement('select');
       details.textContent = `Conversation ${conflict.id}: current ${conflict.currentRequests} requests and ${conflict.currentExclusions} omitted requests; archive ${conflict.archivedRequests} requests and ${conflict.archivedExclusions} omitted requests. Keep current preserves all current text and source scope. This restore adds missing history and keeps existing conflicts; it does not overwrite or merge them.`;

@@ -31,18 +31,23 @@ async function draftIdea(title) {
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(title));
   return { file: await page.getByLabel('Proposed idea destination', { exact: true }).inputValue(), text: await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue() };
 }
-async function importedConversationForPreview() {
-  const sourceText = 'Authored synthetic review';
+async function conversationForPreview(manual = false) {
+  const sourceText = manual ? 'Manually captured independent question.' : 'Authored synthetic review';
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'OLDIDEAGENERATION authored synthetic interpretation.' }), 'utf8');
   await launch();
   await page.getByRole('button', { name: 'Choose vault', exact: true }).click();
   await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Vault ready.');
-  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
-  await page.getByLabel('Finalized review folder', { exact: true }).fill(path.join(root, 'producer'));
-  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Source connected');
-  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  if (manual) {
+    await page.getByLabel('Thought or link', { exact: true }).fill(sourceText);
+    await page.getByRole('button', { name: 'Save capture', exact: true }).click();
+  } else {
+    await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(root, 'producer', 'accept'), { recursive: true });
+    await page.getByLabel('Finalized review folder', { exact: true }).fill(path.join(root, 'producer'));
+    await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  }
   await expect(page.locator('#captures article')).toContainText(sourceText);
   const base = path.join(root, 'vault', 'Companion'), captureName = (await fs.readdir(path.join(base, 'Captures'))).find(name => name.endsWith('.md'));
   const sourceBytes = await fs.readFile(path.join(base, 'Captures', captureName));
@@ -53,24 +58,25 @@ async function importedConversationForPreview() {
   await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
   await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
-  await page.getByLabel('Context question', { exact: true }).fill('What does the synthetic review support for MyTune?');
+  const question = manual ? 'What does the manually captured question support for MyTune?' : 'What does the synthetic review support for MyTune?';
+  await page.getByLabel('Context question', { exact: true }).fill(question);
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
   await page.locator('#context-results article').filter({ hasText: sourceText }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
   await expect(page.locator('#context-selected')).toContainText(sourceText);
   await page.getByLabel('Conversation brief version', { exact: true }).fill('1');
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
-  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/synthetic review support/);
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(manual ? 'manually captured question support' : 'synthetic review support'));
   await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
   await expect(page.locator('#conversation-history')).toContainText('OLDIDEAGENERATION');
   await expect(page.locator('#conversation-history')).toContainText('completed');
   const metadata = YAML.parse(sourceBytes.toString('utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)[1]);
-  return { base, id: metadata.companion_id, sourceBytes };
+  return { base, id: metadata.companion_id, sourceBytes, captureName };
 }
 
 test('source deletion names actual retained writing and requests, cancels byte-exact and requires renewed review after dependent change', async () => {
   test.setTimeout(180000);
-  const fixture = await importedConversationForPreview();
+  const fixture = await conversationForPreview();
   await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
   await page.getByLabel('New annotation').fill('AFFECTED_ANNOTATION independent interpretation with its source quotation.');
   await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
@@ -120,6 +126,10 @@ test('source deletion names actual retained writing and requests, cancels byte-e
   await expect(preview).toContainText(history.id);
   for (const request of history.requests) await expect(preview).toContainText(request.id);
   await expect(preview).toContainText(/Preserve|preserved/);
+  await preview.getByRole('article').filter({ hasText: history.requests[0].id }).getByRole('button', { name: 'Review this request for local removal' }).click();
+  const requestReview = page.getByRole('region', { name: 'Stored request removal review', exact: true });
+  await expect(requestReview.getByLabel('Reply', { exact: true })).toHaveValue(/OLDIDEAGENERATION/);
+  await requestReview.getByRole('button', { name: 'Cancel request removal', exact: true }).click();
   expect(await files(path.join(root, 'vault'))).toEqual(before);
   expect(await files(path.join(root, 'conversations'))).toEqual(historyBefore);
   await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
@@ -153,9 +163,38 @@ test('source deletion names actual retained writing and requests, cancels byte-e
 });
 
 
+test('manual capture deletion distinguishes an owned saved idea stage from equal-byte independent writing', async () => {
+  const { base, id, captureName, sourceBytes } = await conversationForPreview(true);
+  await draftIdea('Pending independently authored saved idea');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-before-publication' }));
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+  await fs.writeFile(path.join(root, 'faults.json'), '{}');
+  const ideas = path.join(base, '.ideas'), stages = (await fs.readdir(ideas)).filter(name => name.endsWith('.md.pending'));
+  expect(stages).toHaveLength(1);
+  const stage = path.join(ideas, stages[0]), original = await fs.readFile(stage);
+  expect(original.toString('utf8')).toContain(id);
+  const deletion = page.getByRole('button', { name: 'Delete capture', exact: true }), preview = page.getByLabel('Capture deletion preview');
+  await deletion.click();
+  await expect(preview).toBeVisible();
+  await preview.getByRole('button', { name: 'Cancel capture deletion', exact: true }).click();
+
+  const retained = path.join(root, 'original-idea-stage.md');
+  await fs.rename(stage, retained);
+  await fs.writeFile(stage, original, { flag: 'wx' });
+  const foreign = await fs.lstat(stage, { bigint: true }), owned = await fs.lstat(retained, { bigint: true });
+  expect(foreign.ino).not.toBe(owned.ino);
+  await deletion.click();
+  await expect(page.getByRole('status')).toContainText(/changed|unknown|ownership/i);
+  await expect(preview).toBeHidden();
+  expect(await fs.readFile(path.join(base, 'Captures', captureName))).toEqual(sourceBytes);
+  expect(await fs.readFile(stage)).toEqual(original);
+  expect(await fs.readFile(retained)).toEqual(original);
+});
+
 test('source deletion preview preserves actual writing with damaged artifact types as unknown without changing files', async () => {
   test.setTimeout(150000);
-  const fixture = await importedConversationForPreview();
+  const fixture = await conversationForPreview();
   await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
   await page.getByLabel('New annotation', { exact: true }).fill('UNKNOWN_ANNOTATION independent writing survives external metadata damage.');
   await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
@@ -204,7 +243,7 @@ test('source deletion preview preserves actual writing with damaged artifact typ
 // Exercise the existing provider/save-failure boundary, without fabricating history.
 test('source deletion preview preserves foreign historical dialogue and the only unsaved derived reply without replay', async () => {
   test.setTimeout(150000);
-  await importedConversationForPreview();
+  await conversationForPreview();
   const directory = path.join(root, 'conversations');
   const originalName = (await fs.readdir(directory)).find(name => /^[a-f0-9-]{36}\.json$/.test(name));
   const original = JSON.parse(await fs.readFile(path.join(directory, originalName), 'utf8'));

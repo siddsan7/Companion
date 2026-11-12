@@ -98,8 +98,13 @@
         heading.textContent = 'Preserve ' + dependent.kind + ': ' + dependent.file;
         state.textContent = `${dependent.id || ''}${dependent.requestId ? ' · request ' + dependent.requestId : ''}. ${dependent.attribution === 'unknown' ? 'Dependency attribution is unknown. Preserve and inspect this writing; no removal is authorized.' : 'Independent writing and its quotations remain. Supporting evidence becomes unavailable for future context.'}`;
         text.textContent = dependent.text; item.append(heading, state, text); section.append(item);
+        if (dependent.requestId && dependent.storage === 'durable' && dependent.file === `Local history/${dependent.id}.json`) {
+          const request = document.createElement('button'); request.textContent = 'Review this request for local removal';
+          request.onclick = () => window.dispatchEvent(new CustomEvent('companion-review-stored-request', { detail: { id: dependent.id, requestId: dependent.requestId } }));
+          item.append(request);
+        }
       }
-      const further = document.createElement('p'); further.textContent = 'Further removal needs a separate explicit scope. Use the saved idea, annotation, or readable transcript removal controls where available. Use local conversation deletion only when you intend to remove the whole conversation, including its other requests. Local history archives, comparison records, separate exports/backups and previous provider submissions are separately managed and may retain copies. This preview does not inventory arbitrary external copies.'; section.append(further);
+      const further = document.createElement('p'); further.textContent = 'Further removal needs separate review and confirmation. In Project conversations, preview local request removal to select one stored request. Saved ideas, annotations and readable transcripts have their own removal controls. Whole conversation deletion includes every request. Local history archives, comparison records, separate exports, backups and previous provider submissions may retain copies.'; section.append(further);
       const confirm = document.createElement('button'), cancel = document.createElement('button');
       confirm.textContent = 'Confirm capture deletion'; cancel.textContent = 'Cancel capture deletion';
       cancel.onclick = () => action(async () => { await window.captureDeletion.cancel({ token: preview.token }); section.hidden = true; });

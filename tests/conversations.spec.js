@@ -2448,6 +2448,127 @@ async function deleteHistoryForGeneration(targetPage) {
   await expect(targetPage.locator('#conversation-delete-status')).toContainText('Conversation deleted locally');
 }
 
+test('selected local request removal preserves retained replies and blocks revival from older archives', async () => {
+  test.setTimeout(120000);
+  const removed = 'SELECTED_REQUEST_REMOVAL_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: removed }));
+  await prepareConversation();
+  const send = page.getByRole('button', { name: 'Send reviewed package', exact: true });
+  const previewConversation = page.getByRole('button', { name: 'Preview conversation', exact: true });
+  const packageField = page.getByLabel('Reviewed conversation package', { exact: true });
+  const question = page.getByLabel('Context question', { exact: true });
+  const history = page.locator('#conversation-history article');
+  await send.click();
+  await expect(history.first()).toContainText(removed);
+  await expect(history.first()).toContainText('completed');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Retain this independent reply.' }));
+  await question.fill('Keep this follow-up request.');
+  await previewConversation.click();
+  await expect(packageField).toHaveValue(new RegExp(removed));
+  await send.click();
+  await expect(history).toHaveCount(2);
+  await expect(history.last()).toContainText('Retain this independent reply.');
+  await expect(history.last()).toContainText('completed');
+  const oldArchive = path.join(root, 'old-request-history.json');
+  await exportHistoryForGeneration(page, oldArchive);
+  const oldBytes = await fs.readFile(oldArchive), original = JSON.parse(oldBytes).payload.conversations[0];
+
+  const previewRemoval = history.first().getByRole('button', { name: 'Preview local request removal', exact: true });
+  const review = page.getByRole('region', { name: 'Stored request removal review', exact: true });
+  await previewRemoval.click();
+  await expect(review.getByLabel('Reply', { exact: true })).toHaveValue(removed);
+  await expect(review).toContainText(original.requests[1].id);
+  await review.getByRole('button', { name: 'Cancel request removal', exact: true }).click();
+  await expect(history).toHaveCount(2);
+  await previewRemoval.click();
+  await review.getByRole('button', { name: 'Confirm local request removal', exact: true }).click();
+  await expect(page.locator('#conversation-request-removal-status')).toContainText('Selected request removed');
+  await expect(history).toHaveCount(1);
+  await expect(history.first()).toContainText('Retain this independent reply.');
+  const file = path.join(root, 'conversations', `${original.id}.json`);
+  const local = JSON.parse(await fs.readFile(file, 'utf8'));
+  expect(local.requests).toEqual([original.requests[1]]);
+  expect(local.removedRequests).toEqual([original.requests[0].id]);
+  await question.fill('Review eligible history after removal.');
+  await previewConversation.click();
+  await expect(packageField).toHaveValue(/Review eligible history/);
+  await expect(packageField).not.toHaveValue(new RegExp(removed));
+  await expect(history.first()).toContainText('depends on a historical request removed locally');
+
+  const cleanedArchive = path.join(root, 'reviewed-request-history.json');
+  await exportHistoryForGeneration(page, cleanedArchive);
+  const separateCopy = path.join(root, 'externally-moved-history.json');
+  await fs.rename(file, separateCopy);
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ open: oldArchive }));
+  const archive = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await archive.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Integrity and version validated');
+  await archive.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await archive.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await expect(archive).toContainText('blocked from restoration because this archive contains a request removed locally');
+  await expect(page.locator('#archive-restore-summary')).toContainText('0 missing conversations');
+  await expect(fs.readFile(file)).rejects.toThrow(/ENOENT/);
+  expect(await fs.readFile(oldArchive)).toEqual(oldBytes);
+
+  await restoreHistoryForGeneration(page, cleanedArchive);
+  await app.close(); app = null;
+  await launch(false);
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(original.id);
+  await expect(page.locator('#conversation-history article')).toHaveCount(1);
+  const restored = JSON.parse(await fs.readFile(file, 'utf8'));
+  expect(restored.requests).toEqual([original.requests[1]]);
+  expect(restored.removedRequests).toEqual([original.requests[0].id]);
+  expect(JSON.parse(await fs.readFile(separateCopy, 'utf8')).requests).toEqual([original.requests[1]]);
+  await deleteHistoryForGeneration(page);
+  const authority = JSON.parse(await fs.readFile(path.join(root, 'conversations', '.control', `${original.id}.json`), 'utf8'));
+  expect(authority.removedRequests).toEqual([original.requests[0].id]);
+});
+
+test('selected request removal keeps an unrelated foreign historical reference eligible', async () => {
+  test.setTimeout(90000);
+  const originReply = 'KEEP_HISTORICAL_ORIGIN_CANARY', derivedReply = 'KEEP_UNRELATED_DERIVED_CANARY';
+  const reply = text => fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: text }));
+  await reply(originReply);
+  await prepareConversation();
+  const select = page.getByLabel('Retained conversation', { exact: true });
+  const question = page.getByLabel('Context question', { exact: true });
+  const packageField = page.getByLabel('Reviewed conversation package', { exact: true });
+  const send = page.getByRole('button', { name: 'Send reviewed package', exact: true });
+  const preview = page.getByRole('button', { name: 'Preview conversation', exact: true });
+  const history = page.locator('#conversation-history article');
+  await send.click();
+  await expect(history.first()).toContainText(originReply);
+  const origin = await select.inputValue();
+  await reply('The separately selected request reply.');
+  await question.fill('Remove this other request later.');
+  await preview.click();
+  await expect(packageField).toHaveValue(/Remove this other request/);
+  await send.click();
+  await expect(history.last()).toContainText('The separately selected request reply.');
+
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await question.fill(`Inspect ${originReply} and relate it to the project.`);
+  await page.getByRole('button', { name: 'Search prior conversations', exact: true }).click();
+  await page.getByRole('region', { name: 'Prior conversation search', exact: true }).getByRole('article').filter({ hasText: originReply }).getByRole('button', { name: 'Add historical dialogue', exact: true }).click();
+  await reply(derivedReply);
+  await preview.click();
+  await expect(packageField).toHaveValue(/Prior-conversation historical dialogue/);
+  await send.click();
+  await expect(history.first()).toContainText(derivedReply);
+  const derived = await select.inputValue();
+  expect(derived).not.toBe(origin);
+
+  await select.selectOption(origin);
+  await history.last().getByRole('button', { name: 'Preview local request removal', exact: true }).click();
+  await page.getByRole('button', { name: 'Confirm local request removal', exact: true }).click();
+  await expect(history).toHaveCount(1);
+  await select.selectOption(derived);
+  await question.fill('Preview a continuation after the unrelated request was removed.');
+  await preview.click();
+  await expect(packageField).toHaveValue(new RegExp(derivedReply));
+  await expect(packageField).not.toHaveValue(/The separately selected request reply/);
+});
+
 test('archive generation restoration retains current exclusions and only a fresh explicit scope review can change them', async () => {
   test.setTimeout(180000);
   const canary = 'ARCHIVE_GENERATION_SCOPE_12_CANARY';

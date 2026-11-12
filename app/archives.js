@@ -2,7 +2,7 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
-const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent, inactiveCoverage, codexHints, inactiveCodexHints } = require('./archive-format');
+const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveIntent, inactiveCoverage, codexHints, inactiveCodexHints, requestRemovalStageName, archivePendingName } = require('./archive-format');
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { readNoteScope, changeNoteScope } = require('./note-scope');
@@ -54,7 +54,7 @@ class Archives {
       this.directory = this.history.safeDirectory();
       if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before exporting history.');
       const names = (await fs.readdir(this.history.directory)).sort(); this.guard();
-      const pending = names.filter(name => name.endsWith('.pending')); let coverage;
+      const pending = names.filter(name => name.endsWith('.pending') || requestRemovalStageName(name)); let coverage;
       if (pending.length) {
         if (!savedOnly) throw Error('Unresolved local history pending files need preservation and review before a complete archive can be exported.');
         if (!this.recoveryReview || recoveryId !== this.recoveryReview.id) throw Error('Review unresolved history files before choosing a saved-history-only archive.');
@@ -135,7 +135,7 @@ class Archives {
     return { location: destination, omitted: current.coverage?.omitted.length || 0 };
   }
   restorePlan(archive, current, sourceRoot, targetRoot = sourceRoot, allocations = new Map()) {
-    const additions = [], equal = [], conflicts = [], transitions = [];
+    const additions = [], equal = [], conflicts = [], blocked = [], transitions = [];
     for (const original of archive.payload.conversations) {
       if (sourceRoot && original.vault.root !== sourceRoot) continue;
       const record = structuredClone(original);
@@ -147,7 +147,9 @@ class Archives {
       if (!existing) {
         const baseline = current.authority.markers.find(marker => marker.id === record.id) || null;
         if (baseline && !['deleted', 'active'].includes(baseline.phase)) throw Error('Finish the interrupted local deletion or restoration before adding this archived identity.');
-        if (baseline || record.generation) {
+        if (record.requests.some(request => baseline?.removedRequests?.includes(request.id))) { blocked.push(record.id); continue; }
+        if (baseline?.removedRequests) record.removedRequests = [...new Set([...(record.removedRequests || []), ...baseline.removedRequests])];
+        if (baseline || record.generation || record.removedRequests?.length) {
           if (!allocations.has(record.id)) allocations.set(record.id, { generation: randomUUID(), scopeVersion: randomUUID() });
           const allocated = allocations.get(record.id), scope = record.scope || { excludedSources: [], excludedHistory: record.requests.at(-1)?.package?.excludedHistory || [] };
           record.generation = allocated.generation;
@@ -159,7 +161,7 @@ class Archives {
       else if (canonical(existing) === canonical(record)) equal.push(record.id);
       else conflicts.push(record.id);
     }
-    return { additions, equal, conflicts, transitions };
+    return { additions, equal, conflicts, blocked, transitions };
   }
   async inspect() {
     this.restoreReview = null;
@@ -177,7 +179,7 @@ class Archives {
     const read = await this.json(file, guard, false, true), archive = archiveRecord(read.value);
     const current = await this.snapshot(), allocations = new Map(), plan = this.restorePlan(archive, current, undefined, undefined, allocations), id = randomUUID();
     this.restoreReview = { id, archive, allocations, inspection: current, input: { file, guard, digest: read.digest } };
-    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null, omitted: archive.coverage?.omitted.length || 0, codexHints: this.archiveCodexHints(archive) };
+    return { id, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, blocked: plan.blocked, roots: archive.payload.vaultBindings.map(binding => binding.managedRoot), currentVault: this.history.getVault()?.root || null, omitted: archive.coverage?.omitted.length || 0, codexHints: this.archiveCodexHints(archive) };
   }
   async match(input) {
     const reviewed = this.restoreReview;
@@ -203,7 +205,7 @@ class Archives {
     assertSelection();
     const token = randomUUID();
     reviewed.matched = { token, vault, assertSelection, root, sourceRoot, snapshot: current, plan, metadata, settingsMode, noteCandidates };
-    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, newGenerations: plan.transitions.length, metadataAdditions: metadata.additions.length, metadataConflicts: metadata.conflicts.length, metadataTypes: metadata.types, omitted: reviewed.archive.coverage?.omitted.length || 0, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
+    return { token, missing: plan.additions.length, equal: plan.equal.length, conflicts: plan.conflicts.length, blocked: plan.blocked, newGenerations: plan.transitions.length, metadataAdditions: metadata.additions.length, metadataConflicts: metadata.conflicts.length, metadataTypes: metadata.types, omitted: reviewed.archive.coverage?.omitted.length || 0, noteCandidates, archivedVault: reviewed.archive.payload.vaultBindings.find(binding => binding.managedRoot === sourceRoot), currentVault: { vault: vault.vault, managedRoot: vault.root }, conflictRecords: plan.conflicts.map(id => {
       const archived = reviewed.archive.payload.conversations.find(record => record.id === id), existing = current.payload.conversations.find(record => record.id === id);
       return { id, archivedRequests: archived.requests.length, currentRequests: existing.requests.length, archivedExclusions: archived.scope?.excludedHistory.length || 0, currentExclusions: existing.scope?.excludedHistory.length || 0 };
     }) };
@@ -339,7 +341,7 @@ class Archives {
   async pendingInventory(names) {
     const records = []; let total = 0;
     for (const name of [...names].sort()) {
-      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,140}\.pending$/.test(name)) throw Error('Unrecognized pending filename. Preserve it and inspect the local history folder separately; export stays blocked.');
+      if (!archivePendingName(name)) throw Error('Unrecognized pending filename. Preserve it and inspect the local history folder separately; export stays blocked.');
       const read = await this.json(path.join(this.history.directory, name), undefined, false, false, true);
       total += read.value.length; if (total > LIMIT) throw Error('Pending recovery files exceed 128 MiB. Preserve and review them separately; export stays blocked.');
       let kind = 'unknown-data', text;
@@ -354,7 +356,7 @@ class Archives {
     return this.history.lock(async () => {
       this.directory = this.history.safeDirectory();
       if (this.history.running.size || this.history.unsaved.size) throw Error('Finish active requests and save retained unsaved replies before reviewing recovery files.');
-      const names = (await fs.readdir(this.history.directory)).filter(name => name.endsWith('.pending')); this.guard();
+      const names = (await fs.readdir(this.history.directory)).filter(name => name.endsWith('.pending') || requestRemovalStageName(name)); this.guard();
       const records = await this.pendingInventory(names), id = randomUUID();
       this.recoveryReview = { id, omitted: records.map(({ text, ...item }) => item) };
       return { id, location: this.history.directory, records };
@@ -553,7 +555,8 @@ class Archives {
       verifyAbsentSync(destination, selected);
       verifyStageSync(stage, selected, proof);
     };
-    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation, verifyReservation);
+    const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest },
+      ...(record.removedRequests ? { removedRequests: record.removedRequests } : {}) }, baseline, recheckReservation, verifyReservation);
     const verifyMarker = await controls.restorationMarkerGuard(marker, selected);
     this.history.tokens.clear();
     await this.checkpoint('archive-restore-after-reservation');
