@@ -20,4 +20,5 @@ function unionGenerations(sources) {
 }
 const generationFields = value => { const array = generations(value); return array.length ? { sourceGenerations: array } : {}; };
 const generationProvenance = source => generations(source.sourceGenerations).length ? `; source generations ${JSON.stringify(source.sourceGenerations)}` : '';
-module.exports = { generations, sameGenerations, sameEvidence, unionGenerations, generationFields, generationProvenance };
+const scopeKey = key => key.replace(/^conflict-(?:local|imported):/, 'capture:');
+module.exports = { generations, sameGenerations, sameEvidence, unionGenerations, generationFields, generationProvenance, scopeKey };

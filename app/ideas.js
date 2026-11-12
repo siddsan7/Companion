@@ -8,8 +8,10 @@ const { Briefs } = require('./briefs');
 const { withBriefMutation } = require('./briefs-lock');
 const { IdeasRemoval } = require('./ideas-removal');
 const { scanIdeas } = require('./idea-inventory');
-const { generations, sameEvidence, sameGenerations } = require('./source-generations');
+const { generations, sameEvidence, sameGenerations, scopeKey } = require('./source-generations');
 const { Intake } = require('./intake');
+const { importedConflictEvidence } = require('./context');
+const { comparable } = require('./legacy-capture-ownership');
 const { readExactSync, verifyStageSync } = require('./staged-publication');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
@@ -140,7 +142,7 @@ class Ideas {
     if (request.status === 'completed') for (const dep of request.package.dependencies) {
       if (!dep.captureId || !dep.revisionId || record.scope?.excludedSources.includes(dep.key)) continue;
       try {
-        const resolved = await this.revision(vault, dep.captureId, dep.revisionId, true);
+        const resolved = await this.revision(vault, dep.captureId, dep.revisionId, dep);
         for (const evidence of resolved.revision.evidence?.evidence || []) {
           const anchor = this.anchor(resolved, evidence);
           if (!this.inPackage(request, resolved, anchor)) continue;
@@ -169,8 +171,14 @@ class Ideas {
     if (snapshotHash !== attempts[0].snapshotHash) throw Error('Exact cited revision is damaged. No newer revision was substituted.');
     const revision = JSON.parse(text);
     if (revision.schema !== 1 || revision.id !== revisionId || revision.captureId !== captureId || revision.sourceHash !== sourceHash || typeof revision.text !== 'string') throw Error('Exact cited revision identity is damaged.');
-    const warnings = [];
-    if (capture.removed || capture.rejected || capture.supportEligible === false || capture.conflict || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.blocks?.[sourceHash] || ledger.pending?.[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
+    const warnings = [], block = ledger.blocks?.[sourceHash], authority = ledger.sourceAuthority?.[captureId];
+    const unavailable = capture.removed || capture.rejected || capture.supportEligible === false || capture.identityIssue || capture.reviewChoices?.length || ledger.identityIssues?.[captureId] || ledger.suppressed.includes(sourceHash) || ledger.pending?.[sourceHash] || ledger.acceptedCleanup?.sourceHash === sourceHash || authority && authority.phase !== 'active';
+    // Only the exact imported revision explicitly selected in the retained request
+    // may be cited while the original local conflict is still present.
+    const mayCiteConflict = !unavailable && offering?.key === `capture:${captureId}` && capture.currentRevision === revisionId &&
+      sameGenerations(offering, { sourceGenerations: authority ? [{ captureId, generation: authority.generation }] : [] }) &&
+      (block ? block.outputHold === undefined && !!capture.conflict && block.reason === capture.conflict : !capture.conflict);
+    if (unavailable || (capture.conflict || block) && !mayCiteConflict) warnings.push('Current capture is removed, rejected or unresolved; this historical citation is not current supporting context.');
     if (revision.supportEligible === false || !['unreviewed', 'accept', 'edit'].includes(revision.humanReview)) warnings.push('The cited revision is ineligible as supporting evidence.');
     let offeringProof;
     if (offering) {
@@ -196,7 +204,10 @@ class Ideas {
         const links = match === note ? 1 : local.lstatSync(match.file).nlink;
         const { bytes, proof } = readExactSync(match.file, guard, links);
         const currentHash = hash(decode(bytes));
-        if (match === note && currentHash !== capture.currentHash) throw Error('Current capture was changed outside Companion.');
+        if (match === note && (currentHash !== capture.currentHash || capture.conflict || block)) {
+          if (!mayCiteConflict || matches.length !== 1 || comparable(path.resolve(note.file)) !== comparable(path.resolve(intake.destination(capture))) ||
+              importedConflictEvidence(captureId, revision, snapshotHash, currentHash).digest !== offering.digest) throw Error('Current capture was changed outside Companion.');
+        }
         if (currentHash !== hash(match.content)) throw Error('A capture identity copy changed after inspection. Review the identity before citing evidence.');
         return { file: match.file, guard, proof, links };
       });
@@ -231,7 +242,7 @@ class Ideas {
       if (origin.record.scope?.excludedSources.includes(`capture:${anchor.capture_id}`)) throw Error('Selected supporting source was excluded.');
       const dep = origin.request.package.dependencies.find(dep => dep.captureId === anchor.capture_id && dep.revisionId === anchor.revision_id);
       if (!dep) throw Error('Selected evidence is absent from the original request.');
-      const resolved = await this.revision(origin.vault, anchor.capture_id, anchor.revision_id, true);
+      const resolved = await this.revision(origin.vault, anchor.capture_id, anchor.revision_id, dep);
       const evidence = resolved.revision.evidence?.evidence?.find(item => item.id === anchor.evidence_id);
       if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor) || !this.inPackage(origin.request, resolved, anchor)) throw Error('Selected exact evidence changed or is unavailable.');
       verifyCitation?.(resolved.offeringProof);
@@ -245,7 +256,7 @@ class Ideas {
     const ledger = JSON.parse((await this.readFile(vault, ledgerFile, this.parents(vault, [ledgerFile]))).text);
     const state = [], warnings = []; let unavailable = false;
     for (const dep of request.package.dependencies) {
-      const source = corpus.all.find(item => item.key === dep.key), excluded = record.scope?.excludedSources.includes(dep.key) || false;
+      const source = corpus.all.find(item => item.key === dep.key), excluded = record.scope?.excludedSources.some(key => scopeKey(key) === scopeKey(dep.key)) || false;
       const captureId = dep.captureId || (dep.key.startsWith('capture:') ? dep.key.slice(8) : null);
       const entries = captureId ? Object.entries(ledger.captures).filter(([, item]) => item.id === captureId) : [];
       const entry = entries.length === 1 ? entries[0] : null, capture = entry?.[1];
@@ -295,7 +306,7 @@ class Ideas {
       this.removal.allow(vault, retained.id);
       return { operation: retained.operation, text: retained.text, destination: retained.destination, warnings: [...retained.warnings] };
     }
-    const dependencies = request.package.dependencies.filter(dep => dep.key.startsWith('capture:')).map(dep => {
+    const dependencies = request.package.dependencies.filter(dep => dep.captureId || dep.key.startsWith('capture:')).map(dep => {
       const captureId = dep.captureId || dep.key.slice(8), generation = generations(dep.sourceGenerations).find(item => item.captureId === captureId)?.generation;
       return { capture_id: captureId, ...(dep.revisionId ? { revision_id: dep.revisionId } : { content_sha256: dep.digest }), ...(generation ? { source_generation: generation } : {}) };
     });
@@ -494,6 +505,21 @@ class Ideas {
     const claims = inventory.claims.get(id);
     if (this.removal.fenced(vault, id) || claims?.length !== 1 || !claims[0].savedIdea || claims[0].stat.nlink !== 1n) return null;
     return { vault, parents, inventory, note: claims[0] };
+  }
+  async linkedToCapture(vault, captureId) {
+    if (!uuid(captureId) || this.getVault() !== vault) throw Error('Inspect a capture in the selected vault.');
+    const parents = this.guard(vault), inventory = await scanIdeas(vault), related = [];
+    for (const [id, claims] of inventory.claims) {
+      if (claims.length !== 1 || !claims[0].savedIdea || claims[0].stat.nlink !== 1n || this.removal.fenced(vault, id)) continue;
+      const { source_dependencies: dependencies, citations, title } = claims[0].metadata;
+      const citesCapture = Array.isArray(citations) && citations.some(item => item?.kind === 'imported_evidence' && item.capture_id === captureId && uuid(item.revision_id));
+      const usesCapture = Array.isArray(dependencies) && dependencies.some(item => item?.capture_id === captureId &&
+        (uuid(item.revision_id) || typeof item.content_sha256 === 'string' && /^[a-f0-9]{64}$/.test(item.content_sha256)));
+      if (citesCapture || usesCapture) related.push({ id, title: typeof title === 'string' && title.trim() ? title : `Saved idea ${id}` });
+    }
+    if (this.getVault() !== vault) throw Error('Selected vault changed. Inspect saved ideas again.');
+    this.guard(vault, parents); inventory.check();
+    return related.filter(item => !this.removal.fenced(vault, item.id));
   }
   async openNote(id) {
     if (!uuid(id)) throw Error('Saved idea identity is invalid.');

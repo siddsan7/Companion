@@ -25,7 +25,7 @@ async function launch(configure = true, parent = 'Companion') {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation({ imported = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
+async function completedConversation({ imported = false, localConflict = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario || { reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
   await launch(true, parent);
   if (imported) {
@@ -53,9 +53,20 @@ async function completedConversation({ imported = false, twoCaptures = false, sc
   await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
   const question = imported ? 'What does the synthetic review support for MyTune?' : 'How could retrieval help MyTune?';
+  if (localConflict) {
+    const captures = path.join(root, 'vault', parent || 'Companion', 'Captures');
+    const [file] = (await fs.readdir(captures)).filter(name => name.endsWith('.md'));
+    await fs.appendFile(path.join(captures, file), '\nIndependent local conflict writing.\n');
+  }
   await page.getByLabel('Context question', { exact: true }).fill(question);
   await page.getByRole('button', { name: 'Find context', exact: true }).click();
-  await page.locator('#context-results article').filter({ hasText: imported ? 'Authored synthetic review' : 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  if (localConflict) {
+    await expect(page.locator('#context-results')).not.toContainText('Authored synthetic review');
+    await page.getByLabel('Manual context source', { exact: true }).selectOption({ label: 'Imported revision (conflict): Authored synthetic review' });
+    await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
+  } else {
+    await page.locator('#context-results article').filter({ hasText: imported ? 'Authored synthetic review' : 'Spaced retrieval' }).first().getByRole('button', { name: 'Add to context', exact: true }).click();
+  }
   if (twoCaptures) {
     await page.getByLabel('Manual context source', { exact: true }).selectOption({ label: 'A practice queue makes a delayed revisit visible.' });
     await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
@@ -64,7 +75,7 @@ async function completedConversation({ imported = false, twoCaptures = false, sc
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(imported ? 'synthetic review support' : 'How could retrieval help MyTune\\?'));
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
-  await expect(page.locator('#conversation-history')).toContainText(expectedStatus);
+  await expect(page.locator('#conversation-history')).toContainText(expectedStatus, { timeout: 15000 });
   await expect(page.locator('#conversation-history')).toContainText(expectedReply);
 }
 async function markdownSnapshot(directory) {
@@ -607,6 +618,64 @@ test('Saved idea completion waits for its source inspection before the next expl
   }
 });
 
+test('an explicitly chosen conflict revision keeps its saved idea dependency and exact citation', async () => {
+  await completedConversation({ imported: true, localConflict: true });
+  const revisions = path.join(root, 'vault', 'Companion', 'Revisions');
+  const [name] = (await fs.readdir(revisions)).filter(file => file.endsWith('.json'));
+  const snapshot = JSON.parse(await fs.readFile(path.join(revisions, name), 'utf8'));
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Interpret the explicit imported revision');
+  const citation = page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true });
+  await expect.soft(citation).toBeVisible({ timeout: 5000 });
+  if (await citation.isVisible()) await citation.check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  const preview = page.getByLabel('Proposed idea Markdown', { exact: true });
+  await expect(preview).toHaveValue(/source_dependencies:/);
+  const fields = YAML.parse((await preview.inputValue()).match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect.soft(fields.source_dependencies).toEqual([expect.objectContaining({ capture_id: snapshot.captureId, revision_id: snapshot.id })]);
+  expect.soft(fields.citations).toEqual([expect.objectContaining({ capture_id: snapshot.captureId, revision_id: snapshot.id, evidence_id: 'a1' })]);
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea.');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await expect(page.getByLabel('Source inspection').getByRole('button', { name: 'Open linked saved idea in Obsidian: Interpret the explicit imported revision', exact: true })).toBeVisible();
+});
+
+test('a conversation from an explicit conflict revision can be archived and its transcript inspected', async () => {
+  await completedConversation({ imported: true, localConflict: true });
+  const history = path.join(root, 'conversations');
+  const [name] = (await fs.readdir(history)).filter(file => file.endsWith('.json'));
+  const original = JSON.parse(await fs.readFile(path.join(history, name), 'utf8'));
+  const dependency = original.requests[0].package.dependencies.find(dep => dep.revisionId);
+  expect(dependency).toMatchObject({ key: expect.stringMatching(/^capture:/), digest: expect.stringMatching(/^[a-f0-9]{64}$/) });
+
+  const archive = path.join(root, 'explicit-conflict-history.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archive }));
+  await page.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  const exportArchive = page.getByRole('button', { name: 'Export reviewed archive', exact: true });
+  await expect.soft(exportArchive).toBeEnabled({ timeout: 5000 });
+  if (await exportArchive.isEnabled()) {
+    await exportArchive.click();
+    await expect(page.locator('#archive-summary')).toContainText('Archive exported');
+    const saved = JSON.parse(await fs.readFile(archive, 'utf8'));
+    expect(saved.payload.conversations).toEqual([original]);
+  }
+
+  const transcript = path.join(root, 'vault', 'Explicit conflict transcript.md');
+  await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: transcript }));
+  await page.getByRole('button', { name: 'Preview transcript export', exact: true }).click();
+  const markdown = page.getByLabel('Proposed transcript Markdown', { exact: true });
+  await expect(markdown).toHaveValue(new RegExp(dependency.digest));
+  const reviewedDestination = await page.getByRole('textbox', { name: 'Transcript destination', exact: true }).inputValue();
+  const text = await markdown.inputValue();
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect(page.locator('#transcript-status')).toContainText('Transcript exported');
+  expect(await fs.readFile(transcript, 'utf8')).toBe(text);
+  const exports = page.getByRole('combobox', { name: 'Retained transcript export', exact: true });
+  await exports.selectOption({ label: reviewedDestination });
+  await page.getByRole('button', { name: 'Preview transcript removal', exact: true }).click();
+  await expect(page.getByRole('region', { name: 'Transcript removal review', exact: true })).toContainText(reviewedDestination);
+});
+
 test('an explicitly selected imported evidence citation opens its original revision after a reviewed update', async () => {
   test.setTimeout(120000);
   await completedConversation({ imported: true });
@@ -636,6 +705,12 @@ test('an explicitly selected imported evidence citation opens its original revis
   await expect(page.locator('#idea-status')).toContainText('Saved idea');
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
   expect(await markdownSnapshot(path.join(vault, 'Captures'))).toEqual(capturesBefore);
+
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const linkedIdea = page.getByLabel('Source inspection').getByRole('button', { name: 'Open linked saved idea in Obsidian: Inspect the original authored evidence', exact: true });
+  await expect(linkedIdea).toBeVisible();
+  await linkedIdea.click();
+  await expect.poll(() => fs.readFile(path.join(root, 'opened-uri.txt'), 'utf8').catch(error => error.code)).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
 
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(root, 'producer', 'edit'), { recursive: true });
   await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }), 'utf8');

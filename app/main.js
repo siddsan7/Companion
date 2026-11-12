@@ -167,7 +167,15 @@ app.whenReady().then(async () => {
     return orderVaultWork(selected, () => new Intake(selected).repairs());
   });
   ipcMain.handle('resolve-conflict', async (_, input) => new Intake(vault).resolveConflict(input, clock().now));
-  ipcMain.handle('inspect-source', async (_, id) => new Intake(vault).inspect(id));
+  ipcMain.handle('inspect-source', async (_, id) => {
+    const selected = vault;
+    const info = await new Intake(selected).inspect(id, { verifyCurrentNote: true });
+    let linkedIdeas = [], linkedIdeasWarning;
+    try { linkedIdeas = await ideas.linkedToCapture(selected, id); }
+    catch { linkedIdeasWarning = 'Linked saved ideas are unavailable. Their writing was preserved.'; }
+    if (vault !== selected) throw Error('Selected vault changed. Inspect the source again.');
+    return { ...info, linkedIdeas, linkedIdeasWarning };
+  });
   ipcMain.handle('select-review', async (_, { id, revision }) => new Intake(vault).selectCurrent(id, revision, clock().now));
   ipcMain.handle('link-sources', async (_, { id, related }) => new Intake(vault).linkSources(id, related, clock().now));
   ipcMain.handle('open-note', async (_, id) => {
