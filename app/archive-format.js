@@ -1,6 +1,7 @@
 const { createHash } = require('node:crypto');
 const path = require('node:path');
 const { generations } = require('./source-generations');
+const { sourceExcerptsValid } = require('./source-excerpts');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const fail = () => { throw Error('History contains unsupported data. Preserve local files for repair; archive export was blocked.'); };
@@ -20,7 +21,7 @@ function usage(value) {
   if (value.modelContextWindow !== null && (!Number.isSafeInteger(value.modelContextWindow) || value.modelContextWindow < 0)) fail();
 }
 function packageRecord(value) {
-  object(value, ['schema', 'text', 'digest', 'count', 'limit', 'blocked', 'capacityBinding', 'boundEvidence', 'warnings', 'historyExclusions', 'scope', 'excludedHistory', 'dependencies', 'historyIds', 'historyRefs', 'conversationGeneration', 'brief', 'vault', 'question', 'speculation', 'historyDigest']);
+  object(value, ['schema', 'text', 'digest', 'count', 'limit', 'blocked', 'capacityBinding', 'boundEvidence', 'warnings', 'historyExclusions', 'scope', 'excludedHistory', 'dependencies', 'sourceExcerpts', 'historyIds', 'historyRefs', 'conversationGeneration', 'brief', 'vault', 'question', 'speculation', 'historyDigest']);
   if (value.schema !== 1 || typeof value.text !== 'string' || hash(value.text) !== value.digest || [...value.text].length !== value.count || !Number.isSafeInteger(value.limit) || typeof value.blocked !== 'boolean' || typeof value.question !== 'string' || typeof value.speculation !== 'boolean') fail();
   for (const key of ['capacityBinding', 'boundEvidence', 'historyDigest']) if (value[key] !== null && typeof value[key] !== 'string') fail();
   strings(value.warnings); strings(value.historyIds); strings(value.excludedHistory); scope(value.scope); pin(value.brief); root(value.vault);
@@ -31,6 +32,7 @@ function packageRecord(value) {
     if (typeof dep.key !== 'string' || !/^[a-f0-9]{64}$/.test(dep.digest) || ['captureId', 'revisionId'].some(key => Object.hasOwn(dep, key) && !uuid(dep[key]))) fail();
     try { generations(dep.sourceGenerations); } catch { fail(); }
   }
+  if (value.sourceExcerpts !== undefined && !sourceExcerptsValid(value)) fail();
   for (const item of value.historyExclusions) { object(item, ['id', 'reason']); if (!uuid(item.id) || typeof item.reason !== 'string') fail(); }
   if (value.historyRefs !== undefined) {
     if (!Array.isArray(value.historyRefs)) fail();

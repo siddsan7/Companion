@@ -380,12 +380,12 @@ class ConversationControls {
         verifyPayload();
       });
     verifyPayload();
-    this.store.tokens.clear(); this.store.durable.set(marker.id, marker.restoration.recordDigest);
+    this.store.tokens.clear();
     return { id: marker.id, generation: active.generation };
   }
   async finish(marker) {
     await this.settlePublication(marker);
-    this.store.tokens.clear(); this.store.durable.delete(marker.id);
+    this.store.tokens.clear();
     await this.store.checkpoint('conversation-delete-after-tombstone');
     const current = await this.recoverySnapshot(marker.id), parent = this.store.safeDirectory();
     if (JSON.stringify(current.marker) !== JSON.stringify(marker)) throw Error('Conversation deletion authority changed. Preserve remaining writing.');
