@@ -524,7 +524,13 @@ class Briefs {
         receipt ||= await this.observeLegacy(version, candidate, guard, lockHeld);
         verifyStageSync(receipt.file, index.guard, receipt.proof);
         verifyStageSync(file, candidate.guard, proof);
-        approvals.set(version, { receipt, record: { ...data.record, file: path.relative(this.dir, file), digest: proof.digest } });
+        const verify = () => {
+          guard();
+          reservation.requireAvailable(file);
+          verifyStageSync(receipt.file, index.guard, receipt.proof);
+          verifyStageSync(file, candidate.guard, proof);
+        };
+        approvals.set(version, { receipt, verify, record: { ...data.record, file: path.relative(this.dir, file), digest: proof.digest } });
       } catch (error) {
         approvals.set(version, { error: Error(integrityError(path.basename(candidate.file)).message, { cause: error }) });
       }
@@ -693,18 +699,21 @@ class Briefs {
     return this.state(true);
     });
   }
-  async pinned(version) {
+  async pinned(version, observe) {
     if (!Number.isSafeInteger(version) || version < 1) throw Error('Approved brief version unavailable.');
-    const [record] = await this.records(version);
+    const { records: [record], approvals } = await this.readStore({ onlyVersion: version });
     if (!record) throw Error('Approved brief version unavailable.');
+    observe?.(approvals.get(version).verify);
     return { ...record, issues: await this.outdated(record) };
   }
-  async pins() {
+  async pins(observe) {
     const inventory = await this.approvedInventory(await this.recoveredIndex());
     const ordered = [...inventory].sort(([a], [b]) => a - b);
-    return Promise.all(ordered.map(async ([version, { record, error }]) => record
-      ? { version, pin: { ...record, issues: await this.outdated(record) } }
-      : { version, error: error || Error('Approved brief version unavailable.') }));
+    return Promise.all(ordered.map(async ([version, { record, error, verify }]) => {
+      if (!record) return { version, error: error || Error('Approved brief version unavailable.') };
+      observe?.(version, record.digest, verify);
+      return { version, pin: { ...record, issues: await this.outdated(record) } };
+    }));
   }
 }
 module.exports = { Briefs };

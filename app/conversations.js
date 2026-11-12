@@ -227,7 +227,7 @@ class Conversations {
     }
     return { matches: matches.sort((a, b) => b.matched.length - a.matched.length || a.conversationId.localeCompare(b.conversationId) || a.requestId.localeCompare(b.requestId)), warnings };
   }
-  async build(input, currentRequestId, baselineRecord) {
+  async build(input, currentRequestId, baselineRecord, dispatch) {
     const directory = this.safeDirectory(true);
     if (this.unsaved.has(input.conversationId)) throw Error('This conversation has an unsaved reply. Save the retained reply locally, or copy it before closing, before preparing another request.');
     const context = await this.getContext(), vault = context.vault;
@@ -235,11 +235,11 @@ class Conversations {
     if (prior && currentRequestId) prior.requests = prior.requests.filter(request => request.id !== currentRequestId);
     if (prior && prior.vault.root !== vault.root) throw Error('Conversation belongs to another vault.');
     const version = prior?.brief.version || input.briefVersion;
-    const pin = await new Briefs(vault).pinned(version);
+    const pin = await new Briefs(vault).pinned(version, dispatch?.observe);
     const brief = { id: pin.id, version, digest: pin.digest };
     if (prior && JSON.stringify(prior.brief) !== JSON.stringify(brief)) throw Error('Pinned approved brief changed or is unavailable.');
     if (typeof input.question !== 'string' || !input.question.trim() || typeof input.speculation !== 'boolean') throw Error('Enter a question and review speculation permission.');
-    const corpus = await context.corpus(), all = corpus.all;
+    const corpus = await context.corpus({ dispatch }), all = corpus.all;
     const selectable = [...all, ...(corpus.manual || [])];
     const selections = structuredClone(input.selections || []), baseline = scopeOf(prior);
     const sourceRemovals = input.excludedSources || [], sourceRestores = input.restoreSources || [];
@@ -249,7 +249,7 @@ class Conversations {
     for (const key of sourceRestores) excluded.delete(scopeKey(key));
     if (selections.some(source => source.key.startsWith('brief:') && source.key !== `brief:${version}`)) throw Error('Use only the conversation’s pinned brief version.');
     if (!excluded.has(`brief:${version}`) && !selections.some(source => source.key === `brief:${version}`)) selections.push({ key: `brief:${version}`, digest: pin.digest });
-    const preview = await context.preview({ question: input.question, selections, excludedSources: [...excluded] });
+    const preview = await context.preview({ question: input.question, selections, excludedSources: [...excluded] }, dispatch);
     const dependencies = new Map();
     const addDependency = source => {
       if (dependencies.has(source.key)) { if (!sameEvidence(dependencies.get(source.key), source)) throw Error('Source dependency authority conflicts.'); return; }
@@ -330,8 +330,9 @@ class Conversations {
     // Oversized text stays inspectable but cannot occupy an approved-send registry slot.
     if (snapshot.blocked) return { ...snapshot, packageId: null };
     if (this.tokens.size >= 64) this.tokens.delete(this.tokens.keys().next().value);
-    this.tokens.set(packageId, { snapshot, input: structuredClone(input) });
-    return { ...snapshot, packageId };
+    const targetId = input.conversationId || randomUUID();
+    this.tokens.set(packageId, { snapshot, input: structuredClone(input), targetId });
+    return { ...snapshot, packageId, targetId };
   }
   async send({ packageId }) {
     const approved = this.tokens.get(packageId); this.tokens.delete(packageId);
@@ -342,7 +343,7 @@ class Conversations {
       const current = await this.build(approved.input, undefined, baseline?.record);
       if (JSON.stringify(current) !== JSON.stringify(approved.snapshot)) throw Error('Context changed. Preview and approve a new package before sending.');
       if (current.blocked) throw Error('Package exceeds the context limit. Remove or explicitly shorten sources, then preview again.');
-      const record = baseline?.record || { schema: 1, id: randomUUID(), vault: current.vault, brief: current.brief, createdAt: this.clock().now, requests: [] };
+      const record = baseline?.record || { schema: 1, id: approved.targetId, vault: current.vault, brief: current.brief, createdAt: this.clock().now, requests: [] };
       if (!record.scope) record.scope = { ...current.scope, version: randomUUID() };
       const request = { id: randomUUID(), question: current.question, speculation: current.speculation, package: current, status: 'inProgress', reply: '', startedAt: this.clock().now, completedAt: null, usage: null, usageEvidence: 'Usage unavailable: no valid matching provider counters were retained for this request.' };
       record.requests.push(request);
@@ -353,12 +354,19 @@ class Conversations {
       try {
         await this.provider.preflight();
         await this.checkpoint('conversation-before-dispatch');
-        const revalidate = async () => {
-          if (JSON.stringify(await this.build(approved.input, request.id)) !== JSON.stringify(approved.snapshot)) throw Error('Context changed during preflight. Preview and approve a new package.');
+        const revalidate = async dispatch => {
+          if (JSON.stringify(await this.build(approved.input, request.id, undefined, dispatch)) !== JSON.stringify(approved.snapshot)) throw Error('Context changed during preflight. Preview and approve a new package.');
         };
         await revalidate();
         const result = await this.provider.turn(current.text, { capacityBinding: current.capacityBinding, beforeStart: async () => {
-          await this.checkpoint('conversation-before-turn-start'); await revalidate();
+          await this.checkpoint('conversation-before-turn-start');
+          const guards = [];
+          const dependencies = new Map(current.dependencies.map(({ key, digest }) => [key, digest]));
+          await revalidate({ dependencies, observe: guard => guards.push(guard) });
+          return () => {
+            try { for (const guard of guards) guard(); }
+            catch (error) { throw Error('Context changed before turn start. Preview and approve a new package.', { cause: error }); }
+          };
         }, onState: async snapshot => { Object.assign(request, snapshot); proof = await this.write(record, proof, directory); } });
         Object.assign(request, result, { status: 'completed', completedAt: this.clock().now });
       } catch (error) { request.status = error.terminalStatus || 'failed'; request.error = error.message; request.completedAt = this.clock().now; }

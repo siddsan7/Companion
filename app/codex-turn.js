@@ -150,7 +150,8 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     if (sinkFailure) throw Error('Conversation history could not be saved. No model request was sent.');
     historySaved = true;
     if (comparisonPin && Object.keys(comparisonPin).some(key => record.effective[key] !== comparisonPin[key])) throw Error('Codex effective model or comparison settings changed or are unavailable. Nothing was sent.');
-    await beforeStart({ threadId, model: started.model });
+    const verifyContext = await beforeStart({ threadId, model: started.model });
+    verifyContext?.();
     startAttempted = true;
     const response = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text }], environments: [] });
     if (!bindTurn(response.turn?.id)) throw Error(unexpected);

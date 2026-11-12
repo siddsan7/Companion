@@ -332,6 +332,7 @@ for (const altered of [true, false]) test(altered ?
     expect.soft(ledger.blocks[sourceHash]).toMatchObject({ incomingRevision: block.incomingRevision });
     expect.soft(ledger.captures[sourceHash].currentRevision).toBe(before.captures[sourceHash].currentRevision);
     expect(ledger.attempts[tx.revision.identity]).toBeUndefined();
+    expect(ledger.annotationLinks?.[intent.annotationId]).toBeUndefined();
     expect.soft(await readOptional(destination)).toEqual(local);
     const restored = await identity(destination).catch(error => ({ code: error.code }));
     expect.soft(restored).toMatchObject({ dev: localIdentity.dev, ino: localIdentity.ino });
@@ -349,6 +350,7 @@ for (const altered of [true, false]) test(altered ?
     expect(ledger.blocks[sourceHash]).toBeUndefined();
     expect(ledger.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
     expect(ledger.captures[sourceHash].currentRevision).toBe(tx.revision.id);
+    expect(ledger.annotationLinks?.[intent.annotationId]).toEqual({ captureId: capture.id, target: `../Captures/${capture.file}` });
     expect(await fs.readFile(destination, 'utf8')).toBe(tx.content);
     expect(await fs.readFile(note, 'utf8')).toBe(intent.annotation);
     expect(await identity(note)).toEqual({ ...original, nlink: 1n });
@@ -657,6 +659,57 @@ test('relationship repair preserves an independent backup created during authori
   const evidence = await readOptional(witness.journal) ? witness.journal : archive;
   expect.soft(await readOptional(evidence)).toEqual(witness.bytes);
   expect.soft(await identity(evidence).catch(error => error.code)).toEqual(witness.journalIdentity);
+});
+
+test('a repaired annotation keeps its generated link authority across a process exit before journal retirement', async ({}, testInfo) => {
+  const { vault, intake, input, note, capture } = await fixture(testInfo);
+  await intake.addAnnotation(input, now);
+  const original = await fs.readFile(note, 'utf8');
+  const first = path.join(path.dirname(note), 'Nested', path.basename(note));
+  await fs.mkdir(path.dirname(first));
+  await fs.rename(note, first);
+  const journal = path.join(intake.dir, 'link-intent.json');
+  const code = String.raw`
+    const local = require('node:fs');
+    const { Intake } = require('./app/intake');
+    const { Vault } = require('./app/vault');
+    const [directory, journal] = process.argv.slice(1);
+    const unlink = local.unlinkSync;
+    local.unlinkSync = (file, ...args) => {
+      if (file === journal) process.exit(77);
+      return unlink(file, ...args);
+    };
+    new Intake(new Vault(directory, 'Companion')).info().then(() => process.exit(78), error => {
+      console.error(error);
+      process.exit(79);
+    });
+  `;
+  const child = spawn(process.execPath, ['-e', code, vault.vault, journal], {
+    cwd: path.join(__dirname, '..'), stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', part => { stderr += part; });
+  const exit = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  expect(exit, stderr).toEqual({ code: 77, signal: null });
+  const firstTarget = `../../Captures/${capture.file}`;
+  expect(await fs.readFile(first, 'utf8')).toBe(original.replace(`../Captures/${capture.file}`, firstTarget));
+  const intent = JSON.parse(await fs.readFile(journal, 'utf8'));
+  expect(intent.content).toContain(firstTarget);
+  const persisted = await intake.load();
+  expect(persisted.annotationLinks?.[input.id]).toEqual({ captureId: input.captureId, target: firstTarget });
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.info();
+  expect(await readOptional(journal)).toBeNull();
+  const second = path.join(vault.vault, 'Notes', 'Second', path.basename(note));
+  await fs.mkdir(path.dirname(second), { recursive: true });
+  await fs.rename(first, second);
+  await restarted.info();
+  expect(await fs.readFile(second, 'utf8')).toBe(original.replace(`../Captures/${capture.file}`, `../../Companion/Captures/${capture.file}`));
 });
 
 for (const state of ['removed', 'replaced', 'removed with a replaced backup']) test(`relationship restart holds when its recorded stage is ${state}`, async ({}, testInfo) => {

@@ -56,7 +56,7 @@ async function readHeader(handle, size) {
   return { header, complete: false };
 }
 
-async function scanIdeas(vault, { captureIds = new Set() } = {}) {
+async function scanIdeas(vault, { captureIds = new Set(), watchCaptureNamespace = false } = {}) {
   const root = path.resolve(vault.vault), managed = path.resolve(vault.root), ideas = path.join(managed, 'Ideas');
   const claims = new Map(), captureClaims = new Map(), observed = new Map(), publications = new Map();
   const intake = new (require('./intake').Intake)(vault);
@@ -236,7 +236,11 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
       if (!entry.isDirectory() && !ideaMarkdown && !captureMarkdown) continue;
       const stat = await fs.lstat(file, { bigint: true });
       if (entry.isDirectory()) await visit(file, stat, publishedIds, scanIdea, scanCapture);
-      else if (entry.isFile()) await markdown(file, stat, publishedIds, ideaMarkdown, captureMarkdown);
+      else if (entry.isFile() && stat.isFile() && !stat.isSymbolicLink()) {
+        const readCapture = captureMarkdown && captureIds.size > 0;
+        if (ideaMarkdown || readCapture) await markdown(file, stat, publishedIds, ideaMarkdown, readCapture);
+        else observe(file, stat);
+      }
       else throw changed(file);
     }
   }
@@ -261,7 +265,7 @@ async function scanIdeas(vault, { captureIds = new Set() } = {}) {
       if (!publishedIds.has(identity)) publishedIds.set(identity, []);
       publishedIds.get(identity).push(id);
     }
-    await visit(root, anchor, publishedIds, true, captureIds.size > 0);
+    await visit(root, anchor, publishedIds, true, captureIds.size > 0 || watchCaptureNamespace);
     check();
   }
   catch (error) {

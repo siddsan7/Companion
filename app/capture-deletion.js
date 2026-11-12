@@ -444,6 +444,7 @@ async function inspectDeletion(intake, ledger, id) {
 
 function deletionNamespace(intake, authority, id, guard, ledgerStage) {
   const { vault } = intake, found = [];
+  const known = new Map(authority.targets.map(target => [target.file, target.kind]));
   const target = authority.targets.find(item => item.kind === 'capture');
   const captureFile = path.join(vault.vault, target.file);
   const captureDirectory = comparable(path.dirname(captureFile));
@@ -455,7 +456,8 @@ function deletionNamespace(intake, authority, id, guard, ledgerStage) {
     const info = native.lstatSync(file, { bigint: true });
     if (!info.isFile() || info.isSymbolicLink()) throw changed();
     const { bytes, proof } = readExactSync(file, leafGuard, Number(info.nlink));
-    if (matches(bytes.toString('utf8'))) found.push([relative(vault, file), proof, String(info.nlink)]);
+    const name = relative(vault, file);
+    if (known.has(name) || matches(bytes.toString('utf8'))) found.push([name, proof, String(info.nlink)]);
   };
   const inspect = (directory, visitEntry) => {
     guard();
@@ -466,9 +468,11 @@ function deletionNamespace(intake, authority, id, guard, ledgerStage) {
   };
   const visit = directory => inspect(directory, (entry, leafGuard) => {
     const file = path.join(directory, entry.name), name = entry.name.toLowerCase();
-    if (comparable(directory) === captureDirectory && name.startsWith(titlePrefix)) throw changed();
+    const kind = known.get(relative(vault, file));
+    if (comparable(directory) === captureDirectory && name.startsWith(titlePrefix) && kind !== 'source-title-backup') throw changed();
     if (['.intake', '.git', '.obsidian', '.codex', 'managed-home', storeName].includes(name)) return;
-    if (entry.isDirectory() && !entry.isSymbolicLink()) visit(file);
+    if (kind) read(file, leafGuard, () => true);
+    else if (entry.isDirectory() && !entry.isSymbolicLink()) visit(file);
     else if (entry.isFile() && entry.name.endsWith('.md')) read(file, leafGuard, text => parse(text)?.id === id);
     else if (entry.isFile() && /(?:\.md\.pending|\.md\.title-transaction\.json|\.md\.before-title-[a-f0-9-]+\.bak)$/.test(entry.name)) read(file, leafGuard, text => text.includes(id));
   });
@@ -495,6 +499,7 @@ async function finishDeletion(intake, ledger, id) {
   for (const target of remaining) {
     const file = path.join(vault.vault, target.file);
     if (authority.mixedRecovery) await vault.checkpoint('mixed-deletion-before-source-unlink', { file });
+    const namespace = deletionNamespace(intake, authority, id, guard);
     let peers = [target.file];
     await inspectDeletion(intake, ledger, id);
     await intake.storage.guard();
@@ -507,6 +512,7 @@ async function finishDeletion(intake, ledger, id) {
     if (authority.mixedRecovery) await mixedDeletion.inspect(intake, ledger, id, true);
     intake.storage.guardSync();
     if (authority.mixedRecovery) mixedDeletion.verifyRetainedWritingSync(intake, authority, guard);
+    if (namespace !== deletionNamespace(intake, authority, id, guard)) throw changed();
     verifyRemovalTarget(vault, target, peers, guard, changed);
     native.unlinkSync(file); await vault.checkpoint('capture-deletion-unlinked');
   }

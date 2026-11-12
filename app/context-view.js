@@ -78,6 +78,7 @@
     finally { recovery.disabled = false; }
   };
   const historyRevision = record => JSON.stringify({ requests: record.requests, storageWarning: record.storageWarning });
+  let pendingSend;
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
   function choices() {
     const select = byId('conversation-select');
@@ -92,7 +93,7 @@
   function resetView() {
     clearRemoval();
     recoveryList.replaceChildren();
-    retireFind(); viewEpoch++; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
+    retireFind(); viewEpoch++; pendingSend = null; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
     excludedHistory.clear(); restoredHistory.clear(); restoredSources.clear(); excluded.clear(); selections = []; all = [];
     historySelections.clear(); byId('history-search-results').replaceChildren(); byId('history-selected').replaceChildren(); byId('history-search-status').textContent = '';
     byId('conversation-history').replaceChildren(); byId('conversation-error').textContent = '';
@@ -179,7 +180,9 @@
       const state = await window.companion['conversation-list'](); if (request !== conversationGeneration || epoch !== viewEpoch) return;
       byId('conversation-location').textContent = `Local conversation history: ${state.location}. No vault notes are created automatically.`;
       retained.clear(); for (const record of state.conversations) retained.set(record.id, record); choices();
-      const record = state.conversations.find(item => item.id === conversationId) || (!draftMode && state.conversations.at(-1));
+      const record = pendingSend
+        ? retained.get(pendingSend.targetId)
+        : retained.get(conversationId) || (!draftMode && state.conversations.at(-1));
       if (record && historyRevision(record) !== displayedHistory) showConversation(record);
     }
     catch (error) { if (request === conversationGeneration && epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
@@ -369,16 +372,21 @@
       if (version !== conversationGeneration) return;
       // A completed restore is one reviewed action, not permission to undo future exclusions.
       restoredSources.clear(); restoredHistory.clear();
-      conversationToken = preview.packageId; byId('conversation-package').value = preview.text;
+      conversationToken = preview.packageId && { packageId: preview.packageId, targetId: preview.targetId };
+      byId('conversation-package').value = preview.text;
       historyExclusions = preview.historyExclusions; warnHistory();
       byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${conversationId ? 'Reviewed exclusion scope saved locally. ' : ''}${preview.boundEvidence} ${preview.warnings.join(' ')}`;
       byId('conversation-send').disabled = preview.blocked;
     } catch (error) { if (version === conversationGeneration) byId('conversation-error').textContent = error.message; }
   };
   byId('conversation-send').onclick = async () => {
-    const packageId = conversationToken, epoch = viewEpoch; invalidateConversation();
-    try { const record = await window.companion['conversation-send']({ packageId }); if (epoch === viewEpoch) showConversation(record); }
-    catch (error) { if (epoch === viewEpoch) byId('conversation-error').textContent = error.message; }
+    if (!conversationToken) return;
+    const owner = pendingSend = conversationToken, epoch = viewEpoch;
+    const current = () => pendingSend === owner && epoch === viewEpoch;
+    invalidateConversation();
+    try { const record = await window.companion['conversation-send']({ packageId: owner.packageId }); if (current()) showConversation(record); }
+    catch (error) { if (current()) byId('conversation-error').textContent = error.message; }
+    finally { if (current()) pendingSend = null; }
   };
   window.addEventListener('companion-vault-configuring', () => {
     switchingVault = true;

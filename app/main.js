@@ -202,7 +202,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('resolve-conflict', async (_, input) => new Intake(vault).resolveConflict(input, clock().now));
   ipcMain.handle('inspect-source', async (_, id) => {
     const selected = vault;
-    const info = await new Intake(selected).inspect(id, { verifyCurrentNote: true });
+    const info = await orderVaultWork(selected, () => new Intake(selected).inspect(id, { verifyCurrentNote: true }));
     let linkedIdeas = [], linkedIdeasWarning;
     try { linkedIdeas = await ideas.linkedToCapture(selected, id); }
     catch { linkedIdeasWarning = 'Linked saved ideas are unavailable. Their writing was preserved.'; }

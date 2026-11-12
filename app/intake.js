@@ -9,7 +9,7 @@ const { sourceMutation } = require('./source-mutation');
 const { withTitle, captureHeading, parseAnnotation } = require('./vault');
 const { validateAuthority, assertPublication, revisionAdmission, activeAdmission, uuid } = require('./source-authority');
 const { IntakeLedger } = require('./intake-ledger');
-const { validateAnnotationRemovals } = require('./annotation-authority');
+const { validateAnnotationLinks, validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
 const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
@@ -76,11 +76,12 @@ class Intake {
     const text = await this.storage.read(); if (text === null) return empty();
     let ledger; try { ledger = JSON.parse(text); } catch { throw Error('Intake ledger is unreadable. Preserve .intake and restore a vault backup before checking sources.'); }
     if (ledger.schema !== 1 || !Array.isArray(ledger.sources) || !ledger.captures || !ledger.attempts || !ledger.blocks || !ledger.pending || !ledger.outcomes || !Array.isArray(ledger.suppressed)) throw Error('Unsupported intake ledger. Preserve it for repair.');
-    validateAuthority(ledger); validateAnnotationRemovals(ledger); return ledger;
+    validateAuthority(ledger); validateAnnotationRemovals(ledger); validateAnnotationLinks(ledger); return ledger;
   }
   async save(ledger, verifyRelated) {
     validateAuthority(ledger);
     validateAnnotationRemovals(ledger);
+    validateAnnotationLinks(ledger);
     await this.storage.replace(JSON.stringify(ledger, null, 2), verifyRelated);
   }
   async publishJournal(file, value) {
@@ -742,9 +743,9 @@ class Intake {
             await this.vault.checkpoint('intake-before-move');
             await checkPublication();
             this.storage.guardSync();
-            exact(destination, captureOutput, tx.previous, 'Capture destination', pairedBackup ? [backup] : []);
             const occupied = () => conflict('Previous capture backup appeared during publication. Both files were preserved.');
             if (transfer?.previous) {
+              exact(destination, captureOutput, tx.previous, 'Capture destination', pairedBackup ? [backup] : []);
               const previous = transfer.previous;
               if (!pairedBackup) {
                 verifyStageSync(destination, guard, previous);
@@ -759,7 +760,8 @@ class Intake {
               verifyAbsentSync(destination, guard);
             } else {
               verifyAbsentSync(backup, guard, occupied);
-              await fs.rename(destination, backup);
+              exact(destination, captureOutput, tx.previous, 'Capture destination');
+              local.renameSync(destination, backup);
               publication.rollback = { proof: fileProof(captureOutput, tx.previous), directories };
             }
           }
@@ -1343,21 +1345,30 @@ class Intake {
     try { await this.finishRepair(expectedJournal?.verifyRepair || expectedJournal?.freshRepair || expectedJournal?.ordinaryRepair ? expectedJournal : undefined); }
     catch (error) { if (!error.intakeRepairHeld) throw error; }
     await this.finishTitleIntent();
-    const text = await read(journal);
-    if (text === null) {
+    const guard = this.vault.publicationFolders(this.dir).guard;
+    guard();
+    const info = local.lstatSync(journal, { bigint: true, throwIfNoEntry: false });
+    if (!info) {
       if (expectedJournal) this.verifyIndependentRecoveryDisposition(await this.load(), expectedJournal);
       return;
     }
     if (expectedJournal?.verifyRepair || expectedJournal?.freshRepair || expectedJournal?.ordinaryRepair) throw Error('The exact repair journal remains active. Recovery files were preserved.');
+    const changed = () => Error('The intake recovery journal changed. Recovery files were preserved.');
+    const links = Number(info.nlink);
+    if (![1, 2, 3].includes(links)) throw changed();
+    const { bytes, proof } = readExactSync(journal, guard, links);
+    if (String(info.dev) !== proof.dev || String(info.ino) !== proof.ino) throw changed();
+    const text = bytes.toString('utf8');
     let tx; try { tx = JSON.parse(text); } catch { throw Error('Unreadable intake recovery journal. Preserve .intake for repair before retrying.'); }
     this.validateTransaction(tx);
     const ledger = await this.load();
-    if (expectedJournal) {
-      expectedJournal.verify();
-      if (hash(text) !== expectedJournal.digest) throw Error('The independent intake journal bytes changed. Recovery files were preserved.');
-    }
+    try { verifyStageSync(journal, guard, proof, links); }
+    catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
+    expectedJournal ||= this.ordinaryRecoveryJournal(ledger, tx);
+    if (!expectedJournal || !sameProofIdentity(expectedJournal, proof) || expectedJournal.digest !== proof.digest) throw changed();
+    expectedJournal.verify();
     assertPublication(ledger, tx.capture.id, tx);
-    if (this.hasHeldJournal(ledger, tx)) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason);
+    if (this.hasHeldJournal(ledger, tx)) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason, { expectedJournal });
     if (tx.externalConflict && !ledger.blocks[tx.sourceHash]) return this.archiveConflict(tx, ledger, 'Destination changed outside Companion. Both versions were preserved.', { expectedJournal });
     if (ledger.blocks[tx.sourceHash] && !tx.restore) return this.archiveConflict(tx, ledger, ledger.blocks[tx.sourceHash].reason, { expectedJournal });
     if (ledger.pending[tx.sourceHash]) return this.defer(tx, ledger, ledger.pending[tx.sourceHash].reason, expectedJournal);

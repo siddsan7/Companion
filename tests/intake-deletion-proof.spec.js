@@ -858,6 +858,76 @@ test('intake preserves a newly occupied backup path and its current capture', as
   expect(Object.keys(updated.attempts)).toEqual(Object.keys(first.attempts));
 });
 
+test('intake preserves an equal-byte replacement at the final backup check', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), retained = testInfo.outputPath('original-capture.md');
+  let selected, backup, replacement;
+  const stat = local.lstatSync;
+  const { intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (boundary !== 'intake-before-move') return;
+    const tx = await readJson(path.join(intake.dir, 'transaction.json'));
+    backup = path.join(intake.dir, tx.backup);
+    selected = intake.destination(tx.capture);
+    local.lstatSync = function (file, ...args) {
+      if (file === backup && /\bverifyAbsentSync\b/.test(new Error().stack)) {
+        local.lstatSync = stat;
+        const bytes = local.readFileSync(selected);
+        local.renameSync(selected, retained);
+        local.writeFileSync(selected, bytes, { flag: 'wx' });
+        replacement = stat(selected, { bigint: true });
+      }
+      return stat.call(this, file, ...args);
+    };
+  });
+  await writeDraft(producer);
+  const baseline = await intake.connect(producer, true, now);
+  const originalFile = intake.destination(Object.values(baseline.captures)[0]), original = await fs.readFile(originalFile);
+  await writeDraft(producer, 'second', '2');
+  try { await intake.reconcile({ now: later }); }
+  finally { local.lstatSync = stat; }
+  expect(replacement).toBeDefined();
+  expect(await fs.readFile(retained)).toEqual(original);
+  expect(await fs.readFile(selected)).toEqual(original);
+  expect((await fs.lstat(selected, { bigint: true })).ino).toBe(replacement.ino);
+  expect(await readOptional(backup)).toBeNull();
+  expect((await readJson(ledgerFile)).attempts).toEqual(baseline.attempts);
+});
+
+test('ordinary startup recovery preserves an equal-byte transaction replacement after observing its journal', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer'), retained = testInfo.outputPath('original-transaction.json');
+  let interrupt = false;
+  const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (interrupt && boundary === 'intake-journaled') throw Error('Simulated interruption after publishing the transaction.');
+  });
+  await writeDraft(producer);
+  const baseline = await intake.connect(producer, true, now);
+  const captureFile = intake.destination(Object.values(baseline.captures)[0]), captureBytes = await fs.readFile(captureFile);
+  await writeDraft(producer, 'second', '2');
+  interrupt = true;
+  expect((await intake.reconcile({ now: later })).lastCheck.status).toBe('held');
+  const journal = path.join(intake.dir, 'transaction.json'), journalBytes = await fs.readFile(journal);
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const load = restarted.load.bind(restarted);
+  let replacement;
+  restarted.load = async function () {
+    if (!replacement && /\bat Intake\.recoverOrdinaryIntake\b/.test(new Error().stack.split('\n')[2])) {
+      await fs.rename(journal, retained);
+      await fs.writeFile(journal, journalBytes, { flag: 'wx' });
+      replacement = await fs.lstat(journal, { bigint: true });
+    }
+    return load();
+  };
+  let failure;
+  try { await restarted.reconcile({ now: later }); }
+  catch (error) { failure = error; }
+  expect(replacement).toBeDefined();
+  expect(failure?.message).toMatch(/journal.*changed/i);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect((await fs.lstat(journal, { bigint: true })).ino).toBe(replacement.ino);
+  expect(await fs.readFile(retained)).toEqual(journalBytes);
+  expect(await fs.readFile(captureFile)).toEqual(captureBytes);
+  expect((await readJson(ledgerFile)).attempts).toEqual(baseline.attempts);
+});
+
 test('an edited ledger stage cannot replace the only committed intake ledger', async ({}, testInfo) => {
   const { intake, ledgerFile } = await setup(testInfo);
   const producer = testInfo.outputPath('producer');

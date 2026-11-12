@@ -1163,6 +1163,30 @@ async function onlyConversation() {
   return JSON.parse(await fs.readFile(path.join(root, 'conversations', files.find(name => name.endsWith('.json'))), 'utf8'));
 }
 
+async function holdFinalProviderEvidence() {
+  const evidenceFile = path.join(root, 'conversation-evidence.json'), checkpoint = path.join(root, 'checkpoint.txt');
+  const held = path.join(root, 'provider-evidence-held.txt'), resume = path.join(root, 'resume-provider-evidence.txt');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-before-turn-start' }));
+  await app.evaluate((_electron, options) => {
+    const local = process.getBuiltinModule('fs'), io = local.promises;
+    const read = io.readFile; let afterCheckpoint = 0;
+    io.readFile = async function (file, ...rest) {
+      if (file === options.evidenceFile && local.existsSync(options.checkpoint) &&
+          local.readFileSync(options.checkpoint, 'utf8') === 'conversation-before-turn-start' && ++afterCheckpoint === 2) {
+        io.readFile = read;
+        await io.writeFile(options.held, 'final evidence read held');
+        while (!local.existsSync(options.resume)) await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      return read.call(this, file, ...rest);
+    };
+  }, { evidenceFile, checkpoint, held, resume });
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect.poll(() => fs.readFile(checkpoint, 'utf8').catch(() => '')).toBe('conversation-before-turn-start');
+  await fs.writeFile(path.join(root, 'release.txt'), 'finish final package rebuild');
+  await expect.poll(() => fs.readFile(held, 'utf8').catch(() => '')).toBe('final evidence read held');
+  return () => fs.writeFile(resume, 'read current provider evidence');
+}
+
 test('shared verified capacity bounds the complete Unicode package without trimming and keeps private proof local', async () => {
   test.setTimeout(60000);
   const evidence = capacityEvidence(); await writeCapacity(evidence);
@@ -1255,6 +1279,224 @@ for (const checkpoint of ['conversation-before-dispatch', 'conversation-before-t
     expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(checkpoint === 'conversation-before-turn-start' ? 1 : 0);
   });
 }
+
+test('annotation removal during the final provider evidence read prevents stale turn start', async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic reply that must not be requested.' }));
+  await prepareConversation();
+  const producer = path.join(root, 'producer');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(producer);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  await page.locator('#captures article').filter({ hasText: 'Authored synthetic review' }).getByRole('button', { name: 'Inspect source', exact: true }).click();
+  const writing = 'ANNOTATION_DISPATCH_BOUNDARY authored independent writing.';
+  await page.getByLabel('New annotation', { exact: true }).fill(writing);
+  await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Annotation saved.');
+  await page.getByLabel('Context question', { exact: true }).fill('What does ANNOTATION_DISPATCH_BOUNDARY say?');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: writing }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(writing));
+
+  await page.getByRole('button', { name: 'Review annotations', exact: true }).click();
+  await page.getByLabel('Annotation removal review', { exact: true }).getByRole('button', { name: 'Preview annotation removal', exact: true }).click();
+  const confirm = page.getByRole('button', { name: 'Confirm annotation removal', exact: true });
+  await expect(confirm).toBeVisible();
+  const releaseEvidence = await holdFinalProviderEvidence();
+  await confirm.click();
+  await expect(page.getByRole('status')).toContainText('Annotation removed.');
+  await releaseEvidence();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  await expect(page.locator('#conversation-history')).toContainText(/changed|preview/i);
+  const request = (await onlyConversation()).requests[0];
+  expect(request.package.text).toContain(writing);
+  expect(request.reply).toBe('');
+  await noSubmission();
+  const rpc = await conversationRpc();
+  expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(1);
+  expect(rpc.filter(call => call.method === 'turn/start')).toEqual([]);
+});
+
+test('saved idea removal during the final provider evidence read prevents a new turn', async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored first reply for the saved idea.' }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const title = 'IDEA_DISPATCH_BOUNDARY';
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Independent authored saved idea writing.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Unverified interpretation.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(title));
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  const idea = page.locator('#saved-ideas article').filter({ hasText: title });
+  await expect(idea).toBeVisible();
+  await page.getByLabel('Context question', { exact: true }).fill(`What does ${title} say?`);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: title }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Independent authored saved idea writing/);
+  await idea.getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+  const confirm = page.getByRole('button', { name: 'Confirm saved idea removal', exact: true });
+  await expect(confirm).toBeVisible();
+  const releaseEvidence = await holdFinalProviderEvidence();
+  await confirm.click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea removal complete.');
+  await releaseEvidence();
+  await expect(page.locator('#conversation-history article').last()).toContainText('failed');
+  const request = (await onlyConversation()).requests.at(-1);
+  expect(request.package.dependencies.some(source => source.key.startsWith('idea:'))).toBe(true);
+  expect(request.reply).toBe('');
+  const rpc = await conversationRpc();
+  expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(2);
+  expect(rpc.filter(call => call.method === 'turn/start')).toHaveLength(1);
+});
+
+test('an edit to an explicitly included note during the final provider evidence read prevents turn start', async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic reply that must not be requested.' }));
+  await prepareConversation();
+  const note = path.join(root, 'vault', 'External evidence.md'), before = 'EXPLICIT_DISPATCH_BOUNDARY reviewed project evidence.';
+  await fs.writeFile(note, before);
+  await fs.writeFile(path.join(root, 'context-selection.json'), JSON.stringify([note]));
+  await page.getByRole('button', { name: 'Include vault notes', exact: true }).click();
+  await expect(page.locator('#context-notes')).toContainText('External evidence.md');
+  await page.getByLabel('Context question', { exact: true }).fill('What does EXPLICIT_DISPATCH_BOUNDARY say?');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: before }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(before));
+  const releaseEvidence = await holdFinalProviderEvidence();
+  const changed = 'Independent edit to the included note while evidence is being checked.';
+  await fs.writeFile(note, changed);
+  await releaseEvidence();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  expect(await fs.readFile(note, 'utf8')).toBe(changed);
+  await noSubmission();
+  expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toEqual([]);
+});
+
+for (const change of ['edit', 'duplicate']) test(`a managed capture ${change} during the final provider evidence read prevents stale turn start`, async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic reply that must not be requested.' }));
+  await prepareConversation();
+  const captures = path.join(root, 'vault', 'Companion', 'Captures');
+  const [name] = (await fs.readdir(captures)).filter(file => file.endsWith('.md'));
+  const capture = path.join(captures, name), before = await fs.readFile(capture, 'utf8');
+  const releaseEvidence = await holdFinalProviderEvidence();
+  const changed = before + '\nAn independent edit while final provider evidence is held.\n';
+  const affected = change === 'edit' ? capture : path.join(captures, 'Late independent capture.md');
+  await fs.writeFile(affected, changed, change === 'duplicate' ? { flag: 'wx' } : undefined);
+  await releaseEvidence();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  expect(await fs.readFile(affected, 'utf8')).toBe(changed);
+  if (change === 'duplicate') expect(await fs.readFile(capture, 'utf8')).toBe(before);
+  await noSubmission();
+  expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toEqual([]);
+});
+
+test('an edit to the older revision supporting a selected saved idea prevents stale turn start', async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored reply for the original exact imported revision.' }));
+  await prepareConversation();
+  const producer = path.join(root, 'producer'), revisions = path.join(root, 'vault', 'Companion', 'Revisions');
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
+  await page.getByLabel('Finalized review folder', { exact: true }).fill(producer);
+  await page.getByRole('button', { name: 'Connect finalized reviews', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Intake check complete');
+  const [original] = (await fs.readdir(revisions)).filter(name => name.endsWith('.json'));
+  await page.getByLabel('Context question', { exact: true }).fill('What does the authored synthetic review say?');
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: 'Human review: accept' }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Authored synthetic review fixture only/);
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('completed');
+  const title = 'HISTORICAL_REVISION_DISPATCH_BOUNDARY';
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill(title);
+  await page.getByLabel('Idea explanation', { exact: true }).fill('Independent interpretation of the original evidence.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Unverified interpretation.');
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(new RegExp(path.basename(original, '.json')));
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#saved-ideas')).toContainText(title);
+
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(producer, 'edit'), { recursive: true });
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }), 'utf8');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('Last check: 2026-11-09T12:00:01Z · manual · complete');
+  await page.getByRole('button', { name: 'All captures', exact: true }).click();
+  await page.locator('#captures article').filter({ hasText: 'Authored synthetic review' }).getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  await page.getByRole('button', { name: 'New conversation', exact: true }).click();
+  await page.getByLabel('Context question', { exact: true }).fill(`What does ${title} say?`);
+  await page.getByRole('button', { name: 'Find context', exact: true }).click();
+  await page.locator('#context-results article').filter({ hasText: title }).getByRole('button', { name: 'Add to context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Independent interpretation of the original evidence/);
+
+  const releaseEvidence = await holdFinalProviderEvidence(), oldSnapshot = path.join(revisions, original);
+  const changed = (await fs.readFile(oldSnapshot, 'utf8')) + '\n';
+  await fs.writeFile(oldSnapshot, changed);
+  await releaseEvidence();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  expect(await fs.readFile(oldSnapshot, 'utf8')).toBe(changed);
+  const rpc = await conversationRpc();
+  expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(2);
+  expect(rpc.filter(call => call.method === 'turn/start')).toHaveLength(1);
+});
+
+test('a change to the pinned brief approval receipt during the final provider read prevents turn start', async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Authored synthetic reply that must not be requested.' }));
+  await prepareConversation();
+  const receipt = path.join(root, 'vault', 'Companion', 'Briefs', '.brief-approval-1.json');
+  const before = await fs.readFile(receipt, 'utf8'), changed = before + '\n';
+  const releaseEvidence = await holdFinalProviderEvidence();
+  await fs.writeFile(receipt, changed);
+  await releaseEvidence();
+  await expect(page.locator('#conversation-history')).toContainText('failed');
+  expect(await fs.readFile(receipt, 'utf8')).toBe(changed);
+  await noSubmission();
+  expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toEqual([]);
+});
+
+for (const lateEdit of [false, true]) test(lateEdit
+  ? 'a brief-only turn remains available when unrelated Markdown changes during the final provider read'
+  : 'a brief-only turn remains available when an unrelated saved idea cannot be inventoried', async () => {
+  const reply = 'Authored brief-only reply with unrelated idea metadata preserved.';
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply }));
+  await prepareConversation();
+  const unrelated = path.join(root, 'vault', 'Companion', 'Ideas', 'Unrelated damaged idea.md');
+  let writing = lateEdit ? 'Independent Markdown outside the reviewed package.\n'
+    : '---\nartifact_type: saved_idea\n---\nIndependent writing with incomplete idea metadata.\n';
+  await fs.writeFile(unrelated, writing, { flag: 'wx' });
+  await page.locator('#context-selected').getByRole('button', { name: 'Remove from context', exact: true }).click();
+  await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
+  await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Approved brief version 1/);
+  if (lateEdit) {
+    const releaseEvidence = await holdFinalProviderEvidence();
+    writing += 'Independent edit while provider evidence is being read.\n';
+    await fs.writeFile(unrelated, writing);
+    await releaseEvidence();
+  } else await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText(reply);
+  expect(await fs.readFile(unrelated, 'utf8')).toBe(writing);
+  const request = (await onlyConversation()).requests[0];
+  expect(request.package.dependencies.map(source => source.key)).toEqual(['brief:1']);
+  expect((await conversationRpc()).filter(call => call.method === 'turn/start')).toHaveLength(1);
+});
 
 test('returned model must match the reviewed capacity model before turn start', async () => {
   test.setTimeout(60000);
