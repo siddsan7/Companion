@@ -6,6 +6,7 @@ const { Transcripts } = require('./transcripts');
 const { generations } = require('./source-generations');
 const { conversation } = require('./archive-format');
 const { uuid } = require('./source-authority');
+const { isAnnotationIntent } = require('./annotation-authority');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const fail = () => { throw Error('Independent writing storage changed or has unknown aliases or linked copies. All writing was preserved. Restore ordinary folders and preview deletion again.'); };
@@ -164,7 +165,7 @@ async function inventory(vault, conversations, captureId) {
     }
   }
   const intake = path.join(vault.root, '.intake');
-  for (const entry of await io.list(intake, entry => /^(?:annotation-intent\.json|annotation-[a-f0-9-]{36}\.stage|(?:link|repair)-(?:intent|[a-f0-9-]{36})\.json|link-[a-f0-9-]{36}\.(?:before\.md|stage|held-.*\.md))$/.test(entry.name))) {
+  for (const entry of await io.list(intake, entry => isAnnotationIntent(entry.name) || /^(?:annotation-[a-f0-9-]{36}\.stage|(?:link|repair)-(?:intent|[a-f0-9-]{36})\.json|link-[a-f0-9-]{36}\.(?:before\.md|stage|held-.*\.md))$/.test(entry.name))) {
     const value = await io.read(path.join(intake, entry.name)); let retained;
     if (entry.name.endsWith('.json')) { try { retained = JSON.parse(value.text); } catch {} }
     let recognized = false;

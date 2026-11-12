@@ -11,7 +11,7 @@ const { validateAuthority, assertPublication, revisionAdmission, activeAdmission
 const { IntakeLedger } = require('./intake-ledger');
 const { validateAnnotationRemovals } = require('./annotation-authority');
 const { pendingParents, isManualHold, requiredDirectories } = require('./source-recovery');
-const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, validProof, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
 const { matchesProducerOutcome, producerCandidate, producerOutcomeKey, producerRootGuard, sameIdentity, samePath, selectProducerRoot, unavailable } = require('./producer-root');
 const empty = () => ({ schema: 1, sources: [], captures: {}, attempts: {}, blocks: {}, pending: {}, outcomes: {}, suppressed: [] });
 const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
@@ -566,6 +566,7 @@ class Intake {
     try { return await this.publishTransaction(tx, ledger, journalProof, publication, transfer); }
     catch (error) {
       if (!publication.committed && publication.transferFailure === error) {
+        if (transfer?.previous) throw Object.assign(Error(error.message, { cause: error }), { intakeTransferFailed: true });
         try { publication.restoreTransfer?.(); }
         catch (cause) { this.vault.warnings.push(`Prior capture recovery files were preserved: ${cause.message}`); }
         throw error;
@@ -579,6 +580,41 @@ class Intake {
       await this.archiveConflict(tx, ledger, reason, { journalProof, guard, committed: false });
       throw Object.assign(Error(reason, { cause: error }), { intakeOutputHeld: true });
     }
+  }
+  restoreOrdinaryTransfer(tx, previous, output, verifyAuthority) {
+    if (!previous) return;
+    const destination = this.destination(tx.capture), backup = path.join(this.dir, tx.backup);
+    const stage = path.join(this.dir, `${tx.revision.id}.stage`);
+    const parents = [...requiredDirectories(this, [{ file: path.relative(this.vault.vault, destination) }])]
+      .map(directory => path.join(this.vault.vault, directory));
+    const { guard } = ordinaryDirectories(parents, 'A transfer recovery folder changed. All files were preserved.');
+    verifyAuthority();
+    guard();
+    const current = local.lstatSync(destination, { bigint: true, throwIfNoEntry: false });
+    if (current && String(current.dev) === previous.dev && String(current.ino) === previous.ino) {
+      const paired = current.nlink === 2n;
+      verifyStageSync(destination, guard, previous, paired ? 2 : 1);
+      if (paired) {
+        verifyStageSync(backup, guard, previous, 2);
+        local.unlinkSync(backup);
+        verifyStageSync(destination, guard, previous);
+      }
+      return;
+    }
+    verifyStageSync(backup, guard, previous);
+    if (current) {
+      if (!output) throw Error('The incoming capture has no exact output proof. All files were preserved.');
+      verifyStageSync(stage, guard, output, 2);
+      verifyStageSync(destination, guard, output, 2);
+      local.unlinkSync(destination);
+      verifyStageSync(stage, guard, output);
+    }
+    verifyAbsentSync(destination, guard);
+    local.linkSync(backup, destination);
+    verifyStageSync(backup, guard, previous, 2);
+    verifyStageSync(destination, guard, previous, 2);
+    local.unlinkSync(backup);
+    verifyStageSync(destination, guard, previous);
   }
   async publishTransaction(tx, ledger, journalProof, publication, transfer) {
     this.validateTransaction(tx);
@@ -669,60 +705,42 @@ class Intake {
     const backupInfo = await this.ownedFile(backup, destination, 'Previous capture backup');
     let captureOutput = currentProof, captureStageProof;
     let current = await read(destination), old = await read(backup);
-    if (transfer) publication.restoreTransfer = () => {
-      const prior = transfer.previous || publication.rollback?.proof;
-      if (!prior) return;
-      this.storage.guardSync();
-      verifyRestorationControls?.();
-      exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
-      const present = local.lstatSync(destination, { bigint: true, throwIfNoEntry: false });
-      if (present && String(present.dev) === prior.dev && String(present.ino) === prior.ino) {
-        verifyStageSync(destination, guard, prior, Number(present.nlink));
-        return;
-      }
-      verifyStageSync(backup, guard, prior);
-      if (present) {
-        if (!captureOutput) throw Error('The incoming capture identity changed. Recovery files were preserved.');
-        const incoming = fileProof(captureOutput, tx.content);
-        verifyStageSync(stage, guard, incoming, 2);
-        verifyStageSync(destination, guard, incoming, 2);
-        local.unlinkSync(destination);
-        verifyStageSync(stage, guard, incoming);
-      }
-      verifyAbsentSync(destination, guard);
-      local.linkSync(backup, destination);
-      verifyStageSync(backup, guard, prior, 2);
-      verifyStageSync(destination, guard, prior, 2);
-      local.unlinkSync(backup);
-      verifyStageSync(destination, guard, prior);
-    };
-    if (transfer?.previous && old !== null) {
-      if (backupInfo?.nlink === 2n && current === tx.previous) {
+    if (transfer) publication.restoreTransfer = () => this.restoreOrdinaryTransfer(tx,
+      transfer.previous || publication.rollback?.proof, transfer.output?.(), () => {
         this.storage.guardSync();
-        verifyTransfer();
-        verifyStageSync(backup, guard, transfer.previous, 2);
-        verifyStageSync(destination, guard, transfer.previous, 2);
-        local.unlinkSync(backup);
-        verifyStageSync(destination, guard, transfer.previous);
-        captureOutput = publicationIdentity(currentProof, 1n);
-        old = null;
-      } else verifyStageSync(backup, guard, transfer.previous);
-    }
+        verifyRestorationControls?.();
+        exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
+      });
+    const pairedBackup = transfer?.previous && backupInfo?.nlink === 2n && current === tx.previous;
+    if (transfer?.previous && old !== null && !pairedBackup) verifyStageSync(backup, guard, transfer.previous);
     if (current !== tx.content) {
       if (tx.previousHash !== null) {
-        if (old === null) {
+        if (old === null || pairedBackup) {
           if (current === null || hash(current) !== tx.previousHash) throw conflict('Destination changed outside Companion. Both source revision and local writing were preserved.');
           try {
             await this.vault.checkpoint('intake-before-move');
             await checkPublication();
             this.storage.guardSync();
-            exact(destination, captureOutput, tx.previous, 'Capture destination');
-            if (transfer?.previous) verifyStageSync(destination, guard, transfer.previous);
-            guard();
-            const occupied = local.lstatSync(backup, { throwIfNoEntry: false });
-            if (occupied) throw conflict('Previous capture backup appeared during publication. Both files were preserved.');
-            await fs.rename(destination, backup);
-            publication.rollback = { proof: fileProof(captureOutput, tx.previous), directories };
+            exact(destination, captureOutput, tx.previous, 'Capture destination', pairedBackup ? [backup] : []);
+            const occupied = () => conflict('Previous capture backup appeared during publication. Both files were preserved.');
+            if (transfer?.previous) {
+              const previous = transfer.previous;
+              if (!pairedBackup) {
+                verifyStageSync(destination, guard, previous);
+                verifyAbsentSync(backup, guard, occupied);
+                try { local.linkSync(destination, backup); }
+                catch (error) { if (error.code === 'EEXIST') throw occupied(); throw error; }
+              }
+              verifyStageSync(backup, guard, previous, 2);
+              verifyStageSync(destination, guard, previous, 2);
+              local.unlinkSync(destination);
+              verifyStageSync(backup, guard, previous);
+              verifyAbsentSync(destination, guard);
+            } else {
+              verifyAbsentSync(backup, guard, occupied);
+              await fs.rename(destination, backup);
+              publication.rollback = { proof: fileProof(captureOutput, tx.previous), directories };
+            }
           }
           catch (error) { if (['EACCES', 'EPERM', 'EBUSY'].includes(error.code)) throw deferred('Capture destination is locked or inaccessible. Existing content and incoming revision were preserved. Fix file access, then Check now to retry.'); throw error; }
           await this.vault.checkpoint('intake-moved'); old = await read(backup); current = await read(destination);
@@ -730,12 +748,26 @@ class Intake {
         if (old === null || hash(old) !== tx.previousHash) throw conflict('External edit conflict. Previous and current files were preserved.');
       }
       if (current !== null) throw conflict('Destination changed outside Companion. The new destination was preserved.');
-      captureStageProof = await staged(stage, tx.content, destination);
+      if (transfer?.recordOutput) {
+        try {
+          let recorded = transfer.output();
+          if (!recorded) {
+            recorded = await writeStage(stage, tx.content, guard);
+            await transfer.recordOutput(recorded, () => verifyStageSync(stage, guard, recorded));
+          }
+          verifyStageSync(stage, guard, recorded);
+          captureStageProof = await this.ownedFile(stage, destination, 'Ordinary transfer capture stage');
+        } catch (error) {
+          publication.transferFailure = error;
+          throw error;
+        }
+      } else captureStageProof = await staged(stage, tx.content, destination);
       await this.vault.checkpoint('intake-capture-staged');
       await checkPublication();
       if (!await this.ownedFile(stage, destination, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
       this.storage.guardSync();
       exact(stage, captureStageProof, tx.content, 'Imported capture stage', [destination]);
+      if (transfer?.recordOutput) verifyStageSync(stage, guard, transfer.output());
       try {
         local.linkSync(stage, destination);
         captureOutput = publicationIdentity(captureStageProof, 2n);
@@ -749,6 +781,12 @@ class Intake {
       { file: snapshot, info: snapshotOutput, content: snapshotBytes, label: 'Immutable revision snapshot', peers: [snapshotStage] },
       { file: destination, info: captureOutput, content: tx.content, label: 'Imported capture', peers: [stage, backup] }
     ];
+    if (transfer?.recordOutput) {
+      const output = transfer.output();
+      if (!output) throw Error('The ordinary transfer has no recorded capture output. Recovery files were preserved.');
+      verifyStageSync(stage, guard, output, 2);
+      verifyStageSync(destination, guard, output, 2);
+    }
     if (!tx.retainOnly && tx.previousHash !== null) {
       outputs.push({ file: backup, info: await this.ownedFile(backup, destination, 'Previous capture backup'), content: tx.previous, label: 'Previous capture backup', peers: [destination] });
     }
@@ -1122,6 +1160,7 @@ class Intake {
     const verify = () => {
       repair?.verifyRepair?.();
       repair?.freshRepair?.verify();
+      repair?.ordinaryRepair?.();
       for (const file of names) {
         if (present.has(file)) verifyStageSync(file, guard, proof, present.size);
         else verifyAbsentSync(file, guard, changed);
@@ -1167,16 +1206,27 @@ class Intake {
       throw Error('The original repair conflict changed. Recovery files were preserved.');
     }
     assertPublication(ledger, tx.capture.id, tx);
+    if (!tx.keptCurrent) {
+      const previous = path.join(this.dir, held.journal), record = readExactSync(previous, guard, 1, binding.journalProof);
+      const old = JSON.parse(record.bytes);
+      this.validateTransaction(old);
+      if (!record.bytes.equals(Buffer.from(JSON.stringify(old))) || old.sourceHash !== tx.sourceHash ||
+          old.capture.id !== tx.capture.id || old.key !== tx.key || !isDeepStrictEqual(old.revision, tx.revision) ||
+          capture.conflict !== held.reason || heldName(old) !== held.journal) throw Error('The original repair conflict changed. Recovery files were preserved.');
+      return () => verifyStageSync(previous, guard, binding.journalProof);
+    }
     const previous = this.repairConflictWitness(ledger, tx, held, guard, binding.journalProof);
     if (!previous) throw Error('The original repair conflict has no exact journal proof. Recovery files were preserved.');
     return previous.verify;
   }
   distinctRepairRecovery(ledger, tx, journal, guard) {
-    if (!tx.resolution || !tx.keptCurrent) return null;
+    if (!tx.resolution) return null;
     const intentFile = path.join(this.dir, 'repair-intent.json');
     const archivedIntent = path.join(this.dir, `repair-${tx.resolution}.json`);
     guard();
-    const intentLinks = local.lstatSync(intentFile, { bigint: true }).nlink === 1n ? 1 : 2;
+    const intentInfo = local.lstatSync(intentFile, { bigint: true, throwIfNoEntry: false });
+    if (!intentInfo) return null;
+    const intentLinks = intentInfo.nlink === 1n ? 1 : 2;
     const intentRecord = readExactSync(intentFile, guard, intentLinks), intent = JSON.parse(intentRecord.bytes);
     this.validateRepairIntent(intent);
     if (intent.intentIdentity && !sameProofIdentity(intent.intentIdentity, intentRecord.proof)) {
@@ -1199,6 +1249,11 @@ class Intake {
     if (intentLinks === 2) {
       verifyIntent(2);
       return { sourceStage, verifyRepair: () => verifyIntent(2) };
+    }
+    if (!tx.keptCurrent) {
+      if (!intent.localProof || !intent.annotationProof || !intent.intentIdentity) throw Error('The ordinary repair has no exact handoff proof. Recovery files were preserved.');
+      verifyIntent(1);
+      return { sourceStage, ordinaryRepair: () => verifyIntent(1) };
     }
 
     // A fresh repair publishes its annotation before creating the source journal.
@@ -1262,7 +1317,7 @@ class Intake {
     await this.holdLegacyAccepted();
     await this.finishLink();
     await this.finishAnnotation();
-    try { await this.finishRepair(expectedJournal?.verifyRepair || expectedJournal?.freshRepair ? expectedJournal : undefined); }
+    try { await this.finishRepair(expectedJournal?.verifyRepair || expectedJournal?.freshRepair || expectedJournal?.ordinaryRepair ? expectedJournal : undefined); }
     catch (error) { if (!error.intakeRepairHeld) throw error; }
     await this.finishTitleIntent();
     const text = await read(journal);
@@ -1270,7 +1325,7 @@ class Intake {
       if (expectedJournal) this.verifyIndependentRecoveryDisposition(await this.load(), expectedJournal);
       return;
     }
-    if (expectedJournal?.verifyRepair || expectedJournal?.freshRepair) throw Error('The exact repair journal remains active. Recovery files were preserved.');
+    if (expectedJournal?.verifyRepair || expectedJournal?.freshRepair || expectedJournal?.ordinaryRepair) throw Error('The exact repair journal remains active. Recovery files were preserved.');
     let tx; try { tx = JSON.parse(text); } catch { throw Error('Unreadable intake recovery journal. Preserve .intake for repair before retrying.'); }
     this.validateTransaction(tx);
     const ledger = await this.load();

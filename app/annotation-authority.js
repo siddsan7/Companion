@@ -4,6 +4,9 @@ const fields = (value, names) => value && typeof value === 'object' && !Array.is
 const safe = value => typeof value === 'string' && !/[\\:]/.test(value) && value.split('/').every(part => part && part !== '.' && part !== '..');
 const number = value => typeof value === 'string' && /^[0-9]+$/.test(value);
 const kinds = ['annotation-note', 'annotation-intent', 'annotation-stage', 'relationship-journal', 'relationship-before', 'relationship-stage', 'relationship-held'];
+const activeAnnotationIntent = 'annotation-intent.json';
+const heldAnnotationIntent = id => `annotation-${id}.held.json`;
+const isAnnotationIntent = name => name === activeAnnotationIntent || /^annotation-[a-f0-9-]{36}\.held\.json$/.test(name);
 function validateAnnotationRemovals(ledger) {
   if (ledger.annotationRemovals !== undefined && !fields(ledger.annotationRemovals, Object.keys(ledger.annotationRemovals || {}))) throw Error('Annotation removal authority needs repair.');
   for (const [id, value] of Object.entries(ledger.annotationRemovals || {})) {
@@ -27,7 +30,7 @@ function validateAnnotationRemovals(ledger) {
     for (const target of targets.values()) {
       const name = target.file.slice(store.length), relationship = name.match(/^link-([a-f0-9-]{36})\.(json|before\.md|stage|held-(?:before|stage)-[a-f0-9]{64}\.md)$/);
       const namespace = target.kind === 'annotation-note' ? !target.file.startsWith(store) && target.file.endsWith('.md')
-        : target.file.startsWith(store) && (target.kind === 'annotation-intent' ? name === 'annotation-intent.json'
+        : target.file.startsWith(store) && (target.kind === 'annotation-intent' ? name === activeAnnotationIntent || name === heldAnnotationIntent(id)
           : target.kind === 'annotation-stage' ? name === `annotation-${id}.stage`
             : target.kind === 'relationship-journal' ? name === 'link-intent.json' || !!relationship && uuid(relationship[1]) && relationship[2] === 'json'
               : !!relationship && uuid(relationship[1]) && (target.kind === 'relationship-before' ? relationship[2] === 'before.md' : target.kind === 'relationship-stage' ? relationship[2] === 'stage' : relationship[2].startsWith('held-')));
@@ -43,4 +46,4 @@ function annotationRemoved(ledger, id) { validateAnnotationRemovals(ledger); ret
 function assertAnnotationPublication(ledger, id) {
   if (!uuid(id) || annotationRemoved(ledger, id)) throw Object.assign(Error('This annotation identity was removed. Old writing cannot be published again; author new writing with a new identity.'), { code: 'ANNOTATION_REMOVED' });
 }
-module.exports = { validateAnnotationRemovals, assertAnnotationPublication, annotationRemoved };
+module.exports = { validateAnnotationRemovals, assertAnnotationPublication, annotationRemoved, activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent };

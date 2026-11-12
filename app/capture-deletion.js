@@ -388,12 +388,18 @@ async function inspectDeletion(intake, ledger, id) {
   await pendingTitle.inspect(intake, ledger, authority);
   await inspectManualPeers(vault, { captureId: id }, new Set([...(authority.titleProofs || []).map(proof => proof.before), ...pendingTitle.sidecars(authority.titleRecovery)]));
   const knownPaths = new Set(authority.targets.map(target => target.file));
+  const independent = !authority.manual && await sourceInventory.independentAnnotationHolds(intake, id, authority.sourceHash);
   for (const note of (await vault.scan()).filter(note => note.id === id)) if (!knownPaths.has(relative(vault, note.file))) throw changed();
   for (const folder of [intake.dir, path.join(vault.root, 'Revisions')]) for (const name of await fs.readdir(folder)) {
     if (folder === intake.dir && name === 'ledger.json') continue;
-    const file = path.join(folder, name), info = await fs.lstat(file);
+    const file = path.join(folder, name), info = await fs.lstat(file, { bigint: true });
     if (!info.isFile() || info.isSymbolicLink()) throw changed();
-    const text = await fs.readFile(file, 'utf8');
+    const bytes = await fs.readFile(file), text = bytes.toString('utf8');
+    const held = folder === intake.dir && independent && independent.get(name);
+    if (held) {
+      if (String(info.dev) !== held.target.dev || String(info.ino) !== held.target.ino || Number(info.nlink) !== held.nlink || hash(bytes) !== held.target.sha256) throw changed();
+      continue;
+    }
     if ((text.includes(id) || authority.sourceHash && text.includes(authority.sourceHash)) && !knownPaths.has(relative(vault, file))) throw changed();
   }
   // Validate the entire remaining manifest before the first unlink, and each file again at unlink.

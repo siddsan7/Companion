@@ -235,11 +235,17 @@ async function scan(intake, authority, allowedStages) {
   const descriptor = authority.mixedRecovery, id = path.posix.basename(descriptor.current, '.md');
   const detachedBackup = descriptor.format === 'restored-backup-editor-hold-v1' ? descriptor.sourceCopy.slice(0, -'.independent'.length) : null;
   const known = new Set(authority.targets.map(item => item.file));
+  const independent = await require('./source-inventory').independentAnnotationHolds(intake, id, authority.sourceHash);
   for (const note of (await intake.vault.scan()).filter(note => note.id === id)) if (!known.has(relative(intake, note.file))) fail('extra capture ' + relative(intake, note.file));
   for (const folder of [intake.dir, path.join(intake.vault.root, 'Revisions')]) for (const name of await fs.readdir(folder)) {
     if (folder === intake.dir && name === 'ledger.json') continue;
     const file = path.join(folder, name), value = await leaf(intake, file, 'scan'), relativeFile = relative(intake, file);
     if (known.has(relativeFile) || allowedStages.has(relativeFile)) continue;
+    const held = folder === intake.dir && independent.get(name);
+    if (held) {
+      if (!matches(value, held.target) || value.nlink !== held.nlink) fail('changed independent writing at ' + relativeFile);
+      continue;
+    }
     if (value.bytes.includes(Buffer.from(id)) || value.bytes.includes(Buffer.from(authority.sourceHash)) || detachedBackup && (relativeFile === detachedBackup || relativeFile.startsWith(detachedBackup + '.')) || authority.preservedWriting.some(plan => relativeFile === plan.stage)) fail('unreviewed recovery copy ' + relativeFile);
   }
 }
