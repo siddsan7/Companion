@@ -89,13 +89,13 @@ for (const kind of ['manual thought', 'imported draft']) test(`${kind} deletion 
   const observer = path.join(root, 'first-native-unlink.json'), faults = path.join(root, 'faults.json');
   // Observe the real filesystem boundary; do not omit or replace source files.
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, nativeUnlink = io.unlink;
-    io.unlink = async function (file, ...args) {
-      const result = await nativeUnlink.call(this, file, ...args);
+    const io = process.getBuiltinModule('fs'), nativeUnlink = io.unlinkSync;
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
       if (options.targets.includes(file)) {
-        io.unlink = nativeUnlink;
-        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, actualFirstRemovedFile: file, nativeUnlinkReturned: true, controlledSourceOmissions: [] }));
-        await io.writeFile(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, actualFirstRemovedFile: file, nativeUnlinkReturned: true, controlledSourceOmissions: [] }));
+        io.writeFileSync(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
       }
       return result;
     };

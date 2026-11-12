@@ -494,6 +494,7 @@ async function finishDeletion(intake, ledger, id) {
   const guard = removalParentGuard(vault, authority.directories);
   for (const target of remaining) {
     const file = path.join(vault.vault, target.file);
+    if (authority.mixedRecovery) await vault.checkpoint('mixed-deletion-before-source-unlink', { file });
     let peers = [target.file];
     await inspectDeletion(intake, ledger, id);
     await intake.storage.guard();
@@ -507,8 +508,7 @@ async function finishDeletion(intake, ledger, id) {
     intake.storage.guardSync();
     if (authority.mixedRecovery) mixedDeletion.verifyRetainedWritingSync(intake, authority, guard);
     verifyRemovalTarget(vault, target, peers, guard, changed);
-    // Dispatch directly after the last proof so no application work runs in between.
-    await fs.unlink(file); await vault.checkpoint('capture-deletion-unlinked');
+    native.unlinkSync(file); await vault.checkpoint('capture-deletion-unlinked');
   }
   const namespace = deletionNamespace(intake, authority, id, guard);
   if ((await inspectDeletion(intake, ledger, id)).length) throw changed();

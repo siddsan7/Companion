@@ -7,7 +7,7 @@ const { hash } = require('./intake-producer');
 const { matchesProducerOutcome } = require('./producer-root');
 const YAML = require('yaml');
 const { validateNormalizedReview } = require('./source-review');
-const { verifyStageSync } = require('./staged-publication');
+const { verifyStageSync, writeStage, verifyAbsentSync } = require('./staged-publication');
 const { removalParentGuard } = require('./source-recovery');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -327,24 +327,34 @@ async function publish(intake, ledger, id) {
         const output = await payload(intake, authority, plan);
         await inspect(intake, ledger, id);
         // Exclusive creation: a pre-receipt stage cannot be adopted by byte equality.
-        try { await fs.writeFile(stagePath, output, { flag: 'wx', flush: true }); } catch (error) { if (error.code === 'EEXIST') fail(plan.stage + ' already exists without a receipt'); throw error; }
-        const stage = await leaf(intake, stagePath, 'stage');
-        if (!stage || stage.nlink !== 1 || stage.target.sha256 !== plan.outputSha256 || stage.target.bytes !== plan.outputBytes) fail(plan.stage);
+        let proof;
+        try { proof = await writeStage(stagePath, output, guard); }
+        catch (error) { if (error.code === 'EEXIST') fail(plan.stage + ' already exists without a receipt'); throw error; }
+        const owned = { dev: proof.dev, ino: proof.ino, sha256: proof.digest, bytes: plan.outputBytes };
+        const verify = () => verifyWritingFileSync(stagePath, guard, owned, 1);
+        verify();
         if ((await require('./source-inventory').inspectTargets(intake, authority)).length !== authority.targets.length) fail('source origin changed before stage receipt');
         await scan(intake, authority, new Set([plan.stage]));
         await require('./source-recovery').sourceParents(intake, authority); await rawGuard(intake, ledger, id);
-        plan.stageIdentity = identity(stage); await intake.save(ledger);
+        plan.stageIdentity = owned; await intake.save(ledger, verify);
       }
       await inspect(intake, ledger, id); state = await writingState(intake, plan);
       if (!state.output) {
         await inspect(intake, ledger, id);
         intake.storage.guardSync();
+        verifyAbsentSync(outputPath, guard);
         verifyWritingFileSync(stagePath, guard, plan.stageIdentity, 1);
-        try { await fs.link(stagePath, outputPath); } catch (error) { if (error.code === 'EEXIST') fail(plan.file + ' appeared before publication'); throw error; }
+        try { local.linkSync(stagePath, outputPath); } catch (error) { if (error.code === 'EEXIST') fail(plan.file + ' appeared before publication'); throw error; }
+        await intake.vault.checkpoint('mixed-writing-after-link');
       }
       await inspect(intake, ledger, id); state = await writingState(intake, plan);
       if (!state.output || state.stage.nlink !== 2 || state.output.nlink !== 2) fail(plan.file + ' publication pair');
-      await rawGuard(intake, ledger, id); plan.publication = identity(state.output); await intake.save(ledger);
+      await rawGuard(intake, ledger, id);
+      plan.publication = identity(state.output);
+      await intake.save(ledger, () => {
+        verifyWritingFileSync(stagePath, guard, plan.stageIdentity, 2);
+        verifyWritingFileSync(outputPath, guard, plan.publication, 2);
+      });
     }
     await inspect(intake, ledger, id); state = await writingState(intake, plan);
     if (state.stage) {
@@ -352,7 +362,7 @@ async function publish(intake, ledger, id) {
       intake.storage.guardSync();
       verifyWritingFileSync(outputPath, guard, plan.publication, 2);
       verifyWritingFileSync(stagePath, guard, plan.stageIdentity, 2);
-      await fs.unlink(stagePath);
+      local.unlinkSync(stagePath);
     }
     await inspect(intake, ledger, id);
   }

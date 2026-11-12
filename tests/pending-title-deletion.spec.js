@@ -443,14 +443,14 @@ test('restored imported staged title deletion resumes actual first-unlink surviv
   await expect(preview).toBeHidden(); expect(await files(base)).toEqual(retained);
   const observer = path.join(root, 'pending-title-first-unlink.json'), faults = path.join(root, 'faults.json');
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), nativeUnlink = io.unlink;
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), nativeUnlink = io.unlinkSync;
     const exact = new Set(options.targets.map(file => paths.resolve(file).toLowerCase()));
-    io.unlink = async function (file, ...args) {
-      const result = await nativeUnlink.call(this, file, ...args);
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
       if (typeof file === 'string' && exact.has(paths.resolve(file).toLowerCase())) {
-        io.unlink = nativeUnlink;
-        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
-        await io.writeFile(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
+        io.writeFileSync(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
       }
       return result;
     };
@@ -599,14 +599,14 @@ test('fresh restart holds an actual staged-title deletion authority with a dupli
   await expect(preview).toBeHidden(); expect(await files(base)).toEqual(retained);
   const observer = path.join(root, 'pending-title-first-unlink.json'), faults = path.join(root, 'faults.json');
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), nativeUnlink = io.unlink;
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), nativeUnlink = io.unlinkSync;
     const exact = new Set(options.targets.map(file => paths.resolve(file).toLowerCase()));
-    io.unlink = async function (file, ...args) {
-      const result = await nativeUnlink.call(this, file, ...args);
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
       if (typeof file === 'string' && exact.has(paths.resolve(file).toLowerCase())) {
-        io.unlink = nativeUnlink;
-        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
-        await io.writeFile(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
+        io.writeFileSync(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
       }
       return result;
     };
@@ -868,14 +868,14 @@ test('pending-title survivor recovery holds an arriving mixed-case adjacent titl
   await expect(preview).toBeHidden(); expect(await files(base)).toEqual(retained);
   const observer = path.join(root, 'pending-title-first-unlink.json'), faults = path.join(root, 'faults.json');
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), nativeUnlink = io.unlink;
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), nativeUnlink = io.unlinkSync;
     const exact = new Set(options.targets.map(file => paths.resolve(file).toLowerCase()));
-    io.unlink = async function (file, ...args) {
-      const result = await nativeUnlink.call(this, file, ...args);
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
       if (typeof file === 'string' && exact.has(paths.resolve(file).toLowerCase())) {
-        io.unlink = nativeUnlink;
-        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
-        await io.writeFile(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
+        io.writeFileSync(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
       }
       return result;
     };
@@ -1179,14 +1179,14 @@ for (const variant of ['unowned-sidecars', 'double-owned-transaction']) test(`fr
   await expect(preview).toBeHidden(); expect(await files(base)).toEqual(retained);
   const observer = path.join(root, 'pending-title-first-unlink.json'), faults = path.join(root, 'faults.json');
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), nativeUnlink = io.unlink;
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), nativeUnlink = io.unlinkSync;
     const exact = new Set(options.targets.map(file => paths.resolve(file).toLowerCase()));
-    io.unlink = async function (file, ...args) {
-      const result = await nativeUnlink.call(this, file, ...args);
+    io.unlinkSync = function (file, ...args) {
+      const result = nativeUnlink.call(this, file, ...args);
       if (typeof file === 'string' && exact.has(paths.resolve(file).toLowerCase())) {
-        io.unlink = nativeUnlink;
-        await io.writeFile(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
-        await io.writeFile(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
+        io.unlinkSync = nativeUnlink;
+        io.writeFileSync(options.observer, JSON.stringify({ mainPid: process.pid, removedFile: file, nativeUnlinkReturned: true, checkpointArmedAfterActualRemoval: 'capture-deletion-unlinked', controlledSourceOmissions: [] }, null, 2));
+        io.writeFileSync(options.faults, JSON.stringify({ pause: 'capture-deletion-unlinked' }));
       }
       return result;
     };
