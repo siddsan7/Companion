@@ -652,7 +652,9 @@ test('source-only deletion preserves accepted reviewed A while purging an unadmi
   await expectAbsent([...targets, ...absent]); expect(await files(producer)).toEqual(producerBytes);
 });
 
-test('completed reviewed Make current deletion inventories actual selection copies without rewriting accepted history', async ({}, testInfo) => {
+for (const replaceBackup of [false, true]) test(replaceBackup
+  ? 'completed reviewed Make current deletion preserves an equal-byte replacement of its exact backup'
+  : 'completed reviewed Make current deletion inventories actual selection copies without rewriting accepted history', async ({}, testInfo) => {
   test.setTimeout(150000);
   const producer = path.join(root, 'producer');
   await fs.cp(path.join(__dirname, 'fixtures/reel-review/accept'), path.join(producer, 'accept'), { recursive: true });
@@ -710,6 +712,29 @@ test('completed reviewed Make current deletion inventories actual selection copi
   expect(new Set(identities.map(item => item.join(':'))).size).toBe(4);
   expect(await files(producer)).toEqual(producerBytes);
   await fs.writeFile(testInfo.outputPath('completed-reviewed-selection-observation.json'), JSON.stringify({ description: 'Actual public Make current after finalized accept A and retained edit B; ordinary completed writer output, no process exit or controlled file omission.', files: targets.map(file => path.relative(base, file).split(path.sep).join('/')), selectionHistory: selectedCapture.selectionHistory, intakeNames, identities, previousSha256: createHash('sha256').update(previousBytes).digest('hex'), currentSha256: selectedCapture.currentHash }, null, 2));
+  if (replaceBackup) {
+    const originalBackup = path.join(root, 'original-selection-backup.md');
+    const original = await fs.lstat(backup, { bigint: true });
+    await fs.rename(backup, originalBackup);
+    await fs.copyFile(originalBackup, backup, fs.constants.COPYFILE_EXCL);
+    const replacement = await fs.lstat(backup, { bigint: true });
+    expect(replacement.ino).not.toBe(original.ino);
+    expect(await fs.readFile(backup)).toEqual(previousBytes);
+    await app.close(); app = null; await launch();
+    await expect(page.locator('#idea-support-status')).toContainText('Current support inspected.');
+    await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source recovery inventory contains changed or unsupported writing');
+    await expect(page.getByLabel('Capture deletion preview')).toBeHidden();
+    expect((await fs.lstat(backup, { bigint: true })).ino).toBe(replacement.ino);
+    expect((await fs.lstat(originalBackup, { bigint: true })).ino).toBe(original.ino);
+    expect(await fs.readFile(backup)).toEqual(previousBytes);
+    expect(await fs.readFile(originalBackup)).toEqual(previousBytes);
+    expect(await fs.readFile(destination)).toEqual(currentBytes);
+    expect(await fs.readFile(snapshotA)).toEqual(snapshotABytes);
+    expect(await fs.readFile(snapshotB)).toEqual(snapshotBBytes);
+    expect(JSON.parse(await fs.readFile(ledgerFile, 'utf8')).attempts).toEqual(retained.attempts);
+    return;
+  }
   const before = await files(base), preview = page.getByLabel('Capture deletion preview');
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await expect(preview).toBeVisible();

@@ -1294,13 +1294,23 @@ class Intake {
         throw Object.assign(Error(error.message, { cause: error }), { intakeOutputHeld: true });
       }
     }
-    retire(journals, verifyJournals);
     const next = { ...ledger, pending: { ...ledger.pending } };
     delete next.pending[sourceHash];
     delete next.acceptedCleanup;
+    if (receipt.backup) {
+      // The retiring receipt already verified this retained output. Keep its
+      // physical identity after the journal and temporary stages are gone.
+      const name = `${capture.id}-${revision}.before${resolution ? `-${resolution}` : ''}.md`;
+      const record = { sourceHash, generation: outcome.sourceGeneration ?? null, proof: receipt.backup };
+      const previous = ledger.retainedIntakeBackups?.[name];
+      if (previous && !isDeepStrictEqual(previous, record)) throw changed();
+      next.retainedIntakeBackups = { ...ledger.retainedIntakeBackups, [name]: record };
+    }
+    retire(journals, verifyJournals);
     retireStageRecords(next, record => matchesProof(record.journal, receipt.journal));
     await this.save(next, verifyJournals);
     ledger.pending = next.pending;
+    if (receipt.backup) ledger.retainedIntakeBackups = next.retainedIntakeBackups;
     if (next.intakeStageRecords) ledger.intakeStageRecords = next.intakeStageRecords;
     else delete ledger.intakeStageRecords;
     delete ledger.acceptedCleanup;
