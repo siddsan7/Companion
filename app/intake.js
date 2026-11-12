@@ -396,16 +396,20 @@ class Intake {
     const file = note.file, initial = await fs.lstat(file, { bigint: true }), block = ledger.blocks[sourceHash];
     if (!block || !/^conflict-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(block.journal)) return;
     const journal = path.join(this.dir, block.journal);
-    await this.ownedFile(journal, [], 'Restored capture conflict journal');
+    const { guard: guardNote } = this.vault.publicationFolders(path.dirname(file));
+    const { guard: guardIntake } = this.vault.publicationFolders(this.dir);
+    const guard = () => { guardNote(); guardIntake(); };
+    const journalInfo = await this.ownedFile(journal, [], 'Restored capture conflict journal');
     const journalBytes = await read(journal), tx = JSON.parse(journalBytes); this.validateTransaction(tx);
+    const journalProof = fileProof(journalInfo, journalBytes);
     const backup = path.join(this.dir, tx.backup), stage = backup + '.independent', intentFile = backup + '.detach.json';
-    await this.ownedFile(intentFile, [], 'Restored capture detach intent');
+    const intentInfo = await this.ownedFile(intentFile, [], 'Restored capture detach intent');
     let intentBytes = await read(intentFile);
     if (initial.nlink === 1n && intentBytes === null) return;
     const valid = block.journal === `conflict-${tx.revision.id}${tx.resolution ? `-${tx.resolution}` : ''}.json` && block.incomingRevision === tx.revision.id && tx.sourceHash === sourceHash && tx.capture.id === capture.id && tx.capture.file === capture.file && note.id === capture.id && note.type === 'reel_import' && this.destination(capture) === file && tx.previous !== null && tx.previousHash === capture.currentHash && note.content === tx.previous;
     if (!valid) { if (intentBytes !== null) throw Error('Invalid restored capture detach authority. All files were preserved.'); return; }
     const bytes = Buffer.from(tx.previous, 'utf8'), same = async target => (await fs.readFile(target)).equals(bytes);
-    let intent;
+    let intent, intentProof;
     if (intentBytes === null) {
       const source = await this.ownedFile(file, backup, 'Restored capture destination');
       const previous = await this.ownedFile(backup, file, 'Restored capture backup');
@@ -418,8 +422,11 @@ class Intake {
       if (!independent || !await same(stage)) throw conflict('Independent restored capture backup changed. All files were preserved.');
       intent = { schema: 1, id: randomUUID(), sourceHash, captureId: capture.id, file: capture.relative, journal: block.journal, journalHash: hash(journalBytes), backup: tx.backup, previousHash: tx.previousHash, dev: String(source.dev), ino: String(source.ino), stageDev: String(independent.dev), stageIno: String(independent.ino) };
       intentBytes = JSON.stringify(intent);
-      await fs.writeFile(intentFile, intentBytes, { flag: 'wx', flush: true });
-    } else intent = JSON.parse(intentBytes);
+      intentProof = await writeStage(intentFile, intentBytes, guard);
+    } else {
+      intent = JSON.parse(intentBytes);
+      intentProof = fileProof(intentInfo, intentBytes);
+    }
     const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
     if (intent.schema !== 1 || !uuid.test(intent.id) || intent.sourceHash !== sourceHash || intent.captureId !== capture.id || intent.file !== capture.relative || intent.journal !== block.journal || intent.journalHash !== hash(journalBytes) || intent.backup !== tx.backup || intent.previousHash !== tx.previousHash || ![intent.dev, intent.ino, intent.stageDev, intent.stageIno].every(value => typeof value === 'string' && /^[0-9]+$/.test(value))) throw Error('Invalid restored capture detach intent. All files were preserved.');
     const retained = backup + '.detached-' + intent.id;
@@ -430,6 +437,20 @@ class Intake {
       const current = await this.ownedFile(file, [backup, retained], 'Restored capture destination');
       if (!identity(current, intent.dev, intent.ino) || !await same(file)) throw conflict('Restored capture destination changed. All files were preserved.');
       return current;
+    };
+    const verifyAuthority = (current, links = Number(current.nlink)) => {
+      this.storage.guardSync();
+      verifyStageSync(journal, guard, journalProof);
+      verifyStageSync(intentFile, guard, intentProof);
+      verifyStageSync(file, guard, fileProof(current, bytes), links);
+    };
+    const unlinkPeer = (target, info) => {
+      try { verifyStageSync(target, guard, fileProof(info, bytes), Number(info.nlink)); }
+      catch (error) {
+        if (error.code !== 'STAGING_CHANGED') throw error;
+        throw conflict('Restored capture backup peer changed. All files were preserved.');
+      }
+      local.unlinkSync(target);
     };
     const independent = async () => {
       const info = await this.ownedFile(stage, backup, 'Independent restored capture backup');
@@ -464,31 +485,49 @@ class Intake {
       if (ledger.outcomes[tx.key]) ledger.outcomes[tx.key].reason = reason;
       await this.save(ledger);
       await authority(); await independent();
+      const heldProofs = [];
       for (const item of evidence) {
-        const target = path.join(this.dir, item.file); await this.ownedFile(target, [], 'Restored capture held evidence');
+        const target = path.join(this.dir, item.file), info = await this.ownedFile(target, [], 'Restored capture held evidence');
         if (hash(await fs.readFile(target)) !== item.hash) throw Error('Restored capture held evidence changed. All files were preserved.');
+        heldProofs.push(() => verifyStageSync(target, guard, { dev: String(info.dev), ino: String(info.ino), digest: item.hash }));
       }
       const peer = await this.ownedFile(retained, file, 'Restored capture retained peer');
       if (identity(peer, intent.dev, intent.ino)) {
         if (!await same(retained)) throw conflict('Restored capture retained peer changed. All files were preserved.');
-        await authority(); await fs.unlink(retained);
+        const current = await authority();
+        verifyAuthority(current);
+        for (const verify of heldProofs) verify();
+        unlinkPeer(retained, peer);
       }
       await this.ownedFile(file, [], 'Restored capture destination');
-      await authority(); await this.ownedFile(archive, [], 'Restored capture detach hold');
+      const current = await authority(), held = await this.ownedFile(archive, [], 'Restored capture detach hold');
       if (await read(archive) !== archivedBytes) throw Error('Restored capture detach hold changed. All files were preserved.');
-      await fs.unlink(intentFile);
+      verifyAuthority(current, 1);
+      for (const verify of heldProofs) verify();
+      verifyStageSync(archive, guard, fileProof(held, archivedBytes));
+      local.unlinkSync(intentFile);
       this.vault.warnings.push(reason);
     };
     await authority();
     let peer = await this.ownedFile(retained, file, 'Restored capture retained peer');
     let previous = await this.ownedFile(backup, [file, stage], 'Restored capture backup');
     if (!peer && identity(previous, intent.dev, intent.ino)) {
-      await independent(); await authority();
+      const independentCopy = await independent();
+      await authority();
       await this.vault.checkpoint('intake-restored-backup-publish');
-      // Move the current path aside before inspecting it. An editor recreation
-      // is retained, never replaced by the independent publication.
-      if (await this.ownedFile(retained, file, 'Restored capture retained peer')) throw conflict('Restored capture retained path already exists. All files were preserved.');
-      await fs.rename(backup, retained);
+      const occupied = () => conflict('Restored capture retained path already exists. All files were preserved.');
+      if (await this.ownedFile(retained, file, 'Restored capture retained peer')) throw occupied();
+      // Keep an ordinary editor recreation at the retained path for the existing hold.
+      const moving = await this.ownedFile(backup, file, 'Restored capture backup'), current = await authority();
+      if (!moving) throw conflict('Restored capture backup disappeared. All remaining files were preserved.');
+      verifyAuthority(current);
+      verifyStageSync(stage, guard, fileProof(independentCopy, bytes));
+      const { proof } = readExactSync(backup, guard, Number(moving.nlink));
+      if (!identity(moving, proof.dev, proof.ino) || identity(moving, intent.dev, intent.ino) && proof.digest !== tx.previousHash) {
+        throw conflict('Restored capture backup changed. All files were preserved.');
+      }
+      verifyAbsentSync(retained, guard, occupied);
+      local.renameSync(backup, retained);
       await this.vault.checkpoint('intake-restored-backup-moved');
       peer = await this.ownedFile(retained, file, 'Restored capture retained peer'); previous = await this.ownedFile(backup, [file, stage], 'Restored capture backup');
     }
@@ -496,27 +535,44 @@ class Intake {
     if (peer && !await same(retained)) throw conflict('Restored capture retained peer changed. All files were preserved.');
     if (!previous) {
       if (!peer) throw conflict('Restored capture backup disappeared. All remaining files were preserved.');
-      await authority(); await independent();
-      try { await fs.link(stage, backup); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+      const current = await authority(), independentCopy = await independent();
+      verifyAuthority(current);
+      verifyStageSync(retained, guard, fileProof(peer, bytes), Number(peer.nlink));
+      verifyStageSync(stage, guard, fileProof(independentCopy, bytes));
+      try { if (!local.lstatSync(backup, { throwIfNoEntry: false })) local.linkSync(stage, backup); }
+      catch (error) { if (error.code !== 'EEXIST') throw error; }
       previous = await this.ownedFile(backup, stage, 'Independent restored capture backup');
       if (!identity(previous, intent.stageDev, intent.stageIno)) return hold();
       await this.vault.checkpoint('intake-restored-backup-published');
     }
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
-    await authority();
+    const currentBeforeStage = await authority();
     const staged = await this.ownedFile(stage, backup, 'Independent restored capture backup');
-    if (staged) { await independent(); await fs.unlink(stage); }
+    if (staged) {
+      await independent();
+      verifyAuthority(currentBeforeStage);
+      verifyStageSync(backup, guard, fileProof(staged, bytes), 2);
+      unlinkPeer(stage, staged);
+    }
     await this.ownedFile(backup, [], 'Independent restored capture backup');
     peer = await this.ownedFile(retained, file, 'Restored capture retained peer');
     if (peer) {
       if (!identity(peer, intent.dev, intent.ino) || !await same(retained)) throw conflict('Restored capture retained peer changed. All files were preserved.');
-      await authority(); await fs.unlink(retained);
+      const current = await authority();
+      verifyAuthority(current);
+      verifyStageSync(backup, guard, fileProof(previous, bytes));
+      unlinkPeer(retained, peer);
     }
     await this.ownedFile(file, [], 'Restored capture destination');
     await this.vault.checkpoint('intake-restored-backup-cleaned');
-    await authority(); await this.ownedFile(backup, [], 'Independent restored capture backup');
+    const current = await authority();
+    await this.ownedFile(backup, [], 'Independent restored capture backup');
     if (!await same(backup)) throw conflict('Independent restored capture backup changed. All files were preserved.');
-    await fs.unlink(intentFile);
+    verifyAuthority(current, 1);
+    verifyStageSync(backup, guard, fileProof(previous, bytes));
+    verifyAbsentSync(stage, guard);
+    verifyAbsentSync(retained, guard);
+    local.unlinkSync(intentFile);
   }
   async publicationAuthority(tx, ledger, { verifyOnly = false, verifyRestorationControls, verifyIndependentJournal } = {}) {
     if (!this.storage.matches(await this.storage.view())) throw Error('Intake ledger changed before publication. Refresh before retrying; changed authority was preserved.');

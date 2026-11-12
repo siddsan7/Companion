@@ -7,6 +7,8 @@ const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
 const pendingTitle = require('./pending-title');
 const { activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent } = require('./annotation-authority');
+const { requiredDirectories } = require('./source-recovery');
+const { ordinaryDirectories } = require('./staged-publication');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -196,7 +198,9 @@ function accountDetachedLeaf(proof, value) {
 async function readDetachedEditor(intake, ledger, capture, sourceHash, note) {
   const block = ledger.blocks[sourceHash], { noteText } = require('./intake');
   const reason = 'Restored capture backup changed. Independent editor writing was preserved; this source remains paused for explicit conflict repair.';
-  if (!exact(block, ['reason', 'journal', 'incomingRevision', 'detachHold']) || !exact(block.detachHold, ['journal', 'reason', 'evidence']) || block.reason !== reason || block.detachHold.reason !== reason || capture.conflict !== reason || ledger.pending[sourceHash]) fail();
+  const witness = block?.outputHold;
+  const keys = ['reason', 'journal', 'incomingRevision', 'detachHold', ...(witness === undefined ? [] : ['outputHold'])];
+  if (!exact(block, keys) || !exact(block.detachHold, ['journal', 'reason', 'evidence']) || block.reason !== reason || block.detachHold.reason !== reason || capture.conflict !== reason || ledger.pending[sourceHash]) fail();
   if (!uuid(capture.id) || !uuid(capture.currentRevision) || capture.file !== capture.id + '.md' || note.file !== intake.destination(capture) || note.id !== capture.id || note.type !== 'reel_import' || note.title !== capture.title || note.capturedAt !== capture.capturedAt || capture.reviewed !== false || capture.rejected !== false || capture.supportEligible !== true || !equal(capture.revisions, [capture.currentRevision]) || !fields(capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'conflict']) || !date(capture.capturedAt) || !date(capture.updatedAt)) fail();
   const current = await leaf(intake, note.file, 'capture'), snapshot = await leaf(intake, path.join(intake.vault.root, 'Revisions', capture.currentRevision + '.json'), 'snapshot');
   const admitted = JSON.parse(text(snapshot.bytes)); normalizedDraft(admitted, capture, sourceHash);
@@ -210,6 +214,15 @@ async function readDetachedEditor(intake, ledger, capture, sourceHash, note) {
   const revisions = new Map([[admitted.id, admitted]]);
   transaction(intake, tx, ledger, capture, sourceHash, revisions);
   if (journal.nlink !== 1 || tx.revision.id !== block.incomingRevision || tx.revision.review !== undefined || tx.resolution !== undefined || tx.externalConflict !== false || tx.retainOnly !== false || tx.previous !== canonical || tx.previousHash !== capture.currentHash || tx.content !== noteText(tx.capture, tx.revision) || tx.capture.currentHash !== hash(tx.content) || tx.capture.updatedAt !== tx.revision.importedAt || ledger.attempts[tx.revision.identity] || ledger.admissions?.[tx.revision.id]) fail();
+  if (witness !== undefined) {
+    const matches = (proof, target) => exact(proof, ['dev', 'ino', 'digest']) &&
+      proof.dev === target.dev && proof.ino === target.ino && proof.digest === target.sha256;
+    if (!exact(witness, ['journal', 'pending', 'committed', 'mode', 'rollback']) || witness.mode !== 'precommit-conflict' ||
+        !intake.validOutputHold(witness, `pending-${tx.revision.id}.json`, tx.previousHash) ||
+        !matches(witness.journal, journal.target) || !matches(witness.rollback?.proof, current.target)) fail();
+    const parents = [...requiredDirectories(intake, [current.target])].map(directory => path.join(intake.vault.vault, directory));
+    ordinaryDirectories(parents, 'Source recovery parent identity changed. All files were preserved.', witness.rollback.directories);
+  }
   const producer = ledger.sources.find(item => item.id === tx.key.split(':')[0]);
   if (!producer || (producer.kind || 'draft') !== 'draft' || !matchesProducerOutcome(producer, tx.key, tx.revision.locator)) fail();
   const outcome = ledger.outcomes[tx.key];
