@@ -513,6 +513,100 @@ for (const boundary of ['receipt write', 'receipt link']) test(`interrupted firs
   } finally { if (app) await app.close(); }
 });
 
+async function writeIntakeDraft() {
+  const producer = path.join(root, 'producer');
+  const artifact = path.join(producer, 'draft'), clip = 'b'.repeat(64);
+  const draft = require('./fixtures/reel-draft/example.json');
+  await fs.mkdir(artifact, { recursive: true });
+  await fs.writeFile(path.join(artifact, 'run.json'), JSON.stringify({
+    job_id: clip, attempt_id: '1'.repeat(32), started_utc: anchor, input_sha256: 'a'.repeat(64),
+    input_kind: 'local_video', result_kind: 'local_video_unreviewed', state: 'partial', validation: 'passed'
+  }));
+  await fs.writeFile(path.join(artifact, 'evidence.json'), JSON.stringify({ ...draft.input, clip_id: clip }));
+  await fs.writeFile(path.join(artifact, 'first-pass-target.json'), JSON.stringify(draft.target));
+  await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(artifact, 'notes.md'));
+  return producer;
+}
+
+for (const operation of ['enable', 'pause']) test(`intake records its terminal check while ${operation} holds the cadence lock`, async () => {
+  const scan = Promise.withResolvers(), scanRelease = Promise.withResolvers();
+  const task = Promise.withResolvers(), taskRelease = Promise.withResolvers();
+  const vault = new Vault(path.join(root, 'vault'), 'Companion', { checkpoint: async boundary => {
+    if (boundary !== 'intake-snapshot-staged') return;
+    scan.resolve();
+    await scanRelease.promise;
+  } });
+  await vault.setup();
+  const intake = new Intake(vault), scheduleFile = path.join(root, 'schedule.json');
+  await intake.connect(await writeIntakeDraft(), false, anchor);
+  const schedule = new Schedule(scheduleFile, vault, { testRoot: root });
+  const trigger = operation === 'pause' ? 'scheduled' : 'manual';
+  if (operation === 'pause') await schedule.enable(anchor);
+  const apply = schedule.tasks.apply.bind(schedule.tasks);
+  schedule.tasks.apply = async (action, ...args) => {
+    if (action === operation) {
+      task.resolve();
+      await taskRelease.promise;
+    }
+    return apply(action, ...args);
+  };
+  const checking = (trigger === 'scheduled' ? schedule.run(now, trigger) : intake.reconcile({
+    now, trigger, onComplete: (result, verifyLatest) => schedule.record(result, verifyLatest)
+  })).then(value => ({ value }), error => ({ error: error.message }));
+  let controlling;
+  try {
+    await scan.promise;
+    controlling = schedule.control(operation, anchor);
+    await task.promise;
+    scanRelease.resolve();
+    const ledger = path.join(intake.dir, 'ledger.json');
+    await expect.poll(async () => JSON.parse(await readOptional(ledger)).lastCheck).toMatchObject({ at: now, trigger, status: 'complete' });
+    expect(await Promise.race([checking, new Promise(resolve => setTimeout(() => resolve('waiting'), 100))])).toBe('waiting');
+  } finally {
+    scanRelease.resolve();
+    taskRelease.resolve();
+    await controlling;
+    await checking;
+  }
+  expect((await checking).value.lastCheck).toEqual({ at: now, trigger, status: 'complete' });
+  expect(Object.values((await checking).value.attempts)).toMatchObject([{ status: 'imported' }]);
+  const current = JSON.parse(await readOptional(scheduleFile));
+  expect(current).toMatchObject({
+    mode: operation === 'pause' ? 'paused' : 'enabled', anchor,
+    worker: { at: now, trigger, status: 'complete' }, lastSuccess: { at: now, trigger }
+  });
+  expect(current.handledSlot || 0).toBe(trigger === 'scheduled' ? 4 : 0);
+  if (trigger === 'scheduled') expect(await schedule.run(now, trigger)).toEqual({ skipped: true });
+});
+
+test('manual and scheduled checks finish when cadence and Intake share the same native lock', async () => {
+  const vault = new Vault(path.join(root, 'vault'), 'Companion');
+  await vault.setup();
+  const intake = new Intake(vault);
+  const scheduleFile = path.join(vault.root, 'schedule.json');
+  const schedule = new Schedule(scheduleFile, vault, { testRoot: root });
+  await intake.connect(await writeIntakeDraft(), false, anchor);
+  await schedule.enable(anchor);
+
+  let timeout;
+  const waitForManual = intake.reconcile({
+    now, trigger: 'manual', onComplete: (result, verifyLatest) => schedule.record(result, verifyLatest)
+  });
+  const deadline = new Promise((_, reject) => {
+    timeout = setTimeout(() => reject(Error('The manual result waited on its own native lock.')), 3000);
+  });
+  const manual = await Promise.race([waitForManual, deadline]).finally(() => clearTimeout(timeout));
+  expect(manual.lastCheck).toEqual({ at: now, trigger: 'manual', status: 'complete' });
+  expect(Object.values(manual.attempts)).toMatchObject([{ status: 'imported' }]);
+  expect(JSON.parse(await readOptional(scheduleFile)).worker).toMatchObject(manual.lastCheck);
+
+  const scheduled = await schedule.run(now, 'scheduled');
+  expect(scheduled.lastCheck).toEqual({ at: now, trigger: 'scheduled', status: 'complete' });
+  expect(Object.values(scheduled.attempts)).toEqual(Object.values(manual.attempts));
+  expect(JSON.parse(await readOptional(scheduleFile))).toMatchObject({ handledSlot: 4, worker: scheduled.lastCheck });
+  expect(await schedule.run(now, 'scheduled')).toEqual({ skipped: true });
+});
+
 for (const boundary of ['receipt write', 'receipt link', 'schedule link']) {
   test(`a process exit at first cadence ${boundary} allows explicit enable on restart`, async () => {
     const vault = new Vault(path.join(root, 'vault'), 'Companion');

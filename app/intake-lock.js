@@ -9,7 +9,9 @@ async function intakeLock(root, work) {
   if (!address) throw Error('Native intake locking is unavailable on this platform.');
   const server = net.createServer(socket => socket.destroy());
   await new Promise((resolve, reject) => {
-    server.once('error', error => reject(Error(error.code === 'EADDRINUSE' ? 'An intake check is already running. Wait for it to finish.' : `Native intake lock unavailable (${error.code}).`)));
+    server.once('error', error => reject(error.code === 'EADDRINUSE'
+      ? Object.assign(Error('An intake check is already running. Wait for it to finish.'), { code: 'INTAKE_BUSY' })
+      : Error(`Native intake lock unavailable (${error.code}).`)));
     server.listen(address, resolve);
   });
   try { return await work(); } finally { await new Promise(resolve => server.close(resolve)); }

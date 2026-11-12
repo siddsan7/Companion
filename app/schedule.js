@@ -6,6 +6,7 @@ const { performance } = require('node:perf_hooks');
 const { setTimeout: wait } = require('node:timers/promises');
 const { Intake } = require('./intake');
 const { intakeLock } = require('./intake-lock');
+const { sourceMutation } = require('./source-mutation');
 const { TaskScheduler } = require('./task-scheduler');
 const { Vault } = require('./vault');
 const { ordinaryDirectories, readExact, readExactSync, writeStage, verifyStage, verifyStageSync, validProof, verifyAbsentSync, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication } = require('./staged-publication');
@@ -111,15 +112,29 @@ class Schedule {
     };
     await removeOwned(this.legacyReceipt, settled, receipt.proof);
   }
-  async change(work) {
-    return intakeLock(path.dirname(this.file), async () => {
-      const guard = this.directoryGuard();
-      if (initialPublicationPending(this.file, guard)) {
-        verifyAbsentSync(this.legacyReceipt, guard, scheduleChanged);
-        recoverInitialPublication(this.file, guard, stagingName);
-      } else await this.settleLegacyReceipt(guard);
-      return work(guard);
-    });
+  async change(work, { onBusy, duringIntake = false } = {}) {
+    // The data directory can be the managed vault root. In that case an
+    // admitted Intake check already owns this exact canonical native lock.
+    const lock = duringIntake ? sourceMutation : intakeLock;
+    let entered = false, delay = 25;
+    for (;;) {
+      try {
+        return await lock(path.dirname(this.file), async () => {
+          entered = true;
+          const guard = this.directoryGuard();
+          if (initialPublicationPending(this.file, guard)) {
+            verifyAbsentSync(this.legacyReceipt, guard, scheduleChanged);
+            recoverInitialPublication(this.file, guard, stagingName);
+          } else await this.settleLegacyReceipt(guard);
+          return work(guard);
+        });
+      } catch (error) {
+        if (entered || error.code !== 'INTAKE_BUSY' || !onBusy) throw error;
+        onBusy();
+        await wait(delay);
+        delay = Math.min(delay * 2, 250);
+      }
+    }
   }
   requireCurrent(expected, guard) {
     let current = null;
@@ -218,13 +233,15 @@ class Schedule {
     });
   }
   async record(result, verifyLatest, ownsAttempt) {
+    // Intake still owns the check. Wait for a concurrent task control to
+    // release the data lock before binding the result to the current cadence.
     return this.change(async guard => {
       const current = await this.snapshot(guard), state = current?.state;
       if (!this.matches(state) || ownsAttempt && !ownsAttempt(state)) return;
       if (!ownsAttempt) state.lastSuccess = result.lastSuccess;
       retainWorkerResult(state, result);
       await this.save(state, current.proof, { guard, assertSelected: this.assertSelected, verifyRelated: verifyLatest });
-    });
+    }, { onBusy: verifyLatest, duringIntake: true });
   }
   async enable(now) { return this.control('enable', now); }
   async run(now, trigger = 'catch-up', expectedId) {
@@ -245,7 +262,7 @@ class Schedule {
           if (state.mode !== 'enabled' || slot < 1 || slot <= (state.handledSlot || 0)) return false;
           state.handledSlot = slot; state.worker = { ...check, status: 'running' };
           await this.save(state, current.proof, { guard, assertSelected: this.assertSelected }); admittedSlot = slot; return true;
-        }),
+        }, { duringIntake: true }),
         onComplete: (result, verifyLatest) => this.record(result, verifyLatest,
           state => currentOwner(state) && currentAttempt(state) && scheduledRunning(state.worker))
       });
@@ -267,7 +284,7 @@ class Schedule {
   async settleExitedWorker(observed) {
     if (!this.matches(observed) || !scheduledRunning(observed.worker)) return observed;
     try {
-      return await intakeLock(this.vault.root, () => this.change(async guard => {
+      return await sourceMutation(this.vault.root, () => this.change(async guard => {
         const current = await this.snapshot(guard), state = current?.state;
         if (state?.id !== observed.id || !this.matches(state) || state.handledSlot !== observed.handledSlot ||
             !scheduledRunning(state.worker) || !sameCheck(state.worker, observed.worker)) return state || null;
@@ -281,7 +298,7 @@ class Schedule {
         }
         await this.save(state, current.proof, { guard, assertSelected: this.assertSelected, verifyRelated: () => intake.storage.guardSync() });
         return state;
-      }));
+      }, { duringIntake: true }));
     } catch (error) {
       if (error.message.includes('already running')) return observed;
       throw error;
