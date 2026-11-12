@@ -3,59 +3,15 @@ const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { spawn } = require('node:child_process');
 const { createHash, randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
+const { Briefs } = require('../app/briefs');
 const { Conversations } = require('../app/conversations');
+const { Vault } = require('../app/vault');
+const { holdReadSharing, sharingRefusals } = require('./fixtures/windows-sharing');
 
-const sharingRefusals = ['EPERM', 'EBUSY', 'EACCES'];
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const withBom = bytes => Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), bytes]);
-
-function holdControl(file) {
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    '$stream = [IO.File]::Open($env:COMPANION_CONTROL_FIXTURE, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)',
-    'try { [Console]::WriteLine("READY:" + $PID); [void][Console]::ReadLine() } finally { $stream.Dispose(); [Console]::WriteLine("RELEASED:" + $PID) }'
-  ].join('; ');
-  const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    windowsHide: true,
-    env: { ...process.env, COMPANION_CONTROL_FIXTURE: file },
-    stdio: ['pipe', 'pipe', 'pipe']
-  });
-  const proof = { pid: child.pid, file, access: 'FileAccess.Read', share: 'FileShare.Read', stdout: '', stderr: '' };
-  child.stdout.on('data', chunk => { proof.stdout += chunk.toString(); });
-  child.stderr.on('data', chunk => { proof.stderr += chunk.toString(); });
-  child.on('error', error => { proof.error = error.message; });
-  child.stdin.on('error', error => { proof.inputError = error.message; });
-  const closed = new Promise(resolve => child.once('close', (code, signal) => {
-    proof.exit = { code, signal };
-    resolve();
-  }));
-  let released = false;
-  return {
-    proof,
-    async ready() {
-      await expect.poll(() => {
-        if (proof.error || proof.exit) throw Error(JSON.stringify(proof));
-        return proof.stdout;
-      }).toContain(`READY:${child.pid}`);
-    },
-    release() {
-      if (!released) {
-        released = true;
-        child.stdin.end('\n');
-      }
-    },
-    async awaitRelease() {
-      await expect.poll(() => {
-        if (proof.error || proof.exit?.code) throw Error(JSON.stringify(proof));
-        return proof.stdout;
-      }, { intervals: [5, 10, 20, 40] }).toContain(`RELEASED:${child.pid}`);
-    },
-    closed
-  };
-}
 
 async function prepareRestoration(store, record) {
   const generation = randomUUID();
@@ -83,20 +39,21 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
   const temp = await fs.realpath(os.tmpdir());
   const root = await fs.mkdtemp(path.join(temp, 'companion-control-publication-'));
   const identity = await fs.lstat(root, { bigint: true });
+  const vault = new Vault(root, 'Companion');
   const id = randomUUID();
   const scope = { version: randomUUID(), excludedSources: ['capture:excluded-fixture'], excludedHistory: [randomUUID()] };
   const record = {
-    schema: 1, id, scope, vault: { root }, brief: { id: randomUUID(), version: 1, digest: 'a'.repeat(64) },
+    schema: 1, id, scope, vault: { root: vault.root }, brief: { id: randomUUID(), version: 1, digest: 'a'.repeat(64) },
     createdAt: '2026-11-08T12:00:00Z', requests: []
   };
   const attempts = [], checkpoints = [];
   const rename = local.renameSync, open = fs.open;
   const holdAt = restoring ? 'archive-restore-before-active' : 'conversation-delete-after-tombstone';
   let holder;
-  const store = new Conversations({ dataRoot: root, getVault: () => record.vault, checkpoint: async name => {
+  const store = new Conversations({ dataRoot: root, getVault: () => vault, checkpoint: async name => {
     checkpoints.push(name);
     if (name === holdAt) {
-      holder = holdControl(control);
+      holder = holdReadSharing(control);
       await holder.ready();
     }
   } });
@@ -111,6 +68,16 @@ async function withControlFixture(testInfo, operation, changeAfterRefusal, verif
     await fs.writeFile(independent, independentBytes, { flag: 'wx' });
     let restoration, preview;
     if (restoring) {
+      await vault.setup();
+      const source = path.join(root, 'README.md');
+      await fs.writeFile(source, '# Control publication fixture\n\nConfirm the exact restored conversation.\n', { flag: 'wx' });
+      const briefs = new Briefs(vault), { proposed } = await briefs.propose([source], record.createdAt);
+      const { approved: [{ id, version, digest }] } = await briefs.approve({
+        id: proposed.id, digest: proposed.digest,
+        sections: proposed.sections.map(section => section.text),
+        references: proposed.sections.map(section => section.references.map(ref => `${ref.source + 1}:${ref.start}-${ref.end}`).join(', '))
+      }, record.createdAt);
+      record.brief = { id, version, digest };
       restoration = await prepareRestoration(store, record);
       preview = restoration.preview;
     } else {
