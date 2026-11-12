@@ -1371,6 +1371,57 @@ test('explicit metadata-only restore preserves inert cadence and Codex hints wit
   }
 });
 
+test('an archived disabled cadence belongs to its original managed parent after switching vault configuration', async () => {
+  test.setTimeout(120000);
+  await launch();
+  const vault = path.join(root, 'vault'), original = path.join(vault, 'Companion'), other = path.join(vault, 'Other Parent');
+  await page.getByLabel('Draft source folder', { exact: true }).fill(path.resolve('tests/fixtures/reel-draft'));
+  await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Source connected');
+  await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+  await page.getByRole('button', { name: 'Disable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake disabled');
+  const scheduleFile = path.join(root, 'schedule.json'), scheduleBytes = await fs.readFile(scheduleFile, 'utf8');
+  const selectParent = async (parent, location) => {
+    await page.getByLabel('Parent folder', { exact: true }).fill(parent);
+    await page.getByRole('button', { name: 'Use this folder', exact: true }).click();
+    await expect(page.locator('#location')).toHaveText(location);
+    await expect(page.getByRole('status')).toContainText('Vault ready');
+  };
+  await selectParent('Other Parent', other);
+  const archiveFile = path.join(root, 'disabled-parent-archive.json');
+  await fs.writeFile(path.join(root, 'archive-dialog.json'), JSON.stringify({ save: archiveFile, open: archiveFile }));
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  await region.getByRole('button', { name: 'Preview history archive', exact: true }).click();
+  await region.getByRole('button', { name: 'Export reviewed archive', exact: true }).click();
+  await expect(region).toContainText('Archive exported');
+  const archive = JSON.parse(await fs.readFile(archiveFile, 'utf8'));
+  expect(archive.payload.scheduleIntent).toMatchObject({ id: JSON.parse(scheduleBytes).id, mode: 'disabled', vault, parent: 'Companion' });
+  const match = async source => {
+    await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+    await expect(region).toContainText('Integrity and version validated');
+    await region.getByLabel('Archive vault to match', { exact: true }).selectOption(source);
+    await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+    await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  };
+  const restore = region.getByRole('button', { name: 'Restore reviewed additions', exact: true });
+  await match(other);
+  await expect(region).toContainText('0 inert settings records to preserve');
+  await expect(restore).toBeDisabled();
+  expect(archive.payload.vaultBindings).toContainEqual({ managedRoot: original, vault, parent: 'Companion', matchingRequired: true, pins: [] });
+  await selectParent('Companion', original);
+  await match(original);
+  await expect(region).toContainText('1 inert settings records to preserve');
+  await restore.click();
+  await expect(region).toContainText('Imported daily intake intent is inactive');
+  const [file] = (await fs.readdir(root)).filter(name => name.startsWith('archive-intent-'));
+  const inactive = JSON.parse(await fs.readFile(path.join(root, file), 'utf8'));
+  expect(inactive).toMatchObject({ archiveId: archive.id, sourceRoot: original, targetRoot: original, intent: archive.payload.scheduleIntent });
+  expect(await fs.readFile(scheduleFile, 'utf8')).toBe(scheduleBytes);
+  await expect(fs.lstat(path.join(root, 'scheduler-task.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
 test('third-installation vault matching reconnects only inherited cadence bound to the selected archived vault', async () => {
   test.setTimeout(150000);
   const crypto = require('node:crypto'), sourceRoot = root;

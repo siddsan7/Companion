@@ -136,9 +136,9 @@ class Context {
     await this.changeScope(current => [...new Set([...current, ...files])], validate);
   }
   async exclude(key) { await this.changeScope(current => current.filter(file => `note:${digest(file)}` !== key)); }
-  async corpus({ captureRelationshipIds } = {}) {
+  async corpus({ captureRelationshipIds, includeIdeaInventory = false } = {}) {
     const sources = await sourceInspection(this.vault.root, () => this.sourceCorpusOwned(captureRelationshipIds));
-    return this.corpusFromSources(sources);
+    return this.corpusFromSources(sources, includeIdeaInventory);
   }
   conflictChoices(note, capture, sourceHash, ledger, intake, observed, sourceGenerations) {
     const block = ledger.blocks[sourceHash], localHash = digest(note.content);
@@ -221,7 +221,7 @@ class Context {
       .map(note => [note.id, { file: note.file, digest: digest(note.content) }]));
     return { intake, ledger, observed, issues, all, manualChoices, eligible, histories, capturePaths };
   }
-  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories, capturePaths }) {
+  async corpusFromSources({ intake, ledger, observed, issues, all, manualChoices = [], eligible, histories, capturePaths }, includeIdeaInventory) {
     const included = [];
     const annotationGroups = new Map();
     for (const annotation of await intake.annotations()) {
@@ -280,7 +280,7 @@ class Context {
       if (!claim) continue;
       try {
         if (claims.length !== 1) throw Error(`duplicate identity ${id}; preserve and resolve these copies: ${claims.map(item => ideas.relative(item.file)).join(', ')}`);
-        if (!claim.savedIdea || claim.stat.nlink !== 1n) throw Error('unsupported saved-idea record or linked file');
+        if (!claim.savedIdea || claim.repairPending || claim.stat.nlink !== 1n) throw Error('unsupported saved-idea record or linked file');
         const { content, metadata } = claim;
         this.ideaEligibility(this.vault, id);
         if (metadata.support_attribution_unavailable === true) throw Error('additional source dependency attribution is unavailable');
@@ -334,6 +334,7 @@ class Context {
     }
     intake.storage.guardSync(observed);
     const result = { all: available.filter(source => !duplicates.has(source.key)).map(normalized), manual, issues, included };
+    if (includeIdeaInventory) result.ideaInventory = ideas;
     if (capturePaths) {
       result.captureRelationships = new Map();
       for (const [id, note] of capturePaths) {

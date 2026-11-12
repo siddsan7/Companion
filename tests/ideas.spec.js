@@ -201,6 +201,113 @@ test('a moved and renamed Experiment Proposal keeps its saved idea identity and 
   await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
 });
 
+test('verified target moves repair saved idea Markdown while preserving current writing, exact citations and separate removal', async () => {
+  test.setTimeout(120000);
+  const title = 'Preserve a cited proposal through verified target moves';
+  const proposal = await saveCitedExperimentProposal(title, 'repairedtargetpaths');
+  const idea = () => page.locator('#saved-ideas article').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+  const vault = path.dirname(proposal.vault), related = path.join(vault, 'Moved targets (reviewed)');
+  await fs.mkdir(related);
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(root, 'producer', 'edit'), { recursive: true });
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('Last check: 2026-11-09T12:00:01Z · manual · complete');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  await expect(page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('heading')).toContainText(' · current');
+  let text = proposal.bytes.toString('utf8');
+  for (const [area, name] of [['Captures', 'Moved capture.md'], ['Briefs', 'Moved approved brief.md']]) {
+    const [, url] = [...text.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].find(([, link]) => link.startsWith(`Companion/${area}/`));
+    const currentCapture = area === 'Captures' && (await fs.readdir(path.join(proposal.vault, area))).find(file => file.endsWith('.md'));
+    const original = currentCapture ? path.join(proposal.vault, area, currentCapture) : path.resolve(vault, decodeURIComponent(url));
+    const moved = path.join(related, name);
+    const targetBytes = await fs.readFile(original);
+    await fs.rename(original, moved);
+    text += `\nIndependent edit before ${name}.\n`;
+    await fs.writeFile(proposal.destination, text);
+    await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+    await expect(page.locator('#idea-support-status')).toContainText('Current support inspected');
+    await expect(idea()).toBeVisible();
+    expect(await fs.readFile(proposal.destination, 'utf8')).toBe(text);
+    if (area === 'Captures') {
+      const copy = path.join(related, 'Independent capture copy.md');
+      const copied = targetBytes.toString('utf8') + '\nIndependent writing kept in the excluded copy.\n';
+      await fs.writeFile(copy, copied, { flag: 'wx' });
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+      await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
+      await idea().getByRole('button', { name: 'Repair saved idea links', exact: true }).click();
+      await expect(page.locator('#idea-status')).toContainText('Saved idea links are held');
+      expect(await fs.readFile(proposal.destination, 'utf8')).toBe(text);
+      await page.getByRole('button', { name: 'Use this file: Moved targets (reviewed)/Moved capture.md', exact: true }).click();
+      await expect(page.getByRole('status')).toContainText('Identity selection saved');
+      expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+    }
+    await idea().getByRole('button', { name: 'Repair saved idea links', exact: true }).click();
+    await expect(page.locator('#idea-status')).toContainText('Saved idea links repaired');
+    const updated = `Moved%20targets%20%28reviewed%29/${name.replaceAll(' ', '%20')}`;
+    text = text.replace(`](${url})`, `](${updated})`);
+    expect(await fs.readFile(proposal.destination, 'utf8')).toBe(text);
+    expect(await fs.readFile(moved)).toEqual(targetBytes);
+    await app.close(); app = null; await launch(false);
+  }
+  await idea().getByRole('button', { name: 'Inspect cited evidence', exact: true }).click();
+  await expect(page.locator('#idea-evidence')).toContainText(`Cited revision ${proposal.snapshot.id}; evidence a1`);
+  await expect(page.getByLabel('Cited revision snapshot', { exact: true })).toHaveValue(proposal.snapshot.text.replace(/\r\n?/g, '\n'));
+  await fs.rename(path.join(related, 'Moved approved brief.md'), path.join(related, 'Approved brief moved again.md'));
+  const editedLink = text.replace('[Approved brief version 1]', '[My own brief reference]');
+  await fs.writeFile(proposal.destination, editedLink);
+  await idea().getByRole('button', { name: 'Repair saved idea links', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea links are held');
+  expect(await fs.readFile(proposal.destination, 'utf8')).toBe(editedLink);
+  await idea().getByRole('button', { name: 'Preview saved idea removal', exact: true }).click();
+  const preview = page.getByLabel('Saved idea removal preview', { exact: true });
+  await expect(preview).toContainText('Independent edit before Moved approved brief.md.');
+  await page.getByRole('button', { name: 'Confirm saved idea removal', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea removal complete');
+  await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect((await fs.readdir(related)).sort()).toEqual(['Approved brief moved again.md', 'Independent capture copy.md', 'Moved capture.md']);
+});
+
+test('a moved saved idea resumes an exact link repair after actual process exit', async () => {
+  test.setTimeout(120000);
+  const title = 'Resume a moved idea link repair';
+  const proposal = await saveCitedExperimentProposal(title, 'movedideaheldrepair');
+  const vault = path.dirname(proposal.vault), destination = path.join(vault, 'Moved idea with retained links.md');
+  const text = proposal.bytes.toString('utf8');
+  const [, url] = [...text.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].find(([, link]) => link.startsWith('Companion/Briefs/'));
+  const brief = path.resolve(vault, decodeURIComponent(url)), movedBrief = path.join(vault, 'Verified approved brief.md');
+  await fs.rename(proposal.destination, destination);
+  await fs.rename(brief, movedBrief);
+  const article = () => page.locator('#saved-ideas article').filter({ hasText: title });
+  await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+  await expect(page.locator('#idea-support-status')).toContainText('Current support inspected');
+  const boundary = 'idea-link-repair-after-replacement';
+  const fault = path.join(root, 'faults.json');
+  await fs.writeFile(fault, JSON.stringify({ pause: boundary }));
+  await article().getByRole('button', { name: 'Repair saved idea links', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => null)).toBe(boundary);
+  const repaired = text.replace(`](${url})`, '](Verified%20approved%20brief.md)');
+  expect(await fs.readFile(destination, 'utf8')).toBe(repaired);
+  const child = app.process(), mainPid = await app.evaluate(() => process.pid);
+  const exited = new Promise(resolve => child.once('exit', resolve));
+  const abrupt = app.evaluate(({ app: electronApp }) => electronApp.exit(77)).catch(error => { if (!/closed|disposed/i.test(error.message)) throw error; });
+  await exited; await abrupt;
+  await expect.poll(() => { try { process.kill(mainPid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; } }).toBe(false);
+  app = null;
+  await fs.writeFile(fault, '{}');
+  await launch(false);
+  await expect(article()).toContainText('Finish the pending saved idea link repair');
+  await expect(article().getByRole('button', { name: 'Open saved idea in Obsidian', exact: true })).toBeDisabled();
+  await article().getByRole('button', { name: 'Repair saved idea links', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea links repaired');
+  await page.getByRole('button', { name: 'Refresh saved idea support', exact: true }).click();
+  await article().getByRole('button', { name: 'Open saved idea in Obsidian', exact: true }).click();
+  await expect.poll(dispatchedUri).toBe(`obsidian://open?path=${encodeURIComponent(destination)}`);
+  expect(await fs.readFile(destination, 'utf8')).toBe(repaired);
+  await expect(fs.lstat(proposal.destination)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
 test('a duplicate saved idea in an ordinary nested folder blocks discovery and previously selected use', async () => {
   test.setTimeout(120000);
   const title = 'A proposal with an independent copy';
@@ -941,7 +1048,7 @@ test('an interrupted reply with late unselected memory can retain independent wr
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
 });
 
-test('a failed publication retains the exact proposal across restart and explicit retry saves one note', async () => {
+for (const refusal of ['before publication', 'at the native link']) test(`a failed publication ${refusal} retains the exact proposal across restart and explicit retry saves one note`, async () => {
   test.setTimeout(120000);
   await completedConversation();
   const vault = path.join(root, 'vault', 'Companion'), ideas = path.join(vault, 'Ideas'), journal = path.join(vault, '.ideas');
@@ -961,9 +1068,20 @@ test('a failed publication retains the exact proposal across restart and explici
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/retrywriting/);
   const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
   const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
-  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-before-publication' }), 'utf8');
+  const nativeRefusal = path.join(root, 'native-idea-refusal.txt');
+  if (refusal === 'before publication') await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'idea-before-publication' }), 'utf8');
+  else await app.evaluate((_, { file, evidence }) => {
+    const native = process.getBuiltinModule('fs'), link = native.linkSync;
+    native.linkSync = (from, to) => {
+      if (to !== file || !from.endsWith('.md.pending')) return link(from, to);
+      native.linkSync = link;
+      native.writeFileSync(evidence, 'EACCES');
+      throw Object.assign(Error('The native link was refused.'), { code: 'EACCES' });
+    };
+  }, { file: destination, evidence: nativeRefusal });
   await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
   await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+  if (refusal === 'at the native link') expect(await fs.readFile(nativeRefusal, 'utf8')).toBe('EACCES');
   await expect(page.getByLabel('Idea explanation', { exact: true })).toHaveValue(explanation);
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
   expect(await fs.readFile(unrelatedFile, 'utf8')).toBe(unrelated);
@@ -1038,8 +1156,8 @@ test('an unknown outside hardlink to a staged proposal blocks publication before
   await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
 });
 
-for (const [boundary, receiptExists] of [['idea-after-publication', false], ['idea-after-receipt', true]]) {
-  test(`a process exit at ${boundary} retains one owned note and explicit recovery completes it without resurrection`, async ({}, testInfo) => {
+for (const [boundary, receiptExists, legacy] of [['idea-after-publication', false], ['idea-after-receipt', true], ['idea-after-receipt', true, true]]) {
+  test(`a process exit at ${boundary} retains one owned note and explicit recovery completes it without resurrection${legacy ? ' with a legacy receipt pair' : ''}`, async ({}, testInfo) => {
     test.setTimeout(120000);
     await completedConversation();
     const vault = path.join(root, 'vault', 'Companion'), directory = path.join(vault, '.ideas'), ideas = path.join(vault, 'Ideas');
@@ -1074,6 +1192,7 @@ for (const [boundary, receiptExists] of [['idea-after-publication', false], ['id
     await expect.poll(() => { try { process.kill(mainPid, 0); return 'alive'; } catch (error) { if (error.code === 'ESRCH') return 'exited'; throw error; } }).toBe('exited');
     await testInfo.attach('crash-processes.json', { body: JSON.stringify(evidence, null, 2), contentType: 'application/json' });
     app = null;
+    if (legacy) await fs.unlink(path.join(directory, `${intent.operation}.attempt.json`));
     const expectedSources = { ...sources };
     if (!receiptExists) {
       // Acknowledge the already published note, without authorizing new source use.
@@ -1110,6 +1229,92 @@ for (const [boundary, receiptExists] of [['idea-after-publication', false], ['id
     expect(await fs.readdir(ideas)).toEqual([]);
     expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(submissions);
+  });
+}
+
+for (const change of ['replaced prepared stage', 'removed publication', 'removed publication and attempt', 'removed publication and renamed attempt', 'late receipt stage replacement', 'late published edit']) {
+  test(`saved idea confirmation holds after ${change}`, async () => {
+    test.setTimeout(120000);
+    await completedConversation();
+    const title = 'Retain exact publication ownership';
+    await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+    await page.getByLabel('Idea title', { exact: true }).fill(title);
+    await page.getByLabel('Idea explanation', { exact: true }).fill('Original independent publication writing.');
+    await page.getByLabel('Idea limitations', { exact: true }).fill('This interpretation remains unverified.');
+    await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+    await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(/Original independent/);
+    const proposed = await page.getByLabel('Proposed idea Markdown', { exact: true }).inputValue();
+    const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+    const directory = path.join(root, 'vault', 'Companion', '.ideas');
+    const fault = path.join(root, 'faults.json');
+    const boundary = {
+      'replaced prepared stage': 'idea-before-publication',
+      'removed publication': 'idea-after-publication',
+      'removed publication and attempt': 'idea-after-publication',
+      'removed publication and renamed attempt': 'idea-after-publication',
+      'late receipt stage replacement': 'idea-after-receipt',
+      'late published edit': 'idea-before-publication'
+    }[change];
+    await fs.writeFile(fault, JSON.stringify({ fail: boundary }));
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+    const [stageName] = (await fs.readdir(directory)).filter(name => name.endsWith('.md.pending'));
+    const stage = path.join(directory, stageName), independent = path.join(root, 'independent.md');
+    await app.close(); app = null;
+    await fs.writeFile(fault, '{}');
+    if (change === 'replaced prepared stage') {
+      await fs.rename(stage, independent);
+      await fs.writeFile(stage, proposed, { flag: 'wx' });
+    }
+    if (change.startsWith('removed publication')) await fs.unlink(destination);
+    if (change === 'removed publication and attempt') await fs.unlink(stage.replace(/\.md\.pending$/, '.attempt.json'));
+    if (change === 'removed publication and renamed attempt') {
+      await fs.rename(stage.replace(/\.md\.pending$/, '.attempt.json'), stage.replace(/\.md\.pending$/, '.prepared.json'));
+    }
+    await launch(false);
+    const pending = page.locator('#pending-ideas article').filter({ hasText: title });
+    await expect(pending).toBeVisible();
+    await pending.getByRole('button', { name: 'Resume proposed idea', exact: true }).click();
+    await expect(page.getByLabel('Proposed idea Markdown', { exact: true })).toHaveValue(proposed);
+    const late = change.startsWith('late ');
+    const changed = proposed.replace('Original independent', 'Modified unrelated  ');
+    const observed = path.join(root, 'late-change.txt');
+    if (late) await app.evaluate((_, args) => {
+      const files = process.getBuiltinModule('fs').promises;
+      const open = files.open;
+      const receipt = args.stage.replace(/\.md\.pending$/, '.published.json');
+      files.open = async (file, ...options) => {
+        const handle = await open(file, ...options);
+        if (file !== args.destination || !process.getBuiltinModule('fs').existsSync(receipt)) return handle;
+        const close = handle.close.bind(handle);
+        handle.close = async () => {
+          await close();
+          files.open = open;
+          if (args.replace) {
+            await files.rename(args.stage, args.independent);
+            await files.writeFile(args.stage, args.proposed, { flag: 'wx' });
+          } else {
+            const before = await files.stat(args.destination);
+            await files.writeFile(args.destination, args.changed);
+            await files.utimes(args.destination, before.atime, before.mtime);
+          }
+          await files.writeFile(args.observed, 'changed');
+        };
+        return handle;
+      };
+    }, { destination, stage, independent, proposed, changed, observed,
+      replace: change === 'late receipt stage replacement' });
+    await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+    if (late) await expect.poll(() => fs.readFile(observed, 'utf8').catch(() => null)).toBe('changed');
+    await expect(page.locator('#idea-status')).toContainText('Save failed. Proposed content is retained.');
+    const read = file => fs.readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+    const output = change === 'late published edit' ? changed : change === 'late receipt stage replacement' ? proposed : null;
+    expect(await read(destination)).toBe(output);
+    expect(await read(stage)).toBe(change === 'late published edit' ? changed : proposed);
+    if (change === 'replaced prepared stage' || change === 'late receipt stage replacement') {
+      expect(await read(independent)).toBe(proposed);
+      expect((await fs.stat(stage, { bigint: true })).ino).not.toBe((await fs.stat(independent, { bigint: true })).ino);
+    }
   });
 }
 
