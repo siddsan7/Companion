@@ -696,6 +696,32 @@ test('matched archive restore stops when the selected managed parent changes ins
   await expect(summary).toContainText(/Restored 0 conversations.*selection changed.*Inspect again/i);
 });
 
+test('archive restore preserves a late note edit and leaves its reviewed inclusion unpublished', async () => {
+  test.setTimeout(90000);
+  const note = path.join(root, 'vault', 'practice.md');
+  await createSafetyArchive(note);
+  const region = page.getByRole('region', { name: 'Local history archive', exact: true });
+  const directory = path.join(root, (await fs.readdir(root)).find(name => name.startsWith('context-settings-')));
+  const scope = path.join(directory, 'notes.json');
+  const pause = 'archive-note-scope-before-first-link';
+  await fs.unlink(scope);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause }));
+  await region.getByRole('button', { name: 'Inspect history archive', exact: true }).click();
+  await expect(region).toContainText('Integrity and version validated');
+  await region.getByLabel('Match archive vault to the currently selected vault', { exact: true }).check();
+  await region.getByLabel('Application settings restoration', { exact: true }).selectOption('review-note-inclusions');
+  await region.getByRole('button', { name: 'Preview matched restore', exact: true }).click();
+  await region.getByLabel(`Restore note inclusion ${note}`, { exact: true }).check();
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(pause);
+  const edited = 'Independent note edit made during the reviewed restore.';
+  try { await fs.writeFile(note, edited); }
+  finally { await fs.writeFile(path.join(root, 'release.txt'), 'resume'); }
+  await expect(region.locator('#archive-restore-summary')).toContainText(/restore stopped.*Reviewed note changed.*0 reviewed note inclusions/i);
+  expect(await fs.stat(scope).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.readFile(note, 'utf8')).toBe(edited);
+});
+
 for (const beforeLink of [false, true]) test(beforeLink ?
   'archive preview retires an exact unpublished note scope after an actual pre-link exit' :
   'archive restore reports an exact published note inclusion when stage cleanup is refused', async () => {

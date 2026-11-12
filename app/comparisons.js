@@ -256,11 +256,11 @@ class Comparisons {
       await this.write(record, true); return this.view(record);
     });
   }
-  async build(record, slot) {
+  async build(record, slot, observe) {
     const vault = this.getVault();
     if (!vault || vault.root !== record.vault.root) throw Error('Comparison belongs to another vault.');
     if (this.unsaved.has(record.id)) throw Error('Comparison has unsaved output. Copy retained text and repair storage before continuing.');
-    const brief = await new Briefs(vault).pinned(record.brief.version);
+    const briefs = new Briefs(vault), brief = await briefs.pinned(record.brief.version, observe);
     if (JSON.stringify(brief) !== JSON.stringify(record.brief.snapshot) || brief.issues.length) throw Error('Pinned approved brief or its selected inputs changed or are unavailable. No request was sent.');
     if (JSON.stringify(record.fixtures) !== JSON.stringify(fixtures)) throw Error('Versioned comparison fixtures changed. Create and inspect a separate comparison.');
     const fixture = fixtures.find(item => item.id === slot.fixtureId);
@@ -271,6 +271,14 @@ class Comparisons {
     const pin = { requested, capacity, settings, binding: evidence.binding, bindingEvidence: 'Random process-local evidence binding, not portable capacity or authentication proof.' };
     const count = [...slot.package.text].length, limit = Math.min(32000, capacity.maxCodePoints);
     if (count > limit) throw Error('Comparison package exceeds the verified context limit. Nothing was shortened or sent.');
+    if (observe) {
+      const { guard } = vault.publicationFolders(vault.root);
+      observe(() => {
+        if (this.getVault() !== vault) throw Error('Comparison vault changed.');
+        guard();
+        briefs.requireCurrentSourcesSync(brief);
+      });
+    }
     return { pin, package: slot.package, slotId: slot.id };
   }
   async preview(input) {
@@ -307,12 +315,20 @@ class Comparisons {
       const started = performance.now();
       try {
         await this.provider.preflight(); await this.checkpoint('comparison-before-dispatch');
-        const revalidate = async () => {
-          if (JSON.stringify(await this.build(record, slot)) !== JSON.stringify(approved.snapshot)) throw Error('Comparison context, settings or proof changed before dispatch. No request was sent.');
+        const revalidate = async observe => {
+          if (JSON.stringify(await this.build(record, slot, observe)) !== JSON.stringify(approved.snapshot)) throw Error('Comparison context, settings or proof changed before dispatch. No request was sent.');
         };
         await revalidate();
         const result = await this.provider.turn(slot.package.text, { comparisonPin: slot.requested, capacityBinding: approved.snapshot.pin.binding,
-          beforeStart: async () => { await this.checkpoint('comparison-before-turn-start'); await revalidate(); },
+          beforeStart: async () => {
+            await this.checkpoint('comparison-before-turn-start');
+            const guards = [];
+            await revalidate(guard => guards.push(guard));
+            return () => {
+              try { for (const guard of guards) guard(); }
+              catch (error) { throw Error('Pinned approved brief or its selected inputs changed or are unavailable. No request was sent.', { cause: error }); }
+            };
+          },
           onState: async snapshot => { Object.assign(slot, snapshot); await this.write(record); }
         });
         Object.assign(slot, result, { status: 'completed' });

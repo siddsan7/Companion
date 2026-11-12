@@ -80,6 +80,18 @@ class Conversations {
     verifyStageSync(file, guard, proof);
     return withBytes ? { record, text, proof } : record;
   }
+  async readHistoryEvidence(id, directory, observed) {
+    let verifyControl;
+    const { record, proof } = await this.readStored(id, true, directory, record =>
+      this.controls.check(record, verify => { verifyControl = verify; }));
+    const file = path.join(this.directory, `${id}.json`);
+    observed.set(id, () => {
+      if (this.unsaved.has(id)) throw historyChanged();
+      verifyControl();
+      verifyStageSync(file, () => this.safeDirectory(false, directory), proof);
+    });
+    return record;
+  }
   async write(record, expected = null, directory = this.safeDirectory()) {
     const guard = () => this.safeDirectory(false, directory);
     const stage = path.join(this.directory, `${randomUUID()}.pending`);
@@ -146,11 +158,11 @@ class Conversations {
     }
     return { conversations, location: this.directory };
   }
-  historyResolver({ all, vault, active, excludedSources, excludedHistory }) {
+  historyResolver({ all, vault, active, excludedSources, excludedHistory, readOrigin = id => this.readStored(id) }) {
     const records = new Map(active ? [[active.id, active]] : []), resolved = new Map(), visiting = new Set();
     const load = async id => {
       if (!uuid(id) || this.unsaved.has(id)) throw Error('historical origin is unavailable or has unsaved writing');
-      if (!records.has(id)) records.set(id, await this.readStored(id));
+      if (!records.has(id)) records.set(id, await readOrigin(id));
       const record = records.get(id);
       if (record.vault?.root !== vault.root) throw Error('historical origin belongs to another vault');
       return record;
@@ -231,7 +243,10 @@ class Conversations {
     const directory = this.safeDirectory(true);
     if (this.unsaved.has(input.conversationId)) throw Error('This conversation has an unsaved reply. Save the retained reply locally, or copy it before closing, before preparing another request.');
     const context = await this.getContext(), vault = context.vault;
-    const prior = input.conversationId ? baselineRecord || await this.read(input.conversationId) : null;
+    const observedHistory = new Map();
+    const readOrigin = dispatch ? id => this.readHistoryEvidence(id, directory, observedHistory) : undefined;
+    const readPrior = readOrigin || (id => this.read(id));
+    const prior = input.conversationId ? baselineRecord || await readPrior(input.conversationId) : null;
     if (prior && currentRequestId) prior.requests = prior.requests.filter(request => request.id !== currentRequestId);
     if (prior && prior.vault.root !== vault.root) throw Error('Conversation belongs to another vault.');
     const version = prior?.brief.version || input.briefVersion;
@@ -265,7 +280,7 @@ class Conversations {
     for (const id of historyRestores) excludedHistory.delete(id);
     const warnings = [...preview.warnings], history = [], historyExclusions = [];
     const scope = { version: baseline.version, excludedSources: [...excluded].sort(), excludedHistory: [...excludedHistory].sort() };
-    const resolveHistory = this.historyResolver({ all, vault, active: prior && { ...prior, scope }, excludedSources: excluded, excludedHistory });
+    const resolveHistory = this.historyResolver({ all, vault, active: prior && { ...prior, scope }, excludedSources: excluded, excludedHistory, readOrigin });
     const foreign = new Map(), selectedDialogue = new Map();
     const includeForeign = (result, includeText = false) => {
       // Ancestry authorizes eligibility checks, never implicit inclusion of raw dialogue.
@@ -312,6 +327,10 @@ class Conversations {
     const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}${foreignText ? `\n\nPrior-conversation historical dialogue (retained discussion, not independent evidence):\n${foreignText}` : ''}${authorityText ? `\n\nHistorical dependency authority (provenance only; unselected ancestor dialogue is omitted):\n${authorityText}` : ''}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
     const count = [...text].length;
     this.safeDirectory(false, directory);
+    if (dispatch) {
+      const usedHistory = new Set([prior?.id, ...[...foreign.values()].map(turn => turn.ref.conversationId)]);
+      for (const id of usedHistory) if (id) dispatch.observe(observedHistory.get(id));
+    }
     return { schema: 1, text, digest: hash(text), count, limit: preview.limit, blocked: count > preview.limit, capacityBinding: preview.capacityBinding, boundEvidence: preview.boundEvidence, warnings, historyExclusions, scope, excludedHistory: scope.excludedHistory, dependencies: [...dependencies.values()], sourceExcerpts: preview.sourceExcerpts, historyIds: history.map(item => item.id), historyRefs: [...foreign.values()].map(turn => turn.ref), conversationGeneration: prior?.generation || null, brief, vault: { root: vault.root }, question: input.question, speculation: input.speculation, historyDigest: hash(JSON.stringify(prior?.requests || [])) };
   }
   async preview(input) {

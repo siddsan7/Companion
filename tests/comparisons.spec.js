@@ -273,7 +273,9 @@ test('changed comparison proof during thread preflight blocks turn start while c
   await expect(page.getByRole('status')).toContainText('Capture saved.');
 });
 
-test('changed pinned brief input before comparison dispatch starts no provider thread or turn', async () => {
+for (const late of [false, true]) test(late ?
+  'changed pinned brief input during final provider evidence prevents comparison turn start' :
+  'changed pinned brief input before comparison dispatch starts no provider thread or turn', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
     dispatchEnabled: true,
@@ -281,21 +283,40 @@ test('changed pinned brief input before comparison dispatch starts no provider t
     comparisonSettings: { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'authored fixture settings, not live proof' }
   }), 'utf8');
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ model: 'fixture', modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', messages: [{ phase: 'final_answer', text: 'NO_OUTPUT_AFTER_BRIEF_INPUT_CHANGE' }] }), 'utf8');
-  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'comparison-before-dispatch' }), 'utf8');
+  const pause = late ? 'comparison-before-turn-start' : 'comparison-before-dispatch';
+  const checkpoint = path.join(root, 'checkpoint.txt'), release = path.join(root, 'release.txt');
+  const held = path.join(root, 'comparison-evidence-held'), resume = path.join(root, 'comparison-evidence-resume');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause }), 'utf8');
   await launch(); await approveBrief();
   await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
   await expect(page.locator('#comparison-slots article')).toHaveCount(6);
   await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
   const pinned = await savedComparison();
+  if (late) await app.evaluate((_, { evidence, checkpoint, pause, held, resume }) => {
+    const io = process.getBuiltinModule('fs'), original = io.promises.readFile;
+    let reads = 0;
+    io.promises.readFile = async function (file, ...args) {
+      if (file === evidence && io.existsSync(checkpoint) && io.readFileSync(checkpoint, 'utf8') === pause && ++reads === 2) {
+        io.promises.readFile = original;
+        await io.promises.writeFile(held, 'held');
+        while (!io.existsSync(resume)) await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      return original.call(this, file, ...args);
+    };
+  }, { evidence: path.join(root, 'conversation-evidence.json'), checkpoint, pause, held, resume });
   await page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true }).click();
-  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('comparison-before-dispatch');
-  await fs.appendFile(path.join(root, 'README.md'), '\nA newly supplied constraint requires a fresh brief review.\n', 'utf8');
-  await fs.writeFile(path.join(root, 'release.txt'), 'release', 'utf8');
+  await expect.poll(() => fs.readFile(checkpoint, 'utf8').catch(() => '')).toBe(pause);
+  if (late) {
+    await fs.writeFile(release, 'finish final comparison package rebuild');
+    await expect.poll(() => fs.readFile(held, 'utf8').catch(() => '')).toBe('held');
+  }
+  try { await fs.appendFile(path.join(root, 'README.md'), '\nA newly supplied constraint requires a fresh brief review.\n', 'utf8'); }
+  finally { await fs.writeFile(late ? resume : release, 'release', 'utf8'); }
   await expect(page.locator('#comparison-slots article').first()).toContainText('failed');
   await expect(page.locator('#comparison-slots article').first()).toContainText('Pinned approved brief or its selected inputs changed');
   const requests = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(0);
+  expect(requests.filter(request => request.method === 'thread/start')).toHaveLength(late ? 1 : 0);
   expect(requests.filter(request => request.method === 'turn/start')).toHaveLength(0);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8').catch(error => error.code)).toBe('ENOENT');
   const saved = await savedComparison();

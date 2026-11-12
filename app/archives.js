@@ -267,30 +267,18 @@ class Archives {
       throw Error('Archive file changed since inspection or is no longer an ordinary available file. Inspect the current file again; nothing was restored.');
     }
   }
-  async noteSnapshot(file, vault) {
+  async noteSnapshot(file, vault, observe) {
     const base = path.resolve(vault.vault), relative = path.relative(base, file);
     if (!path.isAbsolute(file) || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw Error('Archived note is outside the matched vault.');
-    const directories = [base]; let current = base;
-    for (const segment of path.dirname(relative).split(path.sep).filter(segment => segment && segment !== '.')) { current = path.join(current, segment); directories.push(current); }
-    const identities = directories.map(directory => local.lstatSync(directory, { bigint: true }));
-    const guard = () => {
-      this.guard();
-      directories.forEach((directory, index) => { const stat = local.lstatSync(directory, { bigint: true }); if (!stat.isDirectory() || stat.isSymbolicLink() || !same(stat, identities[index]) || local.realpathSync(directory) !== directory) throw Error('Reviewed note path changed or contains an alias.'); });
-    };
-    guard(); const stat = await fs.lstat(file); guard();
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 2 * 1024 * 1024) throw Error('Choose an ordinary unlinked note no larger than 2 MiB.');
-    const context = new Context(vault), note = await context.note(file); guard();
-    // Re-open a pinned descriptor and compare the current exact bytes with the eligibility reader.
-    let handle;
-    try {
-      handle = await fs.open(file, local.constants.O_RDONLY | (local.constants.O_NOFOLLOW || 0)); guard();
-      const opened = await handle.stat(), bytes = await handle.readFile(); guard();
-      const leaf = await fs.lstat(file), after = await handle.stat(); guard();
-      if (!same(stat, opened) || !same(opened, leaf) || !leaf.isFile() || leaf.isSymbolicLink() || leaf.nlink !== 1 || opened.size !== after.size || opened.mtimeMs !== after.mtimeMs || bytes.length > 2 * 1024 * 1024) throw Error('Reviewed note changed. Preview again.');
-      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-      if (text !== note.text) throw Error('Reviewed note changed. Preview again.');
-      return { file, title: note.title, digest: hash(bytes), text };
-    } finally { await handle?.close(); }
+    this.guard();
+    const stat = await fs.lstat(file, { bigint: true });
+    const maxBytes = 2 * 1024 * 1024;
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.size > BigInt(maxBytes)) throw Error('Choose an ordinary unlinked note no larger than 2 MiB.');
+    const { note, proof, size, verify } = await new Context(vault).readExplicitNote(file);
+    this.guard();
+    if (proof.dev !== String(stat.dev) || proof.ino !== String(stat.ino) || size > maxBytes) throw Error('Reviewed note changed. Preview again.');
+    observe?.(verify);
+    return { file, title: note.title, digest: proof.digest, text: note.text };
   }
   async noteCandidates(archive, sourceRoot, vault) {
     const binding = archive.payload.vaultBindings.find(item => item.managedRoot === sourceRoot), candidates = [];
@@ -309,6 +297,7 @@ class Archives {
   async includeReviewedNotes(files, matched, committed) {
     const { vault, root, assertSelection } = matched;
     const directory = path.join(this.history.dataRoot, `context-settings-${hash(root)}`), file = path.join(directory, 'notes.json');
+    const proofs = [];
     return changeNoteScope(file, {
       guard: () => this.guard(), assertSelection,
       update: (existing, currentDigest) => {
@@ -318,11 +307,15 @@ class Archives {
       beforePublish: async () => {
         for (const chosen of files) {
           assertSelection();
-          const actual = await this.noteSnapshot(chosen, vault), approved = matched.noteCandidates.find(candidate => candidate.file === chosen);
+          const actual = await this.noteSnapshot(chosen, vault, verify => proofs.push(verify)), approved = matched.noteCandidates.find(candidate => candidate.file === chosen);
           if (actual.digest !== approved.digest || actual.text !== approved.text) throw Error('Reviewed note changed. Preview settings again.');
         }
       },
       beforeFirstLink: () => this.checkpoint('archive-note-scope-before-first-link'),
+      verifyRelated: () => {
+        try { for (const verify of proofs) verify(); }
+        catch (error) { throw Error('Reviewed note changed. Preview settings again.', { cause: error }); }
+      },
       committed: count => {
         committed(count);
         this.history.tokens.clear();

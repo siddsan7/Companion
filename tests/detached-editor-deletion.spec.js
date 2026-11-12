@@ -39,6 +39,19 @@ async function exists(file) { return fs.access(file).then(() => true, error => {
 async function checkpoint(name) {
   await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe(name);
 }
+async function holdFirstSourceUnlink(preview, targets) {
+  const pause = 'mixed-deletion-before-source-unlink', faults = path.join(root, 'faults.json');
+  await fs.writeFile(faults, JSON.stringify({ pause }));
+  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
+  await checkpoint(pause);
+  const boundary = JSON.parse(await fs.readFile(path.join(root, 'checkpoint-detail.json'), 'utf8'));
+  expect(targets).toContain(boundary.file);
+  const release = async () => {
+    await fs.writeFile(faults, '{}');
+    await fs.writeFile(path.join(root, 'release.txt'), 'continue');
+  };
+  return { boundary, release };
+}
 async function observe(testInfo, name, base, extra = {}) {
   const observed = { ...extra, files: await files(base) };
   await fs.writeFile(testInfo.outputPath(name + '.json'), JSON.stringify(observed, null, 2));
@@ -157,9 +170,21 @@ test('deleting persistent detached editor writing retains one whole local annota
   expect(await files(path.join(root, 'producer'))).toEqual(producers);
   expect(await fs.readdir(path.join(base, 'Annotations'))).toEqual([]);
   for (const file of targets) expect(recovered[relative(file)].ordinary).toBe(true);
+  const reviewedLedger = await fs.readFile(ledgerFile), stale = JSON.parse(reviewedLedger);
+  const rollback = stale.blocks[sourceHash].outputHold.rollback;
+  expect(rollback.proof.ino).toBe(recovered[relative(current)].ino);
+  rollback.proof.ino = '0';
+  const preview = page.getByLabel('Capture deletion preview');
+  await fs.writeFile(ledgerFile, JSON.stringify(stale, null, 2));
+  try {
+    await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source recovery inventory contains changed or unsupported writing');
+    await expect(preview).toBeHidden();
+    const afterRefusal = await files(base);
+    for (const target of targets) expect(afterRefusal[relative(target)]).toEqual(recovered[relative(target)]);
+  } finally { await fs.writeFile(ledgerFile, reviewedLedger); }
   const before = await files(base), statusBeforePreview = await page.getByRole('status').innerText();
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
-  const preview = page.getByLabel('Capture deletion preview');
   // Wait for either settled preview or reported HOLD, then save evidence before the feature assertion.
   await expect.poll(async () => await preview.isVisible() || (await page.getByRole('status').innerText()) !== statusBeforePreview).toBe(true);
   await observe(testInfo, 'first-feature-preview', base, { status: await page.getByRole('status').innerText(), preview: await preview.textContent(), ui: await page.locator('body').innerText() });
@@ -182,27 +207,9 @@ test('deleting persistent detached editor writing retains one whole local annota
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await expect(preview).toBeVisible();
   const outputPath = await review(), output = path.join(root, 'vault', outputPath);
-  // Observe the native filesystem boundary before the FIRST source-origin unlink.
-  // This test instrumentation does not fabricate a receipt or change product authority.
-  await app.evaluate(({ }, { targets, marker, release }) => {
-    const nativeFs = process.getBuiltinModule('fs').promises, nativeUnlink = nativeFs.unlink;
-    let observed = false;
-    nativeFs.unlink = async function(file, ...args) {
-      if (!observed && targets.includes(String(file))) {
-        observed = true;
-        await nativeFs.writeFile(marker, JSON.stringify({ file: String(file), boundary: 'before native source unlink' }));
-        while (true) {
-          try { await nativeFs.access(release); break; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-          await new Promise(resolve => setTimeout(resolve, 15));
-        }
-      }
-      return nativeUnlink.call(this, file, ...args);
-    };
-  }, { targets, marker: path.join(root, 'before-source-unlink.json'), release: path.join(root, 'release-source-unlink.txt') });
-  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
-  await expect.poll(() => exists(path.join(root, 'before-source-unlink.json'))).toBe(true);
+  const { boundary, release } = await holdFirstSourceUnlink(preview, targets);
   const pausedLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
-  await observe(testInfo, 'before-first-source-unlink', base, { pausedLedger, boundary: JSON.parse(await fs.readFile(path.join(root, 'before-source-unlink.json'), 'utf8')) });
+  await observe(testInfo, 'before-first-source-unlink', base, { pausedLedger, boundary });
   expect((await Promise.all(targets.map(exists))).every(Boolean)).toBe(true);
   const plans = pausedLedger.sourceAuthority[capture.id].preservedWriting;
   expect(plans).toHaveLength(1); expect(plans[0].publication).toBeTruthy(); expect(plans[0].stageIdentity).toBeTruthy(); expect(plans[0].file).toBe(outputPath);
@@ -215,7 +222,7 @@ test('deleting persistent detached editor writing retains one whole local annota
   const fence = quoted.match(/^(`{3,})text\r?$/m)?.[1];
   expect(fence?.length).toBeGreaterThan(8); expect(quoted).toContain(fence + 'text\n' + wholeE.toString('utf8'));
   expect(plans[0].publication.sha256).toBe(createHash('sha256').update(outputBytes).digest('hex'));
-  await fs.writeFile(path.join(root, 'release-source-unlink.txt'), 'continue');
+  await release();
   await expect(page.getByRole('status')).toContainText('Capture deleted');
   await expect(page.getByRole('status')).toContainText('supporting evidence is unavailable');
   async function verifyDeleted(name) {
@@ -640,27 +647,9 @@ test('restored draft A retains detached editor writing with fresh admission and 
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await expect(preview).toBeVisible();
   const outputPath = await review(), output = path.join(root, 'vault', outputPath);
-  // Observe the native filesystem boundary before the FIRST source-origin unlink.
-  // This test instrumentation does not fabricate a receipt or change product authority.
-  await app.evaluate(({ }, { targets, marker, release }) => {
-    const nativeFs = process.getBuiltinModule('fs').promises, nativeUnlink = nativeFs.unlink;
-    let observed = false;
-    nativeFs.unlink = async function(file, ...args) {
-      if (!observed && targets.includes(String(file))) {
-        observed = true;
-        await nativeFs.writeFile(marker, JSON.stringify({ file: String(file), boundary: 'before native source unlink' }));
-        while (true) {
-          try { await nativeFs.access(release); break; } catch (error) { if (error.code !== 'ENOENT') throw error; }
-          await new Promise(resolve => setTimeout(resolve, 15));
-        }
-      }
-      return nativeUnlink.call(this, file, ...args);
-    };
-  }, { targets, marker: path.join(root, 'before-source-unlink.json'), release: path.join(root, 'release-source-unlink.txt') });
-  await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
-  await expect.poll(() => exists(path.join(root, 'before-source-unlink.json'))).toBe(true);
+  const { boundary, release } = await holdFirstSourceUnlink(preview, targets);
   const pausedLedger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
-  await observe(testInfo, 'before-first-source-unlink', base, { pausedLedger, boundary: JSON.parse(await fs.readFile(path.join(root, 'before-source-unlink.json'), 'utf8')) });
+  await observe(testInfo, 'before-first-source-unlink', base, { pausedLedger, boundary });
   expect((await Promise.all(targets.map(exists))).every(Boolean)).toBe(true);
   expect(pausedLedger.sourceAuthority[capture.id].originGenerations).toEqual([{ captureId: capture.id, generation: restoredG }]);
   expect(pausedLedger.sourceAuthority[capture.id].mixedRecovery.sourceGeneration).toBe(restoredG);
@@ -677,7 +666,7 @@ test('restored draft A retains detached editor writing with fresh admission and 
   const fence = quoted.match(/^(`{3,})text\r?$/m)?.[1];
   expect(fence?.length).toBeGreaterThan(8); expect(quoted).toContain(fence + 'text\n' + wholeE.toString('utf8'));
   expect(plans[0].publication.sha256).toBe(createHash('sha256').update(outputBytes).digest('hex'));
-  await fs.writeFile(path.join(root, 'release-source-unlink.txt'), 'continue');
+  await release();
   await expect(page.getByRole('status')).toContainText('Capture deleted');
   await expect(page.getByRole('status')).toContainText('supporting evidence is unavailable');
   async function verifyDeleted(name) {

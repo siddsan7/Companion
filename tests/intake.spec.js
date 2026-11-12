@@ -450,6 +450,89 @@ test('restored capture recovery preserves a recreated backup across same-slot pr
   expect(after.lastCheck.status).toBe('held');
   for (const [key, attempt] of Object.entries(ledger.attempts)) expect(after.attempts[key]).toEqual(attempt);
 });
+for (const [boundary, title] of [
+  ['publish', 'restored capture move preserves writing created after checking that the retained path was absent'],
+  ['moved', 'restored capture link refuses a replacement independent copy after reading its original bytes'],
+  ['published', 'restored capture cleanup preserves an ordinary editor replacement after checking the retained peer']
+]) test(title, async () => {
+  test.setTimeout(45000);
+  await artifact('a-original'); await launch(); await setup(); await connect(true);
+  const base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), captures = path.join(base, 'Captures');
+  const file = path.join(captures, (await fs.readdir(captures)).find(name => name.endsWith('.md'))), original = await fs.readFile(file, 'utf8');
+  await artifact('b-update', '2'.repeat(32));
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'intake-capture-staged' }));
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  const checkpoint = path.join(root, 'checkpoint.txt'), release = path.join(root, 'release.txt');
+  await expect.poll(() => fs.readFile(checkpoint, 'utf8').catch(() => '')).toBe('intake-capture-staged');
+  const tx = JSON.parse(await fs.readFile(path.join(intake, 'transaction.json'), 'utf8'));
+  const incoming = path.join(intake, tx.revision.id + '.stage'), outside = path.join(root, 'outside-incoming');
+  await fs.copyFile(incoming, outside); await fs.unlink(incoming); await fs.link(outside, incoming);
+  await fs.writeFile(release, 'continue');
+  await expect(page.getByRole('status')).toHaveText('Intake check complete. Inspect held imports and source errors.');
+  const ledger = JSON.parse(await fs.readFile(path.join(intake, 'ledger.json'), 'utf8'));
+  const journal = path.join(intake, ledger.blocks[sha].journal);
+  await app.close(); app = null;
+  const backup = path.join(intake, tx.backup), intentFile = backup + '.detach.json';
+  await fs.unlink(backup); await fs.link(file, backup);
+  await fs.unlink(release);
+  const pause = 'intake-restored-backup-' + boundary;
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause }));
+  await launch();
+  await expect.poll(() => fs.readFile(checkpoint, 'utf8').catch(() => '')).toBe(pause);
+  const intent = await fs.readFile(intentFile, 'utf8'), retained = backup + '.detached-' + JSON.parse(intent).id, stage = backup + '.independent';
+  const edited = 'Independent editor writing at a recovery path.';
+  const observed = path.join(root, 'retained-peer-replaced');
+  await app.evaluate((_, { root, journal, retained, stage, edited, observed, boundary }) => {
+    if (process.env.COMPANION_TEST_ROOT !== root) throw Error('Peer replacement requires a disposable vault.');
+    const io = process.getBuiltinModule('fs');
+    if (boundary === 'publish') {
+      const stat = io.promises.lstat;
+      io.promises.lstat = async function (file, ...args) {
+        try { return await stat.call(this, file, ...args); }
+        catch (error) {
+          if (file === retained && error.code === 'ENOENT') {
+            io.promises.lstat = stat;
+            io.writeFileSync(retained, edited, { flag: 'wx' });
+            io.writeFileSync(observed, 'replaced');
+          }
+          throw error;
+        }
+      };
+      return;
+    }
+    const read = io.promises.readFile;
+    let checked = false;
+    io.promises.readFile = async function (file, ...args) {
+      const value = await read.call(this, file, ...args);
+      if (boundary === 'moved' ? file === stage : file === journal && checked) {
+        const target = boundary === 'moved' ? stage : retained;
+        io.promises.readFile = read;
+        io.unlinkSync(target);
+        io.writeFileSync(target, edited, { flag: 'wx' });
+        io.writeFileSync(observed, 'replaced');
+      }
+      if (file === retained) checked = true;
+      return value;
+    };
+  }, { root, journal, retained, stage, edited, observed, boundary });
+  await fs.writeFile(release, 'continue');
+  await expect.poll(() => fs.readFile(observed, 'utf8').catch(() => '')).toBe('replaced');
+  await expect.poll(async () => {
+    if (/changed|preserved/i.test(await page.getByRole('status').innerText())) return true;
+    return await fs.stat(intentFile).catch(error => error.code) === 'ENOENT';
+  }).toBe(true);
+  if (boundary === 'moved') {
+    expect(await fs.stat(backup).catch(error => error.code)).toBe('ENOENT');
+    expect(await fs.readFile(stage, 'utf8')).toBe(edited);
+    expect(await fs.readFile(retained, 'utf8')).toBe(original);
+  } else {
+    expect(await fs.readFile(retained, 'utf8')).toBe(edited);
+    expect(await fs.readFile(backup, 'utf8')).toBe(original);
+  }
+  expect(await fs.readFile(intentFile, 'utf8')).toBe(intent);
+  expect(await fs.readFile(file, 'utf8')).toBe(original);
+});
+
 for (const boundary of ['moved', 'published', 'cleaned']) {
   test(`restored capture detach resumes after actual main exits at backup ${boundary}`, async () => {
     test.setTimeout(45000);

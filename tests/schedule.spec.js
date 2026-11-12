@@ -276,6 +276,38 @@ test('scheduled and manual checks share the native lock and publish one source r
   expect(scheduled.anchor).toBe('2026-11-08T06:59:00.000Z');
 });
 
+test('daily intake reports a real worker exit as interrupted and keeps the admitted slot consumed', async () => {
+  test.setTimeout(60000);
+  await launch(); await setup(); await artifact();
+  const schedule = page.getByLabel('Daily intake schedule');
+  await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+  await clock('2026-11-09T07:00:00Z');
+  const checkpoint = path.join(root, 'checkpoint.txt'), faults = path.join(root, 'faults.json');
+  const scheduleFile = path.join(root, 'schedule.json');
+  await fs.writeFile(faults, JSON.stringify({ pause: 'intake-snapshot-staged' }));
+  const running = startWorker();
+  await expect.poll(() => fs.readFile(checkpoint, 'utf8').catch(() => '')).toBe('intake-snapshot-staged');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(schedule).toContainText('Worker: running');
+  const admitted = JSON.parse(await fs.readFile(scheduleFile));
+  expect(admitted.handledSlot).toBe(1);
+  running.child.kill();
+  await running.done;
+  await fs.unlink(faults);
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(schedule).toContainText('Worker: interrupted');
+  await expect(schedule).toContainText('Check now');
+  await expect(page.locator('#intake-state')).toContainText('scheduled · interrupted');
+  const interrupted = JSON.parse(await fs.readFile(scheduleFile));
+  expect(interrupted.anchor).toBe(admitted.anchor);
+  expect(interrupted.handledSlot).toBe(admitted.handledSlot);
+  expect((await worker()).code).toBe(0);
+  expect(JSON.parse(await fs.readFile(scheduleFile))).toEqual(interrupted);
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('manual · complete');
+});
+
 test('effective trigger and scheduler policy drift stays visible until owned repair restores the anchored schedule', async () => {
   // Eleven desktop drift/repair cycles include normal scrolling and IPC refresh.
   test.setTimeout(60000);
