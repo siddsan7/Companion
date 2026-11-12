@@ -9,6 +9,7 @@ const pendingTitle = require('./pending-title');
 const { activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent } = require('./annotation-authority');
 const { requiredDirectories } = require('./source-recovery');
 const { ordinaryDirectories } = require('./staged-publication');
+const { stageRecord, matchesProof, retireStageRecords } = require('./intake-publication');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -17,6 +18,7 @@ const relative = (intake, file) => path.relative(intake.vault.vault, file).split
 const fail = () => { throw Object.assign(Error('Source recovery inventory contains changed or unsupported writing. Preserve it for explicit review.'), { code: 'SOURCE_FILE_CHANGED' }); };
 const equal = (left, right) => JSON.stringify(left) === JSON.stringify(right);
 const date = value => typeof value === 'string' && /T.*(?:Z|[+-]\d\d:\d\d)$/.test(value) && Number.isFinite(Date.parse(value));
+const fileProof = target => ({ dev: target.dev, ino: target.ino, digest: target.sha256 });
 const formats = ['transaction', 'capture-stage', 'snapshot-stage', 'incoming-snapshot', 'source-backup'];
 const mentions = (bytes, id, sourceHash) => bytes.includes(Buffer.from(id, 'utf8')) || bytes.includes(Buffer.from(sourceHash, 'utf8'));
 function text(bytes) {
@@ -123,7 +125,7 @@ function normalizedDraft(revision, capture, sourceHash) {
   if (!equal(revision.uncertainty, uncertainty)) fail();
 }
 function selectionTransaction(tx, ledger, capture, sourceHash, revisions) {
-  if (!fields(tx, ['schema', 'resolution', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || !uuid(tx.resolution) || tx.retainOnly !== false || tx.sourceHash !== sourceHash || tx.revision.id === capture.currentRevision || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'reviewChoices', 'selectionHistory']) || !date(tx.capture.updatedAt)) fail();
+  if (!fields(tx, ['schema', 'publicationVersion', 'previousProof', 'journalIdentity', 'resolution', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || !uuid(tx.resolution) || tx.retainOnly !== false || tx.sourceHash !== sourceHash || tx.revision.id === capture.currentRevision || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', 'reviewChoices', 'selectionHistory']) || !date(tx.capture.updatedAt)) fail();
   const block = ledger.blocks[sourceHash], pending = ledger.pending[sourceHash], outcome = ledger.outcomes[tx.key];
   if (block === undefined) {
     // The native destination-to-backup rename failed before capture staging.
@@ -155,12 +157,12 @@ function selectionTransaction(tx, ledger, capture, sourceHash, revisions) {
   if (!isDeepStrictEqual(tx.capture, expected) || tx.previous !== noteText(capture, current) || tx.previousHash !== capture.currentHash || tx.content !== noteText(expected, selected)) fail();
   return admission;
 }
-function transaction(intake, tx, ledger, capture, sourceHash, revisions) {
-  intake.validateTransaction(tx);
+function transaction(intake, tx, ledger, capture, sourceHash, revisions, journal) {
+  intake.validateTransaction(tx, journal);
   if (tx.revision.review !== undefined) validateNormalizedReview(tx.revision, capture.id, sourceHash); else normalizedDraft(tx.revision, capture, sourceHash);
   if (tx.resolution !== undefined) return selectionTransaction(tx, ledger, capture, sourceHash, revisions);
   const retainOnly = tx.retainOnly === true;
-  if (!fields(tx, ['schema', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || tx.sourceHash !== sourceHash || tx.externalConflict !== false || typeof tx.retainOnly !== 'boolean' || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', ...(retainOnly ? ['reviewChoices'] : [])]) || tx.capture.id !== capture.id || tx.capture.file !== capture.file || tx.capture.relative !== capture.relative || tx.capture.capturedAt !== capture.capturedAt || tx.capture.title !== capture.title || !date(tx.capture.updatedAt) || tx.capture.currentRevision !== (retainOnly ? capture.currentRevision : tx.revision.id) || !Array.isArray(tx.capture.revisions) || !equal(tx.capture.revisions, [...capture.revisions.filter(id => id !== tx.revision.id), tx.revision.id])) fail();
+  if (!fields(tx, ['schema', 'publicationVersion', 'previousProof', 'journalIdentity', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup', 'sourceGeneration']) || tx.sourceHash !== sourceHash || tx.externalConflict !== false || typeof tx.retainOnly !== 'boolean' || !fields(tx.capture, ['id', 'file', 'relative', 'capturedAt', 'title', 'currentRevision', 'reviewed', 'rejected', 'supportEligible', 'revisions', 'updatedAt', 'currentHash', ...(retainOnly ? ['reviewChoices'] : [])]) || tx.capture.id !== capture.id || tx.capture.file !== capture.file || tx.capture.relative !== capture.relative || tx.capture.capturedAt !== capture.capturedAt || tx.capture.title !== capture.title || !date(tx.capture.updatedAt) || tx.capture.currentRevision !== (retainOnly ? capture.currentRevision : tx.revision.id) || !Array.isArray(tx.capture.revisions) || !equal(tx.capture.revisions, [...capture.revisions.filter(id => id !== tx.revision.id), tx.revision.id])) fail();
   const authority = ledger.sourceAuthority?.[capture.id];
   if (tx.sourceGeneration !== (authority?.phase === 'active' ? authority.generation : undefined)) fail();
   const accepted = ledger.attempts[tx.revision.identity];
@@ -212,7 +214,7 @@ async function readDetachedEditor(intake, ledger, capture, sourceHash, note) {
   if (!uuid(block.incomingRevision) || block.incomingRevision === admitted.id || block.journal !== `conflict-${block.incomingRevision}.json`) fail();
   const journal = await leaf(intake, path.join(intake.dir, block.journal), 'source-recovery'), tx = compact(journal.bytes);
   const revisions = new Map([[admitted.id, admitted]]);
-  transaction(intake, tx, ledger, capture, sourceHash, revisions);
+  transaction(intake, tx, ledger, capture, sourceHash, revisions, journal.target);
   if (journal.nlink !== 1 || tx.revision.id !== block.incomingRevision || tx.revision.review !== undefined || tx.resolution !== undefined || tx.externalConflict !== false || tx.retainOnly !== false || tx.previous !== canonical || tx.previousHash !== capture.currentHash || tx.content !== noteText(tx.capture, tx.revision) || tx.capture.currentHash !== hash(tx.content) || tx.capture.updatedAt !== tx.revision.importedAt || ledger.attempts[tx.revision.identity] || ledger.admissions?.[tx.revision.id]) fail();
   if (witness !== undefined) {
     const matches = (proof, target) => exact(proof, ['dev', 'ino', 'digest']) &&
@@ -235,6 +237,10 @@ async function readDetachedEditor(intake, ledger, capture, sourceHash, note) {
   if (!exact(intent, ['schema', 'id', 'sourceHash', 'captureId', 'file', 'journal', 'journalHash', 'backup', 'previousHash', 'dev', 'ino', 'stageDev', 'stageIno']) || intent.schema !== 1 || !uuid(intent.id) || intent.id !== block.detachHold.journal.slice(heldPrefix.length) || intent.sourceHash !== sourceHash || intent.captureId !== capture.id || intent.file !== capture.relative || intent.journal !== block.journal || intent.journalHash !== journal.target.sha256 || intent.backup !== tx.backup || intent.previousHash !== capture.currentHash || [intent.dev, intent.ino, intent.stageDev, intent.stageIno].some(value => typeof value !== 'string' || !/^[0-9]+$/.test(value)) || intent.dev !== current.target.dev || intent.ino !== current.target.ino) fail();
   const source = await leaf(intake, path.join(intake.dir, prefix + '.independent'), 'mixed-recovery');
   const retained = await leaf(intake, path.join(intake.dir, prefix + '.detached-' + intent.id), 'mixed-recovery');
+  if (tx.publicationVersion === 1) {
+    const detach = stageRecord(ledger, sourceHash, fileProof(journal.target))?.detach;
+    if (detach?.intent.digest !== hash(wrapper.intentBytes) || !matchesProof(detach?.stage, fileProof(source.target))) fail();
+  }
   const whole = text(retained.bytes);
   if (![hold, source, retained].every(value => value.nlink === 1) || source.target.dev !== intent.stageDev || source.target.ino !== intent.stageIno || !source.bytes.equals(current.bytes) || !Buffer.from(whole, 'utf8').equals(retained.bytes) || retained.bytes.equals(current.bytes) || new Set([current, snapshot, journal, hold, source, retained].map(value => value.target.dev + ':' + value.target.ino)).size !== 6) fail();
   const evidence = [{ role: 'independent-editor-writing', file: path.basename(retained.target.file), hash: retained.target.sha256 }, { role: 'original-source-copy', file: path.basename(source.target.file), hash: capture.currentHash }];
@@ -306,23 +312,26 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     // publishJournal writes JSON.stringify(tx); conflict/pending archives link
     // those exact bytes. Do not discard duplicate-key or formatting payloads.
     if (!entry.value.bytes.equals(Buffer.from(JSON.stringify(tx), 'utf8'))) fail();
-    const admission = transaction(intake, tx, ledger, capture, sourceHash, revisions), journal = relative(intake, entry.file);
+    const admission = transaction(intake, tx, ledger, capture, sourceHash, revisions, entry.value.target), journal = relative(intake, entry.file);
     const deferredSelection = tx.resolution !== undefined && ledger.blocks[sourceHash] === undefined;
     if (deferredSelection && (entry.name !== ledger.pending[sourceHash].journal || !entries.some(item => item.name === tx.revision.id + '.snapshot.stage') || entries.some(item => [tx.revision.id + '.stage', tx.backup].includes(item.name)))) fail();
     const descriptor = { transaction: journal, captureId: capture.id, sourceHash, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null };
-    const add = (file, format, content, kind = 'source-recovery') => {
+    const owned = tx.publicationVersion === 1 ? stageRecord(ledger, sourceHash, fileProof(entry.value.target)) : undefined;
+    const add = (file, format, content, kind = 'source-recovery', role) => {
       const item = { file: relative(intake, file), format, ...descriptor }; layout(intake, { sourceHash }, item);
       if (titles.proofFiles.has(item.file)) fail();
       const prior = expected.get(item.file);
       if (prior && (prior.content !== content || prior.item.revisionId !== item.revisionId || prior.item.sourceGeneration !== item.sourceGeneration)) fail();
       // A live transaction/archive pair shares one canonical transaction descriptor.
-      if (!prior) expected.set(item.file, { item, content, kind });
+      const claim = prior || { item, content, kind, proofs: [] };
+      if (role && tx.publicationVersion === 1) claim.proofs.push(owned?.[role]);
+      if (!prior) expected.set(item.file, claim);
     };
     add(entry.file, 'transaction', entry.text);
-    add(path.join(intake.dir, tx.revision.id + '.stage'), 'capture-stage', tx.content);
-    add(path.join(intake.dir, tx.revision.id + '.snapshot.stage'), 'snapshot-stage', JSON.stringify(tx.revision, null, 2));
-    add(path.join(intake.vault.root, 'Revisions', tx.revision.id + '.json'), 'incoming-snapshot', JSON.stringify(tx.revision, null, 2), admission ? 'snapshot' : 'source-recovery');
-    if (tx.previous !== null) add(path.join(intake.dir, tx.backup), 'source-backup', tx.previous, 'source-backup');
+    add(path.join(intake.dir, tx.revision.id + '.stage'), 'capture-stage', tx.content, 'source-recovery', 'captureStage');
+    add(path.join(intake.dir, tx.revision.id + '.snapshot.stage'), 'snapshot-stage', JSON.stringify(tx.revision, null, 2), 'source-recovery', 'snapshotStage');
+    add(path.join(intake.vault.root, 'Revisions', tx.revision.id + '.json'), 'incoming-snapshot', JSON.stringify(tx.revision, null, 2), admission ? 'snapshot' : 'source-recovery', admission ? undefined : 'snapshotStage');
+    if (tx.previous !== null) add(path.join(intake.dir, tx.backup), 'source-backup', tx.previous, 'source-backup', 'backup');
     transactions.set(journal, tx);
     if (!admission) observations.push({ identity: tx.revision.identity, fingerprint: tx.revision.fingerprint, sourceHash, captureId: capture.id, revisionId: tx.revision.id, sourceGeneration: tx.sourceGeneration || null });
   }
@@ -343,9 +352,10 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
     targets.set(relative(intake, entry.file), { ...entry.value.target, kind: 'source-backup' });
   }
   if (observedTitleBackups.size !== titles.sourceBackups.size) fail();
-  for (const { item, content, kind } of expected.values()) {
+  for (const { item, content, kind, proofs } of expected.values()) {
     let value; try { value = await leaf(intake, path.join(intake.vault.vault, item.file), kind); } catch (error) { if (error.code === 'ENOENT') continue; throw error; }
     if (!value.bytes.equals(Buffer.from(content, 'utf8'))) fail();
+    if (proofs.length && !proofs.some(proof => matchesProof(fileProof(value.target), proof))) fail();
     targets.set(item.file, value.target); recovery.push(item);
   }
   // Every present descriptor must point at a present, strictly classified journal.
@@ -411,6 +421,7 @@ function inspectPointers(ledger, authority) {
   for (const kind of ['blocks', 'pending']) if (ledger[kind][authority.sourceHash] && !authority.recoveryPointers.some(item => item.kind === kind)) fail();
 }
 function retirePointers(ledger, authority) {
+  retireStageRecords(ledger, record => record.sourceHash === authority.sourceHash);
   if (authority.mixedRecovery) return require('./mixed-deletion').retirePointers(ledger, authority);
   inspectPointers(ledger, authority);
   const capture = ledger.captures[authority.sourceHash];

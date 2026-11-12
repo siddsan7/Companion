@@ -195,8 +195,9 @@ async function inventory(intake, ledger, capture, sourceHash, note, seed, now) {
   const sourceHeader = noteText(capture, admitted).match(/^---\n([\s\S]*?)\n---\n/)[1], localHeader = current.match(/^(?:\uFEFF)?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)?.[1];
   if (!localHeader || !equal(YAML.parse(localHeader), YAML.parse(sourceHeader))) fail('unsupported local metadata or generation claims');
   const txFields = ['schema', 'externalConflict', 'retainOnly', 'key', 'sourceHash', 'capture', 'revision', 'content', 'previousHash', 'previous', 'backup'];
-  if (!shape(original, txFields, ['sourceGeneration']) || !shape(tx, [...txFields, 'resolution', 'keptCurrent'], ['sourceGeneration']) || !equal(resolution, tx) || original.sourceGeneration !== generation || tx.sourceGeneration !== generation) fail('transaction fields or original generation');
-  intake.validateTransaction(original); intake.validateTransaction(tx);
+  const txProofs = ['sourceGeneration', 'publicationVersion', 'previousProof', 'journalIdentity'];
+  if (!shape(original, txFields, txProofs) || !shape(tx, [...txFields, 'resolution', 'keptCurrent'], txProofs) || !equal(resolution, tx) || original.sourceGeneration !== generation || tx.sourceGeneration !== generation) fail('transaction fields or original generation');
+  intake.validateTransaction(original, originalLeaf.target); intake.validateTransaction(tx, resolutionLeaf.target);
   validateNormalizedReview(original.revision, capture.id, sourceHash); validateNormalizedReview(tx.revision, capture.id, sourceHash);
   if (!equal(tx.revision, original.revision) || tx.revision.id === admitted.id || ledger.attempts[tx.revision.identity] || ledger.admissions?.[tx.revision.id] || tx.revision.importedAt !== original.capture.updatedAt || !equal(tx.keptCurrent, admitted)) fail('incoming revision is not a distinct unadmitted observation');
   const originalCapture = { ...capture, revisions: [...capture.revisions, tx.revision.id], updatedAt: tx.revision.importedAt, reviewChoices: [...new Set([...(capture.reviewChoices || []), capture.currentRevision, tx.revision.id])], supportEligible: false, currentHash: hash(current) }; delete originalCapture.conflict;

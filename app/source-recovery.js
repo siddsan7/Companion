@@ -1,7 +1,8 @@
 const fs = require('node:fs/promises');
 const local = require('node:fs');
 const path = require('node:path');
-const { ordinaryDirectories, verifyStageSync } = require('./staged-publication');
+const { ordinaryDirectories, readExactSync, verifyStageSync } = require('./staged-publication');
+const { matchesProof } = require('./intake-publication');
 const relative = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 function requiredDirectories(intake, targets, preservedWriting = []) {
   const vault = intake.vault, result = new Set();
@@ -72,13 +73,23 @@ async function globalRecovery(intake, ledger) {
   }
   const peers = Object.values(ledger.sourceAuthority || {}).filter(authority => authority.phase === 'restoring' && !authority.manual).map(authority => path.join(intake.dir, authority.restoration.journal));
   for (const item of [...Object.values(ledger.pending), ...Object.values(ledger.blocks)]) if (typeof item?.journal === 'string' && /^(?:pending|conflict)-[a-f0-9-]{36}(?:-[a-f0-9-]{36})?\.json$/.test(item.journal)) peers.push(path.join(intake.dir, item.journal));
-  const links = local.lstatSync(file, { bigint: true, throwIfNoEntry: false })?.nlink;
-  if (links === 3n || links === 2n && Object.values(ledger.blocks).some(item => item.outputHold?.pending)) {
-    const exact = intake.ordinaryRecoveryJournal(ledger);
-    if (exact?.links === Number(links)) return;
+  const infoAtStart = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+  if (!infoAtStart) return;
+  const links = Number(infoAtStart.nlink), { guard } = intake.vault.publicationFolders(intake.dir);
+  const changed = () => Error('The global intake recovery journal or its known aliases changed. Recovery files were preserved.');
+  if (![1, 2, 3].includes(links)) throw changed();
+  const { bytes, proof } = readExactSync(file, guard, links);
+  if (proof.dev !== String(infoAtStart.dev) || proof.ino !== String(infoAtStart.ino)) throw changed();
+  const tx = JSON.parse(bytes);
+  intake.validateTransaction(tx, proof);
+  if (tx.publicationVersion === 1 || links === 3 || links === 2 && Object.values(ledger.blocks).some(item => item.outputHold?.pending)) {
+    const exact = intake.ordinaryRecoveryJournal(ledger, tx.journalIdentity?.temporary ? tx : undefined);
+    if (exact?.links === links && matchesProof(exact, proof)) { exact.verify(); return; }
+    if (tx.publicationVersion === 1) throw changed();
   }
   const info = await intake.ownedFile(file, peers, 'Global intake recovery journal');
-  if (info) intake.validateTransaction(JSON.parse(await fs.readFile(file, 'utf8')));
+  if (!info || info.dev !== infoAtStart.dev || info.ino !== infoAtStart.ino || info.nlink !== infoAtStart.nlink) throw changed();
+  verifyStageSync(file, guard, proof, links);
 }
 function held(id, authority, message) {
   return Object.assign(Error(message), { code: 'SOURCE_OPERATION_HELD', captureId: id, operationId: authority.operationId, family: 'manual-restoration' });
