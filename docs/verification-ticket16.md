@@ -157,3 +157,21 @@ The complete local runner exit, totals, exact candidate and raw results are reta
 2. For the actual-input smoke use `node scripts/probe-real-reel.cjs <fresh-evidence-dir> <selected-producer-attempt> <selected-MyTune-README>`. Use absolute paths for all three arguments. The fresh evidence directory must be a direct child of canonical Windows Temp, outside the selected input folders. Observe the saved note separately in official Obsidian using a disposable profile and vault. Check the same saved note hash.
 3. For root-owned native verification use `node scripts/probe-archive-reconnect.cjs <fresh-absolute-evidence-dir>`. For worker execution, use `node scripts/probe-scheduled-intake.cjs <prepare|arm|observe|cleanup> <fresh-absolute-evidence-dir>` in that order against the same disposable evidence directory, observing the accelerated boundary before observe. Verify owned cleanup in both runs.
 4. Keep raw machine-local evidence in the named Temp folders. Retain only the relevant whitelisted outputs for sharing. Report setup errors and final results separately.
+
+## Complete PR #17 verification
+
+Independent Standards and Spec reviewers approved the complete PR against `04ed4fb6a0451714ee0d64549ad86ec3eb4108d9`. The final executable source and test tree is `85850e86fa26331223cbabd2d92a10c0bf285567` at `660b50785f8a726e8009fd1e5b861c9d197b8a30`. Preserving merges `c1842c3`, `348bbe5`, `dd4fa25`, and `a72c93b` integrate the four scopes from the November 11 handoff. Later reviewed commits retain their ancestry.
+
+| Windows check | Exact source result |
+| --- | --- |
+| Locked dependency install, source and native probe hashes, and pinned Electron preparation | Passed. 125 tracked source files. Electron v45.2.3. |
+| Actual Windows archive reconnect | Passed. The target stayed inactive until confirmation, retained its anchor and task on restart, and both disposable tasks were verified absent after cleanup. |
+| Actual accelerated Windows worker | Passed with the desktop closed. The worker handled the simulated fourth slot and admitted the authored capture and revision. The exact disposable task was absent after cleanup. |
+| Actual Reel to MD and MyTune README smoke | Passed in 7,834 ms using a controlled response. One saved proposal cited the exact admitted producer evidence. The probe checked source preservation and restart idempotence. |
+| Complete Windows regression | 752 passed, zero failed, one capability skip across 753 cases and 41 files. Exit 0 in 2,192,284 ms. The skipped case required file-symlink creation and received Windows EPERM. Hardlink cases ran. |
+
+The complete gate took 2,285,576 ms. The regression ran from 08:42:01.993 to 09:18:34.277 UTC on November 12, 2026. The machine-local evidence prefix is `%TEMP%/companion-pr17-660b507-final`. It contains the preparation record, native reconnect and worker observations and cleanup, controlled input smoke, and complete regression logs and exit record. The regression stdout SHA-256 is `acd7316279cfa72d499cbb0e5acf4a29b5c041f6cdf24d32bdedba1fb23f8657`.
+
+The preceding complete run at `363e6bb` ended with 741 passes, 11 failures, one Windows file-symlink skip and exit 1 in 2,572,135 ms. The correction lets a deliberately moved backup stay outside the deletion scope while checking that its original path remains empty through confirmation and restart. The other changes bring test fixtures to the current Brief, Context and annotation entry points. All 11 prior failures passed on the corrected tree and in the complete rerun. Earlier stopped runs remain partial evidence.
+
+GitHub reported no enforced rules or legacy protection on `main`. Hosted Windows Actions was blocked before any step by the account billing lock and remains waived and unverified. Actual installed Obsidian opening is recorded in the earlier ticket evidence. Windows protocol dispatch, natural daily timing, sleep and sign-out remain unobserved. Live Codex sign-in and inference are deferred. Production chat and comparison readiness remain restricted. No deployment.

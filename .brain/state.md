@@ -4,11 +4,11 @@ Goal: complete [Companion #1](https://github.com/siddsan7/Companion/issues/1) an
 
 ## Pre-merge evidence checkpoint
 
-Tickets #2–#15 are integrated and closed. Ticket #13 passed all 195 cases on its exact reviewed source; see [its report](../docs/verification-ticket13-final.md). Ticket #16 source and automated checks are complete at `1154c10`, tree `5e92866`: 366 passed, zero failed, one actual Windows file-symlink capability skip across 367 cases and 28 files, exit 0 in 1,437,296 ms. The checked source inventory covered 101 files and native pins. The [verification report](../docs/verification-ticket16.md) keeps the four earlier failed full gates, focused evidence, and exact native cleanup records. Windows sharing refusal is handled only by a bounded revalidation of the same staged control rename under the existing lock. See [the plan](plan-ticket16-control-publication.md).
+Tickets #2–#16 are integrated and closed. The four handoff scopes and subsequent reviewed corrections retain their individual commits. The complete [verification report](../docs/verification-ticket16.md) records exact source `660b507`, tree `85850e86`. Both independent whole-PR reviewers approved that source. Its Windows gate passed with 752 passes, zero failures, and one actual file-symlink capability skip across 753 cases and 41 files. The source and native probe checks, pinned Electron, actual scheduler reconnect and worker cleanup, and controlled actual-input smoke also passed.
 
-Actual Reel to MD and MyTune smoke saved a cited proposal with a controlled reply, and official Obsidian opened the exact note. Actual Windows worker and archive reconnect checks passed on the final source. Live signed-in Codex remains deferred; production chat and comparison readiness stay closed. Natural scheduler behavior and Windows protocol dispatch remain unobserved. Hosted CI was refused before execution due to billing and is unverified under the user's waiver. No deployment.
+Hosted CI remains billing-blocked, waived and unverified. Live Codex sign-in and inference remain deferred. Production chat and comparison readiness stays closed. Natural scheduler behavior and Windows protocol dispatch remain unobserved.
 
-At this checkpoint #16 still needs its exact documentation tip reviewed and integrated without losing ancestry. Then review the complete PR against remote `main`; fix blockers and verify the final exact tip. Check enforced rules, merge with a merge commit and verify remote ancestry. If PR #17 already shows that verified merge, the user's pause is active; do not start post-merge work without a new request.
+Verify the final documentation tip preserves the checked runtime and tests. Obtain both exact-tip approvals and recheck enforced GitHub rules before the preserving merge. Verify remote main contains all ticket history and issue #1 closed. If remote verification already succeeded, the user's pause is active. No deployment.
 
 ## Reusable guardrails
 
