@@ -908,6 +908,41 @@ test('an explicitly selected imported evidence citation opens its original revis
   expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
 });
 
+test('an idea saved after an imported revision changes links the current note and cites the exact original revision', async () => {
+  await completedConversation({ imported: true });
+  const vault = path.join(root, 'vault', 'Companion'), revisions = path.join(vault, 'Revisions');
+  const [originalName] = (await fs.readdir(revisions)).filter(name => name.endsWith('.json'));
+  const originalBytes = await fs.readFile(path.join(revisions, originalName)), original = JSON.parse(originalBytes);
+  const captures = path.join(vault, 'Captures'), [name] = await fs.readdir(captures);
+  const moved = path.join(root, 'vault', 'Projects', 'Current imported note.md');
+  await fs.mkdir(path.dirname(moved), { recursive: true }); await fs.rename(path.join(captures, name), moved);
+  await fs.cp(path.join(__dirname, 'fixtures/reel-review/edit'), path.join(root, 'producer', 'edit'), { recursive: true });
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: '2026-11-09T12:00:01Z', timezone: 'America/Phoenix' }), 'utf8');
+  await page.getByRole('button', { name: 'Check now', exact: true }).click();
+  await expect(page.locator('#intake-state')).toContainText('Last check: 2026-11-09T12:00:01Z · manual · complete');
+  await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
+  await page.getByLabel('Source inspection').locator('article').filter({ hasText: 'Human review: edit' }).getByRole('button', { name: 'Make current', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Current revision selected');
+  expect(await fs.readFile(moved, 'utf8')).toContain('Authored synthetic corrected review');
+
+  await page.getByRole('button', { name: 'Draft saved idea', exact: true }).click();
+  await page.getByLabel('Idea title', { exact: true }).fill('Use retained evidence and navigate to its current capture');
+  await page.getByLabel('Idea explanation', { exact: true }).fill('The original authored evidence remains a provenance example.');
+  await page.getByLabel('Idea limitations', { exact: true }).fill('Authored fixture only.');
+  await page.getByRole('checkbox', { name: 'Cite evidence a1 from Authored synthetic review', exact: true }).check();
+  await page.getByRole('button', { name: 'Preview saved idea', exact: true }).click();
+  const proposal = page.getByLabel('Proposed idea Markdown', { exact: true });
+  await expect(proposal).toHaveValue(/evidence_id: a1/);
+  const text = await proposal.inputValue(), fields = YAML.parse(text.match(/^---\n([\s\S]*?)\n---\n/)[1]);
+  expect(fields.citations).toMatchObject([{ capture_id: original.captureId, revision_id: original.id, snapshot_sha256: createHash('sha256').update(originalBytes).digest('hex') }]);
+  expect(text).toContain(`[Capture note ${original.captureId}](Projects/Current%20imported%20note.md)`);
+  const destination = await page.getByLabel('Proposed idea destination', { exact: true }).inputValue();
+  await page.getByRole('button', { name: 'Confirm saved idea', exact: true }).click();
+  await expect(page.locator('#idea-status')).toContainText('Saved idea');
+  expect(await fs.readFile(destination, 'utf8')).toBe(text);
+  expect(await fs.readFile(path.join(revisions, originalName))).toEqual(originalBytes);
+});
+
 test('citation inspection ignores damaged uncited revisions and reports a damaged cited revision without substitution', async () => {
   test.setTimeout(120000);
   await completedConversation({ imported: true });

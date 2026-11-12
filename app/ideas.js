@@ -297,6 +297,7 @@ class Ideas {
           } catch {}
         }
         if (!historical) unavailable = true;
+        else if (note) captureNotes.set(captureId, note);
         warnings.push(`Supporting context ${dep.key} changed since the conversation. ${historical ? 'The exact eligible imported revision remains retained; it was not replaced by the current revision.' : 'The historical interpretation is retained with unavailable or unverified support.'}`);
       }
       for (const warning of source?.warnings || []) warnings.push(warning);
