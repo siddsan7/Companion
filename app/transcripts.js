@@ -6,10 +6,19 @@ const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
 const { TranscriptRemoval } = require('./transcript-removal');
+const { readExactSync } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
+const stageFields = ['dev', 'ino', 'birthtimeNs', 'mtimeNs', 'size'];
+const stageProof = stat => Object.fromEntries(stageFields.map(field => [field, String(stat[field])]));
+const matchesStage = (proof, stat) => Boolean(proof && stageFields.every(field => proof[field] === String(stat[field])));
+const sameStage = (a, b) => stageFields.every(field => a[field] === b[field]);
+const sameRead = (a, b) => sameStage(a, b) && a.ctimeNs === b.ctimeNs && a.nlink === b.nlink;
+const changed = () => Error('Transcript publication identity changed. Preserve all files for review.');
+const missingPublication = () => Error('A transcript publication may already have occurred. Its exact output is missing. Preserve the retained writing for review.');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const number = value => typeof value === 'string' && /^\d+$/.test(value);
 const literal = text => {
   let length = 3; for (const match of text.matchAll(/`+/g)) length = Math.max(length, match[0].length + 1);
   const fence = '`'.repeat(length); return `${fence}text\n${text}\n${fence}`;
@@ -51,12 +60,71 @@ class Transcripts {
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== BigInt(links)) throw Error('Transcript publication contains a linked or nonordinary file. Preserve it for review.');
     const handle = await fs.open(file, 'r');
     try {
-      if (!same(before, await handle.stat({ bigint: true }))) throw Error('Transcript file identity changed. Preserve it for review.');
+      if (!sameRead(before, await handle.stat({ bigint: true }))) throw changed();
       const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(await handle.readFile());
       this.guard(vault, destination, parents);
       const after = await fs.lstat(file, { bigint: true });
-      if (!same(before, after) || after.nlink !== BigInt(links)) throw Error('Transcript file identity changed. Preserve it for review.');
+      if (!sameRead(before, after)) throw changed();
       return { text, stat: after };
+    } finally { await handle.close(); }
+  }
+  checkLeaf(file, expected) {
+    const current = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!current?.isFile() || !sameRead(current, expected)) throw changed();
+  }
+  checkStage(intent, stat, receipt) {
+    if (intent.stageProof && !matchesStage(intent.stageProof, stat)) throw changed();
+    if (receipt && (receipt.dev !== String(stat.dev) || receipt.ino !== String(stat.ino))) throw changed();
+    if (!intent.stageProof && !receipt) throw Error('Transcript stage lacks an exact identity proof. Preserve the proposed writing for review.');
+  }
+  async readPair(intent, vault, stage, parents, receipt) {
+    const a = await this.read(vault, intent.destination, stage, parents, 2);
+    const b = await this.read(vault, intent.destination, intent.destination, parents, 2);
+    if (!sameRead(a.stat, b.stat) || a.text !== intent.text || b.text !== intent.text) throw changed();
+    this.checkStage(intent, a.stat, receipt);
+    return a.stat;
+  }
+  async readReceipt(intent, vault, receipt, parents) {
+    const { text, stat } = await this.read(vault, intent.destination, receipt, parents);
+    return { value: this.validateReceipt(intent, JSON.parse(text)), stat };
+  }
+  validateReceipt(intent, value) {
+    if (!value || Object.keys(value).length !== 6 || value.schema !== 1 || value.operation !== intent.operation || value.id !== intent.id || value.digest !== intent.digest || !number(value.dev) || !number(value.ino)) throw Error('Transcript publication receipt is damaged. Preserve the writing for review.');
+    return value;
+  }
+  validateAttempt(intent, text, stat) {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw changed();
+    const { control, ...details } = value;
+    this.validateReceipt(intent, details);
+    if (!control || Object.keys(control).length !== 2 || control.dev !== String(stat.dev) || control.ino !== String(stat.ino)
+      || !intent.stageProof || intent.stageProof.dev !== value.dev || intent.stageProof.ino !== value.ino
+      || text !== JSON.stringify(value, null, 2)) throw changed();
+    return value;
+  }
+  async readAttempt(intent, vault, file, parents) {
+    this.guard(vault, intent.destination, parents);
+    const before = local.lstatSync(file, { bigint: true, throwIfNoEntry: false });
+    if (!before) return null;
+    const record = await this.read(vault, intent.destination, file, parents);
+    if (!sameRead(before, record.stat)) throw changed();
+    this.validateAttempt(intent, record.text, record.stat);
+    return record;
+  }
+  writeControl(file, value) {
+    const handle = local.openSync(file, 'wx');
+    try {
+      local.writeFileSync(handle, JSON.stringify(value(local.fstatSync(handle, { bigint: true })), null, 2));
+      local.fsyncSync(handle);
+      return local.fstatSync(handle, { bigint: true });
+    } finally { local.closeSync(handle); }
+  }
+  async writeExclusive(file, bytes) {
+    const handle = await fs.open(file, 'wx');
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+      return await handle.stat({ bigint: true });
     } finally { await handle.close(); }
   }
   async snapshot(id) {
@@ -121,7 +189,8 @@ class Transcripts {
   validateIntent(intent, operation, vault) {
     const object = (value, fields) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => fields.includes(key));
     const reject = () => { throw Error('Transcript intent has unknown or damaged ownership. Preserve all retained writing for review.'); };
-    if (!object(intent, ['schema', 'operation', 'id', 'vault', 'conversationId', 'recordDigest', 'destination', 'text', 'digest', 'reviewState', 'createdAt']) || intent.schema !== 1 || !uuid(operation) || intent.operation !== operation || !uuid(intent.id) || !uuid(intent.conversationId) || !digest(intent.recordDigest) || !digest(intent.digest) || typeof intent.text !== 'string' || hash(intent.text) !== intent.digest || typeof intent.createdAt !== 'string' || !Number.isFinite(Date.parse(intent.createdAt))) reject();
+    if (!object(intent, ['schema', 'operation', 'id', 'vault', 'conversationId', 'recordDigest', 'destination', 'text', 'digest', 'reviewState', 'createdAt', 'stageProof']) || intent.schema !== 1 || !uuid(operation) || intent.operation !== operation || !uuid(intent.id) || !uuid(intent.conversationId) || !digest(intent.recordDigest) || !digest(intent.digest) || typeof intent.text !== 'string' || hash(intent.text) !== intent.digest || typeof intent.createdAt !== 'string' || !Number.isFinite(Date.parse(intent.createdAt))) reject();
+    if (Object.hasOwn(intent, 'stageProof') && (!object(intent.stageProof, stageFields) || !stageFields.every(field => number(intent.stageProof[field])) || intent.stageProof.size !== String(Buffer.byteLength(intent.text)))) reject();
     if (!object(intent.vault, ['vault', 'root']) || intent.vault.vault !== vault.vault || intent.vault.root !== vault.root || typeof intent.destination !== 'string' || !path.isAbsolute(intent.destination) || path.resolve(intent.destination) !== intent.destination) reject();
     const state = intent.reviewState;
     if (!object(state, ['digest', 'warnings', 'dependencies', 'origins', 'contextError']) || state.digest !== intent.recordDigest || !Array.isArray(state.warnings) || state.warnings.some(warning => typeof warning !== 'string') || !Array.isArray(state.dependencies) || !Array.isArray(state.origins) || state.contextError !== null && typeof state.contextError !== 'string') reject();
@@ -142,27 +211,27 @@ class Transcripts {
     const journal = await this.read(vault, placeholder, `${base}.intent.json`, parents);
     const intent = this.validateIntent(JSON.parse(journal.text), operation, vault);
     await this.removal.fence(intent, vault);
-    return { intent, vault, base };
+    return { intent, vault, base, journal: journal.stat };
   }
   async publicationState(intent, vault, base, parents) {
     const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
     const stage = `${base}.md.pending`, receipt = `${base}.published.json`;
     const hasStage = await exists(stage), hasReceipt = await exists(receipt);
-    let saved;
-    if (hasReceipt) {
-      saved = JSON.parse((await this.read(vault, intent.destination, receipt, parents)).text);
-      if (!saved || Object.keys(saved).some(key => !['schema', 'operation', 'id', 'digest', 'dev', 'ino'].includes(key)) || saved.schema !== 1 || saved.operation !== intent.operation || saved.id !== intent.id || saved.digest !== intent.digest || typeof saved.dev !== 'string' || typeof saved.ino !== 'string') throw Error('Transcript publication receipt is damaged. Preserve the writing for review.');
-      if (!hasStage) return { completed: true, published: true };
-    }
+    const saved = hasReceipt ? await this.readReceipt(intent, vault, receipt, parents) : null;
+    const attempt = await this.readAttempt(intent, vault, `${base}.link.json`, parents);
+    if (saved && !hasStage) return { completed: true, published: true };
     if (!hasStage) throw Error('Transcript stage is unavailable. Preserve the retained intent writing; no publication was attempted.');
-    const hasDestination = await exists(intent.destination), links = hasDestination ? 2 : 1;
-    const stageFile = await this.read(vault, intent.destination, stage, parents, links);
-    if (stageFile.text !== intent.text) throw Error('Transcript stage was edited. Preserve the retained writing for review.');
+    const hasDestination = await exists(intent.destination);
     if (hasDestination) {
-      const destination = await this.read(vault, intent.destination, intent.destination, parents, 2);
-      if (!same(stageFile.stat, destination.stat) || destination.text !== intent.text || saved && (saved.dev !== String(stageFile.stat.dev) || saved.ino !== String(stageFile.stat.ino))) throw Error('Transcript publication peers changed. Preserve both copies for review.');
-    } else if (hasReceipt) throw Error('Completed transcript destination is missing. Preserve the stage; it will not be recreated.');
-    return { completed: false, published: hasDestination };
+      if (!saved && !attempt) throw changed();
+      const pair = await this.readPair(intent, vault, stage, parents, saved?.value);
+      return { completed: false, published: true, attempt: attempt?.stat, pair, receipt: saved?.stat };
+    }
+    if (saved || attempt) throw missingPublication();
+    const stageFile = await this.read(vault, intent.destination, stage, parents);
+    if (stageFile.text !== intent.text) throw Error('Transcript stage was edited. Preserve the retained writing for review.');
+    this.checkStage(intent, stageFile.stat);
+    return { completed: false, published: false };
   }
   async pending() {
     const vault = this.getVault(); if (!vault) return { records: [], issues: [] };
@@ -182,7 +251,7 @@ class Transcripts {
       let intent;
       try {
         const retained = await this.retained(match[1]); intent = retained.intent;
-        owned.add(`${intent.operation}.md.pending`); owned.add(`${intent.operation}.published.json`);
+        owned.add(`${intent.operation}.md.pending`); owned.add(`${intent.operation}.published.json`); owned.add(`${intent.operation}.link.json`);
         const parents = this.guard(vault, intent.destination), state = await this.publicationState(intent, vault, retained.base, parents);
         if (!state.completed) records.push({ operation: intent.operation, destination: intent.destination, text: intent.text, canResume: true, warning: state.published ? 'Already-published copy awaits explicit acknowledgement. No fresh source eligibility is needed to acknowledge the exact pair.' : 'Unpublished retained writing. Resume and confirm explicitly; current origin and warnings will be rechecked.' });
       } catch (error) {
@@ -193,7 +262,7 @@ class Transcripts {
     return { records, issues };
   }
   async resume(operation) {
-    const { intent, vault, base } = await this.retained(operation), parents = this.guard(vault, intent.destination);
+    const { intent, vault, base, journal } = await this.retained(operation), parents = this.guard(vault, intent.destination);
     const state = await this.publicationState(intent, vault, base, parents);
     if (state.completed) throw Error('This transcript export is already completed. Missing or edited destinations are never recreated.');
     if (!state.published) {
@@ -201,12 +270,16 @@ class Transcripts {
       if (JSON.stringify(fresh.state) !== JSON.stringify(intent.reviewState) || this.markdown(fresh, intent.id, intent.createdAt) !== intent.text) throw Error('The original conversation or support warnings changed. Retained writing remains inspectable; new publication requires a fresh preview.');
     }
     const token = randomUUID(); if (this.previews.size >= 32) this.previews.delete(this.previews.keys().next().value);
-    this.previews.set(token, { intent, parents });
+    this.previews.set(token, {
+      intent, parents, journal, published: state.published, attempt: state.attempt,
+      reviewedPair: state.pair, reviewedReceipt: state.receipt
+    });
     return { token, destination: intent.destination, text: intent.text };
   }
   async confirm(token) {
     const preview = this.previews.get(token); if (!preview) throw Error('Preview the transcript again before exporting.');
-    const { intent } = preview, vault = this.getVault();
+    let { intent } = preview;
+    const vault = this.getVault();
     if (!vault || vault.vault !== intent.vault.vault || vault.root !== intent.vault.root) throw Error('Selected vault changed. Preview the transcript again.');
     this.guard(vault, intent.destination, preview.parents);
     await this.removal.fence(intent, vault);
@@ -216,55 +289,174 @@ class Transcripts {
       return withBriefMutation(directory, async () => {
         this.guard(vault, intent.destination, parents);
         await this.removal.fence(intent, vault);
-        const base = path.join(directory, intent.operation), journal = `${base}.intent.json`, stage = `${base}.md.pending`, receipt = `${base}.published.json`;
+        const base = path.join(directory, intent.operation), journalFile = `${base}.intent.json`, stage = `${base}.md.pending`, receipt = `${base}.published.json`, attemptFile = `${base}.link.json`;
         const exists = async file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
-        const exactIntent = async () => {
-          if (await exists(journal)) {
-            if ((await this.read(vault, intent.destination, journal, parents)).text !== JSON.stringify(intent, null, 2)) throw Error('Transcript intent changed. Preserve the proposed writing for review.');
-          } else { this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.writeFile(journal, JSON.stringify(intent, null, 2), { flag: 'wx', flush: true }); this.guard(vault, intent.destination, parents); }
+        let journal;
+        if (await exists(journalFile)) {
+          const current = await this.read(vault, intent.destination, journalFile, parents);
+          if (!preview.journal || !sameRead(preview.journal, current.stat) || current.text !== JSON.stringify(intent, null, 2)) throw changed();
+          journal = current.stat;
+        } else if (preview.journal) throw changed();
+        let attempt = await this.readAttempt(intent, vault, attemptFile, parents);
+
+        const checkPair = stat => {
+          this.guard(vault, intent.destination, parents);
+          this.checkLeaf(journalFile, journal);
+          this.checkLeaf(stage, stat);
+          this.checkLeaf(intent.destination, stat);
+          this.removal.fenceSync(intent, vault);
         };
-        const pair = async () => {
-          const a = await this.read(vault, intent.destination, stage, parents, 2), b = await this.read(vault, intent.destination, intent.destination, parents, 2);
-          if (!same(a.stat, b.stat) || a.text !== intent.text || b.text !== intent.text) throw Error('Transcript publication peers changed. Preserve both files for review.');
-          return a.stat;
+        const checkReviewedPair = stat => {
+          // Retiring the stage changes the link count and may change the change time.
+          if (preview.reviewedPair && !sameStage(preview.reviewedPair, stat)) throw changed();
         };
-        if (await exists(receipt)) {
-          const saved = JSON.parse((await this.read(vault, intent.destination, receipt, parents)).text);
-          if (saved.schema !== 1 || saved.operation !== intent.operation || saved.id !== intent.id || saved.digest !== intent.digest) throw Error('Transcript publication receipt changed. Preserve files for review.');
+        const checkAttempt = () => {
+          if (attempt) this.checkLeaf(attemptFile, attempt.stat);
+          else if (local.lstatSync(attemptFile, { throwIfNoEntry: false })) throw changed();
+        };
+        const checkNoReceipt = () => {
+          if (local.lstatSync(receipt, { throwIfNoEntry: false })) throw changed();
+        };
+        const checkCompletedControls = receiptStat => {
+          this.guard(vault, intent.destination, parents);
+          this.checkLeaf(journalFile, journal);
+          this.checkLeaf(receipt, receiptStat);
+          checkAttempt();
+          this.removal.fenceSync(intent, vault);
+          if (local.lstatSync(stage, { throwIfNoEntry: false })) throw changed();
+        };
+        const checkCompletedOutput = (stat, receiptStat) => {
+          const guard = () => checkCompletedControls(receiptStat);
+          guard();
+          const output = local.lstatSync(intent.destination, { bigint: true, throwIfNoEntry: false });
+          if (!output?.isFile() || output.nlink !== 1n || !sameStage(stat, output)) throw changed();
+          readExactSync(intent.destination, guard, 1, {
+            dev: String(stat.dev), ino: String(stat.ino), digest: intent.digest
+          });
+          this.checkLeaf(intent.destination, output);
+          guard();
+        };
+        const finishPublication = (stat, receiptStat) => {
+          checkCompletedOutput(stat, receiptStat);
+          if (attempt) {
+            local.unlinkSync(attemptFile);
+            attempt = null;
+            checkCompletedOutput(stat, receiptStat);
+          }
+        };
+        const retireStage = (stat, receiptStat) => {
+          checkPair(stat);
+          this.checkLeaf(receipt, receiptStat);
+          checkAttempt();
+          // The attempt fences republication for as long as the stage survives.
+          local.unlinkSync(stage);
+          finishPublication(stat, receiptStat);
+        };
+
+        const hasReceipt = await exists(receipt);
+        if (preview.reviewedReceipt && !hasReceipt) throw changed();
+        if (hasReceipt) {
+          if (!journal) throw changed();
+          const saved = await this.readReceipt(intent, vault, receipt, parents);
+          if (preview.reviewedReceipt && !sameRead(preview.reviewedReceipt, saved.stat)) throw changed();
           if (await exists(stage)) {
-            const stat = await pair();
-            if (String(stat.dev) !== saved.dev || String(stat.ino) !== saved.ino) throw Error('Transcript publication identity changed. Preserve files for review.');
-            this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.unlink(stage);
+            const stat = await this.readPair(intent, vault, stage, parents, saved.value);
+            checkReviewedPair(stat);
+            await this.removal.fence(intent, vault);
+            retireStage(stat, saved.stat);
+          } else {
+            const output = await this.read(vault, intent.destination, intent.destination, parents).catch(error => {
+              if (error.code === 'ENOENT') throw missingPublication();
+              throw error;
+            });
+            this.checkStage(intent, output.stat, saved.value);
+            checkReviewedPair(output.stat);
+            if (output.text !== intent.text) throw changed();
+            await this.removal.fence(intent, vault);
+            this.checkLeaf(intent.destination, output.stat);
+            finishPublication(output.stat, saved.stat);
           }
           this.previews.delete(token); return { destination: intent.destination, completed: true };
         }
-        let published = await exists(stage) && await exists(intent.destination);
-        if (published) { await exactIntent(); await pair(); }
-        else {
+
+        const published = await exists(stage) && await exists(intent.destination);
+        if (published && (!journal || !attempt)) throw changed();
+        if (preview.attempt && (!attempt || !sameRead(preview.attempt, attempt.stat))) throw changed();
+        if (!published && (preview.published || attempt)) throw missingPublication();
+        if (!published) {
           const fresh = await this.snapshot(intent.conversationId);
           if (fresh.digest !== intent.recordDigest || JSON.stringify(fresh.state) !== JSON.stringify(intent.reviewState)) throw Error('Conversation or support warnings changed. Preview the transcript again before new publication.');
           if (await exists(intent.destination)) throw Error('Transcript destination already exists. Existing writing was preserved.');
-          await exactIntent();
-          if (await exists(stage)) {
-            if ((await this.read(vault, intent.destination, stage, parents)).text !== intent.text) throw Error('Transcript stage changed. Preserve it for review.');
-          } else { this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.writeFile(stage, intent.text, { flag: 'wx', flush: true }); }
+          if (!journal) {
+            await this.removal.fence(intent, vault);
+            this.guard(vault, intent.destination, parents);
+            checkNoReceipt();
+            checkAttempt();
+            const created = await this.writeExclusive(stage, intent.text);
+            await this.removal.fence(intent, vault);
+            this.guard(vault, intent.destination, parents);
+            this.checkLeaf(stage, created);
+            checkNoReceipt();
+            checkAttempt();
+            intent = { ...intent, stageProof: stageProof(created) };
+            journal = await this.writeExclusive(journalFile, JSON.stringify(intent, null, 2));
+            preview.intent = intent;
+            preview.journal = journal;
+          }
+          const original = await this.read(vault, intent.destination, stage, parents);
+          this.checkStage(intent, original.stat);
+          if (original.text !== intent.text) throw changed();
           await this.checkpoint('transcript-before-publish');
           await this.removal.fence(intent, vault);
           const current = await this.snapshot(intent.conversationId);
           if (JSON.stringify(current.state) !== JSON.stringify(intent.reviewState)) throw Error('Conversation or support warnings changed. Preview the transcript again before new publication.');
-          if ((await this.read(vault, intent.destination, stage, parents)).text !== intent.text) throw Error('Transcript stage changed. Preserve it for review.');
-          this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.link(stage, intent.destination); published = true;
+          const staged = await this.read(vault, intent.destination, stage, parents);
+          if (!sameRead(staged.stat, original.stat) || staged.text !== intent.text) throw changed();
+          await this.removal.fence(intent, vault);
+          this.guard(vault, intent.destination, parents);
+          this.checkLeaf(journalFile, journal);
+          this.checkLeaf(stage, staged.stat);
+          this.removal.fenceSync(intent, vault);
+          checkNoReceipt();
+          checkAttempt();
+          if (local.lstatSync(intent.destination, { throwIfNoEntry: false })) throw Error('Transcript destination already exists. Existing writing was preserved.');
+          // Once an attempt is durable, recovery can acknowledge an exact pair only.
+          // An interruption before link then conservatively holds the proposal.
+          const stat = this.writeControl(attemptFile, control => ({
+            schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest,
+            dev: String(staged.stat.dev), ino: String(staged.stat.ino), control: { dev: String(control.dev), ino: String(control.ino) }
+          }));
+          attempt = { stat };
+          preview.published = true;
+          preview.attempt = stat;
+          this.guard(vault, intent.destination, parents);
+          this.checkLeaf(journalFile, journal);
+          this.checkLeaf(stage, staged.stat);
+          checkAttempt();
+          this.removal.fenceSync(intent, vault);
+          checkNoReceipt();
+          local.linkSync(stage, intent.destination);
           await this.checkpoint('transcript-after-link');
           await this.removal.fence(intent, vault);
         }
-        const stat = await pair();
-        this.guard(vault, intent.destination, parents);
+
+        const stat = await this.readPair(intent, vault, stage, parents);
+        checkReviewedPair(stat);
         await this.removal.fence(intent, vault);
-        await fs.writeFile(receipt, JSON.stringify({ schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest, dev: String(stat.dev), ino: String(stat.ino) }, null, 2), { flag: 'wx', flush: true });
+        checkPair(stat);
+        checkAttempt();
+        checkNoReceipt();
+        const saved = { schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest, dev: String(stat.dev), ino: String(stat.ino) };
+        const receiptStat = this.writeControl(receipt, () => saved);
+        checkPair(stat);
+        checkAttempt();
         await this.checkpoint('transcript-after-receipt');
         await this.removal.fence(intent, vault);
-        await pair(); this.guard(vault, intent.destination, parents); await this.removal.fence(intent, vault); await fs.unlink(stage);
-        this.previews.delete(token); return { destination: intent.destination, completed: published };
+        const ready = await this.readPair(intent, vault, stage, parents, saved);
+        if (!sameRead(stat, ready)) throw changed();
+        await this.removal.fence(intent, vault);
+        retireStage(ready, receiptStat);
+        this.previews.delete(token); return { destination: intent.destination, completed: true };
       });
     });
   }

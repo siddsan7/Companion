@@ -1838,9 +1838,11 @@ for (const [boundary, receiptExists] of [['transcript-after-link', false], ['tra
     const directory = path.join(root, 'vault', 'Companion', '.transcripts'), intentName = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
     const intentFile = path.join(directory, intentName), intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
     const stage = path.join(directory, `${intent.operation}.md.pending`), receipt = path.join(directory, `${intent.operation}.published.json`);
+    const attempt = path.join(directory, `${intent.operation}.link.json`);
     expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
     expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
     expect((await fs.stat(destination)).nlink).toBe(2);
+    expect(JSON.parse(await fs.readFile(attempt, 'utf8'))).toMatchObject({ operation: intent.operation, id: intent.id, digest: intent.digest });
     expect(await fs.access(receipt).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(receiptExists);
     const child = app.process(), mainPid = await app.evaluate(() => process.pid);
     const evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
@@ -1872,6 +1874,7 @@ for (const [boundary, receiptExists] of [['transcript-after-link', false], ['tra
     expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
     expect((await fs.stat(destination)).nlink).toBe(1);
     expect(await fs.lstat(stage).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+    expect(await fs.lstat(attempt).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
     expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({ operation: intent.operation, id: intent.id, digest: intent.digest });
     expect((await fs.readdir(directory)).filter(name => name.endsWith('.published.json'))).toEqual([`${intent.operation}.published.json`]);
     expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);
@@ -1971,6 +1974,43 @@ test('transcript guards reject an unknown hardlink peer before publishing any de
   await expect(page.getByLabel('Proposed transcript Markdown', { exact: true })).toHaveValue(fixture.proposed);
   const pending = page.getByRole('region', { name: 'Pending transcript exports', exact: true });
   await expect(pending.getByRole('button', { name: 'Resume transcript export', exact: true })).toBeDisabled();
+  expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(fixture.history);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
+test('transcript guards preserve an independent equal-byte stage before first publication', async () => {
+  test.setTimeout(90000);
+  const fixture = await guardedTranscript('EQUAL_BYTE_STAGE');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'transcript-before-publish' }), 'utf8');
+  await page.getByRole('button', { name: 'Export reviewed transcript', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; })).toBe('transcript-before-publish');
+
+  const intentName = (await fs.readdir(fixture.directory)).find(name => name.endsWith('.intent.json'));
+  const intentPath = path.join(fixture.directory, intentName);
+  const intentBytes = await fs.readFile(intentPath, 'utf8'), { operation } = JSON.parse(intentBytes);
+  const stage = path.join(fixture.directory, `${operation}.md.pending`);
+  const receipt = path.join(fixture.directory, `${operation}.published.json`);
+  const retained = path.join(root, 'retained-original-transcript-stage.md');
+  const original = await fs.lstat(stage, { bigint: true }), stageBytes = await fs.readFile(stage);
+  expect(stageBytes.toString('utf8')).toBe(fixture.proposed);
+  await fs.rename(stage, retained);
+  await fs.writeFile(stage, stageBytes, { flag: 'wx' });
+  const replacement = await fs.lstat(stage, { bigint: true });
+  expect([replacement.dev, replacement.ino]).not.toEqual([original.dev, original.ino]);
+
+  await fs.writeFile(path.join(root, 'release.txt'), 'release after equal-byte stage replacement', 'utf8');
+  const status = page.locator('#transcript-status');
+  await expect(status).toContainText(/exported|identity|changed|preserve/i);
+  await expect.soft(status).toContainText(/identity|changed|preserve/i, { timeout: 1000 });
+  expect.soft(await fs.lstat(fixture.destination).catch(error => error.code)).toBe('ENOENT');
+  expect.soft(await fs.lstat(receipt).catch(error => error.code)).toBe('ENOENT');
+  expect.soft(await fs.readFile(stage).catch(error => error.code)).toEqual(stageBytes);
+  const current = await fs.lstat(stage, { bigint: true }).catch(error => error.code);
+  expect.soft([current.dev, current.ino]).toEqual([replacement.dev, replacement.ino]);
+  const saved = await fs.lstat(retained, { bigint: true });
+  expect([saved.dev, saved.ino]).toEqual([original.dev, original.ino]);
+  expect(await fs.readFile(retained)).toEqual(stageBytes);
+  expect(await fs.readFile(intentPath, 'utf8')).toBe(intentBytes);
   expect(await fs.readFile(fixture.historyFile, 'utf8')).toBe(fixture.history);
   expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
 });

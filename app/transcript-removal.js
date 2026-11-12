@@ -1,7 +1,9 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
+const { readExactSync } = require('./staged-publication');
 const sha = text => createHash('sha256').update(text).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const digest = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -10,6 +12,7 @@ const same = (a, b) => String(a.dev) === String(b.dev) && String(a.ino) === Stri
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join('|') === [...keys].sort().join('|');
 const exists = file => fs.lstat(file).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; });
 const held = () => Error('Transcript removal scope or identity changed. Preserve all remaining files and review the exact copies again.');
+const removed = () => Error('This transcript identity has an observed removal record. Old export confirmations and recovery cannot recreate or acknowledge it, even if that control is later missing.');
 
 // This store owns only explicitly selected transcript exports, never their origins.
 class TranscriptRemoval {
@@ -34,7 +37,14 @@ class TranscriptRemoval {
     const { marker, stage } = this.location(vault, intent.id);
     if (this.refusals(vault).has(intent.id) || await exists(marker) || await exists(stage)) {
       this.rememberRefusal(vault, intent.id);
-      throw Error('This transcript identity has an observed removal record. Old export confirmations and recovery cannot recreate or acknowledge it, even if that control is later missing.');
+      throw removed();
+    }
+  }
+  fenceSync(intent, vault) {
+    const { marker, stage } = this.location(vault, intent.id);
+    if (this.refusals(vault).has(intent.id) || local.lstatSync(marker, { throwIfNoEntry: false }) || local.lstatSync(stage, { throwIfNoEntry: false })) {
+      this.rememberRefusal(vault, intent.id);
+      throw removed();
     }
   }
   relative(vault, file) {
@@ -48,6 +58,18 @@ class TranscriptRemoval {
   }
   vault() { const vault = this.store.getVault(); if (!vault) throw Error('Choose a vault first.'); return vault; }
   placeholder(vault) { return path.join(vault.vault, 'Transcript inspection.md'); }
+  scopeFiles({ destination, exportOperation }, vault) {
+    const base = path.join(vault.root, '.transcripts', exportOperation);
+    return new Map([
+      [destination, 'output'], [`${base}.intent.json`, 'intent'], [`${base}.md.pending`, 'stage'],
+      [`${base}.published.json`, 'receipt'], [`${base}.link.json`, 'attempt']
+    ]);
+  }
+  checkNames(scope, names, files) {
+    const allowed = new Set(files.map(file => path.basename(file)));
+    const prefix = `${scope.exportOperation}.`;
+    if (names.some(name => name.toLowerCase().startsWith(prefix) && !allowed.has(name))) throw held();
+  }
   async inventory(operation) {
     if (!uuid(operation)) throw held();
     const vault = this.vault(), directory = path.join(vault.root, '.transcripts');
@@ -57,20 +79,15 @@ class TranscriptRemoval {
     const intent = this.store.validateIntent(JSON.parse(raw.text), operation, vault);
     await this.fence(intent, vault);
     const parents = this.store.guard(vault, intent.destination, initial);
-    const candidates = [
-      { file: intent.destination, kind: 'output' }, { file: journal, kind: 'intent' },
-      { file: path.join(directory, `${operation}.md.pending`), kind: 'stage' },
-      { file: path.join(directory, `${operation}.published.json`), kind: 'receipt' }
-    ];
-    const names = await fs.readdir(directory);
-    const allowed = new Set(candidates.map(item => path.basename(item.file)));
-    if (names.some(name => name.startsWith(`${operation}.`) && !allowed.has(name))) throw held();
+    const scope = { destination: intent.destination, exportOperation: operation };
+    const candidates = this.scopeFiles(scope, vault);
+    this.checkNames(scope, await fs.readdir(directory), [...candidates.keys()].filter(file => file !== intent.destination));
     const present = [];
-    for (const item of candidates) {
-      if (!await exists(item.file)) continue;
-      const stat = await fs.lstat(item.file, { bigint: true });
+    for (const [file, kind] of candidates) {
+      if (!await exists(file)) continue;
+      const stat = await fs.lstat(file, { bigint: true });
       if (!stat.isFile() || stat.isSymbolicLink()) throw held();
-      present.push({ ...item, stat });
+      present.push({ file, kind, stat });
     }
     const targets = [], texts = new Map();
     for (const item of present) {
@@ -78,17 +95,24 @@ class TranscriptRemoval {
       const read = await this.store.read(vault, intent.destination, item.file, parents, peers.length);
       if (!same(read.stat, item.stat)) throw held();
       if (['output', 'stage'].includes(item.kind) && read.text !== intent.text) throw held();
+      if (item.kind === 'attempt') {
+        if (read.stat.nlink !== 1n) throw held();
+        this.store.validateAttempt(intent, read.text, read.stat);
+      }
       texts.set(item.kind, read.text);
       targets.push({ file: this.relative(vault, item.file), kind: item.kind, sha256: sha(read.text), dev: String(read.stat.dev), ino: String(read.stat.ino), bytes: String(read.stat.size), peers });
     }
     const output = present.find(item => item.kind === 'output'), stage = present.find(item => item.kind === 'stage');
     if (output && stage && !same(output.stat, stage.stat)) throw held();
+    let receipt;
     if (texts.has('receipt')) {
-      const receipt = JSON.parse(texts.get('receipt')), target = output || stage;
+      receipt = JSON.parse(texts.get('receipt'));
+      const target = output || stage;
       if (!exact(receipt, ['schema', 'operation', 'id', 'digest', 'dev', 'ino']) || receipt.schema !== 1 || receipt.operation !== operation || receipt.id !== intent.id || receipt.digest !== intent.digest || !number(receipt.dev) || !number(receipt.ino) || target && !same(receipt, target.stat)) throw held();
-    } else if (output && !stage) throw held();
+    } else if (output && (!stage || !texts.has('attempt'))) throw held();
+    if (stage) this.store.checkStage(intent, stage.stat, receipt);
     return {
-      vault, intent, parents,
+      vault, intent,
       scope: {
         id: intent.id, exportOperation: operation, vault: { vault: vault.vault, root: vault.root }, destination: intent.destination,
         parents: [...parents].map(([file, stat]) => ({ file: file === path.resolve(vault.vault) ? '.' : this.relative(vault, file), dev: String(stat.dev), ino: String(stat.ino) })).sort((a, b) => a.file.localeCompare(b.file)),
@@ -145,9 +169,7 @@ class TranscriptRemoval {
       const file = parent.file === '.' ? path.resolve(vault.vault) : this.absolute(vault, parent.file);
       if (!required.has(file) || !same(parent, required.get(file))) throw held();
     }
-    const base = path.join(vault.root, '.transcripts', marker.exportOperation), allowed = new Map([
-      [marker.destination, 'output'], [`${base}.intent.json`, 'intent'], [`${base}.md.pending`, 'stage'], [`${base}.published.json`, 'receipt']
-    ]);
+    const allowed = this.scopeFiles(marker, vault);
     for (const target of marker.targets) {
       if (!exact(target, ['file', 'kind', 'sha256', 'dev', 'ino', 'bytes', 'peers']) || !digest(target.sha256) || !number(target.dev) || !number(target.ino) || !number(target.bytes) || allowed.get(this.absolute(vault, target.file)) !== target.kind || !Array.isArray(target.peers) || !sortedUnique(target.peers) || !target.peers.includes(target.file)) throw held();
       const peers = marker.targets.filter(item => same(item, target)).map(item => item.file).sort((a, b) => a.localeCompare(b));
@@ -161,37 +183,76 @@ class TranscriptRemoval {
     const hasMarker = await exists(file), hasStage = await exists(stage), links = hasMarker && hasStage ? 2 : 1;
     if (!hasMarker && !hasStage) throw held();
     this.rememberRefusal(vault, id);
-    const raw = await this.store.read(vault, this.placeholder(vault), hasMarker ? file : stage, parents, links);
+    const controlFile = hasMarker ? file : stage;
+    const raw = await this.store.read(vault, this.placeholder(vault), controlFile, parents, links);
     const marker = this.validate(JSON.parse(raw.text), vault, id);
     if (!same(marker.control, raw.stat)) throw held();
+    const controls = new Map([[file, null], [stage, null]]);
+    controls.set(controlFile, raw.stat);
     if (hasMarker && hasStage) {
       const peer = await this.store.read(vault, marker.destination, stage, parents, 2);
       if (!same(raw.stat, peer.stat) || peer.text !== raw.text) throw held();
+      controls.set(stage, peer.stat);
     }
-    return { vault, marker, bytes: raw.text, hasMarker, hasStage };
+    return { vault, marker, bytes: raw.text, hasMarker, hasStage, controls };
   }
   async verifyAuthority(expected) {
     const current = await this.load(expected.vault, expected.marker.id);
     if (current.bytes !== expected.bytes || current.hasMarker !== expected.hasMarker || current.hasStage !== expected.hasStage || !same(current.marker.control, expected.marker.control)) throw held();
+    return current;
+  }
+  scopeParents(marker, vault) {
+    return new Map(marker.parents.map(item => [item.file === '.' ? path.resolve(vault.vault) : this.absolute(vault, item.file), { dev: BigInt(item.dev), ino: BigInt(item.ino) }]));
+  }
+  checkAuthority({ vault, marker, controls, bytes }) {
+    const parents = this.scopeParents(marker, vault);
+    const guard = () => this.store.guard(vault, marker.destination, parents);
+    guard();
+    const digest = sha(bytes);
+    for (const [file, stat] of controls) {
+      if (stat) {
+        readExactSync(file, guard, Number(stat.nlink), { ...marker.control, digest });
+        this.store.checkLeaf(file, stat);
+      }
+      else if (local.lstatSync(file, { throwIfNoEntry: false })) throw held();
+    }
+  }
+  checkScope(scope, vault, remaining) {
+    const parents = this.scopeParents(scope, vault);
+    const guard = () => this.store.guard(vault, scope.destination, parents);
+    guard();
+    const files = new Map(remaining.map(target => [this.absolute(vault, target.file), target]));
+    this.checkNames(scope, local.readdirSync(path.join(vault.root, '.transcripts')), [...files.keys()].filter(file => file !== scope.destination));
+    for (const file of this.scopeFiles(scope, vault).keys()) {
+      const target = files.get(file);
+      if (!target) {
+        if (local.lstatSync(file, { throwIfNoEntry: false })) throw held();
+        continue;
+      }
+      const links = remaining.filter(peer => target.peers.includes(peer.file)).length;
+      const { bytes } = readExactSync(file, guard, links, { dev: target.dev, ino: target.ino, digest: target.sha256 });
+      if (String(bytes.length) !== target.bytes) throw held();
+    }
   }
   async remaining(marker, vault) {
     this.validate(marker, vault, marker.id);
     const remaining = [];
     for (const target of marker.targets) if (await exists(this.absolute(vault, target.file))) remaining.push(target);
     const names = await fs.readdir(path.join(vault.root, '.transcripts'));
-    const allowed = new Set(marker.targets.map(item => path.basename(item.file)));
-    if (names.some(name => name.startsWith(`${marker.exportOperation}.`) && !allowed.has(name))) throw held();
+    this.checkNames(marker, names, marker.targets.filter(item => item.kind !== 'output').map(item => item.file));
     // A committed scope cannot silently accept an output that was absent at review.
     const expected = new Set(marker.targets.map(item => this.absolute(vault, item.file)));
-    for (const file of [marker.destination, ...['intent.json', 'md.pending', 'published.json'].map(suffix => path.join(vault.root, '.transcripts', `${marker.exportOperation}.${suffix}`))]) if (!expected.has(file) && await exists(file)) throw held();
+    for (const file of this.scopeFiles(marker, vault).keys()) if (!expected.has(file) && await exists(file)) throw held();
     for (const target of remaining) await this.checkTarget(marker, vault, target, remaining);
     return remaining;
   }
   async checkTarget(marker, vault, target, remaining) {
-    const parents = new Map(marker.parents.map(item => [item.file === '.' ? path.resolve(vault.vault) : this.absolute(vault, item.file), { dev: BigInt(item.dev), ino: BigInt(item.ino) }]));
+    const parents = this.scopeParents(marker, vault);
+    const file = this.absolute(vault, target.file);
     const peers = remaining.filter(item => target.peers.includes(item.file));
-    const read = await this.store.read(vault, marker.destination, this.absolute(vault, target.file), parents, peers.length);
+    const read = await this.store.read(vault, marker.destination, file, parents, peers.length);
     if (!same(read.stat, target) || String(read.stat.size) !== target.bytes || sha(read.text) !== target.sha256) throw held();
+    return file;
   }
   async resume(id) {
     const record = await this.load(this.vault(), id);
@@ -203,24 +264,24 @@ class TranscriptRemoval {
     const vault = this.vault(), scope = preview.marker || preview.scope;
     if (vault.vault !== scope.vault.vault || vault.root !== scope.vault.root) throw held();
     return this.store.conversations.lock(async () => withBriefMutation(path.join(vault.root, '.transcripts'), async () => {
-      let record;
+      let record, remaining = scope.targets;
       if (preview.marker) {
         record = await this.load(vault, scope.id);
         if (record.bytes !== preview.bytes || record.hasMarker !== preview.hasMarker || record.hasStage !== preview.hasStage) throw held();
-        await this.remaining(record.marker, vault);
+        remaining = await this.remaining(record.marker, vault);
       } else {
         const fresh = await this.inventory(scope.exportOperation);
         if (JSON.stringify(fresh.scope) !== JSON.stringify(scope)) throw held();
         const { stage } = this.location(vault, scope.id);
-        const handle = await fs.open(stage, 'wx');
-        try {
-          const stat = await handle.stat({ bigint: true });
-          const marker = { schema: 1, kind: 'transcript-removal', ...scope, operation: randomUUID(), control: { dev: String(stat.dev), ino: String(stat.ino) } };
-          const bytes = JSON.stringify(marker, null, 2);
-          record = { vault, marker, bytes, hasMarker: false, hasStage: true };
+        this.checkScope(scope, vault, remaining);
+        this.fenceSync(fresh.intent, vault);
+        let marker;
+        this.store.writeControl(stage, stat => {
+          marker = { schema: 1, kind: 'transcript-removal', ...scope, operation: randomUUID(), control: { dev: String(stat.dev), ino: String(stat.ino) } };
           this.rememberRefusal(vault, scope.id);
-          await handle.writeFile(bytes); await handle.sync();
-        } finally { await handle.close(); }
+          return marker;
+        });
+        record = { vault, marker, bytes: JSON.stringify(marker, null, 2), hasMarker: false, hasStage: true };
         await this.store.checkpoint('transcript-remove-after-stage');
         await this.verifyAuthority(record);
       }
@@ -228,31 +289,42 @@ class TranscriptRemoval {
       await this.verifyAuthority(record);
       await this.remaining(record.marker, vault);
       if (!record.hasMarker) {
-        await this.verifyAuthority(record);
-        await fs.link(stage, file);
+        const authority = await this.verifyAuthority(record);
+        this.checkScope(scope, vault, remaining);
+        this.checkAuthority(authority);
+        local.linkSync(stage, file);
         record.hasMarker = true;
         await this.verifyAuthority(record);
       }
       await this.store.checkpoint('transcript-remove-after-tombstone');
       await this.verifyAuthority(record);
       if (record.hasStage) {
-        await this.verifyAuthority(record); await fs.unlink(stage);
+        const authority = await this.verifyAuthority(record);
+        this.checkScope(scope, vault, remaining);
+        this.checkAuthority(authority);
+        local.unlinkSync(stage);
         record.hasStage = false;
         await this.verifyAuthority(record);
       }
-      let remaining = await this.remaining(record.marker, vault);
+      await this.remaining(record.marker, vault);
       for (const target of [...remaining]) {
         await this.verifyAuthority(record);
-        remaining = await this.remaining(record.marker, vault);
-        await this.verifyAuthority(record);
-        await this.checkTarget(record.marker, vault, target, remaining);
-        await fs.unlink(this.absolute(vault, target.file));
+        await this.remaining(record.marker, vault);
+        const authority = await this.verifyAuthority(record);
+        const file = await this.checkTarget(record.marker, vault, target, remaining);
+        // Recheck the full selected scope after the last yielded read.
+        this.checkScope(scope, vault, remaining);
+        this.checkAuthority(authority);
+        local.unlinkSync(file);
+        remaining = remaining.filter(item => item !== target);
         await this.store.checkpoint('transcript-remove-after-unlink');
         await this.verifyAuthority(record);
       }
       await this.verifyAuthority(record);
       if ((await this.remaining(record.marker, vault)).length) throw held();
-      await this.verifyAuthority(record);
+      const authority = await this.verifyAuthority(record);
+      this.checkScope(scope, vault, remaining);
+      this.checkAuthority(authority);
       this.previews.delete(token);
       return { id: scope.id, destination: scope.destination, completed: true };
     }));

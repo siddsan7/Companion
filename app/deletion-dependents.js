@@ -102,6 +102,7 @@ async function pureWritingPending(vault, file) {
   const io = await reader(vault.vault);
   const journal = await io.read(path.join(path.dirname(file), operation + '.intent.json'));
   const value = JSON.parse(journal.text);
+  const transcript = area === '.transcripts' ? new Transcripts({}) : null;
   if (journal.stat.nlink !== 1n || !journal.bytes.equals(Buffer.from(JSON.stringify(value, null, 2)))) fail();
   if (area === '.ideas') {
     if (!fields(value, ['schema', 'operation', 'id', 'vault', 'destination', 'text', 'digest', 'proposalKey', 'warnings', 'input', 'referenceBindings', 'supportState'])) return false;
@@ -109,7 +110,7 @@ async function pureWritingPending(vault, file) {
     const front = metadata(value.text);
     // The existing Ideas.intent ownership contract, checked on these guarded raw bytes.
     if (value.schema !== 1 || value.operation !== operation || !uuid(value.id) || value.vault !== vault.root || typeof value.destination !== 'string' || path.dirname(value.destination) !== path.join(vault.root, 'Ideas') || !path.basename(value.destination).endsWith(`--${value.id}.md`) || typeof value.text !== 'string' || hash(Buffer.from(value.text)) !== value.digest || front?.artifact_type !== 'saved_idea' || front.schema_version !== 1 || front.companion_id !== value.id || value.input.conversationId !== front.origin?.conversation_id || value.input.requestId !== front.origin?.request_id || typeof front.created_at !== 'string' || !Number.isFinite(Date.parse(front.created_at))) return false;
-  } else { const store = new Transcripts({}); store.validateIntent(value, operation, vault); store.guard(vault, value.destination); }
+  } else { transcript.validateIntent(value, operation, vault); transcript.guard(vault, value.destination); }
   const front = metadata(value.text);
   if (!front || front.schema_version !== 1 || front.companion_id !== value.id || front.artifact_type !== (area === '.ideas' ? 'saved_idea' : 'conversation_transcript')) return false;
   if (area === '.ideas' && !fields(front, ['artifact_type', 'schema_version', 'companion_id', 'title', 'created_at', 'idea_kind', 'experiment', 'source_dependencies', 'project_brief_version', 'project_brief', 'support_attribution_unavailable', 'citations', 'origin'])) return false;
@@ -129,10 +130,18 @@ async function pureWritingPending(vault, file) {
   }
   const stage = await io.read(file);
   if (!stage.bytes.equals(Buffer.from(value.text)) || stage.value.sha256 !== value.digest) return false;
+  let saved;
   if (stage.stat.nlink === 2n) {
     const output = await io.read(value.destination);
     if (output.stat.nlink !== 2n || !same(stage.stat, output.stat) || !output.bytes.equals(stage.bytes)) fail();
+    if (transcript && !value.stageProof) {
+      // Older writers recorded the original pair in the receipt only.
+      const receipt = await io.read(path.join(path.dirname(file), operation + '.published.json'));
+      saved = transcript.validateReceipt(value, JSON.parse(receipt.text));
+      if (receipt.stat.nlink !== 1n || !receipt.bytes.equals(Buffer.from(JSON.stringify(saved, null, 2)))) fail();
+    }
   } else if (stage.stat.nlink !== 1n) fail();
+  transcript?.checkStage(value, stage.stat, saved);
   await io.check(); return true;
 }
 
@@ -154,7 +163,7 @@ async function inventory(vault, conversations, captureId) {
   await markdown(vault.vault);
   for (const area of ['.ideas', '.transcripts']) {
     const directory = path.join(vault.root, area);
-    for (const entry of await io.list(directory, entry => /\.(?:intent\.json|md\.pending|published\.json)$/.test(entry.name))) {
+    for (const entry of await io.list(directory, entry => /\.(?:intent\.json|md\.pending|published\.json)$/.test(entry.name) || area === '.transcripts' && entry.name.endsWith('.link.json'))) {
       const file = path.join(directory, entry.name), value = await io.read(file);
       if (entry.name.endsWith('.md.pending')) add(area === '.ideas' ? 'pending idea stage' : 'pending transcript stage', value.value.file, value.text, metadata(value.text));
       else if (entry.name.endsWith('.intent.json')) {
