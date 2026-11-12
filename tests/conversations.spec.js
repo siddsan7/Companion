@@ -1838,9 +1838,11 @@ for (const [boundary, receiptExists] of [['transcript-after-link', false], ['tra
     const directory = path.join(root, 'vault', 'Companion', '.transcripts'), intentName = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
     const intentFile = path.join(directory, intentName), intentBytes = await fs.readFile(intentFile, 'utf8'), intent = JSON.parse(intentBytes);
     const stage = path.join(directory, `${intent.operation}.md.pending`), receipt = path.join(directory, `${intent.operation}.published.json`);
+    const attempt = path.join(directory, `${intent.operation}.link.json`);
     expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
     expect(await fs.readFile(stage, 'utf8')).toBe(proposed);
     expect((await fs.stat(destination)).nlink).toBe(2);
+    expect(JSON.parse(await fs.readFile(attempt, 'utf8'))).toMatchObject({ operation: intent.operation, id: intent.id, digest: intent.digest });
     expect(await fs.access(receipt).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })).toBe(receiptExists);
     const child = app.process(), mainPid = await app.evaluate(() => process.pid);
     const evidence = { boundary, wrapperPid: child.pid, mainPid, exitBoundary: 'Electron app.exit(77)' };
@@ -1872,6 +1874,7 @@ for (const [boundary, receiptExists] of [['transcript-after-link', false], ['tra
     expect(await fs.readFile(destination, 'utf8')).toBe(proposed);
     expect((await fs.stat(destination)).nlink).toBe(1);
     expect(await fs.lstat(stage).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
+    expect(await fs.lstat(attempt).catch(error => { if (error.code === 'ENOENT') return null; throw error; })).toBeNull();
     expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({ operation: intent.operation, id: intent.id, digest: intent.digest });
     expect((await fs.readdir(directory)).filter(name => name.endsWith('.published.json'))).toEqual([`${intent.operation}.published.json`]);
     expect(await fs.readFile(intentFile, 'utf8')).toBe(intentBytes);

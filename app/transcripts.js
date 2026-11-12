@@ -6,6 +6,7 @@ const YAML = require('yaml');
 const { createHash, randomUUID } = require('node:crypto');
 const { withBriefMutation } = require('./briefs-lock');
 const { TranscriptRemoval } = require('./transcript-removal');
+const { readExactSync } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const stageFields = ['dev', 'ino', 'birthtimeNs', 'mtimeNs', 'size'];
@@ -309,32 +310,47 @@ class Transcripts {
           // Retiring the stage changes the link count and may change the change time.
           if (preview.reviewedPair && !sameStage(preview.reviewedPair, stat)) throw changed();
         };
+        const checkAttempt = () => {
+          if (attempt) this.checkLeaf(attemptFile, attempt.stat);
+          else if (local.lstatSync(attemptFile, { throwIfNoEntry: false })) throw changed();
+        };
+        const checkNoReceipt = () => {
+          if (local.lstatSync(receipt, { throwIfNoEntry: false })) throw changed();
+        };
         const checkCompletedControls = receiptStat => {
           this.guard(vault, intent.destination, parents);
           this.checkLeaf(journalFile, journal);
           this.checkLeaf(receipt, receiptStat);
-          if (attempt) this.checkLeaf(attemptFile, attempt.stat);
+          checkAttempt();
           this.removal.fenceSync(intent, vault);
           if (local.lstatSync(stage, { throwIfNoEntry: false })) throw changed();
         };
-        const retireAttempt = receiptStat => {
-          this.checkLeaf(receipt, receiptStat);
-          if (!attempt) return;
-          this.checkLeaf(attemptFile, attempt.stat);
-          local.unlinkSync(attemptFile);
-          attempt = null;
+        const checkCompletedOutput = (stat, receiptStat) => {
+          const guard = () => checkCompletedControls(receiptStat);
+          guard();
+          const output = local.lstatSync(intent.destination, { bigint: true, throwIfNoEntry: false });
+          if (!output?.isFile() || output.nlink !== 1n || !sameStage(stat, output)) throw changed();
+          readExactSync(intent.destination, guard, 1, {
+            dev: String(stat.dev), ino: String(stat.ino), digest: intent.digest
+          });
+          this.checkLeaf(intent.destination, output);
+          guard();
+        };
+        const finishPublication = (stat, receiptStat) => {
+          checkCompletedOutput(stat, receiptStat);
+          if (attempt) {
+            local.unlinkSync(attemptFile);
+            attempt = null;
+            checkCompletedOutput(stat, receiptStat);
+          }
         };
         const retireStage = (stat, receiptStat) => {
           checkPair(stat);
-          if (attempt) {
-            retireAttempt(receiptStat);
-            checkPair(stat);
-          }
           this.checkLeaf(receipt, receiptStat);
+          checkAttempt();
+          // The attempt fences republication for as long as the stage survives.
           local.unlinkSync(stage);
-          checkCompletedControls(receiptStat);
-          const output = local.lstatSync(intent.destination, { bigint: true, throwIfNoEntry: false });
-          if (!output?.isFile() || output.nlink !== 1n || !sameStage(stat, output)) throw changed();
+          finishPublication(stat, receiptStat);
         };
 
         const hasReceipt = await exists(receipt);
@@ -357,8 +373,8 @@ class Transcripts {
             checkReviewedPair(output.stat);
             if (output.text !== intent.text) throw changed();
             await this.removal.fence(intent, vault);
-            checkCompletedControls(saved.stat);
             this.checkLeaf(intent.destination, output.stat);
+            finishPublication(output.stat, saved.stat);
           }
           this.previews.delete(token); return { destination: intent.destination, completed: true };
         }
@@ -374,10 +390,14 @@ class Transcripts {
           if (!journal) {
             await this.removal.fence(intent, vault);
             this.guard(vault, intent.destination, parents);
+            checkNoReceipt();
+            checkAttempt();
             const created = await this.writeExclusive(stage, intent.text);
             await this.removal.fence(intent, vault);
             this.guard(vault, intent.destination, parents);
             this.checkLeaf(stage, created);
+            checkNoReceipt();
+            checkAttempt();
             intent = { ...intent, stageProof: stageProof(created) };
             journal = await this.writeExclusive(journalFile, JSON.stringify(intent, null, 2));
             preview.intent = intent;
@@ -397,6 +417,8 @@ class Transcripts {
           this.checkLeaf(journalFile, journal);
           this.checkLeaf(stage, staged.stat);
           this.removal.fenceSync(intent, vault);
+          checkNoReceipt();
+          checkAttempt();
           if (local.lstatSync(intent.destination, { throwIfNoEntry: false })) throw Error('Transcript destination already exists. Existing writing was preserved.');
           // Once an attempt is durable, recovery can acknowledge an exact pair only.
           // An interruption before link then conservatively holds the proposal.
@@ -410,8 +432,9 @@ class Transcripts {
           this.guard(vault, intent.destination, parents);
           this.checkLeaf(journalFile, journal);
           this.checkLeaf(stage, staged.stat);
-          this.checkLeaf(attemptFile, stat);
+          checkAttempt();
           this.removal.fenceSync(intent, vault);
+          checkNoReceipt();
           local.linkSync(stage, intent.destination);
           await this.checkpoint('transcript-after-link');
           await this.removal.fence(intent, vault);
@@ -421,11 +444,12 @@ class Transcripts {
         checkReviewedPair(stat);
         await this.removal.fence(intent, vault);
         checkPair(stat);
-        this.checkLeaf(attemptFile, attempt.stat);
+        checkAttempt();
+        checkNoReceipt();
         const saved = { schema: 1, operation: intent.operation, id: intent.id, digest: intent.digest, dev: String(stat.dev), ino: String(stat.ino) };
         const receiptStat = this.writeControl(receipt, () => saved);
         checkPair(stat);
-        retireAttempt(receiptStat);
+        checkAttempt();
         await this.checkpoint('transcript-after-receipt');
         await this.removal.fence(intent, vault);
         const ready = await this.readPair(intent, vault, stage, parents, saved);

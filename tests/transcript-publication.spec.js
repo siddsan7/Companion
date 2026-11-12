@@ -52,10 +52,11 @@ async function interruptedTranscript(testInfo, boundary) {
   const intent = JSON.parse(journalBytes);
   const stage = path.join(fixture.directory, `${intent.operation}.md.pending`);
   const receipt = path.join(fixture.directory, `${intent.operation}.published.json`);
+  const attempt = path.join(fixture.directory, `${intent.operation}.link.json`);
   const original = await fs.lstat(stage, { bigint: true });
   expect(original.nlink).toBe(2n);
   expect(identity(await fs.lstat(fixture.destination, { bigint: true }))).toEqual(identity(original));
-  return { ...fixture, intent, journal, journalBytes, stage, receipt, original };
+  return { ...fixture, intent, journal, journalBytes, stage, receipt, attempt, original };
 }
 
 test('transcript cleanup preserves independent stage writing introduced during the removal fence', async ({}, testInfo) => {
@@ -137,6 +138,54 @@ test('transcript restart holds an unreceipted publication whose destination disa
   expect.soft(await read(stage).catch(error => error.code)).toBe(preview.text);
   const staged = await fs.lstat(stage, { bigint: true }).catch(error => error.code);
   expect.soft(identity(staged)).toEqual(identity(original));
+  expect(await read(journal)).toBe(journalBytes);
+});
+
+test('transcript confirmation preserves a receipt that returns before the first link', async ({}, testInfo) => {
+  const fixture = await interruptedTranscript(testInfo, 'transcript-after-receipt');
+  const { destination, intent, stage, receipt, attempt, original, journal, journalBytes, preview } = fixture;
+  const receiptBytes = await read(receipt);
+  // An older interrupted publication could retire its attempt before the stage.
+  await fs.unlink(attempt);
+  await fs.unlink(destination);
+  await fs.unlink(receipt);
+  let restoredReceipt;
+  const restarted = fixture.createStore(async boundary => {
+    if (boundary !== 'transcript-before-publish') return;
+    await fs.writeFile(receipt, receiptBytes, { flag: 'wx' });
+    restoredReceipt = await fs.lstat(receipt, { bigint: true });
+  });
+  const resumed = await restarted.resume(intent.operation);
+
+  await expect(restarted.confirm(resumed.token)).rejects.toThrow();
+  expect(restoredReceipt).toBeDefined();
+  expect.soft(await absent(destination)).toBe('ENOENT');
+  expect.soft(await absent(attempt)).toBe('ENOENT');
+  expect.soft(await read(stage)).toBe(preview.text);
+  expect.soft(identity(await fs.lstat(stage, { bigint: true }))).toEqual(identity(original));
+  expect(await read(receipt)).toBe(receiptBytes);
+  expect(identity(await fs.lstat(receipt, { bigint: true }))).toEqual(identity(restoredReceipt));
+  expect(await read(journal)).toBe(journalBytes);
+});
+
+test('transcript restart holds a surviving stage after its published output and receipt disappear', async ({}, testInfo) => {
+  const fixture = await interruptedTranscript(testInfo, 'transcript-after-receipt');
+  const { destination, intent, stage, receipt, original, journal, journalBytes, preview } = fixture;
+  await fs.unlink(destination);
+  await fs.unlink(receipt);
+  expect((await fs.lstat(stage)).nlink).toBe(1);
+
+  const restarted = fixture.createStore();
+  expect.soft((await restarted.pending()).records).toContainEqual(expect.objectContaining({
+    operation: intent.operation, destination, text: preview.text, canResume: false
+  }));
+  const outcome = await restarted.resume(intent.operation).then(result => ({ result }), error => ({ error: error.message }));
+  expect.soft(outcome).toMatchObject({ error: expect.stringMatching(/published|identity|changed|preserve|missing/i) });
+  if (outcome.result) await restarted.confirm(outcome.result.token);
+  expect.soft(await absent(destination)).toBe('ENOENT');
+  expect.soft(await absent(receipt)).toBe('ENOENT');
+  expect.soft(await read(stage).catch(error => error.code)).toBe(preview.text);
+  expect.soft(identity(await fs.lstat(stage, { bigint: true }).catch(error => error.code))).toEqual(identity(original));
   expect(await read(journal)).toBe(journalBytes);
 });
 
@@ -295,10 +344,11 @@ test('transcript confirmation checks one-link content after an in-place edit pre
 for (const state of ['independent replacement', 'unchanged pair']) {
   test(`transcript legacy resume binds the reviewed receipt-backed pair: ${state}`, async ({}, testInfo) => {
     const fixture = await interruptedTranscript(testInfo, 'transcript-after-receipt');
-    const { vault, destination, intent, stage, receipt, original, journal, preview } = fixture;
+    const { vault, destination, intent, stage, receipt, attempt, original, journal, preview } = fixture;
     delete intent.stageProof;
     const legacy = JSON.stringify(intent, null, 2), originalReceiptBytes = await read(receipt);
     await fs.writeFile(journal, legacy);
+    await fs.unlink(attempt);
     const restarted = fixture.createStore();
     const resumed = await restarted.resume(intent.operation);
     expect(resumed.text).toBe(preview.text);
@@ -353,10 +403,11 @@ for (const state of ['independent replacement', 'unchanged pair']) {
 }
 
 test('source deletion preserves legacy pending transcript writing proved by its exact receipt', async ({}, testInfo) => {
-  const { vault, destination, intent, stage, receipt, original, journal, preview } = await interruptedTranscript(testInfo, 'transcript-after-receipt');
+  const { vault, destination, intent, stage, receipt, attempt, original, journal, preview } = await interruptedTranscript(testInfo, 'transcript-after-receipt');
   delete intent.stageProof;
   const legacy = JSON.stringify(intent, null, 2), receiptBytes = await read(receipt);
   await fs.writeFile(journal, legacy);
+  await fs.unlink(attempt);
   const recognized = await pureWritingPending(vault, stage).catch(error => error.message);
   expect.soft(recognized).toBe(true);
   expect(await read(journal)).toBe(legacy);
@@ -441,6 +492,72 @@ for (const change of ['equal-byte replacement', 'unchanged target']) {
       expect.soft(identity(await fs.lstat(destination, { bigint: true }).catch(error => error.code))).toEqual(identity(output));
       expect(await fs.readFile(retained)).toEqual(bytes);
       expect(identity(await fs.lstat(retained, { bigint: true }))).toEqual(identity(original));
+    }
+  });
+}
+
+for (const boundary of ['before authority', 'before first unlink', 'before completion']) {
+  test(`transcript removal holds when a missing output returns during verification ${boundary}`, async ({}, testInfo) => {
+    let armed = boundary === 'before authority', unlinks = 0;
+    const { store, preview, directory, destination } = await transcriptFixture(testInfo, async checkpoint => {
+      if (checkpoint === 'transcript-remove-after-tombstone' && boundary === 'before first unlink') armed = true;
+      if (checkpoint === 'transcript-remove-after-unlink') unlinks++;
+    });
+    await store.confirm(preview.token);
+    await fs.unlink(destination);
+    const name = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
+    const journal = path.join(directory, name), journalBytes = await read(journal);
+    const { operation, id } = JSON.parse(journalBytes);
+    const receipt = path.join(directory, `${operation}.published.json`), receiptBytes = await read(receipt);
+    const marker = path.join(directory, `${id}.removed.json`);
+    const review = await store.removal.preview(operation);
+    expect(review.files).toEqual([journal, receipt]);
+
+    const open = fs.open, lstat = fs.lstat;
+    let reads = 0, inserted = false;
+    const independent = '# Independent transcript destination writing\n';
+    fs.lstat = async (file, ...args) => {
+      if (file === destination && boundary === 'before completion' && unlinks === review.files.length) armed = true;
+      return lstat(file, ...args);
+    };
+    fs.open = async (file, ...args) => {
+      const handle = await open(file, ...args);
+      const observed = boundary === 'before authority' ? receipt : boundary === 'before first unlink' ? journal : marker;
+      const readNumber = boundary === 'before first unlink' ? 3 : 1;
+      if (!armed || file !== observed || args[0] !== 'r' || ++reads !== readNumber) return handle;
+      const close = handle.close.bind(handle);
+      handle.close = async () => {
+        await close();
+        await fs.writeFile(destination, independent, { flag: 'wx' });
+        inserted = true;
+      };
+      return handle;
+    };
+    let outcome;
+    try {
+      outcome = await store.removal.confirm(review.token).then(result => ({ result }), error => ({ error: error.message }));
+    } finally {
+      fs.open = open;
+      fs.lstat = lstat;
+    }
+
+    expect(inserted, 'independent writing returned after the relevant guarded read').toBe(true);
+    expect.soft(outcome).toMatchObject({ error: expect.stringMatching(/identity|changed|scope|preserve/i) });
+    expect(await read(destination)).toBe(independent);
+    if (boundary === 'before authority') {
+      expect.soft(await absent(marker)).toBe('ENOENT');
+      expect.soft(await absent(`${marker}.pending`)).toBe('ENOENT');
+    } else {
+      expect(JSON.parse(await read(marker))).toMatchObject({ id, exportOperation: operation });
+    }
+    if (boundary === 'before completion') {
+      expect(unlinks).toBe(review.files.length);
+      expect(await absent(journal)).toBe('ENOENT');
+      expect(await absent(receipt)).toBe('ENOENT');
+    } else {
+      expect.soft(unlinks).toBe(0);
+      expect.soft(await read(journal).catch(error => error.code)).toBe(journalBytes);
+      expect.soft(await read(receipt).catch(error => error.code)).toBe(receiptBytes);
     }
   });
 }

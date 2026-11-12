@@ -51,7 +51,7 @@ async function transcriptProtocolFixture(selectedFailure, selectedRelative = 'Se
   }
   expect(intent).toBeDefined();
   const selectedCopies = [selected, path.join(directory, `${intent.operation}.intent.json`), path.join(directory, `${intent.operation}.published.json`)];
-  if (selectedFailure) selectedCopies.push(path.join(directory, `${intent.operation}.md.pending`));
+  if (selectedFailure) selectedCopies.push(path.join(directory, `${intent.operation}.md.pending`), path.join(directory, `${intent.operation}.link.json`));
   if (selectedFailure) {
     const outputStat = await fs.stat(selected), stageStat = await fs.stat(path.join(directory, `${intent.operation}.md.pending`));
     expect(outputStat.nlink).toBe(2);
@@ -325,7 +325,7 @@ test('separately selected transcript removal previews every managed copy, cancel
   expect(await fs.readFile(selected, 'utf8')).toBe(selectedBytes);
   const intentName = (await fs.readdir(directory)).find(name => name.endsWith('.intent.json'));
   const intent = JSON.parse(await fs.readFile(path.join(directory, intentName), 'utf8'));
-  const selectedCopies = [selected, path.join(directory, intentName), path.join(directory, `${intent.operation}.md.pending`), path.join(directory, `${intent.operation}.published.json`)];
+  const selectedCopies = [selected, path.join(directory, intentName), path.join(directory, `${intent.operation}.md.pending`), path.join(directory, `${intent.operation}.published.json`), path.join(directory, `${intent.operation}.link.json`)];
   expect((await fs.stat(selected)).nlink).toBe(2);
   await fs.writeFile(path.join(root, 'faults.json'), '{}');
   await fs.writeFile(path.join(root, 'transcript-selection.json'), JSON.stringify({ canceled: false, filePath: other }));
