@@ -8,7 +8,8 @@ const { sourceMutation } = require('./source-mutation');
 const { hash } = require('./intake-producer');
 const { uuid } = require('./source-authority');
 const { sourceLink } = require('./repairs');
-const { validateAnnotationRemovals } = require('./annotation-authority');
+const { validateAnnotationRemovals, activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent } = require('./annotation-authority');
+const { validProof } = require('./staged-publication');
 const { removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const { comparable } = require('./legacy-capture-ownership');
 const rel = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
@@ -33,6 +34,18 @@ async function leaf(vault, file) {
   } finally { await handle.close(); }
   return { file: rel(vault, file), sha256: hash(bytes), dev: String(before.dev), ino: String(before.ino), bytes: String(bytes.length), links: Number(before.nlink), raw: bytes, text: new TextDecoder('utf-8', { fatal: true }).decode(bytes) };
 }
+function readStandaloneIntent(intake, name, value) {
+  let intent, note;
+  try {
+    intent = JSON.parse(value.text);
+    note = intake.validateAnnotationIntent(intent);
+  } catch { throw changed(); }
+  if (name !== activeAnnotationIntent && (name !== heldAnnotationIntent(intent.id) || !intent.annotationProof) ||
+      ![1, 2].includes(value.links) || !value.raw.equals(Buffer.from(JSON.stringify(intent), 'utf8')) || intent.intentIdentity &&
+      (intent.intentIdentity.dev !== value.dev || intent.intentIdentity.ino !== value.ino)) throw changed();
+  return { intent, note };
+}
+const matchesPublication = (value, proof) => value.dev === proof.dev && value.ino === proof.ino && value.sha256 === proof.digest;
 async function raw(vault, reserved) {
   const notes = [], directories = [], unsupported = new Set(), reservedIds = new Set(reserved.annotations);
   async function visit(folder) {
@@ -89,21 +102,32 @@ async function inventory(vault, intake, ledger, id, captureId) {
     const value = await leaf(vault, file); entries.set(entry.name, value);
   }
   const links = new Map();
+  let publication, publicationRecord, heldPublication;
   for (const [name, value] of entries) {
-    if (!value.text.includes(id)) continue;
-    let object; try { object = JSON.parse(value.text); } catch {}
+    if (name !== heldAnnotationIntent(id) && !value.text.includes(id)) continue;
     if (/^repair(?:-intent|-[a-f0-9-]{36})\.json$/.test(name)) throw Error('This annotation remains in mixed source repair data. Preserve and split that repair before selecting annotation removal.');
-    if (name === 'annotation-intent.json') {
-      if (!strict(object, ['schema', 'id', 'captureId', 'annotation']) || object.schema !== 1 || object.id !== id || typeof object.annotation !== 'string') throw changed();
-      if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
-      const note = parseAnnotation(object.annotation); if (!note || note.captureId !== object.captureId) throw changed(); bind(note);
+    if (isAnnotationIntent(name)) {
+      const { intent, note } = readStandaloneIntent(intake, name, value);
+      bind(note);
+      if (publicationRecord && (publicationRecord.dev !== value.dev || publicationRecord.ino !== value.ino || publicationRecord.sha256 !== value.sha256)) throw changed();
+      publicationRecord = value;
+      publication = intent;
+      if (name !== activeAnnotationIntent) heldPublication = true;
       candidates.push({ ...value, kind: 'annotation-intent' }); continue;
     }
     if (name === `annotation-${id}.stage`) {
       const note = parseAnnotation(value.text); if (!note) throw changed(); bind(note); candidates.push({ ...value, kind: 'annotation-stage' }); continue;
     }
     if (name === 'link-intent.json' || /^link-[a-f0-9-]{36}\.json$/.test(name)) {
-      if (!strict(object, ['schema', 'id', 'file', 'before', 'content', 'relative']) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      let object; try { object = JSON.parse(value.text); } catch {}
+      const fields = ['schema', 'id', 'file', 'before', 'content', 'relative'];
+      if (object && Object.hasOwn(object, 'stageProof')) fields.push('stageProof');
+      if (object && Object.hasOwn(object, 'originalProof')) fields.push('originalProof');
+      if (!strict(object, fields) || object.schema !== 1 || !uuid(object.id) || typeof object.before !== 'string' || typeof object.content !== 'string' || typeof object.relative !== 'string' || typeof object.file !== 'string' || /:/.test(object.file)) throw changed();
+      if (fields.includes('stageProof') && (!validProof(object.stageProof) || Object.keys(object.stageProof).length !== 3 ||
+          object.stageProof.digest !== hash(object.content))) throw changed();
+      if (fields.includes('originalProof') && (!validProof(object.originalProof) || Object.keys(object.originalProof).length !== 3 ||
+          object.originalProof.digest !== hash(object.before))) throw changed();
       if (!value.raw.equals(Buffer.from(JSON.stringify(object), 'utf8'))) throw changed();
       // Journals retain their native serialized path. Only manifest paths use
       // canonical separators; the normal destination boundary validates both.
@@ -118,11 +142,30 @@ async function inventory(vault, intake, ledger, id, captureId) {
     if (/^link-[a-f0-9-]{36}\.(?:before\.md|stage|held-(?:before|stage)-[a-f0-9]{64}\.md)$/.test(name)) continue;
     throw changed();
   }
+  if (publication?.intentIdentity) {
+    const staged = candidates.find(candidate => candidate.kind === 'annotation-stage');
+    const publishedPath = rel(vault, path.join(vault.root, 'Annotations', `${id}.md`));
+    const published = candidates.find(candidate => candidate.kind === 'annotation-note' && comparable(candidate.file) === comparable(publishedPath));
+    const proof = publication.annotationProof;
+    const matchesAnnotation = candidate => ['annotation-note', 'annotation-stage'].includes(candidate.kind) && matchesPublication(candidate, proof);
+    const editedCanonical = heldPublication && !staged && published?.dev === proof?.dev && published?.ino === proof?.ino;
+    const removal = ledger.annotationRemovals?.[id];
+    // After confirmed removal retires the note and stage, the exact approved
+    // targets still prove the intent while its own retirement is pending.
+    const recorded = proof && removal?.phase === 'removing' && removal.captureId === captureId && removal.targets.some(matchesAnnotation);
+    if (!proof && (staged || published)) throw changed();
+    if (proof && (
+      staged && !matchesPublication(staged, proof) || published && !matchesPublication(published, proof) && !editedCanonical ||
+      !heldPublication && !candidates.some(matchesAnnotation) && !recorded
+    )) throw changed();
+  }
   for (const [name, value] of entries) {
     const match = name.match(/^link-([a-f0-9-]{36})\.(before\.md|stage|held-(?:before|stage)-[a-f0-9]{64}\.md)$/);
     if (!match || !value.text.includes(id) && !links.has(match[1])) continue;
     const intent = links.get(match[1]), note = parseAnnotation(value.text);
     if (!intent || !note) throw changed(); bind(note);
+    if (match[2] === 'before.md' && (!intent.originalProof || !matchesPublication(value, intent.originalProof))) throw changed();
+    if (match[2] === 'stage' && (!intent.stageProof || !matchesPublication(value, intent.stageProof))) throw changed();
     candidates.push({ ...value, kind: match[2] === 'before.md' ? 'relationship-before' : match[2] === 'stage' ? 'relationship-stage' : 'relationship-held' });
   }
   if (!uuid(captureId)) throw changed();
@@ -153,22 +196,22 @@ class AnnotationRemoval {
     const vault = this.vault(), intake = new Intake(vault), ledger = await intake.load();
     const reserved = vault.reservedRestorationIdentities(ledger), scanned = await raw(vault, reserved);
     const notes = scanned.notes.filter(note => !ledger.annotationRemovals?.[note.id] && !scanned.reservedIds.has(note.id)).map(note => ({ id: note.id, captureId: note.captureId, file: note.file, text: note.content }));
-    const intentFile = path.join(intake.dir, 'annotation-intent.json');
-    const pending = await leaf(vault, intentFile).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
-    if (pending) {
-      const intent = JSON.parse(pending.text);
-      if (!strict(intent, ['schema', 'id', 'captureId', 'annotation']) || intent.schema !== 1 || !uuid(intent.id) || !uuid(intent.captureId) || typeof intent.annotation !== 'string') throw changed();
-      if (!pending.raw.equals(Buffer.from(JSON.stringify(intent), 'utf8'))) throw changed();
-      const annotation = parseAnnotation(intent.annotation);
-      if (!annotation || annotation.id !== intent.id || annotation.captureId !== intent.captureId) throw changed();
-      if (!ledger.annotationRemovals?.[intent.id] && !scanned.reservedIds.has(intent.id)) {
+    const pendingIds = new Set();
+    const entries = await fs.readdir(intake.dir).catch(error => { if (error.code === 'ENOENT') return []; throw error; });
+    for (const name of entries.filter(isAnnotationIntent)) {
+      const intentFile = path.join(intake.dir, name);
+      const pending = await leaf(vault, intentFile);
+      const { intent } = readStandaloneIntent(intake, name, pending);
+      if (ledger.annotationRemovals?.[intent.id] || scanned.reservedIds.has(intent.id) || pendingIds.has(intent.id)) continue;
+      if (name === activeAnnotationIntent && !entries.includes(heldAnnotationIntent(intent.id))) {
         const stage = await leaf(vault, path.join(intake.dir, `annotation-${intent.id}.stage`));
-        if (stage.text !== intent.annotation) throw changed();
-        // Reuse the raw classifier and exact parent/peer rules. Listing never
-        // completes the pending writer or materializes its absent note.
-        await inventory(vault, intake, ledger, intent.id, intent.captureId);
-        notes.push({ id: intent.id, captureId: intent.captureId, file: rel(vault, intentFile), text: intent.annotation, pending: true });
+        if (stage.text !== intent.annotation || intent.annotationProof && !matchesPublication(stage, intent.annotationProof)) throw changed();
       }
+      // Reuse the raw classifier and exact parent/peer rules. Listing never
+      // completes the pending writer or materializes its absent note.
+      await inventory(vault, intake, ledger, intent.id, intent.captureId);
+      pendingIds.add(intent.id);
+      notes.push({ id: intent.id, captureId: intent.captureId, file: rel(vault, intentFile), text: intent.annotation, pending: true });
     }
     if (!intake.storage.matches(await intake.storage.view())) throw changed();
     reserved.verify();
@@ -231,9 +274,13 @@ class AnnotationRemoval {
       verifyReserved();
       return { ...scope, verifyReserved };
     };
-    // Relationship payloads must go before their validating journals. A crash
-    // must leave enough reviewed association to classify every remaining copy.
-    const ordered = [...authority.targets].sort((a, b) => Number(a.kind === 'relationship-journal' || a.kind === 'annotation-intent') - Number(b.kind === 'relationship-journal' || b.kind === 'annotation-intent') || (a.file < b.file ? -1 : 1));
+    // Keep the validating journals until payloads are gone. A held standalone
+    // intent also proves its active alias when neither payload survives.
+    const order = target => {
+      if (target.kind === 'annotation-intent') return path.posix.basename(target.file) === heldAnnotationIntent(id) ? 2 : 1;
+      return Number(target.kind === 'relationship-journal');
+    };
+    const ordered = [...authority.targets].sort((a, b) => order(a) - order(b) || (a.file < b.file ? -1 : 1));
     for (const target of ordered) {
       const fresh = await verify(); if (!fresh.targets.some(item => item.file === target.file)) continue;
       await vault.checkpoint('annotation-removal-before-unlink'); const current = await verify();

@@ -1086,7 +1086,14 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '', c
     const { Intake } = require('./app/intake');
     const [directory, now, boundary, pending, shared, rawClaim] = process.argv.slice(1);
     const repair = boundary === 'held-repair-source-journal' ? JSON.parse(rawClaim) : null;
+    const ordinaryRepair = boundary === 'ordinary-repair-published' ? JSON.parse(rawClaim) : null;
     const checkpoint = async name => {
+      if (ordinaryRepair) {
+        if (name !== 'intake-published') return;
+        const tx = JSON.parse(await fs.readFile(shared, 'utf8'));
+        if (tx.sourceHash === ordinaryRepair.input.sourceHash && tx.resolution && !tx.keptCurrent) process.exit(77);
+        return;
+      }
       if (repair && name === 'repair-intent-published') {
         await fs.rename(repair.snapshot, repair.displaced);
         return;
@@ -1147,7 +1154,8 @@ async function stopChildIntake(directory, boundary, pending = '', shared = '', c
       };
     }
     const intake = new Intake(new Vault(directory, 'Companion', { checkpoint }));
-    const operation = repair ? intake.resolveConflict(repair.input, now) : intake.reconcile({ now });
+    const input = repair?.input || ordinaryRepair?.input;
+    const operation = input ? intake.resolveConflict(input, now) : intake.reconcile({ now });
     operation.then(() => process.exit(78), error => { console.error(error); process.exit(79); });
   `;
   const child = spawn(process.execPath, ['-e', code, directory, later, boundary, pending, shared, JSON.stringify(claim)], {
@@ -1289,6 +1297,51 @@ async function fixtureForLaterClaim(testInfo) {
     selected, selectedBytes, selectedIdentity, shared, displaced
   };
 }
+
+test('restart settles an exact ordinary transfer while an unrelated published restoration stays held', async ({}, testInfo) => {
+  const { vault, intake, producer, sourceHash, id, ledgerFile, authority, bHash, cHash, reserved,
+    existing, selected, selectedBytes, selectedIdentity, shared } = await fixtureForLaterClaim(testInfo);
+  const reservedBytes = await fs.readFile(reserved), reservedIdentity = await identity(reserved);
+  await fs.appendFile(existing, '\nLocal writing before the ordinary source transfer.\n');
+  const local = await fs.readFile(existing);
+  const before = await intake.reconcile({ now: later }), prior = before.blocks[bHash];
+  expect(prior).toBeDefined();
+  const original = path.join(intake.dir, prior.journal), originalBytes = await fs.readFile(original), originalIdentity = await identity(original);
+  const input = { sourceHash: bHash, localHash: createHash('sha256').update(local).digest('hex'), text: 'Ordinary transfer writing independent of the held restoration.' };
+  await stopChildIntake(vault.vault, 'ordinary-repair-published', '', shared, { input });
+  const tx = await readJson(shared), intentFile = path.join(intake.dir, 'repair-intent.json');
+  const intent = await readJson(intentFile), stopped = await readJson(ledgerFile);
+  expect(tx).toEqual(intent.tx);
+  expect(tx.keptCurrent).toBeUndefined();
+  expect(stopped.blocks[bHash]).toEqual(prior);
+  expect(stopped.attempts[tx.revision.identity]).toBeUndefined();
+  expect(stopped.sourceAuthority[id]).toEqual(authority);
+  const annotation = path.join(vault.root, 'Annotations', `${intent.annotationId}.md`), stage = path.join(intake.dir, `annotation-${intent.annotationId}.stage`);
+  const publication = await identity(annotation);
+  expect(await identity(stage)).toEqual(publication);
+  expect((await fs.lstat(annotation, { bigint: true })).nlink).toBe(2n);
+  expect(await fs.readFile(annotation, 'utf8')).toBe(intent.annotation);
+  await writeDraft(producer, 'independent-after-ordinary-restart', '4', 'd');
+
+  const result = await new Intake(new Vault(vault.vault, 'Companion')).reconcile({ now: later });
+  expect(result.blocks[bHash]).toBeUndefined();
+  expect(result.captures[bHash].currentRevision).toBe(tx.revision.id);
+  expect(result.attempts[tx.revision.identity]).toMatchObject({ status: 'imported', revision: tx.revision.id });
+  expect(result.captures[cHash]).toBeDefined();
+  expect(result.sourceAuthority[id]).toEqual(authority);
+  expect(result.suppressed).toContain(sourceHash);
+  expect(await fs.readFile(reserved)).toEqual(reservedBytes);
+  expect(await identity(reserved)).toEqual(reservedIdentity);
+  expect(await fs.readFile(selected)).toEqual(selectedBytes);
+  expect(await identity(selected)).toEqual(selectedIdentity);
+  expect(await fs.readFile(original)).toEqual(originalBytes);
+  expect(await identity(original)).toEqual(originalIdentity);
+  expect(await fs.readFile(existing, 'utf8')).toBe(tx.content);
+  expect(await fs.readFile(annotation, 'utf8')).toBe(intent.annotation);
+  expect(await identity(annotation)).toEqual(publication);
+  expect((await fs.lstat(annotation, { bigint: true })).nlink).toBe(1n);
+  for (const file of [shared, intentFile, stage]) expect(await readOptional(file)).toBeNull();
+});
 
 test('restart archives the exact journal after a late reserved restoration claim and admits a disjoint draft', async ({}, testInfo) => {
   const context = await fixtureForLaterClaim(testInfo);

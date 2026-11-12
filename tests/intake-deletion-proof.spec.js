@@ -990,8 +990,11 @@ test('annotation removal holds a note changed during its final ledger check', as
 
 for (const role of ['retained writing', 'reviewed origin']) test(`mixed source deletion holds ${role} changed after its final inspection`, async ({}, testInfo) => {
   const producer = testInfo.outputPath('producer');
+  const annotationStopped = Error('Stopped after the standalone annotation link.');
+  let stopAnnotation = false;
   let keptCurrentRead = false;
   const { vault, intake, ledgerFile } = await setup(testInfo, async boundary => {
+    if (boundary === 'annotation-published' && stopAnnotation) throw annotationStopped;
     if (boundary === 'repair-intent-published') keptCurrentRead = true;
     if (boundary === 'kept-current-read' && keptCurrentRead) {
       throw Object.assign(Error('Controlled kept-current file access failure.'), { code: 'EACCES' });
@@ -1001,6 +1004,20 @@ for (const role of ['retained writing', 'reviewed origin']) test(`mixed source d
   const first = await intake.connect(producer, true, now, 'review');
   expect(first.lastCheck.status).toBe('complete');
   const [sourceHash, capture] = Object.entries(first.captures)[0];
+  const independentHolds = new Map();
+  if (role === 'retained writing') {
+    const id = randomUUID(), text = 'Independent annotation already held before mixed deletion.';
+    stopAnnotation = true;
+    await expect(intake.addAnnotation({ id, captureId: capture.id, text }, now)).rejects.toBe(annotationStopped);
+    stopAnnotation = false;
+    await fs.unlink(path.join(vault.root, 'Annotations', `${id}.md`));
+    await intake.info();
+    for (const name of [`annotation-${id}.stage`, `annotation-${id}.held.json`]) {
+      const file = path.join(intake.dir, name), bytes = await fs.readFile(file, 'utf8');
+      expect(bytes).toContain(text);
+      independentHolds.set(file, bytes);
+    }
+  }
   const captureFile = intake.destination(capture);
   await fs.appendFile(captureFile, '\nWhole independent local observation.\n');
   const whole = await fs.readFile(captureFile);
@@ -1015,6 +1032,7 @@ for (const role of ['retained writing', 'reviewed origin']) test(`mixed source d
   await conversations.lock(async () => {});
   const removal = new CaptureDeletion({ getVault, conversations, clock, clearApprovals() {} });
   const preview = await removal.preview(capture.id);
+  for (const file of independentHolds.keys()) expect(preview.targets).not.toContain(path.relative(vault.vault, file).split(path.sep).join('/'));
   const origins = new Map(await Promise.all(preview.targets.map(async name => {
     const file = path.join(vault.vault, name);
     return [file, await fs.readFile(file, 'utf8')];
@@ -1039,6 +1057,7 @@ for (const role of ['retained writing', 'reviewed origin']) test(`mixed source d
 
   expect(edited, 'the actual final mixed source inspection was reached').toBeTruthy();
   for (const [file, bytes] of origins) expect.soft(await readOptional(file), path.basename(file)).toBe(file === edited ? editedBytes : bytes);
+  for (const [file, bytes] of independentHolds) expect(await fs.readFile(file, 'utf8')).toBe(bytes);
   expect.soft(await readOptional(edited)).toBe(editedBytes);
   expect((await readJson(ledgerFile)).sourceAuthority[capture.id].phase).toBe('deleting');
   expect(outcome).toMatch(/changed|preserv/i);

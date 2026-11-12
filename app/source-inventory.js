@@ -6,6 +6,7 @@ const { matchesProducerOutcome } = require('./producer-root');
 const { validateNormalizedReview, knownRun } = require('./source-review');
 const sourceTitle = require('./source-title');
 const pendingTitle = require('./pending-title');
+const { activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent } = require('./annotation-authority');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(key => names.includes(key));
@@ -242,6 +243,27 @@ async function inventoryDetachedEditor(intake, ledger, capture, sourceHash, note
 async function inventory(intake, ledger, capture, sourceHash, revisions, initial) {
   return inventorySources(intake, ledger, capture, sourceHash, revisions, initial);
 }
+async function independentAnnotationHolds(intake, id, sourceHash) {
+  const independent = new Map();
+  for (const name of (await fs.readdir(intake.dir)).filter(name => isAnnotationIntent(name) && name !== activeAnnotationIntent)) {
+    const value = await leaf(intake, path.join(intake.dir, name), 'annotation-intent');
+    if (!mentions(value.bytes, id, sourceHash)) continue;
+    const intent = compact(value.bytes);
+    try { intake.validateAnnotationIntent(intent); } catch { fail(); }
+    if (name !== heldAnnotationIntent(intent.id) || !intent.annotationProof || value.nlink !== 1 ||
+        intent.intentIdentity.dev !== value.target.dev || intent.intentIdentity.ino !== value.target.ino) fail();
+    const stage = `annotation-${intent.id}.stage`;
+    const staged = await leaf(intake, path.join(intake.dir, stage), 'annotation-stage').catch(error => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (staged && (staged.target.dev !== intent.annotationProof.dev || staged.target.ino !== intent.annotationProof.ino ||
+        staged.target.sha256 !== intent.annotationProof.digest)) fail();
+    independent.set(name, value);
+    if (staged) independent.set(stage, staged);
+  }
+  return independent;
+}
 async function inventorySources(intake, ledger, capture, sourceHash, revisions, initial, detachedEditor = null) {
   if (ledger.acceptedCleanup?.sourceHash === sourceHash) fail();
   const pending = await pendingTitle.inventory(intake, ledger, capture, sourceHash, revisions, initial);
@@ -250,11 +272,16 @@ async function inventorySources(intake, ledger, capture, sourceHash, revisions, 
   const targets = new Map(initial.map(item => [item.file, item])), recovery = [], observations = [], transactions = new Map(), expected = new Map();
   const { noteText } = require('./intake'), current = revisions.get(capture.currentRevision);
   if (!current || !pending && !titles.verifiedCurrent && !initial.some(item => item.kind === 'capture' && item.sha256 === hash(noteText(capture, current)))) fail();
-  const entries = [];
+  const entries = [], independent = await independentAnnotationHolds(intake, capture.id, sourceHash);
   for (const name of (await fs.readdir(intake.dir)).sort()) {
     if (name === 'ledger.json') continue;
     if (pending?.titleRecovery.intent === relative(intake, path.join(intake.dir, name))) continue;
     const file = path.join(intake.dir, name), value = await leaf(intake, file, 'source-recovery');
+    const held = independent.get(name);
+    if (held) {
+      if (held.nlink !== value.nlink || ['dev', 'ino', 'sha256'].some(key => held.target[key] !== value.target[key])) fail();
+      continue;
+    }
     if (detachedEditor && accountDetachedLeaf(detachedEditor, value)) {
       targets.set(value.target.file, { ...value.target, kind: 'mixed-recovery' }); continue;
     }
@@ -382,4 +409,4 @@ function purgedAttempt(ledger, draft) {
   for (const item of matches) if (item.fingerprint !== draft.fingerprint || item.sourceHash !== draft.sourceHash || ledger.captures[draft.sourceHash]?.id !== item.captureId) throw Error('Purged producer identity changed. Preserve its original fingerprint and source binding.');
   return matches[0];
 }
-module.exports = { validateInventory, inventory, inventoryDetachedEditor, inspectTargets, inspectTarget, inspectPointers, retirePointers, purgedAttempt };
+module.exports = { validateInventory, inventory, inventoryDetachedEditor, independentAnnotationHolds, inspectTargets, inspectTarget, inspectPointers, retirePointers, purgedAttempt };
