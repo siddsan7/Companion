@@ -376,15 +376,30 @@ class Conversations {
         const revalidate = async dispatch => {
           if (JSON.stringify(await this.build(approved.input, request.id, undefined, dispatch)) !== JSON.stringify(approved.snapshot)) throw Error('Context changed during preflight. Preview and approve a new package.');
         };
+        const intentGuard = async () => {
+          const changed = cause => Error('Durable conversation intent changed. Review the local history before sending again.', { cause });
+          let verifyControl;
+          try { await this.controls.check(record, verify => { verifyControl = verify; }); }
+          catch (error) { throw changed(error); }
+          return () => {
+            try {
+              verifyControl();
+              verifyStageSync(path.join(this.directory, `${record.id}.json`), () => this.safeDirectory(false, directory), proof);
+            } catch (error) { throw changed(error); }
+          };
+        };
         await revalidate();
+        (await intentGuard())();
         const result = await this.provider.turn(current.text, { capacityBinding: current.capacityBinding, beforeStart: async () => {
           await this.checkpoint('conversation-before-turn-start');
           const guards = [];
           const dependencies = new Map(current.dependencies.map(({ key, digest }) => [key, digest]));
           await revalidate({ dependencies, observe: guard => guards.push(guard) });
+          const verifyIntent = await intentGuard();
           return () => {
             try { for (const guard of guards) guard(); }
             catch (error) { throw Error('Context changed before turn start. Preview and approve a new package.', { cause: error }); }
+            verifyIntent();
           };
         }, onState: async snapshot => { Object.assign(request, snapshot); proof = await this.write(record, proof, directory); } });
         Object.assign(request, result, { status: 'completed', completedAt: this.clock().now });

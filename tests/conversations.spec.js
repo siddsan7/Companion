@@ -1187,6 +1187,40 @@ async function holdFinalProviderEvidence() {
   return () => fs.writeFile(resume, 'read current provider evidence');
 }
 
+for (const late of [false, true]) test(late
+  ? 'a replaced current conversation intent during final provider evidence prevents turn start'
+  : 'a removed current conversation intent before dispatch starts no provider thread', async () => {
+  await writeCapacity(capacityEvidence());
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'No request without the current durable intent.' }));
+  await prepareConversation();
+  let release;
+  if (late) release = await holdFinalProviderEvidence();
+  else {
+    const boundary = 'conversation-before-dispatch';
+    await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }));
+    await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(boundary);
+    release = () => fs.writeFile(path.join(root, 'release.txt'), 'resume');
+  }
+  const intent = await onlyConversation(), file = path.join(root, 'conversations', `${intent.id}.json`);
+  const moved = path.join(root, 'retained original intent.json');
+  const original = await fs.readFile(file, 'utf8');
+  intent.requests[0].question = 'External replacement of the durable intent.';
+  const replacement = JSON.stringify(intent, null, 2);
+  try {
+    await fs.rename(file, moved);
+    if (late) await fs.writeFile(file, replacement, { flag: 'wx' });
+  } finally { await release(); }
+  await expect(page.locator('#conversation-history')).toContainText('interrupted');
+  await expect(page.locator('#conversation-history')).toContainText(/durable.*intent/i);
+  const rpc = await conversationRpc();
+  expect(rpc.filter(call => call.method === 'thread/start')).toHaveLength(late ? 1 : 0);
+  expect(rpc.filter(call => call.method === 'turn/start')).toHaveLength(0);
+  await noSubmission();
+  expect(await fs.readFile(file, 'utf8').catch(error => error.code)).toBe(late ? replacement : 'ENOENT');
+  expect(await fs.readFile(moved, 'utf8')).toBe(original);
+});
+
 test('an edit to selected historical dialogue during the final provider evidence read prevents turn start', async () => {
   test.setTimeout(60000);
   const canary = 'LATE_HISTORY_DIALOGUE';
