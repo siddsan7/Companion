@@ -4,6 +4,7 @@ const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { performance } = require('node:perf_hooks');
 const { setTimeout: wait } = require('node:timers/promises');
+const { Briefs } = require('./briefs');
 const { conversation, validRemovedRequests, requestRemovalStageName, canonicalRequestRemovalStage } = require('./archive-format');
 const { readExactSync, writeStage, validProof, verifyStage, verifyStageSync, verifyAbsentSync, removeLinkedStage, publishReplacement, firstPublicationSuffix, initialPublicationPending } = require('./staged-publication');
 const hash = text => createHash('sha256').update(text).digest('hex');
@@ -623,13 +624,21 @@ class ConversationControls {
   }
   async finishRestoration(snapshot) {
     const { marker, vaultRoot } = snapshot;
+    const vault = this.store.getVault();
     const parent = this.store.safeDirectory(), stageTarget = marker.targets.find(target => target.name.endsWith('.pending')), target = marker.targets.find(target => target.name.endsWith('.json'));
     const stage = path.join(this.store.directory, stageTarget.name), destination = path.join(this.store.directory, target.name);
     const guard = () => {
       this.store.safeDirectory(false, parent);
-      if (!vaultRoot || this.store.getVault()?.root !== vaultRoot) throw Error('The restoration vault selection changed. Preserve the payload for review.');
+      if (!vaultRoot || vault?.root !== vaultRoot || this.store.getVault() !== vault) throw Error('The restoration vault selection changed. Preserve the payload for review.');
     };
     guard();
+    const unavailable = cause => Error('Exact archived brief pin is unavailable. Restore its separate vault backup before confirming recovery.', { cause });
+    let briefProof;
+    try { briefProof = await new Briefs(vault).exactApproval(JSON.parse(snapshot.text).brief); }
+    catch (error) { throw unavailable(error); }
+    const verifyBrief = () => {
+      try { briefProof(); } catch (error) { throw unavailable(error); }
+    };
     await this.settlePublication(marker, guard);
     const verifyMarker = await this.restorationMarkerGuard(marker, guard);
     const proof = { dev: stageTarget.dev, ino: stageTarget.ino, digest: marker.restoration.recordDigest };
@@ -637,6 +646,7 @@ class ConversationControls {
       await this.file(stage, parent, stageTarget);
       verifyMarker();
       verifyStageSync(stage, guard, proof);
+      verifyBrief();
       local.linkSync(stage, destination);
       guard();
       await this.store.checkpoint('archive-restore-after-link');
@@ -654,6 +664,7 @@ class ConversationControls {
       () => this.verifyRestorationComplete(marker, parent), () => {
         verifyMarker();
         verifyPayload();
+        verifyBrief();
       });
     verifyPayload();
     this.store.tokens.clear();

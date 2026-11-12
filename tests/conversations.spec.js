@@ -2953,6 +2953,46 @@ async function reviewReservedArchive(targetPage, archive) {
   await expect(region.getByRole('button', { name: 'Restore reviewed additions', exact: true })).toBeEnabled();
   return region;
 }
+for (const [boundary, removeReceipt] of [
+  ['archive-restore-after-reservation', false],
+  ['archive-restore-before-active', true]
+]) test(`archive restore holds a changed exact brief pin at ${boundary}`, async () => {
+  test.setTimeout(150000);
+  const fixture = await deletedArchiveFixture('RESTORE_BRIEF_CHANGE');
+  const region = await reviewReservedArchive(page, fixture.archive);
+  const { version, digest } = fixture.record.brief;
+  const briefs = path.join(fixture.record.vault.root, 'Briefs');
+  const briefFile = path.join(briefs, removeReceipt ? `.brief-approval-${version}.json` : `approved-${version}-${digest}.md`);
+  const moved = path.join(root, 'original brief evidence');
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: boundary }), 'utf8');
+  await region.getByRole('button', { name: 'Restore reviewed additions', exact: true }).click();
+  await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe(boundary);
+  const marker = JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'));
+  try { await fs.rename(briefFile, moved); }
+  finally { await fs.writeFile(path.join(root, 'release.txt'), 'release', 'utf8'); }
+  await expect(region).toContainText(/Restored 0 conversations.*Exact archived brief pin is unavailable/i);
+  expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'))).toEqual(marker);
+  const stage = path.join(fixture.directory, marker.targets.find(target => target.name.endsWith('.pending')).name);
+  if (removeReceipt) {
+    expect((await fs.stat(fixture.file)).nlink).toBe(1);
+  } else {
+    expect(await fs.stat(fixture.file).catch(error => error.code)).toBe('ENOENT');
+    expect((await fs.stat(stage)).nlink).toBe(1);
+  }
+  const pending = page.getByRole('region', { name: 'Pending history restorations', exact: true });
+  await pending.getByRole('button', { name: 'Resume history restoration', exact: true }).click();
+  const review = page.getByRole('region', { name: 'History restoration recovery review', exact: true });
+  const confirm = review.getByRole('button', { name: 'Confirm history restoration recovery', exact: true });
+  await confirm.click();
+  await expect(page.locator('#archive-restore-summary')).toContainText('Restore its separate vault backup before confirming recovery.');
+  expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'))).toEqual(marker);
+  await fs.rename(moved, briefFile);
+  await confirm.click();
+  await expect(region).toContainText('Restoration recovered');
+  expect(JSON.parse(await fs.readFile(fixture.controlFile, 'utf8'))).toMatchObject({ phase: 'active', generation: marker.generation });
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(fixture.calls);
+});
+
 for (const boundary of ['archive-restore-after-reservation', 'archive-restore-after-link', 'archive-restore-before-active']) {
   test(`restoration authority guards explicitly recover after actual main exit at ${boundary}`, async ({}, testInfo) => {
     test.setTimeout(150000);
