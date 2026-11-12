@@ -60,4 +60,9 @@ function verifyControl(file, guard, read) {
   else if (hasFile(file)) throw changed();
 }
 
-module.exports = { changed, sameProof, hasFile, locations, readOptional, writeExclusive, readControl, writeControl, verifyControl };
+function receiptProof(receipt, value) {
+  if (!receipt || Object.keys(receipt).length !== 6 || receipt.schema !== 1 || receipt.operation !== value.operation || receipt.id !== value.id || receipt.digest !== value.digest || ![receipt.dev, receipt.ino].every(part => typeof part === 'string' && /^[0-9]+$/.test(part))) throw Error('Saved idea receipt identity is damaged. Nothing was republished.');
+  return { dev: receipt.dev, ino: receipt.ino, digest: receipt.digest };
+}
+
+module.exports = { changed, sameProof, hasFile, locations, readOptional, writeExclusive, readControl, writeControl, verifyControl, receiptProof };
