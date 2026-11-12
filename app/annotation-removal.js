@@ -1,4 +1,5 @@
 const fs = require('node:fs/promises');
+const local = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const YAML = require('yaml');
@@ -9,13 +10,22 @@ const { hash } = require('./intake-producer');
 const { uuid } = require('./source-authority');
 const { sourceLink } = require('./repairs');
 const { validateAnnotationRemovals, activeAnnotationIntent, heldAnnotationIntent, isAnnotationIntent } = require('./annotation-authority');
-const { validProof } = require('./staged-publication');
+const { validProof, ordinaryDirectories, readExactSync, verifyAbsentSync } = require('./staged-publication');
 const { removalParentGuard, verifyRemovalTarget } = require('./source-recovery');
 const { comparable } = require('./legacy-capture-ownership');
 const rel = (vault, file) => path.relative(vault.vault, file).split(path.sep).join('/');
 const reservedPath = (vault, reserved, file) => reserved.paths.has(comparable(rel(vault, file)));
 const changed = () => Error('Annotation removal scope changed or contains an unknown copy. Preserve the writing and review again.');
 const strict = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+const ignoredFolder = name => ['.git', '.obsidian', '.intake', '.codex', 'managed-home'].includes(name.toLowerCase());
+function declaredAnnotationIds(text) {
+  const header = text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  const document = header && YAML.parseDocument(header[1]);
+  if (!YAML.isMap(document?.contents)) return [];
+  const declarations = document.contents.items.filter(pair => YAML.isScalar(pair.key) && YAML.isScalar(pair.value));
+  if (!declarations.some(pair => pair.key.value === 'artifact_type' && pair.value.value === 'annotation')) return [];
+  return declarations.filter(pair => pair.key.value === 'companion_id' && uuid(pair.value.value)).map(pair => pair.value.value);
+}
 async function directory(vault, file) {
   const stat = await fs.lstat(file, { bigint: true });
   if (!stat.isDirectory() || stat.isSymbolicLink()) throw changed();
@@ -51,7 +61,7 @@ async function raw(vault, reserved) {
   async function visit(folder) {
     directories.push(await directory(vault, folder));
     for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
-      if (['.git', '.obsidian', '.intake', '.codex', 'managed-home'].includes(entry.name.toLowerCase())) continue;
+      if (ignoredFolder(entry.name)) continue;
       const file = path.join(folder, entry.name);
       if (entry.isSymbolicLink()) throw changed();
       if (entry.isDirectory()) await visit(file);
@@ -65,20 +75,10 @@ async function raw(vault, reserved) {
           // Unsupported copies still invalidate consent for their declared
           // identity. Only the first metadata block owns that identity; body
           // quotations remain independent writing.
-          const header = value.text.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
-          const document = header && YAML.parseDocument(header[1]);
-          if (YAML.isMap(document?.contents)) {
-            // Parser errors cannot erase explicit identity evidence. Read only
-            // direct scalar declarations, without resolving aliases or merges;
-            // this withholds deletion and never establishes ownership.
-            const declarations = document.contents.items.filter(pair => YAML.isScalar(pair.key) && YAML.isScalar(pair.value));
-            if (declarations.some(pair => pair.key.value === 'artifact_type' && pair.value.value === 'annotation')) {
-              for (const pair of declarations) {
-                if (pair.key.value !== 'companion_id' || !uuid(pair.value.value)) continue;
-                unsupported.add(pair.value.value);
-                if (isReserved) reservedIds.add(pair.value.value);
-              }
-            }
+          // Invalid metadata can still declare an identity and withhold consent.
+          for (const id of declaredAnnotationIds(value.text)) {
+            unsupported.add(id);
+            if (isReserved) reservedIds.add(id);
           }
         }
       }
@@ -203,6 +203,37 @@ async function inventory(vault, intake, ledger, id, captureId) {
   const scope = { captureId, root, targets, directories: [...directories.values()].sort((a, b) => a.file < b.file ? -1 : 1) };
   return { scope, verifyReserved: reserved.verify };
 }
+function verifyRemovalComplete(vault, intake, id, authority, guard, ledgerStage) {
+  const inspect = (folder, visit) => {
+    const { guard: folderGuard } = ordinaryDirectories([folder], changed().message);
+    const check = () => { guard(); folderGuard(); };
+    check();
+    for (const entry of local.readdirSync(folder, { withFileTypes: true })) {
+      visit(entry, path.join(folder, entry.name), check);
+    }
+    check();
+  };
+  const text = (file, check) => {
+    const info = local.lstatSync(file, { bigint: true });
+    const { bytes } = readExactSync(file, check, Number(info.nlink));
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  };
+  const visit = folder => inspect(folder, (entry, file, check) => {
+    if (ignoredFolder(entry.name)) return;
+    if (entry.isSymbolicLink()) throw changed();
+    if (entry.isDirectory()) visit(file);
+    else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+      const content = text(file, check);
+      if (parseAnnotation(content)?.id === id || declaredAnnotationIds(content).includes(id)) throw changed();
+    }
+  });
+  visit(vault.vault);
+  inspect(intake.dir, (entry, file, check) => {
+    if (entry.name === 'ledger.json' || file === ledgerStage) return;
+    if (!entry.isFile() || entry.isSymbolicLink() || entry.name === heldAnnotationIntent(id) || text(file, check).includes(id)) throw changed();
+  });
+  for (const target of authority.targets) verifyAbsentSync(path.join(vault.vault, target.file), guard, changed);
+}
 class AnnotationRemoval {
   constructor({ getVault, clearApprovals }) { Object.assign(this, { getVault, clearApprovals }); this.previews = new Map(); }
   vault() { const vault = this.getVault(); if (!vault) throw Error('Choose a vault first.'); return vault; }
@@ -303,11 +334,16 @@ class AnnotationRemoval {
       intake.storage.guardSync();
       current.verifyReserved();
       verifyRemovalTarget(vault, target, expected.peers, guard, changed);
-      await fs.unlink(path.join(vault.vault, target.file)); await vault.checkpoint('annotation-removal-unlinked');
+      local.unlinkSync(path.join(vault.vault, target.file)); await vault.checkpoint('annotation-removal-unlinked');
     }
     const final = await verify();
     if (final.targets.length) throw changed();
-    authority.phase = 'removed'; await intake.save(ledger, final.verifyReserved); return true;
+    authority.phase = 'removed';
+    await intake.save(ledger, ledgerStage => {
+      final.verifyReserved();
+      verifyRemovalComplete(vault, intake, id, authority, guard, ledgerStage);
+    });
+    return true;
   }
 }
 function installAnnotationRemoval(options) {
