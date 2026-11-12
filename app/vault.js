@@ -374,8 +374,8 @@ class Vault {
     }
     this.expected.set(note.id, hash(content)); return note.id;
   }
-  async title(id, title) {
-    return sourceMutation(this.root, () => this.titleOwned(id, title));
+  async title(id, title, observePublication) {
+    return sourceMutation(this.root, () => this.titleOwned(id, title, observePublication));
   }
   async titleHasStage(file) {
     const exists = await fs.lstat(file + transactionSuffix).catch(missing) || await fs.lstat(`${file}.pending`).catch(missing) ||
@@ -418,7 +418,7 @@ class Vault {
       return true;
     } catch (error) { if (error.code === 'STAGING_CHANGED' || error instanceof SyntaxError) return false; throw error; }
   }
-  async titleOwned(id, title) {
+  async titleOwned(id, title, observePublication) {
     if (typeof title !== 'string' || !title.trim() || /[\r\n]/.test(title)) throw Error('Enter a title on one line.');
     const note = await this.find(id);
     if (hash(note.content) !== this.expected.get(id)) throw Error('This note changed outside Companion. Reopen Companion to inspect it before editing.');
@@ -446,6 +446,7 @@ class Vault {
     } finally { if (lock && !retainLock) await this.release(note.file, lock, guard); }
     verifyStageSync(note.file, guard, staged);
     this.expected.set(id, hash(content));
+    observePublication?.({ file: note.file, guard, proof: staged });
   }
   async finishTitleOwned(file, transaction, publication, guard, { owner, legacyJournal } = {}) {
     const backup = path.join(path.dirname(file), transaction.backup), stage = `${file}.pending`, journal = `${file}.title-transaction.json`;

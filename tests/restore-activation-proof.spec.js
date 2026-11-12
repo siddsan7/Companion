@@ -3,7 +3,7 @@ const fs = require('node:fs/promises');
 const native = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { Vault } = require('../app/vault');
 const { Intake } = require('../app/intake');
 const { CaptureDeletion } = require('../app/capture-deletion');
@@ -36,14 +36,19 @@ async function writeDraft(producer, name, attempt, input) {
   return folder;
 }
 
-async function fixture(testInfo, checkpoint, { existing = false } = {}) {
+async function localVault(testInfo, checkpoint) {
   const vaultDirectory = testInfo.outputPath('vault');
-  const producer = testInfo.outputPath('producer');
-  const folder = await writeDraft(producer, 'draft', '1', 'a');
-  if (existing) await writeDraft(producer, 'existing', '2', 'c');
   await fs.mkdir(vaultDirectory, { recursive: true });
   const vault = new Vault(await fs.realpath(vaultDirectory), 'Companion', { checkpoint });
   await vault.setup();
+  return vault;
+}
+
+async function fixture(testInfo, checkpoint, { existing = false } = {}) {
+  const producer = testInfo.outputPath('producer');
+  const folder = await writeDraft(producer, 'draft', '1', 'a');
+  if (existing) await writeDraft(producer, 'existing', '2', 'c');
+  const vault = await localVault(testInfo, checkpoint);
   const intake = new Intake(vault);
   const accepted = await intake.connect(producer, true, now);
   expect(accepted.lastCheck.status).toBe('complete');
@@ -57,6 +62,560 @@ async function fixture(testInfo, checkpoint, { existing = false } = {}) {
   const restoration = await deletion.previewRestoration({ id: capture.id, kind: 'draft', folder });
   return { vault, intake, deletion, restoration, producer, sourceHash, id: capture.id, ledgerFile: path.join(intake.dir, 'ledger.json') };
 }
+
+async function manualFixture(testInfo, checkpoint) {
+  const vault = await localVault(testInfo, checkpoint), intake = new Intake(vault);
+  await intake.info();
+  const id = await vault.capture({ text: 'Manual capture selected for exact restoration.' }, now);
+  const unrelatedId = await vault.capture({ text: 'Unrelated manual capture stays available.' }, now);
+  const { file } = await vault.find(id), unrelated = (await vault.find(unrelatedId)).file;
+  const bytes = await fs.readFile(file), unrelatedBytes = await fs.readFile(unrelated);
+  const backup = testInfo.outputPath('selected-manual-backup.md');
+  await fs.copyFile(file, backup);
+  const getVault = () => vault, clock = () => ({ now: later });
+  const conversations = new Conversations({ dataRoot: testInfo.outputPath('history'), getVault, clock });
+  await conversations.lock(async () => {});
+  const deletion = new CaptureDeletion({ getVault, conversations, clock, clearApprovals() {} });
+  await deletion.confirm((await deletion.preview(id)).token);
+  const restoration = await deletion.previewRestoration({ id, file: backup });
+  expect(await readOptional(file)).toBeNull();
+
+  return { vault, intake, deletion, restoration, id, file, bytes, backup, unrelatedId, unrelated, unrelatedBytes, ledgerFile: path.join(intake.dir, 'ledger.json') };
+}
+
+async function atManualActivation({ intake, deletion, restoration, id, ledgerFile }, change) {
+  const open = fs.open;
+  let witness;
+  fs.open = async (stage, ...args) => {
+    const handle = await open(stage, ...args);
+    if (args[0] !== 'wx' || path.dirname(String(stage)) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(String(stage)))) return handle;
+    const close = handle.close;
+    handle.close = async () => {
+      await close.call(handle);
+      const staged = await readJson(stage);
+      if (staged.sourceAuthority?.[id]?.phase !== 'active' || witness) return;
+      const before = await readJson(ledgerFile), authority = before.sourceAuthority[id];
+      expect(authority).toMatchObject({ phase: 'restoring', restoration: { published: true } });
+      witness = { before, ...await change(authority) };
+    };
+    return handle;
+  };
+  let result;
+  try { result = await deletion.confirmRestoration(restoration.token).catch(error => error); }
+  finally { fs.open = open; }
+
+  expect(witness, 'the exact active ledger stage was written before the independent mutation').toBeDefined();
+  return { result, witness };
+}
+
+test('manual restoration activation holds a replaced capture during the ledger write', async ({}, testInfo) => {
+  const context = await manualFixture(testInfo);
+  const { vault, id, file, bytes, backup, unrelatedId, unrelated, unrelatedBytes, ledgerFile } = context;
+  const backupIdentity = await identity(backup), unrelatedIdentity = await identity(unrelated);
+  const displaced = testInfo.outputPath('displaced-manual-capture.md');
+  const { result, witness } = await atManualActivation(context, async authority => {
+    expect(await fs.readFile(file)).toEqual(bytes);
+    const original = await identity(file);
+    expect(String(original[1])).toBe(authority.restoration.publication.ino);
+    await fs.rename(file, displaced);
+    await fs.writeFile(file, bytes, { flag: 'wx' });
+    const replacement = await identity(file);
+    expect(replacement).not.toEqual(original);
+    return { original, replacement };
+  });
+  expect.soft(result).toBeInstanceOf(Error);
+  expect.soft(await readJson(ledgerFile)).toEqual(witness.before);
+  expect(await fs.readFile(file)).toEqual(bytes);
+  expect(await identity(file)).toEqual(witness.replacement);
+  expect(await fs.readFile(displaced)).toEqual(bytes);
+  expect(await identity(displaced)).toEqual(witness.original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect(await identity(backup)).toEqual(backupIdentity);
+  expect(await fs.readFile(unrelated)).toEqual(unrelatedBytes);
+  expect(await identity(unrelated)).toEqual(unrelatedIdentity);
+  expect((await vault.find(unrelatedId)).file).toBe(unrelated);
+});
+
+for (const claim of ['selected stage', 'selected journal', 'unrelated stage']) {
+  test(`manual restoration final scan distinguishes a late ${claim} claim`, async ({}, testInfo) => {
+    const context = await manualFixture(testInfo);
+    const { vault, intake, id, file, bytes, backup, unrelatedId, unrelated, unrelatedBytes, ledgerFile } = context;
+    const operationId = randomUUID();
+    const journal = claim === 'selected journal', unrelatedClaim = claim === 'unrelated stage';
+    const orphan = path.join(intake.dir, journal ? `restoration-${operationId}.json` : `manual-${operationId}.stage`);
+    const orphanBytes = journal ? Buffer.from(JSON.stringify({
+      schema: 1, id, operationId, generation: randomUUID(), content: bytes.toString('utf8')
+    })) : unrelatedClaim ? unrelatedBytes : bytes;
+    const { result, witness } = await atManualActivation(context, async () => {
+      expect(await readOptional(orphan)).toBeNull();
+      await fs.writeFile(orphan, orphanBytes, { flag: 'wx' });
+      return { orphanIdentity: await identity(orphan) };
+    });
+    const after = await readJson(ledgerFile);
+    if (unrelatedClaim) {
+      expect(result).toBe(true);
+      expect(after.sourceAuthority[id]).toMatchObject({ phase: 'active' });
+      expect((await vault.find(id)).file).toBe(file);
+    } else {
+      expect.soft(result).toBeInstanceOf(Error);
+      expect.soft(after).toEqual(witness.before);
+    }
+    expect(await fs.readFile(orphan)).toEqual(orphanBytes);
+    expect(await identity(orphan)).toEqual(witness.orphanIdentity);
+    expect(await fs.readFile(file)).toEqual(bytes);
+    expect(await fs.readFile(backup)).toEqual(bytes);
+    expect((await vault.find(unrelatedId)).file).toBe(unrelated);
+    expect(await fs.readFile(unrelated)).toEqual(unrelatedBytes);
+  });
+}
+
+async function swapManualStage({ intake, id, ledgerFile }, stage, displaced) {
+  const before = await readJson(ledgerFile), authority = before.sourceAuthority[id];
+  expect(stage).toBe(path.join(intake.dir, `manual-${authority.operationId}.stage`));
+  const bytes = await fs.readFile(stage), original = await identity(stage);
+  const journal = path.join(intake.dir, authority.restoration.journal), journalBytes = await fs.readFile(journal);
+  if (displaced) await fs.rename(stage, displaced);
+  else await fs.unlink(stage);
+  await fs.writeFile(stage, bytes, { flag: 'wx' });
+  const replacement = await identity(stage);
+  expect(replacement).not.toEqual(original);
+  return { before, bytes, original, replacement, journal, journalBytes };
+}
+
+async function interruptFirstManualLink({ deletion, restoration, file }) {
+  const link = native.linkSync, interrupted = Error('Stop after the first native manual capture link.');
+  let stage;
+  native.linkSync = (source, destination) => {
+    link(source, destination);
+    if (destination === file) {
+      stage = source;
+      throw interrupted;
+    }
+  };
+  try { await expect(deletion.confirmRestoration(restoration.token)).rejects.toBe(interrupted); }
+  finally { native.linkSync = link; }
+  expect(await identity(stage)).toEqual(await identity(file));
+  return stage;
+}
+
+for (const legacy of [false, true]) test(`manual restoration restart holds a missing output after the first native link${legacy ? ' with an older receipt' : ''}`, async ({}, testInfo) => {
+  const context = await manualFixture(testInfo);
+  const { vault, intake, deletion, id, file, bytes, backup, unrelatedId, unrelated, ledgerFile } = context;
+  const stage = await interruptFirstManualLink(context), original = await identity(stage);
+  const before = await readJson(ledgerFile), authority = before.sourceAuthority[id];
+  const journal = path.join(intake.dir, authority.restoration.journal), journalBytes = await fs.readFile(journal);
+  expect(authority).toMatchObject({ phase: 'restoring' });
+  expect(authority.restoration.published).toBeUndefined();
+  if (legacy) {
+    delete authority.restoration.stageState;
+    await fs.writeFile(ledgerFile, JSON.stringify(before, null, 2));
+  }
+  await fs.unlink(file);
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.info();
+
+  expect.soft(await readJson(ledgerFile)).toEqual(before);
+  expect.soft(await readOptional(file)).toBeNull();
+  expect.soft(await readOptional(stage)).toEqual(bytes);
+  expect.soft(await readOptional(journal)).toEqual(journalBytes);
+  expect.soft(restarted.vault.warnings.join('\n')).toContain(`Source restoration held: ${id}`);
+  expect(await deletion.pending()).toContainEqual(expect.objectContaining({ id, reason: expect.stringContaining('publication is missing or changed') }));
+  if (legacy) await expect(deletion.previewRetry({ id, operationId: authority.operationId, file: backup })).rejects.toThrow('recorded publication or link attempt');
+  if (await readOptional(stage)) expect(await identity(stage)).toEqual(original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect((await restarted.vault.find(unrelatedId)).file).toBe(unrelated);
+});
+
+test('manual restoration restart admits an exact pair from the first native link', async ({}, testInfo) => {
+  const context = await manualFixture(testInfo);
+  const { vault, intake, id, file, bytes, backup, ledgerFile } = context;
+  const stage = await interruptFirstManualLink(context), original = await identity(stage);
+  const before = (await readJson(ledgerFile)).sourceAuthority[id];
+  const journal = path.join(intake.dir, before.restoration.journal);
+  expect(before).toMatchObject({ phase: 'restoring' });
+  expect(before.restoration.published).toBeUndefined();
+
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const restored = (await restarted.info()).sourceAuthority[id];
+
+  expect(restored).toMatchObject({ phase: 'active', operationId: before.operationId, generation: before.generation });
+  expect((await restarted.vault.find(id)).file).toBe(file);
+  expect(await fs.readFile(file)).toEqual(bytes);
+  expect(await identity(file)).toEqual(original);
+  expect((await fs.lstat(file)).nlink).toBe(1);
+  expect(await readOptional(stage)).toBeNull();
+  expect(await readOptional(journal)).toBeNull();
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect((await restarted.info()).sourceAuthority[id]).toEqual(restored);
+});
+
+test('manual restoration can retry a recorded link attempt with a newly reviewed backup', async ({}, testInfo) => {
+  const context = await manualFixture(testInfo);
+  const { vault, intake, deletion, id, file, bytes, backup, ledgerFile } = context;
+  const stage = await interruptFirstManualLink(context);
+  const before = (await readJson(ledgerFile)).sourceAuthority[id];
+  const journal = path.join(intake.dir, before.restoration.journal);
+  const stageIdentity = await identity(stage), journalIdentity = await identity(journal);
+  await fs.unlink(file);
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  await restarted.info();
+
+  const preview = await deletion.previewRetry({ id, operationId: before.operationId, file: backup });
+  expect(preview.text).toBe(bytes.toString('utf8'));
+  expect(preview.targets.map(slot => [path.basename(slot.file), slot.absent])).toEqual([
+    [path.basename(stage), false], [path.basename(journal), false]
+  ]);
+  expect((await readJson(ledgerFile)).sourceAuthority[id]).toEqual(before);
+  expect(await readOptional(file)).toBeNull();
+  expect(await identity(stage)).toEqual(stageIdentity);
+  expect(await identity(journal)).toEqual(journalIdentity);
+
+  await expect(deletion.confirmRetry(preview.token)).resolves.toBe(true);
+  const restored = (await restarted.info()).sourceAuthority[id];
+  expect(restored.phase).toBe('active');
+  expect(restored.operationId).not.toBe(before.operationId);
+  expect(restored.generation).not.toBe(before.generation);
+  expect(restored.retiredRestorations).toContainEqual(expect.objectContaining({ operationId: before.operationId, generation: before.generation }));
+  expect(await fs.readFile(file)).toEqual(bytes);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect(await readOptional(stage)).toBeNull();
+  expect(await readOptional(journal)).toBeNull();
+});
+
+test('manual restoration retry preview refuses an equal-byte replacement for the published operation journal', async ({}, testInfo) => {
+  const interrupted = Error('Stop at admitted manual restoration.');
+  const context = await manualFixture(testInfo, boundary => {
+    if (boundary === 'capture-restoration-admitted') throw interrupted;
+  });
+  const { intake, deletion, restoration, id, file, bytes, backup, ledgerFile } = context;
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toBe(interrupted);
+  const before = await fs.readFile(ledgerFile), authority = JSON.parse(before).sourceAuthority[id];
+  expect(authority).toMatchObject({ phase: 'restoring', restoration: { published: true } });
+  const stage = path.join(intake.dir, `manual-${authority.operationId}.stage`);
+  const stageIdentity = await identity(stage);
+  const journal = path.join(intake.dir, authority.restoration.journal), journalBytes = await fs.readFile(journal);
+  const original = await identity(journal), displaced = testInfo.outputPath('displaced-operation-journal.json');
+  expect(String(original[1])).toBe(authority.restoration.journalIdentity.ino);
+  await fs.unlink(file);
+  await fs.rename(journal, displaced);
+  await fs.writeFile(journal, journalBytes, { flag: 'wx' });
+  const replacement = await identity(journal);
+  expect(replacement).not.toEqual(original);
+
+  const result = await deletion.previewRetry({ id, operationId: authority.operationId, file: backup }).catch(error => error);
+
+  expect.soft(result).toMatchObject({ code: 'SOURCE_OPERATION_HELD', captureId: id, operationId: authority.operationId });
+  expect(await fs.readFile(ledgerFile)).toEqual(before);
+  expect(await readOptional(file)).toBeNull();
+  expect(await fs.readFile(stage)).toEqual(bytes);
+  expect(await identity(stage)).toEqual(stageIdentity);
+  expect(await fs.readFile(journal)).toEqual(journalBytes);
+  expect(await identity(journal)).toEqual(replacement);
+  expect(await fs.readFile(displaced)).toEqual(journalBytes);
+  expect(await identity(displaced)).toEqual(original);
+});
+
+test('manual restoration retry preserves an equal-byte retirement replacement at unlink', async ({}, testInfo) => {
+  const interrupted = Error('Stop at admitted manual restoration.');
+  let armed = false;
+  const context = await manualFixture(testInfo, boundary => {
+    if (boundary === 'capture-restoration-admitted') throw interrupted;
+    if (boundary === 'capture-restoration-retirement-authorized') armed = true;
+  });
+  const { vault, intake, deletion, restoration, id, file, bytes, backup, unrelatedId, unrelated, ledgerFile } = context;
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toBe(interrupted);
+  const old = (await readJson(ledgerFile)).sourceAuthority[id];
+  const stage = path.join(intake.dir, `manual-${old.operationId}.stage`), journal = path.join(intake.dir, old.restoration.journal);
+  const original = await identity(stage), journalBytes = await fs.readFile(journal), journalIdentity = await identity(journal);
+  const displaced = testInfo.outputPath('displaced-retirement-stage.md');
+  await fs.unlink(file);
+  const retry = await deletion.previewRetry({ id, operationId: old.operationId, file: backup });
+  const readFile = fs.readFile, lstat = fs.lstat;
+  let reads = 0, witness;
+  fs.readFile = async (target, ...args) => {
+    const output = await readFile(target, ...args);
+    if (armed && target === stage) reads += 1;
+    return output;
+  };
+  fs.lstat = async (target, ...args) => {
+    const info = await lstat(target, ...args);
+    // The second inspected read is the one immediately before retirement.
+    if (armed && target === stage && reads === 2) {
+      armed = false;
+      const before = await readJson(ledgerFile);
+      await fs.rename(stage, displaced);
+      await fs.writeFile(stage, bytes, { flag: 'wx' });
+      witness = { before, replacement: await identity(stage) };
+    }
+    return info;
+  };
+  let result;
+  try { result = await deletion.confirmRetry(retry.token).catch(error => error); }
+  finally { fs.readFile = readFile; fs.lstat = lstat; }
+
+  expect(witness, 'the reviewed stage changed after its final yielded read and lstat').toBeDefined();
+  expect(witness.replacement).not.toEqual(original);
+  const authorized = witness.before.sourceAuthority[id];
+  expect(authorized).toMatchObject({ phase: 'restoring', restoration: { retirement: { operationId: old.operationId } } });
+  expect.soft(result).toMatchObject({ code: 'SOURCE_OPERATION_HELD', captureId: id, operationId: authorized.operationId });
+  expect.soft(await readJson(ledgerFile)).toEqual(witness.before);
+  expect.soft(await readOptional(file)).toBeNull();
+  const retained = await readOptional(stage);
+  expect.soft(retained).toEqual(bytes);
+  if (retained) expect(await identity(stage)).toEqual(witness.replacement);
+  const oldJournal = await readOptional(journal);
+  expect.soft(oldJournal).toEqual(journalBytes);
+  if (oldJournal) expect(await identity(journal)).toEqual(journalIdentity);
+  expect(await fs.readFile(displaced)).toEqual(bytes);
+  expect(await identity(displaced)).toEqual(original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect((await vault.find(unrelatedId)).file).toBe(unrelated);
+});
+
+for (const phase of ['first journal link', 'publication stage cleanup', 'ledger refusal rollback']) test(`manual restoration preserves an equal-byte journal replacement during ${phase}`, async ({}, testInfo) => {
+  const { intake, deletion, restoration, file, bytes, backup, ledgerFile } = await manualFixture(testInfo);
+  const before = await fs.readFile(ledgerFile), displaced = testInfo.outputPath('displaced-new-journal.json');
+  const readFile = fs.readFile, lstat = fs.lstat, open = fs.open;
+  const refused = Error('Refuse the restoring ledger stage.');
+  const rollback = phase === 'ledger refusal rollback';
+  const name = rollback ? /^restoration-[a-f0-9-]{36}\.json$/ : /^journal-[a-f0-9-]{36}\.stage$/;
+  const finalRead = phase === 'publication stage cleanup' ? 2 : 1;
+  let armed = !rollback, reads = 0, witness;
+  const matches = target => armed && typeof target === 'string' && path.dirname(target) === intake.dir && name.test(path.basename(target));
+  if (rollback) fs.open = (target, ...args) => {
+    if (args[0] === 'wx' && path.dirname(target) === intake.dir && /^ledger-.*\.tmp$/.test(path.basename(target))) {
+      armed = true;
+      throw refused;
+    }
+    return open(target, ...args);
+  };
+  fs.readFile = async (target, ...args) => {
+    const output = await readFile(target, ...args);
+    if (matches(target)) reads += 1;
+    return output;
+  };
+  fs.lstat = async (target, ...args) => {
+    const info = await lstat(target, ...args);
+    if (matches(target) && reads === finalRead) {
+      armed = false;
+      const content = await readFile(target), original = [info.dev, info.ino];
+      await fs.rename(target, displaced);
+      await fs.writeFile(target, content, { flag: 'wx' });
+      witness = { target, content, original, replacement: await identity(target) };
+    }
+    return info;
+  };
+  let result;
+  try { result = await deletion.confirmRestoration(restoration.token).catch(error => error); }
+  finally { fs.open = open; fs.readFile = readFile; fs.lstat = lstat; }
+
+  expect(witness, 'the new journal changed after its final yielded lstat').toBeDefined();
+  expect(witness.replacement).not.toEqual(witness.original);
+  expect(result).toBeInstanceOf(Error);
+  if (rollback) expect(result).toBe(refused);
+  expect(await fs.readFile(ledgerFile)).toEqual(before);
+  expect(await readOptional(file)).toBeNull();
+  const retained = await readOptional(witness.target);
+  expect.soft(retained).toEqual(witness.content);
+  if (retained) expect(await identity(witness.target)).toEqual(witness.replacement);
+  expect(await fs.readFile(displaced)).toEqual(witness.content);
+  expect(await identity(displaced)).toEqual(witness.original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  if (phase === 'first journal link') {
+    const { operationId } = JSON.parse(witness.content);
+    expect(await readOptional(path.join(intake.dir, `restoration-${operationId}.json`))).toBeNull();
+  }
+});
+
+async function replaceNewJournal(intake, authority, testInfo) {
+  const journal = path.join(intake.dir, authority.restoration.journal), bytes = await fs.readFile(journal);
+  const original = await identity(journal), displaced = testInfo.outputPath('displaced-confirmed-journal.json');
+  expect(String(original[1])).toBe(authority.restoration.journalIdentity.ino);
+  await fs.rename(journal, displaced);
+  await fs.writeFile(journal, bytes, { flag: 'wx' });
+  const replacement = await identity(journal);
+  expect(replacement).not.toEqual(original);
+  return { journal, bytes, replacement, displaced, original };
+}
+
+for (const boundary of ['restore ledger save', 'retry ledger save', 'old journal retirement']) test(`manual restoration holds a replaced new journal at ${boundary}`, async ({}, testInfo) => {
+  const retry = boundary !== 'restore ledger save', atRetirement = boundary === 'old journal retirement';
+  const interrupted = Error('Stop at admitted manual restoration.');
+  let witness, authorized;
+  const context = await manualFixture(testInfo, async checkpoint => {
+    if (retry && checkpoint === 'capture-restoration-admitted') throw interrupted;
+    if (atRetirement && checkpoint === 'capture-restoration-retirement-unlinked' && !witness) {
+      authorized = await readJson(context.ledgerFile);
+      witness = await replaceNewJournal(context.intake, authorized.sourceAuthority[context.id], testInfo);
+    }
+  });
+  const { intake, deletion, restoration, id, file, backup, ledgerFile } = context;
+  let confirm = () => deletion.confirmRestoration(restoration.token), oldStage, oldJournal, oldJournalBytes, oldJournalIdentity;
+  if (retry) {
+    await expect(confirm()).rejects.toBe(interrupted);
+    const old = (await readJson(ledgerFile)).sourceAuthority[id];
+    oldStage = path.join(intake.dir, `manual-${old.operationId}.stage`);
+    oldJournal = path.join(intake.dir, old.restoration.journal);
+    oldJournalBytes = await fs.readFile(oldJournal);
+    oldJournalIdentity = await identity(oldJournal);
+    await fs.unlink(file);
+    const preview = await deletion.previewRetry({ id, operationId: old.operationId, file: backup });
+    confirm = () => deletion.confirmRetry(preview.token);
+  }
+  const before = await readJson(ledgerFile), open = fs.open;
+  if (!atRetirement) fs.open = async (target, ...args) => {
+    const handle = await open(target, ...args);
+    if (args[0] !== 'wx' || path.dirname(target) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(target))) return handle;
+    const close = handle.close;
+    handle.close = async () => {
+      await close.call(handle);
+      const next = (await readJson(target)).sourceAuthority[id];
+      if (!witness && next.phase === 'restoring' && next.operationId !== before.sourceAuthority[id].operationId) {
+        witness = await replaceNewJournal(intake, next, testInfo);
+      }
+    };
+    return handle;
+  };
+  let result;
+  try { result = await confirm().catch(error => error); }
+  finally { fs.open = open; }
+
+  expect(witness, 'the new journal was replaced at the selected boundary').toBeDefined();
+  expect(result).toBeInstanceOf(Error);
+  expect.soft(await readJson(ledgerFile)).toEqual(authorized || before);
+  expect(await readOptional(file)).toBeNull();
+  if (retry) {
+    const oldCopy = await readOptional(oldJournal);
+    expect.soft(oldCopy).toEqual(oldJournalBytes);
+    if (oldCopy) expect(await identity(oldJournal)).toEqual(oldJournalIdentity);
+    expect(await readOptional(oldStage)).toEqual(atRetirement ? null : context.bytes);
+  }
+  expect(await fs.readFile(witness.journal)).toEqual(witness.bytes);
+  expect(await identity(witness.journal)).toEqual(witness.replacement);
+  expect(await fs.readFile(witness.displaced)).toEqual(witness.bytes);
+  expect(await identity(witness.displaced)).toEqual(witness.original);
+});
+
+test('manual restoration refuses an equal-byte initial stage replacement before publication', async ({}, testInfo) => {
+  const context = await manualFixture(testInfo);
+  const { vault, intake, deletion, restoration, id, file, bytes, backup, unrelatedId, unrelated, ledgerFile } = context;
+  const displaced = testInfo.outputPath('original-initial-stage.md');
+  const readdir = fs.readdir;
+  let stage, witness;
+  fs.readdir = async (directory, ...args) => {
+    const entries = await readdir(directory, ...args);
+    if (directory !== intake.dir || witness) return entries;
+    const name = entries.map(entry => typeof entry === 'string' ? entry : entry.name).find(entry => /^manual-[a-f0-9-]{36}\.stage$/.test(entry));
+    if (!name) return entries;
+    expect(await readOptional(file)).toBeNull();
+    stage = path.join(directory, name);
+    witness = await swapManualStage(context, stage, displaced);
+    expect(witness.before.sourceAuthority[id].restoration.published).toBeUndefined();
+    return entries;
+  };
+  let result;
+  try { result = await deletion.confirmRestoration(restoration.token).catch(error => error); }
+  finally { fs.readdir = readdir; }
+
+  expect(witness, 'an independent process replaced the first stage before its link').toBeDefined();
+  expect.soft(result).toBeInstanceOf(Error);
+  expect.soft(await readJson(ledgerFile)).toEqual(witness.before);
+  expect.soft(await readOptional(file)).toBeNull();
+  const retained = await readOptional(stage);
+  expect.soft(retained).toEqual(bytes);
+  if (retained) expect(await identity(stage)).toEqual(witness.replacement);
+  expect.soft(await readOptional(witness.journal)).toEqual(witness.journalBytes);
+  expect(await fs.readFile(displaced)).toEqual(bytes);
+  expect(await identity(displaced)).toEqual(witness.original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect((await vault.find(unrelatedId)).file).toBe(unrelated);
+});
+
+test('manual restoration cleanup preserves an equal-byte stage replacement during containment', async ({}, testInfo) => {
+  let stage;
+  const context = await manualFixture(testInfo, async boundary => {
+    if (boundary !== 'capture-restoration-admitted') return;
+    const authority = (await readJson(context.ledgerFile)).sourceAuthority[context.id];
+    stage = path.join(context.intake.dir, `manual-${authority.operationId}.stage`);
+  });
+  const { vault, deletion, restoration, id, file, bytes, backup, unrelatedId, unrelated, ledgerFile } = context;
+  const readFile = fs.readFile, contained = vault.contained.bind(vault);
+  let cleanupRead, witness;
+  fs.readFile = async (file, ...args) => {
+    const output = await readFile(file, ...args);
+    if (file === stage) cleanupRead = true;
+    return output;
+  };
+  vault.contained = async target => {
+    await contained(target);
+    if (!cleanupRead || target !== file || witness) return;
+    witness = await swapManualStage(context, stage);
+    const authority = witness.before.sourceAuthority[id];
+    expect(authority).toMatchObject({ phase: 'restoring', restoration: { published: true } });
+    expect(await identity(file)).toEqual(witness.original);
+  };
+  let result;
+  try { result = await deletion.confirmRestoration(restoration.token).catch(error => error); }
+  finally { fs.readFile = readFile; vault.contained = contained; }
+
+  expect(witness, 'the stage changed while the last cleanup containment check was pending').toBeDefined();
+  expect.soft(result).toBeInstanceOf(Error);
+  expect.soft(await readJson(ledgerFile)).toEqual(witness.before);
+  const retained = await readOptional(stage);
+  expect.soft(retained).toEqual(bytes);
+  if (retained) expect(await identity(stage)).toEqual(witness.replacement);
+  expect.soft(await readOptional(witness.journal)).toEqual(witness.journalBytes);
+  expect(await fs.readFile(file)).toEqual(bytes);
+  expect(await identity(file)).toEqual(witness.original);
+  expect(await fs.readFile(backup)).toEqual(bytes);
+  expect((await vault.find(unrelatedId)).file).toBe(unrelated);
+});
+
+test('imported title recovery preserves independent writing added after title publication', async ({}, testInfo) => {
+  const producer = testInfo.outputPath('producer');
+  await writeDraft(producer, 'draft', '1', 'a');
+  const vault = await localVault(testInfo), intake = new Intake(vault);
+  const sourceHash = 'a'.repeat(64);
+  const accepted = await intake.connect(producer, true, now), capture = accepted.captures[sourceHash];
+  expect(accepted.lastCheck.status).toBe('complete');
+  const file = intake.destination(capture), before = await fs.readFile(file);
+  const title = 'Selected title on the interrupted import';
+  const intentFile = path.join(intake.dir, 'title-intent.json');
+  const interruption = Error('Stopped before the first Vault title write.');
+  vault.title = async () => { throw interruption; };
+  await expect(intake.title(capture.id, title)).rejects.toBe(interruption);
+  expect(await fs.readFile(file)).toEqual(before);
+  const intentBytes = await fs.readFile(intentFile), intent = JSON.parse(intentBytes);
+  expect(intent).toMatchObject({ id: capture.id, title, before: before.toString('utf8') });
+
+  const restartedVault = new Vault(vault.vault, 'Companion'), restarted = new Intake(restartedVault);
+  const publishTitle = restartedVault.title.bind(restartedVault);
+  const writing = Buffer.from('\nIndependent editor writing after the title publication.\n');
+  const edited = Buffer.concat([Buffer.from(intent.content), writing]);
+  let published;
+  restartedVault.title = async (...args) => {
+    await publishTitle(...args);
+    published = await fs.readFile(file);
+    expect(published).toEqual(Buffer.from(intent.content));
+    await fs.appendFile(file, writing);
+  };
+  const recovered = await restarted.info();
+  expect(published, 'recovery completed the real Vault title publication').toBeDefined();
+  expect(await fs.readFile(file)).toEqual(edited);
+  expect.soft(recovered.captures[sourceHash].currentHash).not.toBe(createHash('sha256').update(edited).digest('hex'));
+  expect.soft(recovered.outcomes[`title:${capture.id}`]).toMatchObject({ status: 'held' });
+  const names = await fs.readdir(intake.dir);
+  const retained = names.filter(name => name === 'title-intent.json' || name.startsWith(`title-conflict-${capture.id}-`));
+  expect.soft(retained).toHaveLength(1);
+  for (const name of retained) expect(await fs.readFile(path.join(intake.dir, name))).toEqual(intentBytes);
+
+  const next = await writeDraft(producer, 'next-attempt', '2', 'a');
+  const result = await new Intake(new Vault(vault.vault, 'Companion')).reconcile({ now: later });
+  expect.soft(result.captures[sourceHash].currentRevision).toBe(capture.currentRevision);
+  expect.soft(Object.values(result.outcomes)).toContainEqual(expect.objectContaining({ status: 'held', locator: next }));
+  expect(await fs.readFile(file)).toEqual(edited);
+});
 
 async function stopAfterActivation(testInfo) {
   const interruption = Error('Stopped immediately after the activation ledger was replaced.');

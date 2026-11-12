@@ -1592,45 +1592,97 @@ class Intake {
       if (!capture) return this.vault.title(id, title);
       if (typeof title !== 'string' || !title.trim() || /[\r\n]/.test(title)) throw Error('Enter a title on one line.');
       const note = await this.vault.find(id); if (hash(note.content) !== capture.currentHash) throw Error('This imported note changed outside Companion. Inspect it before editing.');
-      await this.publishJournal(path.join(this.dir, 'title-intent.json'), { id, before: note.content, previousHash: capture.currentHash, title: title.trim(), content: withTitle(note.content, title.trim()), ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) });
-      await this.vault.title(id, title);
-      const finished = await this.finishTitleIntent();
+      const file = path.join(this.dir, 'title-intent.json'), guard = this.vault.publicationFolders(this.dir).guard;
+      const intent = { id, before: note.content, previousHash: capture.currentHash, title: title.trim(), content: withTitle(note.content, title.trim()), ...(ledger.sourceAuthority?.[id]?.phase === 'active' ? { sourceGeneration: ledger.sourceAuthority[id].generation } : {}) };
+      await this.publishJournal(file, intent);
+      const original = readExactSync(file, guard);
+      if (!original.bytes.equals(Buffer.from(JSON.stringify(intent)))) throw Error('The imported title intent changed. Files were preserved for repair.');
+      let publication;
+      await this.vault.title(id, title, proof => { publication = proof; });
+      const finished = await this.finishTitleIntent(publication, { guard, proof: original.proof });
       if (finished === 'pending') throw Error('The exact title save still awaits recovery. Restart Companion to continue.');
       if (!finished) throw Error('External edit conflict. The title intent and your files were preserved.');
     });
   }
-  async finishTitleIntent() {
+  async finishTitleIntent(publication, selected) {
     this.pendingTitleCapture = undefined;
-    const file = path.join(this.dir, 'title-intent.json'), text = await read(file); if (text === null) return true;
-    let intent; try { intent = JSON.parse(text); } catch { throw Error('Unreadable imported title intent. Preserve .intake for repair.'); }
-    const ledger = await this.load(), capture = Object.values(ledger.captures).find(x => x.id === intent.id);
+    const file = path.join(this.dir, 'title-intent.json');
+    if (!selected && !local.lstatSync(file, { throwIfNoEntry: false })) return true;
+    const intentGuard = selected?.guard || this.vault.publicationFolders(this.dir).guard;
+    const original = readExactSync(file, intentGuard, 1, selected?.proof);
+    const verifyIntent = () => verifyStageSync(file, intentGuard, original.proof);
+    let intent; try { intent = JSON.parse(original.bytes); } catch { throw Error('Unreadable imported title intent. Preserve .intake for repair.'); }
+    let ledger = await this.load();
+    const [sourceHash, capture] = Object.entries(ledger.captures).find(([, item]) => item.id === intent.id) || [];
     assertPublication(ledger, intent.id, { sourceGeneration: intent.sourceGeneration });
-    if (!capture || typeof intent.before !== 'string' || typeof intent.title !== 'string' || !intent.title.trim() || /[\r\n]/.test(intent.title) || intent.previousHash !== hash(intent.before) || intent.content !== withTitle(intent.before, intent.title) || ![intent.previousHash, hash(intent.content)].includes(capture.currentHash)) throw Error('Invalid imported title recovery intent. Files were preserved for repair.');
+    const invalidIntent = () => Error('Invalid imported title recovery intent. Files were preserved for repair.');
+    if (!capture || typeof intent.before !== 'string' || typeof intent.title !== 'string' || !intent.title.trim() ||
+        /[\r\n]/.test(intent.title) || intent.previousHash !== hash(intent.before) || intent.content !== withTitle(intent.before, intent.title)) throw invalidIntent();
+    const intended = Buffer.from(intent.content), digest = hash(intended);
+    if (![intent.previousHash, digest].includes(capture.currentHash)) throw invalidIntent();
     const hold = async (reason, locator) => {
-      capture.conflict = reason; ledger.outcomes[`title:${intent.id}`] = { status: 'held', reason, locator };
-      await this.save(ledger); await fs.rename(file, path.join(this.dir, `title-conflict-${intent.id}-${randomUUID()}.json`)); return false;
+      ledger.captures[sourceHash].conflict = reason;
+      ledger.outcomes[`title:${intent.id}`] = { status: 'held', reason, locator };
+      await this.save(ledger, verifyIntent);
+      const archive = path.join(this.dir, `title-conflict-${intent.id}-${randomUUID()}.json`);
+      this.storage.guardSync();
+      verifyAbsentSync(archive, intentGuard);
+      verifyIntent();
+      local.renameSync(file, archive);
+      return false;
     };
-    let note = (await this.vault.list()).find(x => x.id === intent.id);
+    const holdExternal = locator => hold('External edit conflict during title save. Local writing and title intent were preserved; this source is paused for repair.', locator);
+    const note = (await this.vault.list()).find(x => x.id === intent.id);
     const destination = this.destination(capture);
     if ((!note || note.file === destination) && await this.vault.hasExactTitleIntent(destination, intent)) {
+      verifyIntent();
       this.pendingTitleCapture = intent.id;
       return 'pending';
     }
     if (!note || ![intent.before, intent.content].includes(note.content)) {
-      return hold('External edit conflict during title save. Local writing and title intent were preserved; this source is paused for repair.', note?.file || capture.file);
+      return holdExternal(note?.file || capture.file);
     }
     const holdPublication = () => hold('Title publication is held. The prior note, staging files and title intent were preserved for inspection; this source is paused for repair.', note.file);
     if (await this.vault.titleHasStage(note.file)) return holdPublication();
     if (note.content === intent.before) {
-      try { await this.vault.title(intent.id, intent.title); }
+      verifyIntent();
+      try { await this.vault.title(intent.id, intent.title, proof => { publication = proof; }); }
       catch (error) {
         if (error.code !== 'TITLE_PUBLICATION_HELD') throw error;
         return holdPublication();
       }
-      note = await this.vault.find(intent.id);
     }
-    capture.title = intent.title; capture.currentHash = hash(note.content); this.vault.expected.set(intent.id, capture.currentHash);
-    await this.save(ledger); await fs.unlink(file); return true;
+    publication?.guard();
+    if (publication && publication.file !== note.file) return holdExternal(note.file);
+    const guard = publication?.guard || this.vault.publicationFolders(path.dirname(note.file)).guard;
+    const changedTitle = Error('The published title changed.');
+    const verifyTitle = proof => {
+      try {
+        const exact = verifyStageSync(note.file, guard, proof);
+        if (!exact.bytes.equals(intended)) throw changedTitle;
+        return exact.proof;
+      } catch (error) {
+        if (error.code !== 'STAGING_CHANGED') throw error;
+        guard();
+        throw changedTitle;
+      }
+    };
+    try {
+      const proof = verifyTitle(publication?.proof);
+      const verifyRelated = () => { verifyIntent(); verifyTitle(proof); };
+      const next = { ...ledger, captures: { ...ledger.captures, [sourceHash]: { ...capture, title: intent.title, currentHash: digest } } };
+      await this.save(next, verifyRelated);
+      ledger = next;
+      this.storage.guardSync();
+      verifyTitle(proof);
+      verifyIntent();
+      local.unlinkSync(file);
+    } catch (error) {
+      if (error !== changedTitle) throw error;
+      return holdExternal(note.file);
+    }
+    this.vault.expected.set(intent.id, digest);
+    return true;
   }
   async inspect(id, { verifyCurrentNote = false } = {}) {
     const ledger = await this.info(), entry = Object.entries(ledger.captures).find(([, item]) => item.id === id);
