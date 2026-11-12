@@ -17,6 +17,18 @@ const settingsChanged = () => Error('Current vault changed. Select it again befo
 const equalProof = (a, b) => a === b || a && b && a.dev === b.dev && a.ino === b.ino && a.digest === b.digest;
 const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 const noSelectionCheck = async () => {};
+const sameCheck = (a, b) => !!a && !!b && a.at === b.at && a.trigger === b.trigger;
+const scheduledRunning = worker => worker?.status === 'running' && typeof worker.at === 'string' && ['scheduled', 'catch-up'].includes(worker.trigger);
+
+function retainWorkerResult(state, result) {
+  state.worker = { ...result.lastCheck, finishedAt: new Date().toISOString() };
+  if (result.lastCheck.status === 'complete') {
+    state.lastSuccess = result.lastSuccess;
+    delete state.workerError;
+  } else {
+    state.workerError = result.sources.find(x => x.error)?.error || 'Some imports are held. Inspect held imports and use Check now after repair.';
+  }
+}
 
 async function optionalExact(file, guard) {
   try { return await readExact(file, guard); }
@@ -118,7 +130,7 @@ class Schedule {
     }
     if (!equalProof(current, expected)) throw scheduleChanged();
   }
-  async save(state, expected, { guard = this.directoryGuard(), archive = false, assertSelected = noSelectionCheck } = {}) {
+  async save(state, expected, { guard = this.directoryGuard(), archive = false, assertSelected = noSelectionCheck, verifyRelated = () => {} } = {}) {
     const name = archive ? `.archive-reconnect-${randomUUID()}.pending` : `schedule-${randomUUID()}.tmp`;
     const stage = path.join(path.dirname(this.file), name);
     const proof = await writeStage(stage, JSON.stringify(state, null, 2), guard);
@@ -126,6 +138,7 @@ class Schedule {
       verifyStageSync(stage, guard, proof);
       this.requireCurrent(expected, guard);
       guard();
+      verifyRelated();
     };
     try {
       if (!expected) {
@@ -133,7 +146,7 @@ class Schedule {
           beforeAttempt: assertSelected,
           conflict: scheduleChanged,
           stageName: stagingName,
-          verifyRelated: () => verifyAbsentSync(this.legacyReceipt, guard, scheduleChanged)
+          verifyRelated: () => { verifyAbsentSync(this.legacyReceipt, guard, scheduleChanged); verifyRelated(); }
         });
       } else {
         const deadline = performance.now() + 1000;
@@ -210,9 +223,7 @@ class Schedule {
       const current = await this.snapshot(guard), state = current?.state;
       if (!this.matches(state)) return;
       state.lastSuccess = result.lastSuccess;
-      state.worker = { ...result.lastCheck, finishedAt: new Date().toISOString() };
-      if (result.lastCheck.status === 'complete') delete state.workerError;
-      else state.workerError = result.sources.find(x => x.error)?.error || 'Some imports are held. Inspect held imports and use Check now after repair.';
+      retainWorkerResult(state, result);
       await this.save(state, current.proof, { guard });
     });
     return result;
@@ -223,22 +234,22 @@ class Schedule {
     if (expectedId !== undefined && initial.id !== expectedId) return { skipped: true };
     await this.assertSelected();
     const currentOwner = state => state?.id === initial.id && this.matches(state);
-    let admitted = false;
+    const check = { at: now, trigger };
+    let admittedSlot;
+    const currentAttempt = state => state.handledSlot === admittedSlot && sameCheck(state.worker, check);
     try {
       const result = await new Intake(this.vault).reconcile({ now, trigger, admit: () => this.change(async guard => {
         const current = await this.snapshot(guard), state = current?.state;
         if (!currentOwner(state)) return false;
         const slot = Math.floor((Date.parse(now) - Date.parse(state.anchor)) / DAY);
         if (state.mode !== 'enabled' || slot < 1 || slot <= (state.handledSlot || 0)) return false;
-        state.handledSlot = slot; state.worker = { at: now, trigger, status: 'running' };
-        await this.save(state, current.proof, { guard, assertSelected: this.assertSelected }); admitted = true; return true;
+        state.handledSlot = slot; state.worker = { ...check, status: 'running' };
+        await this.save(state, current.proof, { guard, assertSelected: this.assertSelected }); admittedSlot = slot; return true;
       }) });
-      if (admitted) await this.change(async guard => {
+      if (admittedSlot) await this.change(async guard => {
         const current = await this.snapshot(guard), state = current?.state;
-        if (!currentOwner(state)) return;
-        state.worker = { at: now, finishedAt: new Date().toISOString(), trigger, status: result.lastCheck.status };
-        if (result.lastCheck.status === 'complete') { state.lastSuccess = result.lastSuccess; delete state.workerError; }
-        else state.workerError = result.sources.find(x => x.error)?.error || 'Some imports are held. Inspect held imports and use Check now after repair.';
+        if (!currentOwner(state) || !currentAttempt(state) || state.worker.status !== 'running') return;
+        retainWorkerResult(state, result);
         await this.save(state, current.proof, { guard });
       });
       return result;
@@ -246,22 +257,52 @@ class Schedule {
       // A busy launch was never admitted and must not consume the due slot.
       if (!error.message.includes('already running')) await this.change(async guard => {
         const current = await this.snapshot(guard), state = current?.state;
-        if (!currentOwner(state) || !admitted && state.mode !== 'enabled') return;
+        if (!currentOwner(state)) return;
+        if (admittedSlot) {
+          // The status reader may have closed this exact reservation after the Intake lock released.
+          if (!currentAttempt(state) || !['running', 'interrupted'].includes(state.worker.status)) return;
+        } else if (state.mode !== 'enabled' || state.handledSlot !== initial.handledSlot || scheduledRunning(state.worker)) return;
         state.workerError = error.message;
         state.worker = { at: now, trigger, status: 'error' }; await this.save(state, current.proof, { guard });
       });
       throw error;
     }
   }
+  async settleExitedWorker(observed) {
+    if (!this.matches(observed) || !scheduledRunning(observed.worker)) return observed;
+    try {
+      return await intakeLock(this.vault.root, () => this.change(async guard => {
+        const current = await this.snapshot(guard), state = current?.state;
+        if (state?.id !== observed.id || !this.matches(state) || state.handledSlot !== observed.handledSlot ||
+            !scheduledRunning(state.worker) || !sameCheck(state.worker, observed.worker)) return state || null;
+        await this.assertSelected();
+        const intake = new Intake(this.vault), result = await intake.load(), terminal = result.lastCheck;
+        if (sameCheck(terminal, state.worker) && ['complete', 'held', 'error'].includes(terminal.status)) {
+          retainWorkerResult(state, result);
+        } else {
+          state.worker = { ...state.worker, status: 'interrupted' };
+          state.workerError = 'The daily intake worker exited before recording a result. Use Check now to retry explicitly.';
+        }
+        await this.save(state, current.proof, { guard, assertSelected: this.assertSelected, verifyRelated: () => intake.storage.guardSync() });
+        return state;
+      }));
+    } catch (error) {
+      if (error.message.includes('already running')) return observed;
+      throw error;
+    }
+  }
   async info(now = new Date().toISOString()) {
-    const state = await this.load(); if (!state) return null;
+    let state = await this.load(), workerInspectionError;
+    try { state = await this.settleExitedWorker(state); }
+    catch (error) { workerInspectionError = error.message; }
+    if (!state) return null;
     const next = new Date(Date.parse(state.anchor) + Math.max(1, Math.floor((Date.parse(now) - Date.parse(state.anchor)) / DAY) + 1) * DAY).toISOString();
     let effective, inspectionError;
     try { effective = await this.tasks.apply('inspect', state, this.file); }
     catch (error) { inspectionError = error.message; }
     const taskMismatch = effective && effective.enabled !== (state.mode === 'enabled');
     const policyMismatch = effective && !this.tasks.matchesSchedule(effective, state, this.file);
-    return { ...state, next, effective, inspectionError, taskMismatch, policyMismatch };
+    return { ...state, next, effective, inspectionError: workerInspectionError || inspectionError, taskMismatch, policyMismatch };
   }
 }
 module.exports = { Schedule };

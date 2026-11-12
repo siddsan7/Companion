@@ -168,6 +168,10 @@ app.whenReady().then(async () => {
     });
     const imported = new Map(Object.values(intake?.captures || {}).map(capture => [capture.id, capture]));
     const daily = await selectedSchedule.info(clock().now);
+    const worker = selectedSchedule.matches(daily) ? daily.worker : null, lastCheck = intake?.lastCheck;
+    if (worker && lastCheck?.status === 'running' && lastCheck.at === worker.at && lastCheck.trigger === worker.trigger) {
+      lastCheck.status = worker.status;
+    }
     return { ...clock(), configured: !!selected, location: selected?.root, captures: captures.filter(note => imported.has(note.id) ? !imported.get(note.id).removed : note.type !== 'reel_import').map(note => imported.has(note.id) ? { ...note, type: 'reel_import' } : note), warnings, intake, vaultError, schedule: selectedSchedule.matches(daily) ? daily : null, scheduleRecordId: daily?.id || null };
   });
   ipcMain.handle('capture', async (_, input) => {
