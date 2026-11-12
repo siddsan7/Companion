@@ -1,10 +1,12 @@
 const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { Vault } = require('./vault');
 const { CodexSetup } = require('./codex');
 const { Intake } = require('./intake');
 const { Schedule } = require('./schedule');
+const { intakeLock } = require('./intake-lock');
 const { installBriefs } = require('./briefs-ipc');
 const { installContext } = require('./context');
 const { installConversations } = require('./conversations');
@@ -16,12 +18,23 @@ const { installCaptureDeletion } = require('./capture-deletion');
 const { installAnnotationRemoval } = require('./annotation-removal');
 const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
+const { ordinaryDirectories, readExactSync, verifyAbsentSync, writeStage, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication } = require('./staged-publication');
 let codex, conversationProvider;
 let testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
 const workerFile = process.argv[process.argv.indexOf('--schedule-file') + 1];
 const workerBinding = process.argv.indexOf('--schedule-id');
+const settingsChanged = () => Error('Vault selection settings changed. Preserve the files and select the vault again.');
+const settingsStageName = /^\.vault-settings-[a-f0-9-]{36}\.pending$/;
+function readSettings(file, guard) {
+  try { return readExactSync(file, guard); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    verifyAbsentSync(file, guard);
+    return null;
+  }
+}
 async function resolveDataRoot(requested) {
   const supplied = path.resolve(requested), actual = await fs.realpath(supplied);
   // Case alone is not an alias on the supported Windows data volume. Keep the
@@ -69,10 +82,20 @@ app.whenReady().then(async () => {
   // Keep every local store bound to the same original installation directory.
   const dataRoot = testRoot || await resolveDataRoot(requestedDataRoot);
   settingsPath = path.join(dataRoot, 'settings.json');
+  const { guard: settingsGuard } = ordinaryDirectories([dataRoot], 'Vault selection settings folder changed. Preserve the files for repair.');
   codex = new CodexSetup({ dataRoot: path.join(dataRoot, 'codex'), testRoot });
   ipcMain.handle('codex-state', () => codex.snapshot());
   ipcMain.handle('codex-action', (_, input) => codex.action(input, { vault: vault?.root }));
-  try { const settings = JSON.parse(await fs.readFile(settingsPath, 'utf8')); vault = new Vault(settings.vault, settings.parent, { checkpoint }); } catch (error) { if (error.code !== 'ENOENT') console.error('Cannot load settings:', error.message); }
+  try {
+    if (initialPublicationPending(settingsPath, settingsGuard)) {
+      await intakeLock(dataRoot, () => recoverInitialPublication(settingsPath, settingsGuard, settingsStageName));
+    }
+    const file = readSettings(settingsPath, settingsGuard);
+    if (file) {
+      const settings = JSON.parse(file.bytes);
+      vault = new Vault(settings.vault, settings.parent, { checkpoint });
+    }
+  } catch (error) { console.error('Cannot load settings:', error.message); }
   const schedule = (selected = vault) => {
     const current = new Schedule(path.join(path.dirname(settingsPath), 'schedule.json'), selected, {
       ...scheduleOptions(),
@@ -87,20 +110,29 @@ app.whenReady().then(async () => {
   ipcMain.handle('choose-vault', async () => testRoot ? path.join(testRoot, 'vault') : (await dialog.showOpenDialog({ properties: ['openDirectory'] })).filePaths[0]);
   ipcMain.handle('configure', async (_, settings) => {
     const next = new Vault(settings.vault, settings.parent, { checkpoint });
-    await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+    settingsGuard();
     const nextSchedule = schedule(next);
-    return nextSchedule.change(async guard => {
+    return nextSchedule.change(async scheduleGuard => {
+      const guard = () => { settingsGuard(); scheduleGuard(); };
+      recoverInitialPublication(settingsPath, guard, settingsStageName);
+      const expected = readSettings(settingsPath, guard)?.proof || null;
       const existing = await nextSchedule.snapshot(guard);
       if (existing && !nextSchedule.matches(existing.state)) await nextSchedule.requireDisabled(existing.state);
       await next.setup();
-      const stored = await fs.lstat(settingsPath).catch(error => {
-        if (error.code === 'ENOENT') return null;
+      const stage = path.join(dataRoot, `.vault-settings-${randomUUID()}.pending`);
+      const proof = await writeStage(stage, JSON.stringify(settings), guard);
+      try {
+        await publishReplacement(stage, settingsPath, guard, proof, expected, {
+          conflict: settingsChanged, stageName: settingsStageName,
+          verifyRelated: () => nextSchedule.requireCurrent(existing?.proof || null, guard),
+          commit: () => { vault = next; codex.invalidate(); }
+        });
+      } catch (error) {
+        try { if (expected || !initialPublicationPending(settingsPath, guard)) removeStageIfPresentSync(stage, guard, proof); }
+        catch { error.message += ' The settings stage was preserved for inspection.'; }
         throw error;
-      });
-      if (stored && (!stored.isFile() || stored.isSymbolicLink() || stored.nlink !== 1)) throw Error('Vault selection settings are not an ordinary file. Preserve them for repair.');
-      nextSchedule.requireCurrent(existing?.proof || null, guard);
-      await fs.writeFile(settingsPath, JSON.stringify(settings));
-      vault = next; codex.invalidate(); return true;
+      }
+      return true;
     });
   });
   const localVaultWork = new Map();

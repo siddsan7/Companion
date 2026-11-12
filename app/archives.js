@@ -6,7 +6,7 @@ const { conversation, canonical, hash, parseArchive, archiveRecord, inactiveInte
 const { Briefs } = require('./briefs');
 const { Context } = require('./context');
 const { readNoteScope, changeNoteScope } = require('./note-scope');
-const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyAbsentSync, verifyPeers, verifyPeersSync, removeStage, removeLinkedStage } = require('./staged-publication');
+const { ordinaryDirectories, writeStage, verifyStage, verifyStageSync, verifyAbsentSync, verifyPeers, verifyPeersSync, removeStage, removeLinkedStage, firstPublicationSuffix } = require('./staged-publication');
 const LIMIT = 128 * 1024 * 1024;
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
 class Archives {
@@ -535,7 +535,7 @@ class Archives {
     };
     const marker = await controls.put({ schema: 1, id: record.id, generation: record.generation, phase: 'restoring', scope: { excludedSources: [...record.scope.excludedSources], excludedHistory: [...record.scope.excludedHistory] }, targets: [staged.owned, target], restoration: { archiveId: transition.archiveId, recordDigest: digest } }, baseline, recheckReservation, verifyReservation);
     const verifyMarker = await controls.restorationMarkerGuard(marker, selected);
-    this.history.tokens.clear(); this.history.durable.delete(record.id);
+    this.history.tokens.clear();
     await this.checkpoint('archive-restore-after-reservation');
     await controls.file(stage, directory, staged.owned);
     verifyMarker();
@@ -561,7 +561,6 @@ class Archives {
         check: () => controls.check(record),
         commit: () => {
           verifySettled();
-          this.history.durable.set(record.id, digest);
           committed();
         }
       });
@@ -602,7 +601,8 @@ class Archives {
     destination = path.resolve(destination);
     // Export creates a separate file. It must never add files to guarded application stores.
     const relative = path.relative(this.history.dataRoot, destination);
-    if (!relative.startsWith('..') && !path.isAbsolute(relative) && (relative.includes(path.sep) || ['settings.json', 'schedule.json'].includes(relative))) throw Error('Choose an archive file outside application store folders.');
+    const name = process.platform === 'win32' ? relative.toLowerCase() : relative;
+    if (!relative.startsWith('..') && !path.isAbsolute(relative) && (relative.includes(path.sep) || ['settings.json', 'schedule.json', 'settings.json' + firstPublicationSuffix].includes(name))) throw Error('Choose an archive file outside application store folders.');
     const parent = path.dirname(destination);
     const { guard } = ordinaryDirectories([parent], 'Archive destination folder changed or is an alias. Choose an ordinary folder.');
     const stage = path.join(parent, `.companion-archive-${randomUUID()}.pending`);

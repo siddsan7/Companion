@@ -665,6 +665,13 @@ class Intake {
     exact(journal, journalInfo, journalBytes, 'Intake transaction', journalPeers);
     if (journalProof) verifyStageSync(journal, guard, journalProof, Number(journalInfo.nlink));
     publication.journalProof = journalProof || fileProof(journalInfo, journalBytes);
+    const verifySelectedJournal = () => {
+      if (!tx.restoreOperation) return;
+      if (!journalProof) throw Error('Selected restoration journal identity is unavailable. Suppression remains.');
+      verifyStageSync(journal, guard, journalProof, 2);
+      verifyStageSync(journalPeers[0], guard, journalProof, 2);
+    };
+    verifySelectedJournal();
     const immutable = async (file, content) => {
       try { await fs.writeFile(file, content, { flag: 'wx', flush: true }); } catch (error) { if (error.code !== 'EEXIST' || await read(file) !== content) throw Error('Immutable import file conflicts. Preserve the vault for repair.'); }
     };
@@ -672,10 +679,12 @@ class Intake {
       await checkPublication();
       const info = await this.ownedFile(file, peer, 'Unsafe import staging file');
       const existing = await read(file);
+      verifySelectedJournal();
       if (existing !== null && existing !== content) {
         if (info.nlink !== 1n) throw conflict('Unsafe import staging file: a linked publication changed. Both versions were preserved.');
         await fs.rename(file, `${file}.damaged-${randomUUID()}`);
       }
+      verifySelectedJournal();
       await immutable(file, content);
       return this.ownedFile(file, peer, 'Unsafe import staging file');
     };
@@ -685,6 +694,7 @@ class Intake {
     if (!await this.ownedFile(snapshotStage, snapshot, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
     await this.ownedFile(snapshot, snapshotStage, 'Immutable revision snapshot');
     this.storage.guardSync();
+    verifySelectedJournal();
     exact(snapshotStage, snapshotProof, snapshotBytes, 'Revision snapshot stage', [snapshot]);
     let snapshotOutput;
     try {
@@ -766,6 +776,7 @@ class Intake {
       await checkPublication();
       if (!await this.ownedFile(stage, destination, 'Unsafe import staging file')) throw conflict('Unsafe import staging file disappeared. Its incoming revision was preserved.');
       this.storage.guardSync();
+      verifySelectedJournal();
       exact(stage, captureStageProof, tx.content, 'Imported capture stage', [destination]);
       if (transfer?.recordOutput) verifyStageSync(stage, guard, transfer.output());
       try {
@@ -806,6 +817,7 @@ class Intake {
       if (!committed && journalProof?.freshRepair) journalProof.verify();
       if (!committed || tx.restoreOperation) {
         verifyRestorationControls?.();
+        verifySelectedJournal();
         this.verifyReservedCaptureIdentity(ledger, tx.capture.id, verifyIndependentJournal);
       }
       try {

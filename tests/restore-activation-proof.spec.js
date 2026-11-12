@@ -83,6 +83,93 @@ async function manualFixture(testInfo, checkpoint) {
   return { vault, intake, deletion, restoration, id, file, bytes, backup, unrelatedId, unrelated, unrelatedBytes, ledgerFile: path.join(intake.dir, 'ledger.json') };
 }
 
+test('capture deletion holds a source copy that reappears during final ledger staging', async ({}, testInfo) => {
+  const vault = await localVault(testInfo), intake = new Intake(vault);
+  await intake.info();
+  const id = await vault.capture({ text: 'The reviewed capture may only be removed once.' }, now);
+  const { file } = await vault.find(id), bytes = await fs.readFile(file);
+  const ledgerFile = path.join(intake.dir, 'ledger.json');
+  const getVault = () => vault, clock = () => ({ now: later });
+  const conversations = new Conversations({ dataRoot: testInfo.outputPath('history'), getVault, clock });
+  await conversations.lock(async () => {});
+  const deletion = new CaptureDeletion({ getVault, conversations, clock, clearApprovals() {} });
+  const preview = await deletion.preview(id);
+  const open = fs.open;
+  let before;
+  fs.open = async (stage, ...args) => {
+    const handle = await open(stage, ...args);
+    if (args[0] !== 'wx' || path.dirname(String(stage)) !== intake.dir || !/^ledger-.*\.tmp$/.test(path.basename(String(stage)))) return handle;
+    const close = handle.close;
+    handle.close = async () => {
+      await close.call(handle);
+      if ((await readJson(stage)).sourceAuthority?.[id]?.phase !== 'deleted' || before) return;
+      before = await fs.readFile(ledgerFile);
+      expect(await readOptional(file)).toBeNull();
+      await fs.writeFile(file, bytes, { flag: 'wx' });
+    };
+    return handle;
+  };
+  let outcome;
+  try { outcome = await deletion.confirm(preview.token).catch(error => error); }
+  finally { fs.open = open; }
+  expect(before).toBeDefined();
+  expect(outcome).toMatchObject({ code: 'SOURCE_FILE_CHANGED' });
+  expect(await fs.readFile(ledgerFile)).toEqual(before);
+  expect((await readJson(ledgerFile)).sourceAuthority[id].phase).toBe('deleting');
+  expect(await fs.readFile(file)).toEqual(bytes);
+});
+
+for (const slot of ['selected journal', 'active journal']) test(`imported restoration preserves an equal-byte replacement in the ${slot} before admission`, async ({}, testInfo) => {
+  const stopped = Error('Stop before imported restoration admission.');
+  const { vault, intake, deletion, restoration, id, ledgerFile, sourceHash } = await fixture(testInfo, boundary => {
+    if (boundary === 'capture-restoration-authorized') throw stopped;
+  });
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toBe(stopped);
+  const before = await fs.readFile(ledgerFile), ledger = JSON.parse(before), authority = ledger.sourceAuthority[id];
+  const selected = path.join(intake.dir, authority.restoration.journal), transaction = path.join(intake.dir, 'transaction.json');
+  const changed = slot === 'selected journal' ? selected : transaction;
+  const retained = testInfo.outputPath('original-selected-journal.json');
+  const bytes = await fs.readFile(selected), original = await identity(selected);
+  if (changed === selected) await fs.rename(selected, retained);
+  await fs.writeFile(changed, bytes, { flag: 'wx' });
+  const replacement = await identity(changed);
+  expect(replacement).not.toEqual(original);
+
+  const outcome = await deletion.resume({ id, operationId: authority.operationId }).catch(error => error);
+  expect.soft(outcome).toBeInstanceOf(Error);
+  expect.soft(await fs.readFile(ledgerFile)).toEqual(before);
+  expect.soft(await readOptional(intake.destination(ledger.captures[sourceHash]))).toBeNull();
+  expect.soft(await readOptional(path.join(vault.root, 'Revisions', `${authority.restoration.revision}.json`))).toBeNull();
+  expect.soft(await readOptional(path.join(intake.dir, `${authority.restoration.revision}.stage`))).toBeNull();
+  expect.soft(await readOptional(path.join(intake.dir, `${authority.restoration.revision}.snapshot.stage`))).toBeNull();
+  expect(await fs.readFile(changed)).toEqual(bytes);
+  expect(await identity(changed)).toEqual(replacement);
+  expect(await identity(changed === selected ? retained : selected)).toEqual(original);
+});
+
+test('a legacy unbound restoration journal stays held while independent intake proceeds', async ({}, testInfo) => {
+  const stopped = Error('Stop before imported restoration admission.');
+  const { vault, intake, deletion, restoration, id, ledgerFile, sourceHash, producer } = await fixture(testInfo, boundary => {
+    if (boundary === 'capture-restoration-authorized') throw stopped;
+  });
+  await expect(deletion.confirmRestoration(restoration.token)).rejects.toBe(stopped);
+  const ledger = await readJson(ledgerFile), authority = ledger.sourceAuthority[id];
+  delete authority.restoration.journalIdentity;
+  await fs.writeFile(ledgerFile, JSON.stringify(ledger, null, 2));
+  const selected = path.join(intake.dir, authority.restoration.journal), bytes = await fs.readFile(selected);
+  const selectedIdentity = await identity(selected);
+  await writeDraft(producer, 'new-source', '2', 'c');
+  const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+  const result = await restarted.reconcile({ now: later });
+  expect(result.captures['c'.repeat(64)]).toBeDefined();
+  expect(result.sourceAuthority[id]).toEqual(authority);
+  expect(result.suppressed).toContain(sourceHash);
+  expect(result.admissions?.[authority.restoration.revision]).toBeUndefined();
+  expect(await fs.readFile(selected)).toEqual(bytes);
+  expect(await identity(selected)).toEqual(selectedIdentity);
+  expect(await readOptional(intake.destination(ledger.captures[sourceHash]))).toBeNull();
+});
+
 async function atManualActivation({ intake, deletion, restoration, id, ledgerFile }, change) {
   const open = fs.open;
   let witness;

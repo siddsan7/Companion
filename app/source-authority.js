@@ -53,7 +53,8 @@ function validateAuthority(ledger) {
           ![publication.capture, publication.snapshot, publication.journal].every(fileProof) || publication.journal.digest !== item.sha256)) {
         throw Error('Imported restoration publication needs repair.');
       }
-      if (item.journalIdentity !== undefined && (!value.manual || !identity(item.journalIdentity))) throw Error('Manual restoration journal identity needs repair.');
+      if (item.journalIdentity !== undefined && (!identity(item.journalIdentity) || publication &&
+          (publication.journal.dev !== item.journalIdentity.dev || publication.journal.ino !== item.journalIdentity.ino))) throw Error('Restoration journal identity needs repair.');
       if (item.stageIdentity !== undefined && (!value.manual || item.published || item.retirement || !identity(item.stageIdentity))) throw Error('Manual restoration stage identity needs repair.');
       if (item.stageState !== undefined && (!item.stageIdentity || !item.journalIdentity || !['prepared', 'attempted'].includes(item.stageState))) throw Error('Manual restoration stage state needs repair.');
       if (item.retirement !== undefined) {

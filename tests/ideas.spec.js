@@ -25,7 +25,7 @@ async function launch(configure = true, parent = 'Companion') {
     await expect(page.getByRole('status')).toContainText('Vault ready.');
   }
 }
-async function completedConversation({ imported = false, localConflict = false, twoCaptures = false, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
+async function completedConversation({ imported = false, localConflict = false, twoCaptures = false, shortenedCitation, scenario, expectedStatus = 'completed', expectedReply = 'Authored synthetic observation', parent } = {}) {
   await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify(scenario || { reply: 'Authored synthetic observation: revisiting a chord may help practice. The transfer is unverified.' }), 'utf8');
   await launch(true, parent);
   if (imported) {
@@ -52,7 +52,19 @@ async function completedConversation({ imported = false, localConflict = false, 
   await page.getByRole('button', { name: 'Propose brief', exact: true }).click();
   await page.getByRole('button', { name: 'Approve proposed brief', exact: true }).click();
   await expect(page.locator('#brief-view')).toContainText('Approved version 1');
-  const question = imported ? 'What does the synthetic review support for MyTune?' : 'How could retrieval help MyTune?';
+  let question = imported ? 'What does the synthetic review support for MyTune?' : 'How could retrieval help MyTune?';
+  let passage;
+  if (shortenedCitation) {
+    const revisions = path.join(root, 'vault', parent || 'Companion', 'Revisions');
+    const [name] = (await fs.readdir(revisions)).filter(name => name.endsWith('.json'));
+    const revision = JSON.parse(await fs.readFile(path.join(revisions, name), 'utf8'));
+    const excerpt = revision.evidence.evidence[0].text;
+    passage = shortenedCitation === 'included' ? excerpt : revision.text.split(/\r?\n/).find(line => line.trim() && !line.includes(excerpt));
+    if (shortenedCitation === 'question') question += `\n😀\n${revision.text}\n${excerpt}`;
+    else question += '\n😀';
+    expect(revision.text).toContain(passage);
+    expect(passage.length).toBeLessThan(revision.text.length);
+  }
   if (localConflict) {
     const captures = path.join(root, 'vault', parent || 'Companion', 'Captures');
     const [file] = (await fs.readdir(captures)).filter(name => name.endsWith('.md'));
@@ -71,6 +83,12 @@ async function completedConversation({ imported = false, localConflict = false, 
     await page.getByLabel('Manual context source', { exact: true }).selectOption({ label: 'A practice queue makes a delayed revisit visible.' });
     await page.getByRole('button', { name: 'Add manual source', exact: true }).click();
   }
+  if (passage) {
+    const chosen = page.locator('#context-selected article').filter({ hasText: 'Authored synthetic review' });
+    await chosen.getByLabel('Shorter passage', { exact: true }).fill(passage);
+    await chosen.getByRole('button', { name: 'Approve shorter passage', exact: true }).click();
+    await expect(chosen).toContainText('Shortening approved.');
+  }
   await page.getByLabel('Conversation brief version', { exact: true }).fill('1');
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(new RegExp(imported ? 'synthetic review support' : 'How could retrieval help MyTune\\?'));
@@ -78,6 +96,15 @@ async function completedConversation({ imported = false, localConflict = false, 
   await expect(page.locator('#conversation-history')).toContainText(expectedStatus, { timeout: 15000 });
   await expect(page.locator('#conversation-history')).toContainText(expectedReply);
 }
+
+for (const mode of ['included', 'question']) test(`citation uses the selected imported passage when the anchor is ${mode === 'included' ? 'included' : 'only in the question'}`, async () => {
+  test.setTimeout(60000);
+  await completedConversation({ imported: true, shortenedCitation: mode });
+  const [file] = (await fs.readdir(path.join(root, 'conversations'))).filter(name => name.endsWith('.json'));
+  const record = JSON.parse(await fs.readFile(path.join(root, 'conversations', file), 'utf8'));
+  const draft = await page.evaluate(input => window.companion['idea-draft'](input), { conversationId: record.id, requestId: record.requests[0].id });
+  expect(draft.references.map(reference => reference.excerpt)).toEqual(mode === 'included' ? ['Authored synthetic review fixture only.'] : []);
+});
 async function markdownSnapshot(directory) {
   const result = {};
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {

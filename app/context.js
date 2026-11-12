@@ -12,6 +12,7 @@ const { revisionAdmission } = require('./source-authority');
 const { comparable } = require('./legacy-capture-ownership');
 const { ordinaryDirectories, readExactSync, verifyAbsentSync, verifyStageSync } = require('./staged-publication');
 const { generationFields, sameEvidence, sameGenerations, unionGenerations, generationProvenance, scopeKey } = require('./source-generations');
+const { serializeSources } = require('./source-excerpts');
 const digest = text => createHash('sha256').update(text).digest('hex');
 const body = content => content.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '').trim();
 function importedProvenance(id, revision, snapshotHash) {
@@ -384,12 +385,11 @@ class Context {
     }).filter(Boolean);
     const conflicting = chosen.filter(source => source.conflictChoice).map(source => source.captureId);
     if (new Set(conflicting).size !== conflicting.length) throw Error('Choose one exact local or imported version of each conflicted capture.');
-    const text = `Question:\n${question}\n\nSources:\n${chosen.map(source => `${source.provenance}\n${source.text}`).join('\n\n')}`;
-    const serialized = text.replace(/\r\n?/g, '\n');
+    const { text: serialized, sourceExcerpts } = serializeSources(question, chosen);
     const bound = this.verifiedInputBound;
     if (bound !== null && (!Number.isSafeInteger(bound.maxCodePoints) || bound.maxCodePoints < 1 || typeof bound.model !== 'string' || !bound.model.trim() || typeof bound.evidence !== 'string' || !bound.evidence.trim())) throw Error('Verified input bound is invalid. Preview is blocked until its main-process evidence is repaired.');
     const count = [...serialized].length, limit = Math.min(32000, bound?.maxCodePoints || 32000);
-    return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), sources: chosen, capacityBinding: this.capacityBinding, boundEvidence: bound ? `${bound.model}: ${bound.evidence}${bound.harnessAndOutputEvidence ? `; ${bound.harnessAndOutputEvidence}` : ''}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
+    return { text: serialized, count, limit, blocked: count > limit, digest: digest(serialized), sources: chosen, sourceExcerpts, capacityBinding: this.capacityBinding, boundEvidence: bound ? `${bound.model}: ${bound.evidence}${bound.harnessAndOutputEvidence ? `; ${bound.harnessAndOutputEvidence}` : ''}` : 'No verified provider input bound; default application limit only. Harness and output headroom require separate verification.', warnings: [...omissions, ...chosen.flatMap(source => source.warnings || [])] };
   }
 }
 function installContext({ ipcMain, getVault, dialog, testRoot, dataRoot, getEvidence, getVerifiedInputBound = async () => null, ideaEligibility = rawIdeaEligibility }) {

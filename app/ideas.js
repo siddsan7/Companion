@@ -13,6 +13,7 @@ const { Intake } = require('./intake');
 const { importedConflictEvidence } = require('./context');
 const { comparable } = require('./legacy-capture-ownership');
 const { readExactSync, verifyStageSync } = require('./staged-publication');
+const { lf, sourceExcerptsValid } = require('./source-excerpts');
 const hash = value => createHash('sha256').update(value).digest('hex');
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(value);
 const same = (a, b) => a.dev === b.dev && a.ino === b.ino;
@@ -145,7 +146,7 @@ class Ideas {
         const resolved = await this.revision(vault, dep.captureId, dep.revisionId, dep);
         for (const evidence of resolved.revision.evidence?.evidence || []) {
           const anchor = this.anchor(resolved, evidence);
-          if (!this.inPackage(request, resolved, anchor)) continue;
+          if (!this.inPackage(request, dep, resolved, anchor)) continue;
           const referenceId = randomUUID();
           const label = `Cite evidence ${evidence.id} from ${resolved.capture.title}`;
           this.references.set(referenceId, { conversationId: record.id, requestId: request.id, anchor, label });
@@ -227,9 +228,16 @@ class Ideas {
     if (typeof evidence.id !== 'string' || typeof evidence.text !== 'string' || !evidence.text.trim()) throw Error('Evidence text is unavailable.');
     return { kind: 'imported_evidence', capture_id: resolved.capture.id, revision_id: resolved.revision.id, snapshot_sha256: resolved.snapshotHash, evidence_id: evidence.id, evidence_kind: evidence.kind, start_seconds: evidence.start_seconds ?? null, end_seconds: evidence.end_seconds ?? null, excerpt: evidence.text, excerpt_sha256: hash(evidence.text) };
   }
-  inPackage(request, resolved, anchor) {
-    const text = request.package.text;
-    return hash(text) === request.package.digest && text.includes(`Imported capture ${anchor.capture_id}; exact imported revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}`) && text.includes(resolved.revision.text.replace(/\r\n?/g, '\n')) && text.includes(anchor.excerpt.replace(/\r\n?/g, '\n'));
+  inPackage(request, dependency, resolved, anchor) {
+    const pkg = request.package;
+    if (!sourceExcerptsValid(pkg) || hash(pkg.text) !== pkg.digest) return false;
+    const provenance = `Imported capture ${anchor.capture_id}; exact imported revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256};`;
+    const revision = lf(resolved.revision.text), evidence = lf(anchor.excerpt);
+    return pkg.sourceExcerpts.some(span => {
+      if (span.key !== dependency.key || span.digest !== dependency.digest || !pkg.text.slice(span.header, span.start - 1).startsWith(provenance)) return false;
+      const passage = pkg.text.slice(span.start, span.end);
+      return revision.includes(passage) && passage.includes(evidence);
+    });
   }
   async selectedReferences(input, origin, verifyCitation) {
     const ids = input.referenceIds ?? [];
@@ -244,7 +252,7 @@ class Ideas {
       if (!dep) throw Error('Selected evidence is absent from the original request.');
       const resolved = await this.revision(origin.vault, anchor.capture_id, anchor.revision_id, dep);
       const evidence = resolved.revision.evidence?.evidence?.find(item => item.id === anchor.evidence_id);
-      if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor) || !this.inPackage(origin.request, resolved, anchor)) throw Error('Selected exact evidence changed or is unavailable.');
+      if (!evidence || JSON.stringify(this.anchor(resolved, evidence)) !== JSON.stringify(anchor) || !this.inPackage(origin.request, dep, resolved, anchor)) throw Error('Selected exact evidence changed or is unavailable.');
       verifyCitation?.(resolved.offeringProof);
       citations.push(structuredClone(anchor));
     }
@@ -314,7 +322,7 @@ class Ideas {
     const id = identity?.id || randomUUID(), operation = identity?.operation || randomUUID();
     this.removal.allow(vault, id);
     const fields = { artifact_type: 'saved_idea', schema_version: 1, companion_id: id, title: input.title.trim(), created_at: identity?.createdAt || this.clock().now, idea_kind: kind, ...(kind === 'experiment_proposal' ? { experiment } : {}), source_dependencies: dependencies, project_brief_version: record.brief.version, project_brief: record.brief, support_attribution_unavailable: unsupported, citations, origin: { conversation_id: record.id, request_id: request.id, package_sha256: request.package.digest, reply_sha256: hash(request.reply), status: request.status } };
-    const disclosure = citations.length ? 'Supporting references were explicitly selected and checked against exact admitted revisions and the original full source in the retained package. The original package had no structured passage offsets. These references do not establish sentence-level support for the explanation. Claims are not independently verified.' : 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
+    const disclosure = citations.length ? 'Supporting references were explicitly selected and checked against exact admitted revisions and their selected passages in the retained package. These references do not establish sentence-level support for the explanation. Claims are not independently verified.' : 'Supporting references: no sentence-level citations were selected or validated. Context dependencies record provenance and revocation only; they do not prove that the explanation is supported.';
     const experimentText = kind === 'experiment_proposal' ? `\n# Experiment Proposal\n\n${Object.entries(experimentLabels).map(([key, label]) => `## ${label}\n\n${experiment[key]}`).join('\n\n')}\n` : '';
     const citationText = citations.map(anchor => `Capture ${anchor.capture_id}; exact revision ${anchor.revision_id}; snapshot sha256 ${anchor.snapshot_sha256}; evidence ${anchor.evidence_id}; ${anchor.evidence_kind}; time ${anchor.start_seconds ?? 'unknown'}–${anchor.end_seconds ?? 'unknown'} seconds.\n\n${anchor.excerpt}\n\nExcerpt sha256 ${anchor.excerpt_sha256}.`).join('\n\n');
     const text = `---\n${YAML.stringify(fields)}---\n\n# ${fields.title}\n\n## Explanation\n\n${input.explanation}\n\n## Limitations\n\n${input.limitations}\n${experimentText}\n## Supporting references\n\n${disclosure}\n\n${support.warnings.join('\n')}\n\n${citationText}\n\nExact project brief: ${record.brief.id}, version ${record.brief.version}, sha256 ${record.brief.digest}.\n\n${dependencies.map(dep => `Capture ${dep.capture_id}; ${dep.revision_id ? `exact revision ${dep.revision_id}` : `content sha256 ${dep.content_sha256}`}; context dependency only.`).join('\n')}\n\nConversation output status: ${request.status}. Interpretation is not an executed experiment or a verified result.\n`;

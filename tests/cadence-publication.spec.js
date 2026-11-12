@@ -372,6 +372,146 @@ test('Configure cannot switch managed parents during native cadence reconnection
   } finally { await app.close(); }
 });
 
+test('Configure preserves an independently replaced settings file during publication', async () => {
+  test.setTimeout(60000);
+  const vault = new Vault(path.join(root, 'vault'), 'Companion');
+  await vault.setup();
+  const settings = path.join(root, 'settings.json'), parked = path.join(root, 'prior-settings.json');
+  const original = JSON.stringify({ vault: vault.vault, parent: 'Companion' });
+  await fs.writeFile(settings, original);
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify(clock()));
+  const app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  try {
+    const page = await app.firstWindow();
+    await app.evaluate((_, { settings, parked, original }) => {
+      const files = process.getBuiltinModule('fs').promises;
+      const open = files.open, write = files.writeFile;
+      let replaced = false;
+      const replace = async () => {
+        if (replaced) return;
+        replaced = true;
+        await files.rename(settings, parked);
+        await write(settings, original, { flag: 'wx' });
+      };
+      files.open = async (file, flag, ...args) => {
+        if (String(file).includes('.vault-settings-') && flag === 'wx') await replace();
+        return open(file, flag, ...args);
+      };
+      files.writeFile = async (file, ...args) => {
+        if (file === settings) await replace();
+        return write(file, ...args);
+      };
+    }, { settings, parked, original });
+    const result = await page.evaluate(async selection => {
+      try { return { value: await window.companion.configure(selection) }; }
+      catch (error) { return { error: error.message }; }
+    }, { vault: vault.vault, parent: 'Another parent' });
+    expect(result.error).toMatch(/settings changed|publication peer changed/i);
+    expect(await readOptional(settings)).toBe(original);
+    expect(await readOptional(parked)).toBe(original);
+    expect((await page.evaluate(() => window.companion.state())).location).toBe(vault.root);
+  } finally { await app.close(); }
+});
+
+for (const replaced of [null, 'stage', 'receipt']) test(`startup ${replaced ? `preserves a foreign ${replaced} for` : 'recovers'} first settings publication after process exit`, async () => {
+  test.setTimeout(60000);
+  const vault = new Vault(path.join(root, 'vault'), 'Companion');
+  const settings = path.join(root, 'settings.json');
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify(clock()));
+  const launch = () => electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  let app = await launch();
+  try {
+    let page = await app.firstWindow();
+    await app.evaluate((_, settings) => {
+      const files = process.getBuiltinModule('fs'), link = files.linkSync;
+      files.linkSync = (source, destination) => {
+        link(source, destination);
+        if (destination === settings) process.kill(process.pid, 'SIGKILL');
+      };
+    }, settings);
+    const child = app.process(), exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    await page.evaluate(selection => window.companion.configure(selection), { vault: vault.vault, parent: 'Companion' }).catch(() => {});
+    expect(await exited).not.toEqual({ code: 0, signal: null });
+    app = null;
+    const [name] = (await fs.readdir(root)).filter(name => /^\.vault-settings-.*\.pending$/.test(name));
+    const stage = path.join(root, name), receipt = `${settings}.first-publication`;
+    const original = await fs.readFile(settings);
+    expect((await fs.stat(settings)).nlink).toBe(2);
+    expect(await fs.readFile(stage)).toEqual(original);
+    const replacedFile = replaced === 'receipt' ? receipt : stage;
+    const parked = `${replacedFile}.original`;
+    let replacement;
+    if (replaced) {
+      replacement = await fs.readFile(replacedFile);
+      await fs.rename(replacedFile, parked);
+      await fs.writeFile(replacedFile, replacement, { flag: 'wx' });
+    }
+    app = await launch();
+    page = await app.firstWindow();
+    const state = await page.evaluate(() => window.companion.state());
+    expect(await fs.readFile(settings)).toEqual(original);
+    if (replaced) {
+      expect(state.configured).toBe(false);
+      expect((await fs.stat(settings)).nlink).toBe(2);
+      expect(await fs.readFile(stage)).toEqual(original);
+      expect(await fs.readFile(replacedFile)).toEqual(replacement);
+      expect(await fs.readFile(parked)).toEqual(replacement);
+      expect(await fs.readFile(receipt, 'utf8')).toContain(name);
+    } else {
+      expect(state.location).toBe(vault.root);
+      expect((await fs.stat(settings)).nlink).toBe(1);
+      expect(await readOptional(stage)).toBeNull();
+      expect(await readOptional(receipt)).toBeNull();
+    }
+  } finally { if (app) await app.close(); }
+});
+
+for (const boundary of ['receipt write', 'receipt link']) test(`interrupted first settings ${boundary} allows fresh Configure without relinking`, async () => {
+  test.setTimeout(60000);
+  const vault = new Vault(path.join(root, 'vault'), 'Companion');
+  const settings = path.join(root, 'settings.json'), receipt = `${settings}.first-publication`;
+  await fs.writeFile(path.join(root, 'clock.json'), JSON.stringify(clock()));
+  const launch = () => electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
+  let app = await launch();
+  try {
+    let page = await app.firstWindow();
+    await app.evaluate((_, { receipt, boundary }) => {
+      const files = process.getBuiltinModule('fs'), path = process.getBuiltinModule('path');
+      const open = files.promises.open, link = files.linkSync;
+      const exit = () => process.kill(process.pid, 'SIGKILL');
+      files.promises.open = async (file, flag, ...args) => {
+        const handle = await open(file, flag, ...args);
+        if (flag !== 'wx') return handle;
+        if (boundary === 'receipt write' && (file === receipt || path.basename(file).startsWith('.first-receipt-'))) exit();
+        if (boundary === 'receipt link' && file === receipt) {
+          const close = handle.close;
+          handle.close = async () => { await close.call(handle); exit(); };
+        }
+        return handle;
+      };
+      files.linkSync = (source, destination) => {
+        link(source, destination);
+        if (boundary === 'receipt link' && destination === receipt) exit();
+      };
+    }, { receipt, boundary });
+    const child = app.process(), exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+    const selection = { vault: vault.vault, parent: 'Companion' };
+    await page.evaluate(selection => window.companion.configure(selection), selection).catch(() => {});
+    expect(await exited).not.toEqual({ code: 0, signal: null });
+    app = null;
+    expect(await readOptional(settings)).toBeNull();
+    if (boundary === 'receipt link') expect((await fs.stat(receipt)).nlink).toBe(2);
+    app = await launch();
+    page = await app.firstWindow();
+    expect((await page.evaluate(() => window.companion.state())).configured).toBe(false);
+    expect(await readOptional(settings)).toBeNull();
+    expect(await page.evaluate(selection => window.companion.configure(selection), selection)).toBe(true);
+    expect((await page.evaluate(() => window.companion.state())).location).toBe(vault.root);
+    expect((await fs.stat(settings)).nlink).toBe(1);
+    expect(await readOptional(receipt)).toBeNull();
+  } finally { if (app) await app.close(); }
+});
+
 test('daily intake controls cannot enable a new vault from the old displayed schedule', async () => {
   const vaultFolder = path.join(root, 'vault');
   const first = new Vault(vaultFolder, 'Companion');

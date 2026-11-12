@@ -75,7 +75,7 @@ class IntakeLedger {
       this.guardSync(expected, guard);
       try { verifyStageSync(stage, guard, proof); }
       catch (error) { if (error.code === 'STAGING_CHANGED') throw changed(); throw error; }
-      verifyRelated();
+      verifyRelated(stage);
       try { local.renameSync(stage, this.file); return; }
       catch (error) {
         const remaining = deadline - performance.now();

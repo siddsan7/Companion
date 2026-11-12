@@ -710,10 +710,12 @@ async function unavailableFinalHistory() {
   ] }));
   await prepareConversation(); await observeConversation();
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
-  await expect(page.locator('#conversation-history')).toContainText('DURABLE_PREFIX');
+  await expect.poll(async () => (await fs.readdir(path.join(root, 'conversations'))).some(name => name.endsWith('.json'))).toBe(true);
   const files = await fs.readdir(path.join(root, 'conversations'));
   const savedFile = path.join(root, 'conversations', files.find(name => name.endsWith('.json')));
   await expect.poll(async () => JSON.parse(await fs.readFile(savedFile, 'utf8')).requests[0].reply).toContain('DURABLE_PREFIX');
+  await page.getByLabel('Retained conversation', { exact: true }).selectOption(path.basename(savedFile, '.json'));
+  await expect(page.locator('#conversation-history')).toContainText('DURABLE_PREFIX');
   // Existing filesystem checkpoint fails all later history writes; provider release is external.
   await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ fail: 'conversation-before-store', code: 'EACCES' }));
   await fs.writeFile(path.join(root, 'conversation-release.json'), '{}');
@@ -773,6 +775,62 @@ test('persistent history storage recovery preserves a conflicting update from an
     expect(await fs.readFile(savedFile, 'utf8')).toBe(changed);
     expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
   } finally { await otherApp.close(); }
+});
+
+test('a retained reply cannot replace an equal-byte history file installed during local resave', async () => {
+  test.setTimeout(60000);
+  const { savedFile, calls } = await unavailableFinalHistory();
+  const parked = `${savedFile}.original`;
+  const original = await fs.readFile(savedFile);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'conversation-before-store' }));
+  const preserve = page.evaluate(async id => {
+    try { return { value: await window.companion['conversation-preserve']({ id }) }; }
+    catch (error) { return { error: error.message }; }
+  }, path.basename(savedFile, '.json'));
+  try {
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => null)).toBe('conversation-before-store');
+    await fs.rename(savedFile, parked);
+    await fs.writeFile(savedFile, original, { flag: 'wx' });
+  } finally { await fs.writeFile(path.join(root, 'release.txt'), ''); }
+  expect(await preserve).toMatchObject({ error: expect.stringMatching(/local history changed/i) });
+  expect(await fs.readFile(savedFile)).toEqual(original);
+  expect(await fs.readFile(parked)).toEqual(original);
+  expect(await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8')).toBe(calls);
+  await page.reload();
+  await expect(page.locator('#conversation-history')).toContainText('LATEST_VISIBLE_REPLY_CANARY');
+});
+
+test('an exact first conversation link is recovered after the main process exits before dispatch', async () => {
+  test.setTimeout(90000);
+  await prepareConversation();
+  const directory = path.join(root, 'conversations');
+  await app.evaluate((_, directory) => {
+    const files = process.getBuiltinModule('fs'), path = process.getBuiltinModule('path');
+    const link = files.linkSync;
+    files.linkSync = (source, destination) => {
+      link(source, destination);
+      if (path.dirname(destination) === directory && /^[a-f0-9-]{36}\.json$/.test(path.basename(destination))) process.kill(process.pid, 'SIGKILL');
+    };
+  }, directory);
+  const child = app.process(), exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click().catch(() => {});
+  expect(await exited).not.toEqual({ code: 0, signal: null });
+  app = null;
+  const files = await fs.readdir(directory);
+  const stored = path.join(directory, files.find(name => name.endsWith('.json')));
+  const stage = path.join(directory, files.find(name => name.endsWith('.pending')));
+  const receipt = `${stored}.first-publication`;
+  expect((await fs.stat(stored)).nlink).toBe(2);
+  const original = JSON.parse(await fs.readFile(stored, 'utf8'));
+  expect(original.requests[0]).toMatchObject({ status: 'inProgress', reply: '' });
+  expect(await fs.readFile(stage)).toEqual(await fs.readFile(stored));
+  await launch(false);
+  await expect(page.locator('#conversation-history')).toContainText('interrupted');
+  expect(JSON.parse(await fs.readFile(stored, 'utf8')).requests[0]).toMatchObject({ id: original.requests[0].id, status: 'interrupted', reply: '' });
+  expect((await fs.stat(stored)).nlink).toBe(1);
+  expect(await fs.stat(stage).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.stat(receipt).catch(error => error.code)).toBe('ENOENT');
+  expect(await fs.stat(path.join(root, 'conversation-submissions.jsonl')).catch(error => error.code)).toBe('ENOENT');
 });
 
 for (const outcome of ['completed', 'failed', 'interrupted', 'late citation']) {
@@ -1326,6 +1384,25 @@ test('prior conversation search is opt-in and selected excerpts are labelled his
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).toHaveValue(/Use only current project context/);
   await expect(page.getByLabel('Reviewed conversation package', { exact: true })).not.toHaveValue(/HISTORICAL_DIALOGUE_12_CANARY|revisit one chord after a delay/);
+});
+
+test('completed dialogue without its excluded pinned brief remains eligible for continuation and search', async () => {
+  test.setTimeout(60000);
+  const canary = 'DIALOGUE_WITHOUT_BRIEF_CANARY';
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: canary }));
+  await prepareConversation();
+  const first = await page.evaluate(input => window.companion['conversation-preview'](input), {
+    question: 'Consider the question without approved brief evidence.', briefVersion: 1, speculation: false, excludedSources: ['brief:1']
+  });
+  expect(first.dependencies).toEqual([]);
+  const record = await page.evaluate(packageId => window.companion['conversation-send']({ packageId }), first.packageId);
+  expect(record.requests[0]).toMatchObject({ status: 'completed', reply: canary });
+  const input = { question: `Continue ${canary}.`, briefVersion: 1, speculation: false };
+  const next = await page.evaluate(input => window.companion['conversation-preview'](input), { ...input, conversationId: record.id });
+  expect(next.historyIds).toEqual([record.requests[0].id]);
+  expect(next.dependencies).toEqual([]);
+  const search = await page.evaluate(input => window.companion['conversation-search'](input), input);
+  expect(search.matches).toMatchObject([{ conversationId: record.id, requestId: record.requests[0].id, dependencies: [] }]);
 });
 
 test('omitting prior dialogue retains dependency authority without resending unselected raw ancestor text', async () => {
