@@ -602,7 +602,7 @@ class Archives {
     // Export creates a separate file. It must never add files to guarded application stores.
     const relative = path.relative(this.history.dataRoot, destination);
     const name = process.platform === 'win32' ? relative.toLowerCase() : relative;
-    if (!relative.startsWith('..') && !path.isAbsolute(relative) && (relative.includes(path.sep) || ['settings.json', 'schedule.json', 'settings.json' + firstPublicationSuffix].includes(name))) throw Error('Choose an archive file outside application store folders.');
+    if (!relative.startsWith('..') && !path.isAbsolute(relative) && (relative.includes(path.sep) || ['settings.json', 'schedule.json', 'settings.json' + firstPublicationSuffix, 'schedule.json' + firstPublicationSuffix, 'schedule.json.initial-publication.json'].includes(name))) throw Error('Choose an archive file outside application store folders.');
     const parent = path.dirname(destination);
     const { guard } = ordinaryDirectories([parent], 'Archive destination folder changed or is an alias. Choose an ordinary folder.');
     const stage = path.join(parent, `.companion-archive-${randomUUID()}.pending`);
