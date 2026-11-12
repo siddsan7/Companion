@@ -21,6 +21,21 @@ async function launch() {
   page = await app.firstWindow();
   await expect(page.locator('#timezone')).toContainText('America/Phoenix');
 }
+async function observeNativeRename(current, observerFile) {
+  await app.evaluate((_electron, options) => {
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), originalRename = io.renameSync;
+    io.renameSync = function (from, to, ...args) {
+      try { return originalRename.call(this, from, to, ...args); }
+      catch (error) {
+        if (typeof from === 'string' && paths.resolve(from).toLowerCase() === paths.resolve(options.current).toLowerCase()) {
+          io.renameSync = originalRename;
+          io.writeFileSync(options.observerFile, JSON.stringify({ mainPid: process.pid, from, to, code: error.code, syscall: error.syscall, message: error.message, delegatedOriginal: true }));
+        }
+        throw error;
+      }
+    };
+  }, { current, observerFile });
+}
 async function holdCurrent(file) {
   const release = path.join(root, 'native-handle-release');
   const script = '$ErrorActionPreference="Stop"; $stream=$null; try { $stream=[System.IO.File]::Open($env:COMPANION_LOCK_TARGET,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::Read); [Console]::WriteLine("READY:"+$PID); while (-not [System.IO.File]::Exists($env:COMPANION_LOCK_RELEASE)) { Start-Sleep -Milliseconds 25 } } finally { if ($null -ne $stream) { $stream.Dispose(); [Console]::WriteLine("RELEASED:"+$PID) } }';
@@ -84,19 +99,7 @@ test('deferred reviewed Make current can be deleted before Check now without com
   expect(retained.attempts[reviewedB.identity].fingerprint).toBe(reviewedB.fingerprint);
   expect(retainedCapture.reviewChoices).toEqual([capture.currentRevision, revisionB]);
   const observerFile = path.join(root, 'native-rename.json');
-  await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalRename = io.rename;
-    io.rename = async function (from, to, ...args) {
-      try { return await originalRename.call(this, from, to, ...args); }
-      catch (error) {
-        if (typeof from === 'string' && paths.resolve(from).toLowerCase() === paths.resolve(options.current).toLowerCase()) {
-          io.rename = originalRename;
-          await io.writeFile(options.observerFile, JSON.stringify({ mainPid: process.pid, from, to, code: error.code, syscall: error.syscall, message: error.message, delegatedOriginal: true }));
-        }
-        throw error;
-      }
-    };
-  }, { current, observerFile });
+  await observeNativeRename(current, observerFile);
   const native = await holdCurrent(current);
   let deferred, pendingBytes, tx, writerStatus, heldCurrent;
   try {
@@ -204,19 +207,7 @@ test('pending reviewed selection deletion holds a contradictory prospective hist
   const sourceHash = 'a'.repeat(64), base = path.join(root, 'vault', 'Companion'), intake = path.join(base, '.intake'), ledgerFile = path.join(intake, 'ledger.json');
   const retained = JSON.parse(await fs.readFile(ledgerFile)), capture = retained.captures[sourceHash], current = path.join(base, 'Captures', capture.file), currentA = await fs.readFile(current);
   const producerBytes = await files(producer), revisionB = capture.revisions.find(id => id !== capture.currentRevision), observerFile = path.join(root, 'guard-native-rename.json');
-  await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalRename = io.rename;
-    io.rename = async function (from, to, ...args) {
-      try { return await originalRename.call(this, from, to, ...args); }
-      catch (error) {
-        if (typeof from === 'string' && paths.resolve(from).toLowerCase() === paths.resolve(options.current).toLowerCase()) {
-          io.rename = originalRename;
-          await io.writeFile(options.observerFile, JSON.stringify({ mainPid: process.pid, from, to, code: error.code, syscall: error.syscall, message: error.message, delegatedOriginal: true }));
-        }
-        throw error;
-      }
-    };
-  }, { current, observerFile });
+  await observeNativeRename(current, observerFile);
   const native = await holdCurrent(current);
   try {
     await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
@@ -311,19 +302,7 @@ test('restored-generation pending selection deletion resumes after the first nat
   const retained = JSON.parse(await fs.readFile(ledgerFile)), capture = retained.captures[sourceHash], current = path.join(base, 'Captures', capture.file), currentA = await fs.readFile(current);
   const revisionB = capture.revisions.find(revision => revision !== capture.currentRevision), snapshotB = path.join(base, 'Revisions', revisionB + '.json'), stageB = path.join(intake, revisionB + '.snapshot.stage');
   const renameFile = path.join(root, 'generation-native-rename.json');
-  await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalRename = io.rename;
-    io.rename = async function (from, to, ...args) {
-      try { return await originalRename.call(this, from, to, ...args); }
-      catch (error) {
-        if (typeof from === 'string' && paths.resolve(from).toLowerCase() === paths.resolve(options.current).toLowerCase()) {
-          io.rename = originalRename;
-          await io.writeFile(options.renameFile, JSON.stringify({ mainPid: process.pid, from, to, code: error.code, syscall: error.syscall, message: error.message, delegatedOriginal: true }));
-        }
-        throw error;
-      }
-    };
-  }, { current, renameFile });
+  await observeNativeRename(current, renameFile);
   const native = await holdCurrent(current);
   try {
     await page.getByRole('button', { name: 'Inspect source', exact: true }).click();
@@ -364,12 +343,12 @@ test('restored-generation pending selection deletion resumes after the first nat
   const first = path.join(base, names[0]), unlinkFile = path.join(root, 'generation-native-first-unlink.json'), mainPid = await app.evaluate(() => process.pid);
   // Observe the original unlink. The existing checkpoint pauses immediately after it.
   await app.evaluate((_electron, options) => {
-    const io = process.getBuiltinModule('fs').promises, paths = process.getBuiltinModule('path'), originalUnlink = io.unlink;
-    io.unlink = async function (file, ...args) {
-      const result = await originalUnlink.call(this, file, ...args);
+    const io = process.getBuiltinModule('fs'), paths = process.getBuiltinModule('path'), originalUnlink = io.unlinkSync;
+    io.unlinkSync = function (file, ...args) {
+      const result = originalUnlink.call(this, file, ...args);
       if (typeof file === 'string' && paths.resolve(file).toLowerCase() === paths.resolve(options.first).toLowerCase()) {
-        io.unlink = originalUnlink;
-        await io.writeFile(options.unlinkFile, JSON.stringify({ mainPid: process.pid, file, delegatedOriginal: true, nativeUnlinkReturned: true, controlledSourceOmissions: [] }));
+        io.unlinkSync = originalUnlink;
+        io.writeFileSync(options.unlinkFile, JSON.stringify({ mainPid: process.pid, file, delegatedOriginal: true, nativeUnlinkReturned: true, controlledSourceOmissions: [] }));
       }
       return result;
     };
