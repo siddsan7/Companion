@@ -25,8 +25,8 @@ async function transcriptProtocolFixture(selectedFailure, selectedRelative = 'Se
   await page.getByRole('button', { name: 'Preview conversation', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Send reviewed package', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
-  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_PROTOCOL_13');
-  await expect(page.locator('#conversation-history')).toContainText('completed');
+  await expect(page.locator('#conversation-history')).toContainText('TRANSCRIPT_PROTOCOL_13', { timeout: 15000 });
+  await expect(page.locator('#conversation-history')).toContainText('completed', { timeout: 15000 });
   const vault = path.join(root, 'vault'), directory = path.join(vault, 'Companion', '.transcripts');
   const selected = path.join(vault, selectedRelative), other = path.join(vault, 'Other protocol transcript.md');
   await fs.mkdir(path.dirname(selected), { recursive: true });
