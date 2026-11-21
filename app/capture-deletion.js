@@ -16,6 +16,7 @@ const sourceTitle = require('./source-title');
 const manualTitle = require('./manual-title');
 const pendingTitle = require('./pending-title');
 const deletionDependents = require('./deletion-dependents');
+const { revisitDependents } = require('./revisit');
 const mixedDeletion = require('./mixed-deletion');
 const { ordinaryDirectories, readExactSync, verifyAbsentSync, verifyStageSync, writeStage } = require('./staged-publication');
 const { comparable, storeName } = require('./legacy-capture-ownership');
@@ -117,7 +118,10 @@ class CaptureDeletion {
     if (!vault) throw Error('Choose a vault first.');
     const inventory = await sourceInspection(vault.root, () => this.inventory(id, undefined, vault));
     const token = randomUUID(); this.previews.set(token, inventory);
-    return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations, dependents: inventory.dependents.rows, ...(inventory.retainedWriting ? { retainedWriting: inventory.retainedWriting } : {}) };
+    // Decisions, notices and candidates that depend on this capture are shown for review
+    // only; deletion never edits a decision (D49-I01, D49-I03).
+    const revisit = revisitDependents(vault, id);
+    return { token, title: inventory.capture.title, revisions: inventory.capture.revisions.length, targets: inventory.targets.map(target => target.file), annotations: inventory.annotations, dependents: [...inventory.dependents.rows, ...revisit], ...(inventory.retainedWriting ? { retainedWriting: inventory.retainedWriting } : {}) };
   }
   cancel(token) { this.previews.delete(token); }
   async suppressed() {
