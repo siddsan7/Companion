@@ -10,12 +10,12 @@ Every number below is **on these authored fixtures only**. The fixture is small,
 | --- | --- |
 | Fixture | `tests/fixtures/revisit-replay/fixture-v1.json`, version 1, sha256 `213f829b2186c63324af0f40d75e3260efc7dec1fe52550c8f7a9a7351418a54` |
 | Fixture content | 12 true triggers, 12 near misses, 2 negative timelines, 8 timelines |
-| Source commit | `b8d033200600f66ca398c91312cf9fcf2d969e7e` |
+| Source commit | `2f82a386b6fce4af36a703718ae8547fba9b3096` |
 | Model and settings | none: no model was called in this run |
 | Gate | closed: production chat readiness has not passed (D46-I10) |
 | Perfect-answer audit (D51-I04) | Set-F1 1.000 (12 / 0 / 0) |
-| Raw outputs | `docs/evaluation/revisit-replay/fixture-v1-b8d033200600.json` |
-| Generated | 2026-11-21T09:49:09.938Z |
+| Raw outputs | `docs/evaluation/revisit-replay/fixture-v1-2f82a386b6fc.json` |
+| Generated | 2026-11-21T10:01:09.772Z |
 
 ## D53 comparison
 
