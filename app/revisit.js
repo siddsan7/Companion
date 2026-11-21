@@ -1,6 +1,6 @@
 const local = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { randomUUID, createHash } = require('node:crypto');
 const {
   readExactSync, verifyAbsentSync, writeStage, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication
 } = require('./staged-publication');
@@ -24,11 +24,16 @@ const open = status => ['pending', 'sending', 'held', 'held-oversize'].includes(
 // Gate runs in progress in this process. A request owned by one of them, or by another
 // live process, is still in flight and must not be settled as interrupted.
 const activeRuns = new Set();
+// A request older than this is never still in flight, even if its owner's process id has
+// been reused by another program (common on Windows after a restart).
+const maxRequestMs = 30 * 60 * 1000;
 function inFlight(owner) {
   if (!owner) return false;
-  if (owner.pid === process.pid) return activeRuns.has(owner.run);
+  if (owner.pid === process.pid && owner.started === processStarted) return activeRuns.has(owner.run);
+  if (!Number.isFinite(owner.sentAt) || Date.now() - owner.sentAt > maxRequestMs) return false;
   try { process.kill(owner.pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
 }
+const processStarted = Math.round(Date.now() - process.uptime() * 1000);
 
 function localDate(instant, timezone) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: timezone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(instant));
@@ -70,6 +75,25 @@ class Revisit {
       throw error;
     }
     return proof;
+  }
+  // Gate packages are kept as separate files so the records stay small; the records keep
+  // the path, length and digest (D46-I06).
+  writePackage(attemptId, text) {
+    const guard = this.guard(), directory = path.join(this.directory, 'packages');
+    try { local.mkdirSync(directory); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    this.vault.publicationFolders(directory).guard();
+    const file = path.join(directory, `${attemptId}.txt`), bytes = Buffer.from(text), descriptor = local.openSync(file, 'wx');
+    try { local.writeSync(descriptor, bytes); local.fsyncSync(descriptor); } finally { local.closeSync(descriptor); }
+    guard();
+    return { packageFile: `packages/${attemptId}.txt`, packageLength: codePoints(text), packageDigest: createHash('sha256').update(bytes).digest('hex') };
+  }
+  readPackage(attempt) {
+    if (typeof attempt.package === 'string') return attempt.package;
+    if (typeof attempt.packageFile !== 'string' || !/^packages\/[a-f0-9-]{36}\.txt$/.test(attempt.packageFile)) return null;
+    try {
+      const bytes = local.readFileSync(path.join(this.directory, attempt.packageFile));
+      return createHash('sha256').update(bytes).digest('hex') === attempt.packageDigest ? bytes.toString('utf8') : null;
+    } catch { return null; }
   }
   async evidence() {
     const corpus = await this.getEvidence(this.vault);
@@ -189,11 +213,12 @@ class Revisit {
       const text = this.packageFor(state, ledger, candidate);
       if (codePoints(text) > packageLimit) {
         // Never shortened silently (D46-I04, D36-I03).
-        Object.assign(candidate, { status: 'held-oversize', heldReason: `Package is ${codePoints(text)} characters, over the ${packageLimit}-character limit. Review it and check manually.` });
+        Object.assign(candidate, { status: 'held-oversize', heldReason: `Package is ${codePoints(text)} characters, over the ${packageLimit}-character limit, and is never shortened automatically. Shorten this decision's choice or reasons in a new version; the candidate is then checked again.` });
         if (mode === 'manual') throw Error(candidate.heldReason);
         continue;
       }
-      const attempt = { id: randomUUID(), at: now, mode: status.rule === 'match' ? 'rule' : mode, status: 'sent', owner: { pid: process.pid, run }, package: text, packageLength: codePoints(text) };
+      const attemptId = randomUUID();
+      const attempt = { id: attemptId, at: now, mode: status.rule === 'match' ? 'rule' : mode, status: 'sent', owner: { pid: process.pid, started: processStarted, run, sentAt: Date.now() }, ...this.writePackage(attemptId, text) };
       candidate.attempts.push(attempt); candidate.status = 'sending';
       chosen.push({ candidate: candidate.id, attempt: attempt.id, text });
     }
@@ -208,8 +233,11 @@ class Revisit {
       if (status.rule === 'match') { results.push({ ...item, rule: true }); continue; }
       try { results.push({ ...item, response: await this.gate.send(item.text, mode) }); }
       catch (error) {
-        results.push({ ...item, error: error.message });
-        if (stopPattern.test(error.message)) stop = error.message;
+        // Usage, offline and sign-in failures stop the run and are not the candidate's
+        // fault, so they do not count toward its three attempts (D46-I07, D46-I08).
+        const stopped = stopPattern.test(error.message);
+        results.push({ ...item, error: error.message, stopped });
+        if (stopped) stop = error.message;
       }
     }
     return { results, stop };
@@ -228,7 +256,7 @@ class Revisit {
         raised += state.notices.length - before; continue;
       }
       if (result.error) {
-        Object.assign(attempt, { status: 'failed', error: result.error, finishedAt: now });
+        Object.assign(attempt, { status: result.stopped ? 'stopped' : 'failed', error: result.error, finishedAt: now });
         candidate.status = attempt.mode === 'automatic' && this.failedAttempts(candidate) >= maxAttempts ? 'held' : 'pending';
         if (candidate.status === 'held') candidate.heldReason = `Gate request failed ${maxAttempts} times. Retry explicitly.`;
         continue;
@@ -330,12 +358,14 @@ class Revisit {
         warnings: present ? decision.latest.relied_on.filter(ref => !present.has(ref.key)).map(ref => `Missing reference: ${ref.title} (${ref.key}) is removed or unavailable. The decision is unchanged.`) : [],
         draft: this.decisions.draftFrom(decision.latest)
       }));
+      // Attach each recorded package so every request stays inspectable from the list.
+      const shown = candidates => candidates.map(candidate => ({ ...candidate, attempts: candidate.attempts.map(attempt => ({ ...attempt, package: this.readPackage(attempt) ?? 'Package file is missing or changed.' })) })).reverse();
       return {
         settings: state.settings, lastRun: state.lastRun, issues: ledger.issues, decisions,
         notices: state.notices.slice().reverse(),
-        notRaised: state.candidates.filter(candidate => ['does not meet', 'cannot tell'].includes(candidate.status)).reverse(),
-        pending: state.candidates.filter(candidate => open(candidate.status)).reverse(),
-        other: state.candidates.filter(candidate => ['withdrawn', 'duplicate'].includes(candidate.status)).reverse(),
+        notRaised: shown(state.candidates.filter(candidate => ['does not meet', 'cannot tell'].includes(candidate.status))),
+        pending: shown(state.candidates.filter(candidate => open(candidate.status))),
+        other: shown(state.candidates.filter(candidate => ['withdrawn', 'duplicate'].includes(candidate.status))),
         events: state.events.slice(-50).reverse()
       };
     });
@@ -417,6 +447,8 @@ class Revisit {
         if (notice.decision.id !== record.decision_id) throw Error('This notice belongs to a different decision.');
       }
       const published = await this.decisions.publish(record, expectedVersion);
+      // A shorter version may now fit the package limit; check those candidates again.
+      for (const candidate of state.candidates) if (candidate.status === 'held-oversize' && candidate.decision.id === record.decision_id) Object.assign(candidate, { status: 'pending', heldReason: null });
       if (items) { this.sweep(state, items, now); state.presentKeys = [...new Set(items.map(item => item.key))].sort(); }
       this.reconcileResolutions(state, this.decisions.load());
       await this.writeState(state, proof);

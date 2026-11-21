@@ -166,7 +166,9 @@ test('D46 D47-I04 D46-I04 D46-I06: a meets reply raises one quoted notice, other
     expect(request.text).not.toContain('CANARY-7731');
     expect(request.text).toContain('## Revisit condition');
     expect(request.text).toContain('Choice: Use local lexical search, not embeddings.');
-    expect(records.some(candidate => candidate.attempts.some(attempt => attempt.package === request.text && attempt.status === 'answered'))).toBe(true);
+    const recorded = [];
+    for (const candidate of records) for (const attempt of candidate.attempts) if (attempt.status === 'answered') recorded.push(await fs.readFile(path.join(base(), '.revisit', attempt.packageFile), 'utf8'));
+    expect(recorded).toContain(request.text);
   }
   // The pre-existing canary capture was swept at save time and never matched.
   expect(records.some(candidate => candidate.evidence.title.includes('CANARY'))).toBe(false);
@@ -291,6 +293,11 @@ test('D46-I04 D46-I05: injected instructions and out-of-shape replies change not
   expect(held.status).toBe('held-oversize');
   expect(held.heldReason).toContain('over the 32000-character limit');
   expect((await requests()).some(request => request.text.includes('Huge reasons'))).toBe(false);
+  // Shortening the decision in a new version puts the held candidate back in the queue.
+  await save(decision([evidenceCondition(['oversize'], { id: (await call('decision-view')).decisions.find(item => item.id === huge.decisionId).latest.conditions[0].id })], { title: 'Huge reasons', reasons: ['Short now.'] }), huge.decisionId, 1);
+  expect((await state()).candidates.find(candidate => candidate.decision.id === huge.decisionId).status).toBe('pending');
+  await checkDecisions();
+  expect((await requests()).some(request => request.text.includes('Huge reasons'))).toBe(true);
 });
 
 test('D46-I07: the cap limits requests per check and a usage-limit failure stops the run', async () => {
@@ -311,6 +318,12 @@ test('D46-I07: the cap limits requests per check and a usage-limit failure stops
   expect(records.lastRun.message).toContain('usage limit');
   expect(records.candidates.filter(candidate => candidate.status === 'pending')).toHaveLength(3);
   await expect(page.locator('#revisit-run')).toContainText('stopped');
+  // Outages are not the candidate's fault: repeated stops never hold it (D46-I07, D46-I08).
+  for (let index = 0; index < 3; index++) await checkDecisions();
+  const afterOutages = await state();
+  expect(await requests()).toHaveLength(6);
+  expect(afterOutages.candidates.filter(candidate => candidate.status === 'held')).toHaveLength(0);
+  expect(afterOutages.candidates.flatMap(candidate => candidate.attempts).filter(attempt => attempt.status === 'stopped')).toHaveLength(4);
 });
 
 test('D46-I08: a candidate whose request fails three times is held and is not sent a fourth time without an explicit retry', async () => {
@@ -344,6 +357,30 @@ test('D46-I03: with automatic checks off, one reviewed package can be sent by th
   const [request] = await requests();
   expect(request.mode).toBe('manual');
   expect((await state()).notices).toHaveLength(1);
+});
+
+test('D41 D48: relied-on titles stay literal in the note, and revising from a notice records its evidence', async () => {
+  await gate({ chatReady: true, workerIsolation: true, rule: 'match' });
+  await launch(); await setup();
+  await capture('![remote](https://example.invalid/p.png) [[Other note]]');
+  const relied = (await call('decision-sources')).find(source => source.title.includes('example.invalid'));
+  const saved = await save(decision([evidenceCondition(['lexical search'])], { reliedOn: [relied] }));
+  const first = await fs.readFile(path.join(base(), 'Decisions', saved.decisionId, 'version-1.md'), 'utf8');
+  const body = first.slice(first.indexOf('## Relied on'));
+  expect(body).toContain(String.raw`\!\[remote\]\(https\:\/\/example\.invalid\/p\.png\)`);
+  expect(body).not.toContain('![remote](https://');
+  await enableAutomatic();
+  await capture('Lexical search misses paraphrases in 40% of our queries.');
+  await expect.poll(async () => (await state()).notices.length).toBe(1);
+  const notice = (await state()).notices[0];
+  await page.reload();
+  await page.getByLabel('Revisit notice for Use lexical search').getByRole('button', { name: 'Revise decision', exact: true }).click();
+  await page.getByLabel('Choice made').fill('Add embeddings for paraphrased queries.');
+  await page.getByRole('button', { name: 'Preview decision version', exact: true }).click();
+  await expect(page.getByLabel('Proposed decision note')).toHaveValue(new RegExp(`Evidence: ${notice.evidence.key} sha256 ${notice.evidence.digest}`));
+  await page.getByLabel('Decision version preview').getByRole('button', { name: 'Save decision version', exact: true }).click();
+  await expect(page.getByRole('status')).toContainText('Decision version 2 saved.');
+  expect((await state()).notices[0]).toMatchObject({ status: 'revised', resolution: { action: 'revise', decisionVersion: 2 } });
 });
 
 test('failure and recovery: interrupted decision publication and gate request leave no duplicate version, no false notice and no replay', async () => {
