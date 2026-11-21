@@ -332,6 +332,10 @@ test('Configure cannot switch managed parents during native cadence reconnection
   const app = await electron.launch({ args: ['.'], env: { ...process.env, COMPANION_TEST_ROOT: root } });
   try {
     const page = await app.firstWindow();
+    // Startup reads of local history share the history lock with reconnection, which
+    // refuses while the lock is held. Let them finish so the test does not race them.
+    await expect(page.locator('#conversation-location')).toContainText('Local conversation history');
+    await expect(page.locator('#archive-cadence option')).toHaveCount(2);
     await app.evaluate(({ app: mainApp }) => {
       const load = process.getBuiltinModule('module').createRequire(mainApp.getAppPath() + '/app/main.js');
       const { TaskScheduler } = load('./task-scheduler');
@@ -354,7 +358,11 @@ test('Configure cannot switch managed parents during native cadence reconnection
     }, review.token);
     let switched;
     try {
-      await expect.poll(() => app.evaluate(() => globalThis.__cadenceRegistration.entered)).toBe(true);
+      await expect.poll(() => app.evaluate(() => globalThis.__cadenceRegistration.entered)).toBe(true).catch(async error => {
+        const settled = await Promise.race([reconnect, new Promise(resolve => setTimeout(() => resolve('still pending'), 100))]);
+        error.message += `\nReconnect result: ${JSON.stringify(settled)}`;
+        throw error;
+      });
       const pending = JSON.parse(await readOptional(path.join(root, 'schedule.json')));
       expect(pending).toMatchObject({ mode: 'disabled', archiveReconnect: { status: 'pending' } });
       switched = await page.evaluate(async selected => {
