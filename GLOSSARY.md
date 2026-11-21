@@ -85,3 +85,25 @@ A retrieval outcome in which no suitable source material was found for the reque
 
 **No Supported Connection**
 A reasoning outcome in which the available material supports no useful transfer to the project.
+
+**Decision**
+A technical choice the user records for a project, with its reasons, rejected alternatives and the sources it relied on. Every change publishes a new numbered version; earlier versions stay readable and inert.
+
+**Decision Ledger**
+The set of decision notes in the vault's `Decisions` area. The notes are the authority; revisit records can be rebuilt around them.
+
+**Revisit Condition**
+A statement on a decision of what evidence, or what review-by date, should prompt a second look. It has a label, a trigger and an action, and its own version number.
+_Avoid_ calling a condition met because a capture is merely on the same topic.
+
+**Evidence Event**
+The admission of new material that might bear on a decision: a capture, a source revision, an annotation, a saved idea or an approved brief version. Each evidence revision is matched against active conditions exactly once.
+
+**Revisit Candidate**
+A local text match between one evidence revision and one condition version. It is not a notice and is not shown as one.
+
+**Gate Outcome**
+The answer to whether a candidate's evidence meets its condition: meets, does not meet, or cannot tell. Only meets raises a notice.
+
+**Revisit Notice**
+A message that a condition's evidence or review-by date has arrived, showing the decision, the condition, the passage and the reason. At most one per condition version and evidence revision.

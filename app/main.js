@@ -16,10 +16,14 @@ const { installTranscripts } = require('./transcripts');
 const { installComparisons } = require('./comparisons');
 const { installCaptureDeletion } = require('./capture-deletion');
 const { installAnnotationRemoval } = require('./annotation-removal');
+const { installDecisions } = require('./decisions-ipc');
+const { Revisit } = require('./revisit');
+const { ControlledGate } = require('./revisit-gate');
+const { Context } = require('./context');
 const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
 const { ordinaryDirectories, readExactSync, verifyAbsentSync, writeStage, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication } = require('./staged-publication');
-let codex, conversationProvider;
+let codex, conversationProvider, decisions;
 let testRoot = process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
@@ -54,6 +58,14 @@ async function checkpoint(name, detail) {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
 }
+async function scheduledRevisit(selected, dataRoot) {
+  const { createHash } = require('node:crypto');
+  const scopeFile = path.join(dataRoot, `context-settings-${createHash('sha256').update(selected.root).digest('hex')}`, 'notes.json');
+  const gate = testRoot ? new ControlledGate(testRoot) : { status: async () => ({ open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' }), send: async () => { throw Error('Revisit gate is closed.'); } };
+  const revisit = new Revisit(selected, { getEvidence: target => new Context(target, { scopeFile }).corpus(), gate, checkpoint });
+  const { now, timezone } = clock();
+  return revisit.check({ now, timezone, trigger: 'scheduled' });
+}
 function clock() {
   if (testRoot) return JSON.parse(require('node:fs').readFileSync(path.join(testRoot, 'clock.json'), 'utf8'));
   return { now: new Date().toISOString(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
@@ -74,6 +86,10 @@ app.whenReady().then(async () => {
         assertSelected: state.launchBinding === 1 ? () => schedule.assertConfiguration(path.join(path.dirname(workerFile), 'settings.json')) : undefined
       });
       const result = await schedule.run(clock().now, 'scheduled', state.id);
+      // D46-I02: the scheduled worker checks new evidence against active revisit
+      // conditions after intake has released its lock. Automatic gate requests from this
+      // worker stay closed outside controlled tests until their isolation is verified.
+      if (result && !result.skipped) await scheduledRevisit(selected, path.dirname(workerFile)).catch(error => console.error('Revisit check:', error.message));
       app.exit(result && !result.skipped && result.lastCheck.status !== 'complete' ? 1 : 0);
     } catch (error) { console.error(error.message); app.exit(1); }
     return;
@@ -177,15 +193,19 @@ app.whenReady().then(async () => {
   ipcMain.handle('capture', async (_, input) => {
     const selected = vault, now = clock().now;
     if (!selected) throw Error('Choose a vault first.');
-    return orderVaultWork(selected, () => selected.capture(input, now));
+    const result = await orderVaultWork(selected, () => selected.capture(input, now));
+    await decisions.afterEvidence(selected, 'capture');
+    return result;
   });
   ipcMain.handle('title', async (_, { id, title }) => new Intake(vault).title(id, title));
   async function intakeRequest(work) {
     const selected = vault, now = clock().now;
     if (!selected) throw Error('Choose a vault first.');
     const selectedSchedule = schedule(selected);
-    return orderVaultWork(selected, () => work(new Intake(selected), now,
+    const result = await orderVaultWork(selected, () => work(new Intake(selected), now,
       (result, verifyLatest) => selectedSchedule.record(result, verifyLatest)));
+    await decisions.afterEvidence(selected, 'intake');
+    return result;
   }
   ipcMain.handle('connect-drafts', (_, { folder, scan }) => intakeRequest((intake, now, onComplete) => intake.connect(folder, scan, now, 'draft', onComplete)));
   ipcMain.handle('connect-reviews', (_, { folder, scan }) => intakeRequest((intake, now, onComplete) => intake.connect(folder, scan, now, 'review', onComplete)));
@@ -194,7 +214,11 @@ app.whenReady().then(async () => {
     return intake.reconnect(input);
   }));
   ipcMain.handle('check-intake', () => intakeRequest((intake, now, onComplete) => intake.reconcile({ trigger: 'manual', now, onComplete })));
-  ipcMain.handle('add-annotation', async (_, input) => new Intake(vault).addAnnotation(input, clock().now));
+  ipcMain.handle('add-annotation', async (_, input) => {
+    const selected = vault, result = await new Intake(selected).addAnnotation(input, clock().now);
+    await decisions.afterEvidence(selected, 'annotation');
+    return result;
+  });
   ipcMain.handle('choose-identity', async (_, input) => new Intake(vault).chooseIdentity(input));
   ipcMain.handle('retry-annotation-link', async (_, input) => new Intake(vault).retryLink(input));
   ipcMain.handle('restore-missing', async (_, input) => new Intake(vault).restoreMissing(input, clock().now));
@@ -232,8 +256,15 @@ app.whenReady().then(async () => {
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
   const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot, clock, checkpoint, provider: conversationProvider, testRoot });
-  installCaptureDeletion({ ipcMain, getVault: () => vault, conversations, clearApprovals: context.clearApprovals, clock });
-  installAnnotationRemoval({ ipcMain, getVault: () => vault, clearApprovals: context.clearApprovals });
+  // A deletion or removal changes the evidence corpus without an intake check. Once its
+  // request has finished, a revisit check updates candidates and notices (D49).
+  const afterRemoval = { handle: (channel, listener) => ipcMain.handle(channel, async (...args) => {
+    const selected = vault, result = await listener(...args);
+    if (/-(?:confirm|resume)$/.test(channel)) await decisions?.afterEvidence(selected, 'removal');
+    return result;
+  }) };
+  installCaptureDeletion({ ipcMain: afterRemoval, getVault: () => vault, conversations, clearApprovals: context.clearApprovals, clock });
+  installAnnotationRemoval({ ipcMain: afterRemoval, getVault: () => vault, clearApprovals: context.clearApprovals });
   installTranscripts({ ipcMain, conversations, getVault: () => vault, getContext: context.store, clock, checkpoint, choose: async selected => {
     const selection = testRoot ? JSON.parse(await fs.readFile(path.join(testRoot, 'transcript-selection.json'), 'utf8')) : await dialog.showSaveDialog({ title: 'Export readable conversation transcript', defaultPath: path.join(selected.vault, 'Conversation transcript.md'), filters: [{ name: 'Markdown transcript', extensions: ['md'] }] });
     return selection.canceled ? null : selection.filePath;
@@ -243,6 +274,9 @@ app.whenReady().then(async () => {
     if (testRoot) await fs.writeFile(path.join(testRoot, 'opened-uri.txt'), uri, 'utf8'); else await shell.openExternal(uri);
   } });
   installComparisons({ ipcMain, getVault: () => vault, dataRoot, clock, checkpoint, provider: conversationProvider, getEvidence });
+  decisions = installDecisions({ ipcMain, getVault: () => vault, getContext: context.store, orderEvidence: orderVaultWork, clock, checkpoint, testRoot, provider: conversationProvider, getEvidence });
+  // Revisit runs after the startup catch-up above has admitted any missed evidence.
+  await decisions.afterEvidence(vault, 'catch-up');
   const fixtureRendering = testRoot ? { backgroundThrottling: false } : {};
   const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { ...fixtureRendering, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
