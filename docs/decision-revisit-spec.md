@@ -1,6 +1,6 @@
 # Decision Ledger and Revisit Notices
 
-Status: **draft, proposed, not yet accepted.** Decision IDs D41–D50 continue the numbering in [the first spec](local-second-brain-spec.md) and become binding only after review. The measurement plan is in the companion draft, [Revisit Replay Evaluation](revisit-replay-evaluation-spec.md).
+Status: **implemented on branch `spec/decision-revisit`; acceptance review of D41–D50 pending.** Decision IDs D41–D50 continue the numbering in [the first spec](local-second-brain-spec.md). [Implementation notes](#implementation-notes) record where the code settles or departs from this text. The measurement plan is in the companion draft, [Revisit Replay Evaluation](revisit-replay-evaluation-spec.md).
 
 ## Problem Statement
 
@@ -168,9 +168,24 @@ Live model behaviour is a separate real integration gate and is not replaced by 
 
 Settled on 2026-11-20: the gate runs automatically at intake, not on a user send. See [ADR 0007](adr/0007-automatic-revisit-gate.md).
 
-## Proposed glossary terms
+## Glossary terms
 
-**Decision**, **Decision Ledger**, **Revisit Condition**, **Evidence Event**, **Revisit Candidate**, **Gate Outcome**, **Revisit Notice**. To be added to `GLOSSARY.md` when accepted.
+**Decision**, **Decision Ledger**, **Revisit Condition**, **Evidence Event**, **Revisit Candidate**, **Gate Outcome**, **Revisit Notice** are defined in `GLOSSARY.md`.
+
+## Implementation notes
+
+Code: `app/decisions.js` (ledger), `app/revisit.js` (checks, candidates, notices), `app/revisit-match.js` (local matching), `app/revisit-gate.js` (package, reply parsing, providers), `app/decisions-ipc.js` and `app/decisions-view.js` (desktop). Acceptance tests: `tests/decisions.spec.js`.
+
+- **Storage (D41).** Each version is an immutable note at `<parent>/Decisions/<decision id>/version-<N>.md`, published with the existing exclusive first-publication path, so an interrupted save leaves either no new version or exactly one. Revisit records (seen evidence, events, candidates, gate requests with their full packages, notices, settings) live in one atomically replaced file, `<parent>/.revisit/state.json`, inside the vault. Vault backups therefore include them; the Local History Archive is unchanged (D49-I03).
+- **When matching runs (D44-I02, departure).** Matching runs right after intake or capture finishes, not inside the intake lock. Reading the eligible corpus takes the intake source lock, so the check queues behind the same per-vault request order as capture and intake. Every evidence revision is still matched exactly once, by the first check that sees it, and no model decides when to look. Checks also run after capture deletion and annotation removal, at desktop startup catch-up, from **Check decisions now**, and in the scheduled worker.
+- **Evidence before a condition.** Evidence present when a decision version is saved is marked as seen without matching, so a new condition never fires on material that existed when it was written. If the corpus cannot be read at save time, the save still succeeds and that older evidence can still be matched at the next check.
+- **Matching (D45).** A candidate needs at least one cue-term match (whole words, or a phrase for multi-word cues) or a linked source. Trigger words only add to the recorded reasons. Up to three matched passages are kept.
+- **Repeats (D47-I02).** Besides one notice per condition version and evidence revision, a candidate whose matched passages are identical to an earlier candidate for the same condition version is recorded as a duplicate and never sent to the gate. This is how a retitled copy or re-import stays silent without a model call.
+- **Superseded conditions (D43-I03).** Pending candidates for a condition version that is no longer current are withdrawn as inert.
+- **Gate (D46).** Replies must be exactly one JSON object with `outcome`, `reason` and `quote`; the quote must appear in the matched passages. Anything else is a failed request. Failures that look like usage limits, offline or sign-in problems stop the run. The production gate stays closed: chat readiness is closed, and isolation of automatic requests from the scheduled worker is unverified (D46-I10). Desktop tests use controlled replies from `revisit-gate.json` in the disposable test root.
+- **Test seam (D50-I02).** Under the test root only, `"rule": "match"` in `revisit-gate.json` replaces the gate with "notify on any match".
+- **Open questions, settled with the recommended defaults.** The cap defaults to 10 requests per check and can be set from 1 to 100. Decisions carry a free-text project, defaulting to MyTune. Notices appear in a Revisit list in the Decision ledger section, and the navigation link shows the open count.
+- **Resolution (D48).** Reaffirm and dismiss on a review-by notice mark that condition as met in the new version. Revise opens the editor with the notice attached. Withdraw withdraws the decision and its conditions.
 
 ## References
 
