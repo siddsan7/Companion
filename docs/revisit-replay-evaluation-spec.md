@@ -1,6 +1,6 @@
 # Revisit Replay Evaluation
 
-Status: **draft, proposed, not yet accepted.** Decision IDs D51–D57 continue the numbering in [the first spec](local-second-brain-spec.md). This draft measures the feature described in [Decision Ledger and Revisit Notices](decision-revisit-spec.md) and does not repeat its design.
+Status: **implemented on branch `spec/decision-revisit`; acceptance review pending.** Results: [Revisit Replay Report](revisit-replay-report.md). Run with `node scripts/revisit-replay.cjs`; harness tests are in `tests/revisit-replay.spec.js`. Decision IDs D51–D57 continue the numbering in [the first spec](local-second-brain-spec.md). This draft measures the feature described in [Decision Ledger and Revisit Notices](decision-revisit-spec.md) and does not repeat its design.
 
 ## Problem Statement
 

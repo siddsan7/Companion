@@ -1,0 +1,155 @@
+{
+  "fixture": "revisit-replay",
+  "version": 1,
+  "label": "Comparison Fixture (D28, D51-I03): authored synthetic material for the revisit replay. Not real imports, not real decisions, not evidence about any real system.",
+  "author": "Authored and labelled by the developer before any scored run (D52-I04).",
+  "timelines": [
+    {
+      "id": "A-search",
+      "negative": false,
+      "steps": [
+        { "id": "A1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DA", "due": [], "draft": {
+          "title": "Use lexical search for note retrieval", "choice": "Use local lexical search over notes, not embeddings.", "reasons": ["Inspectable, offline and needs no model."], "alternatives": ["Embedding retrieval"],
+          "conditions": [
+            { "ref": "CA1", "kind": "evidence", "label": "Paraphrase recall", "trigger": "A capture reports measured recall of lexical search below 80% on paraphrased queries.", "action": "Reconsider adding embedding retrieval.", "cueTerms": ["lexical search", "recall", "paraphrased"] },
+            { "ref": "CA2", "kind": "time", "label": "Search review date", "trigger": "Review by date reached.", "action": "Check whether lexical search still fits the corpus.", "reviewBy": "2026-12-01" }
+          ] } },
+        { "id": "A2", "at": "2026-11-09T07:00:00Z", "type": "evidence", "evidence": "EA1", "kind": "trigger:cue", "text": "Benchmark on our notes: lexical search recall fell to 62% on paraphrased queries.", "relevant": ["DA/CA1"], "meets": ["DA/CA1"],
+          "due": [{ "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA1" }] },
+        { "id": "A3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "EA2", "kind": "near-miss:same-topic", "text": "Lexical search recall was 95% on exact keyword queries; paraphrased queries were not tested.", "relevant": ["DA/CA1"],
+          "due": [{ "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA1" }] },
+        { "id": "A4", "at": "2026-11-11T07:00:00Z", "type": "evidence", "evidence": "EA3", "kind": "trigger:paraphrase", "text": "When people reworded their questions, the keyword finder missed about four in ten relevant notes.", "relevant": ["DA/CA1"], "meets": ["DA/CA1"],
+          "due": [{ "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA1" }, { "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA3" }] },
+        { "id": "A5", "at": "2026-11-12T07:00:00Z", "type": "evidence", "evidence": "EA4", "kind": "near-miss:repeat", "repeats": "EA1", "text": "Benchmark on our notes: lexical search recall fell to 62% on paraphrased queries.", "relevant": ["DA/CA1"],
+          "due": [{ "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA1" }, { "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA3" }] },
+        { "id": "A6", "at": "2026-12-02T18:00:00Z", "type": "advance", "meets": [{ "condition": "DA/CA2", "reviewBy": "2026-12-01" }],
+          "due": [{ "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA1" }, { "decision": "DA", "condition": "CA1", "conditionVersion": 1, "evidence": "EA3" }, { "decision": "DA", "condition": "CA2", "conditionVersion": 1, "evidence": "clock:2026-12-01" }] }
+      ]
+    },
+    {
+      "id": "B-decoder",
+      "negative": false,
+      "steps": [
+        { "id": "B1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DB", "due": [], "draft": {
+          "title": "Use the platform audio decoder", "choice": "Decode audio with the operating system decoder, not a bundled FFmpeg.", "reasons": ["Smaller install and no codec licensing work."], "alternatives": ["Bundled FFmpeg"],
+          "conditions": [
+            { "ref": "CB1", "kind": "evidence", "label": "Decoder failures", "trigger": "A capture reports the platform decoder failing on FLAC files.", "action": "Reconsider bundling FFmpeg.", "cueTerms": ["decoder", "flac"] }
+          ] } },
+        { "id": "B2", "at": "2026-11-09T07:00:00Z", "type": "edit-condition", "decision": "DB", "condition": "CB1", "changes": { "trigger": "A capture reports the platform decoder failing on FLAC or Opus files at least twice.", "cueTerms": ["decoder", "flac", "opus"] }, "due": [] },
+        { "id": "B3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "EB1", "kind": "trigger:cue", "text": "The platform decoder failed on two FLAC files and one Opus file in today's test.", "relevant": ["DB/CB1"], "meets": ["DB/CB1"],
+          "due": [{ "decision": "DB", "condition": "CB1", "conditionVersion": 2, "evidence": "EB1" }] },
+        { "id": "B4", "at": "2026-11-11T07:00:00Z", "type": "evidence", "evidence": "EB2", "kind": "near-miss:superseded", "text": "The platform decoder failed once on a single FLAC file.", "relevant": ["DB/CB1"],
+          "due": [{ "decision": "DB", "condition": "CB1", "conditionVersion": 2, "evidence": "EB1" }] },
+        { "id": "B5", "at": "2026-11-12T07:00:00Z", "type": "evidence", "evidence": "EB3", "kind": "near-miss:opposite", "text": "The decoder played every FLAC and Opus file in the test set without a single failure.", "relevant": ["DB/CB1"],
+          "due": [{ "decision": "DB", "condition": "CB1", "conditionVersion": 2, "evidence": "EB1" }] },
+        { "id": "B6", "at": "2026-11-13T07:00:00Z", "type": "evidence", "evidence": "EB4", "kind": "trigger:paraphrase", "text": "Two lossless tracks and an Ogg voice memo would not play through the built-in audio engine.", "relevant": ["DB/CB1"], "meets": ["DB/CB1"],
+          "due": [{ "decision": "DB", "condition": "CB1", "conditionVersion": 2, "evidence": "EB1" }, { "decision": "DB", "condition": "CB1", "conditionVersion": 2, "evidence": "EB4" }] }
+      ]
+    },
+    {
+      "id": "C-storage",
+      "negative": false,
+      "steps": [
+        { "id": "C1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DC", "due": [], "draft": {
+          "title": "Store library metadata in SQLite", "choice": "Keep library metadata in a single SQLite file.", "reasons": ["Simple backups."], "alternatives": ["One JSON file per track"],
+          "conditions": [
+            { "ref": "CC1", "kind": "evidence", "label": "Database corruption", "trigger": "A capture reports the SQLite library database becoming corrupt after a crash.", "action": "Reconsider the storage engine or add write-ahead logging.", "cueTerms": ["sqlite", "corrupt", "corruption"] }
+          ] } },
+        { "id": "C2", "at": "2026-11-09T07:00:00Z", "type": "evidence", "evidence": "EC1", "kind": "trigger:cue", "text": "After a power cut, the SQLite library database was corrupt and would not open.", "relevant": ["DC/CC1"], "meets": ["DC/CC1"],
+          "due": [{ "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC1" }] },
+        { "id": "C3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "EC2", "kind": "near-miss:repeat", "repeats": "EC1", "text": "After a power cut, the SQLite library database was corrupt and would not open.", "relevant": ["DC/CC1"],
+          "due": [{ "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC1" }] },
+        { "id": "C4", "at": "2026-11-11T07:00:00Z", "type": "evidence", "evidence": "EC3", "kind": "trigger:paraphrase", "text": "The music library file would not open after the laptop lost power mid-write.", "relevant": ["DC/CC1"], "meets": ["DC/CC1"],
+          "due": [{ "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC1" }, { "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC3" }] },
+        { "id": "C5", "at": "2026-11-12T07:00:00Z", "type": "withdraw", "decision": "DC",
+          "due": [{ "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC1" }, { "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC3" }] },
+        { "id": "C6", "at": "2026-11-13T07:00:00Z", "type": "evidence", "evidence": "EC4", "kind": "near-miss:withdrawn", "text": "SQLite corruption again after a forced shutdown: the database is corrupt.", "relevant": [],
+          "due": [{ "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC1" }, { "decision": "DC", "condition": "CC1", "conditionVersion": 1, "evidence": "EC3" }] }
+      ]
+    },
+    {
+      "id": "D-sync",
+      "negative": false,
+      "steps": [
+        { "id": "D1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DD", "due": [], "draft": {
+          "title": "No cloud sync in version one", "choice": "Ship version one without cloud sync; local files only.", "reasons": ["Avoid conflict handling until the core is stable."], "alternatives": ["Build sync now"],
+          "conditions": [
+            { "ref": "CD1", "kind": "evidence", "label": "Desktop sync losses", "trigger": "A capture reports desktop users losing edits to sync conflicts.", "action": "Reconsider building conflict-safe sync.", "cueTerms": ["sync", "conflicts"] },
+            { "ref": "CD2", "kind": "time", "label": "Sync review date", "trigger": "Review by date reached.", "action": "Check whether local-only is still acceptable.", "reviewBy": "2026-12-10" }
+          ] } },
+        { "id": "D2", "at": "2026-11-09T07:00:00Z", "type": "evidence", "evidence": "ED1", "kind": "near-miss:deleted", "deleteAfter": true, "text": "Users lost edits to sync conflicts twice this week on desktop.", "relevant": [], "due": [] },
+        { "id": "D3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "ED2", "kind": "near-miss:same-topic", "text": "Sync conflicts were reported on the mobile beta only; desktop users lost nothing.", "relevant": ["DD/CD1"], "due": [] },
+        { "id": "D4", "at": "2026-11-11T07:00:00Z", "type": "evidence", "evidence": "ED3", "kind": "trigger:cue", "text": "Three desktop users lost edits to sync conflicts after the last release.", "relevant": ["DD/CD1"], "meets": ["DD/CD1"],
+          "due": [{ "decision": "DD", "condition": "CD1", "conditionVersion": 1, "evidence": "ED3" }] },
+        { "id": "D5", "at": "2026-11-12T07:00:00Z", "type": "evidence", "evidence": "ED4", "kind": "near-miss:opposite", "text": "Sync conflicts on desktop: zero lost edits across 500 sessions.", "relevant": ["DD/CD1"],
+          "due": [{ "decision": "DD", "condition": "CD1", "conditionVersion": 1, "evidence": "ED3" }] },
+        { "id": "D6", "at": "2026-11-13T07:00:00Z", "type": "evidence", "evidence": "ED5", "kind": "trigger:paraphrase", "text": "People on the desktop app keep losing changes when two devices save at once.", "relevant": ["DD/CD1"], "meets": ["DD/CD1"],
+          "due": [{ "decision": "DD", "condition": "CD1", "conditionVersion": 1, "evidence": "ED3" }, { "decision": "DD", "condition": "CD1", "conditionVersion": 1, "evidence": "ED5" }] },
+        { "id": "D7", "at": "2026-12-11T18:00:00Z", "type": "advance", "meets": [{ "condition": "DD/CD2", "reviewBy": "2026-12-10" }],
+          "due": [{ "decision": "DD", "condition": "CD1", "conditionVersion": 1, "evidence": "ED3" }, { "decision": "DD", "condition": "CD1", "conditionVersion": 1, "evidence": "ED5" }, { "decision": "DD", "condition": "CD2", "conditionVersion": 1, "evidence": "clock:2026-12-10" }] }
+      ]
+    },
+    {
+      "id": "E-reviews",
+      "negative": false,
+      "steps": [
+        { "id": "E1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DE", "due": [], "draft": {
+          "title": "Keep the free tier ad-free", "choice": "Show no ads in the free tier.", "reasons": ["Trust matters more than early revenue."], "alternatives": ["Audio ads between tracks"],
+          "conditions": [
+            { "ref": "CE1", "kind": "time", "label": "Pricing review", "trigger": "Review by date reached.", "action": "Check free-to-paid conversion.", "reviewBy": "2026-11-20" },
+            { "ref": "CE2", "kind": "time", "label": "Accessibility review", "trigger": "Review by date reached.", "action": "Re-run the screen reader audit.", "reviewBy": "2026-11-30" }
+          ] } },
+        { "id": "E2", "at": "2026-11-10T07:00:00Z", "type": "edit-condition", "decision": "DE", "condition": "CE1", "changes": { "reviewBy": "2026-12-15" }, "due": [] },
+        { "id": "E3", "at": "2026-11-25T18:00:00Z", "type": "advance", "meets": [], "due": [] },
+        { "id": "E4", "at": "2026-12-01T18:00:00Z", "type": "advance", "meets": [{ "condition": "DE/CE2", "reviewBy": "2026-11-30" }],
+          "due": [{ "decision": "DE", "condition": "CE2", "conditionVersion": 1, "evidence": "clock:2026-11-30" }] },
+        { "id": "E5", "at": "2026-12-16T18:00:00Z", "type": "advance", "meets": [{ "condition": "DE/CE1", "reviewBy": "2026-12-15" }],
+          "due": [{ "decision": "DE", "condition": "CE2", "conditionVersion": 1, "evidence": "clock:2026-11-30" }, { "decision": "DE", "condition": "CE1", "conditionVersion": 2, "evidence": "clock:2026-12-15" }] }
+      ]
+    },
+    {
+      "id": "F-shuffle",
+      "negative": false,
+      "steps": [
+        { "id": "F1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DF", "due": [], "draft": {
+          "title": "Rank shuffle by listening history", "choice": "Order shuffle using each listener's history.", "reasons": ["Fewer skips in the prototype."], "alternatives": ["Uniform random shuffle"],
+          "conditions": [
+            { "ref": "CF1", "kind": "evidence", "label": "Skip rate", "trigger": "A capture reports the history-ranked shuffle raising skip rate above 30%.", "action": "Revert to random shuffle.", "cueTerms": ["skip rate", "shuffle"] }
+          ] } },
+        { "id": "F2", "at": "2026-11-09T07:00:00Z", "type": "edit-condition", "decision": "DF", "condition": "CF1", "changes": { "trigger": "A capture reports the history-ranked shuffle raising skip rate above 40%." }, "due": [] },
+        { "id": "F3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "EF1", "kind": "near-miss:superseded", "text": "Skip rate under the history-ranked shuffle reached 35% this week.", "relevant": ["DF/CF1"], "due": [] },
+        { "id": "F4", "at": "2026-11-11T07:00:00Z", "type": "evidence", "evidence": "EF2", "kind": "near-miss:deleted", "deleteAfter": true, "text": "Skip rate hit 55% with the history-ranked shuffle.", "relevant": [], "due": [] },
+        { "id": "F5", "at": "2026-11-12T07:00:00Z", "type": "withdraw", "decision": "DF", "due": [] },
+        { "id": "F6", "at": "2026-11-13T07:00:00Z", "type": "evidence", "evidence": "EF3", "kind": "near-miss:withdrawn", "text": "Skip rate climbed to 48% under the history-ranked shuffle.", "relevant": [], "due": [] }
+      ]
+    },
+    {
+      "id": "N1-unrelated",
+      "negative": true,
+      "steps": [
+        { "id": "N1-1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DN1", "due": [], "draft": {
+          "title": "Keep notes in Markdown", "choice": "Store every note as plain Markdown.", "reasons": ["Portable and readable in any editor."], "alternatives": ["A proprietary database"],
+          "conditions": [
+            { "ref": "CN1", "kind": "evidence", "label": "Export losses", "trigger": "A capture reports Markdown export losing formatting.", "action": "Reconsider the note format.", "cueTerms": ["markdown", "export"] },
+            { "ref": "CN2", "kind": "time", "label": "Format review", "trigger": "Review by date reached.", "action": "Check the note format again.", "reviewBy": "2027-06-01" }
+          ] } },
+        { "id": "N1-2", "at": "2026-11-09T07:00:00Z", "type": "evidence", "evidence": "EN1", "kind": "unrelated", "text": "Lunch at noon with the band.", "relevant": [], "due": [] },
+        { "id": "N1-3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "EN2", "kind": "unrelated", "text": "New guitar strings arrived today.", "relevant": [], "due": [] },
+        { "id": "N1-4", "at": "2026-11-11T07:00:00Z", "type": "evidence", "evidence": "EN3", "kind": "unrelated", "text": "Practice the bridge section slowly before speeding up.", "relevant": [], "due": [] },
+        { "id": "N1-5", "at": "2026-12-31T18:00:00Z", "type": "advance", "meets": [], "due": [] }
+      ]
+    },
+    {
+      "id": "N2-no-conditions",
+      "negative": true,
+      "steps": [
+        { "id": "N2-1", "at": "2026-11-08T07:00:00Z", "type": "decision", "decision": "DN2", "due": [], "draft": {
+          "title": "Use a dark theme by default", "choice": "Start new installs in the dark theme.", "reasons": ["Most listening happens at night."], "alternatives": ["Follow the system theme"],
+          "conditions": [] } },
+        { "id": "N2-2", "at": "2026-11-09T07:00:00Z", "type": "evidence", "evidence": "EN4", "kind": "unrelated", "text": "The album artwork looks sharper on the new screen.", "relevant": [], "due": [] },
+        { "id": "N2-3", "at": "2026-11-10T07:00:00Z", "type": "evidence", "evidence": "EN5", "kind": "unrelated", "text": "Markdown export kept every heading and list in the test.", "relevant": [], "due": [] },
+        { "id": "N2-4", "at": "2026-12-20T18:00:00Z", "type": "advance", "meets": [], "due": [] }
+      ]
+    }
+  ]
+}
