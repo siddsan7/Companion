@@ -109,6 +109,10 @@ function validRecord(record, id, version) {
   return !!valid;
 }
 
+// Source titles can come from imported producer output. Escape Markdown and wiki-link
+// syntax so a title can never become a remote image or link in the note (as for captures).
+const literal = value => String(value).replace(/[\r\n]+/g, ' ').replace(/[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/g, character => `\\${character}`);
+
 function bullets(items, empty) { return items.length ? items.map(item => `- ${item.replace(/\n/g, '\n  ')}`).join('\n') : empty; }
 function markdown(record) {
   const front = YAML.stringify(record);
@@ -122,7 +126,7 @@ function markdown(record) {
     ...(c.kind === 'evidence' ? [`- Cue terms: ${c.cue_terms.join(', ') || 'none'}`, `- Linked sources: ${c.links.join(', ') || 'none'}`] : [])
   ].join('\n')).join('\n\n') : 'No revisit condition. This decision can never raise a revisit notice.';
   const resolution = record.resolution ? `\n\n## Revisit resolution\n\n- Action: ${record.resolution.action}\n- Notice: ${record.resolution.notice_id}\n- Evidence: ${record.resolution.evidence || 'review-by date'}\n- Reason: ${record.resolution.reason || 'none given'}` : '';
-  return `---\n${front}---\n\n# ${record.title}\n\nDecision version ${record.version} · state ${record.state}${record.superseded_by ? ` · superseded by ${record.superseded_by}` : ''} · project ${record.project}\n\n## Choice\n\n${record.choice}\n\n## Reasons\n\n${bullets(record.reasons, 'None recorded.')}\n\n## Alternatives rejected\n\n${bullets(record.alternatives, 'None recorded.')}\n\n## Relied on\n\n${bullets(record.relied_on.map(ref => `${ref.title} (${ref.key}${ref.revision_id ? `, revision ${ref.revision_id}` : ''}, sha256 ${ref.digest})`), 'No recorded sources.')}\n\n## Revisit conditions\n\n${conditions}${resolution}\n`;
+  return `---\n${front}---\n\n# ${record.title}\n\nDecision version ${record.version} · state ${record.state}${record.superseded_by ? ` · superseded by ${record.superseded_by}` : ''} · project ${record.project}\n\n## Choice\n\n${record.choice}\n\n## Reasons\n\n${bullets(record.reasons, 'None recorded.')}\n\n## Alternatives rejected\n\n${bullets(record.alternatives, 'None recorded.')}\n\n## Relied on\n\n${bullets(record.relied_on.map(ref => `${literal(ref.title)} (${ref.key}${ref.revision_id ? `, revision ${ref.revision_id}` : ''}, sha256 ${ref.digest})`), 'No recorded sources.')}\n\n## Revisit conditions\n\n${conditions}${resolution}\n`;
 }
 function parse(bytes) {
   const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);

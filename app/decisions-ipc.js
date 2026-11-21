@@ -43,11 +43,16 @@ function installDecisions({ ipcMain, getVault, getContext, orderEvidence, clock,
     return sources.all.filter(item => /^(?:capture|annotation|idea|brief):/.test(item.key))
       .map(item => ({ key: item.key, digest: item.digest, title: item.title, revisionId: item.revisionId || null }));
   });
+  const noticeEvidence = notice => notice.kind === 'due' ? `review-by date ${notice.evidence.clock}` : `${notice.evidence.key} sha256 ${notice.evidence.digest}`;
+  const findNotice = (revisit, noticeId) => revisit.decisions.lock(async () => revisit.readState().state.notices.find(item => item.id === noticeId));
   ipcMain.handle('decision-preview', async (_, { id, expectedVersion, draft, resolution }) => {
     const vault = selected(), revisit = revisitFor(vault), at = now().now;
     const current = id ? latestOf(revisit, id) : null;
     if ((current?.version || 0) !== expectedVersion) throw Error('This decision changed since you opened it. Reload it before saving.');
-    const record = revisit.decisions.build({ ...draft, resolution: resolution && { ...resolution, action: 'revise' } }, current, at);
+    // Revising from a notice records that notice's evidence in the new version.
+    const notice = resolution ? await findNotice(revisit, resolution.noticeId) : null;
+    if (resolution && (!notice || notice.decision.id !== id)) throw Error('This notice is unavailable for this decision. Refresh the Revisit list.');
+    const record = revisit.decisions.build({ ...draft, resolution: resolution && { noticeId: resolution.noticeId, reason: resolution.reason, action: 'revise', evidence: noticeEvidence(notice) } }, current, at);
     return remember(vault, record, expectedVersion, resolution?.noticeId);
   });
   // Reaffirm, withdraw and dismiss build the next version directly from the latest one.
@@ -55,14 +60,13 @@ function installDecisions({ ipcMain, getVault, getContext, orderEvidence, clock,
   ipcMain.handle('decision-resolve-preview', async (_, { noticeId, action, reason }) => {
     if (!['reaffirm', 'withdraw', 'dismiss'].includes(action)) throw Error('Choose reaffirm, withdraw or dismiss, or revise the decision in the editor.');
     const vault = selected(), revisit = revisitFor(vault), at = now().now;
-    const notice = await revisit.decisions.lock(async () => revisit.readState().state.notices.find(item => item.id === noticeId));
+    const notice = await findNotice(revisit, noticeId);
     if (!notice || !['open', 'evidence removed'].includes(notice.status)) throw Error('This notice is no longer open. Refresh the Revisit list.');
     const current = latestOf(revisit, notice.decision.id), draft = revisit.decisions.draftFrom(current);
     if (action === 'withdraw') draft.state = 'withdrawn';
     // A time-based condition that has been reviewed is met; a changed date belongs in revise.
     else if (notice.kind === 'due') draft.conditions = draft.conditions.map(condition => condition.id === notice.condition.id ? { ...condition, state: 'met' } : condition);
-    const evidence = notice.kind === 'due' ? `review-by date ${notice.evidence.clock}` : `${notice.evidence.key} sha256 ${notice.evidence.digest}`;
-    const record = revisit.decisions.build({ ...draft, resolution: { noticeId, action, reason, evidence } }, current, at);
+    const record = revisit.decisions.build({ ...draft, resolution: { noticeId, action, reason, evidence: noticeEvidence(notice) } }, current, at);
     return remember(vault, record, current.version, noticeId);
   });
   ipcMain.handle('decision-confirm', async (_, { previewId }) => {
