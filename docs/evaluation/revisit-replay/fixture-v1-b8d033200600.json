@@ -1,0 +1,1076 @@
+{
+  "fixture": "tests/fixtures/revisit-replay/fixture-v1.json",
+  "version": 1,
+  "sha256": "213f829b2186c63324af0f40d75e3260efc7dec1fe52550c8f7a9a7351418a54",
+  "commit": "b8d033200600f66ca398c91312cf9fcf2d969e7e",
+  "dirty": false,
+  "generatedAt": "2026-11-21T09:49:09.938Z",
+  "gate": "closed",
+  "runs": [
+    {
+      "records": [
+        {
+          "step": "A1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "A2",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DA",
+              "condition": "CA1",
+              "conditionVersion": 1,
+              "evidence": "EA1",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: lexical search, recall, paraphrased",
+                "Trigger words also present: recall, lexical, search, paraphrased, queries"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EA1",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DA",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EA1",
+              "matchedVersion": 1,
+              "shared": [
+                "lexical",
+                "search"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "A3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DA",
+              "condition": "CA1",
+              "conditionVersion": 1,
+              "evidence": "EA2",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: lexical search, recall, paraphrased",
+                "Trigger words also present: recall, lexical, search, paraphrased, queries"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EA2",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DA",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EA2",
+              "matchedVersion": 1,
+              "shared": [
+                "lexical",
+                "search"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "A4",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EA3",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": []
+        },
+        {
+          "step": "A5",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DA",
+              "condition": "CA1",
+              "conditionVersion": 1,
+              "evidence": "EA4",
+              "status": "duplicate",
+              "reasons": [
+                "Cue terms matched: lexical search, recall, paraphrased",
+                "Trigger words also present: recall, lexical, search, paraphrased, queries"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EA4",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DA",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EA4",
+              "matchedVersion": 1,
+              "shared": [
+                "lexical",
+                "search"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "A6",
+          "type": "advance",
+          "notices": [
+            {
+              "decision": "DA",
+              "condition": "CA2",
+              "conditionVersion": 1,
+              "evidence": "clock:2026-12-01"
+            }
+          ],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        }
+      ],
+      "finalCandidates": [
+        {
+          "condition": "CA1",
+          "conditionVersion": 1,
+          "decision": "DA",
+          "evidence": "EA1",
+          "status": "pending"
+        },
+        {
+          "condition": "CA1",
+          "conditionVersion": 1,
+          "decision": "DA",
+          "evidence": "EA2",
+          "status": "pending"
+        },
+        {
+          "condition": "CA1",
+          "conditionVersion": 1,
+          "decision": "DA",
+          "evidence": "EA4",
+          "status": "duplicate"
+        }
+      ]
+    },
+    {
+      "records": [
+        {
+          "step": "B1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "B2",
+          "type": "edit-condition",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "B3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DB",
+              "condition": "CB1",
+              "conditionVersion": 2,
+              "evidence": "EB1",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: decoder, flac, opus",
+                "Trigger words also present: platform, decoder, files"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EB1",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DB",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EB1",
+              "matchedVersion": 1,
+              "shared": [
+                "platform",
+                "decoder"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "B4",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DB",
+              "condition": "CB1",
+              "conditionVersion": 2,
+              "evidence": "EB2",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: decoder, flac",
+                "Trigger words also present: platform, decoder"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EB2",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DB",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EB2",
+              "matchedVersion": 1,
+              "shared": [
+                "platform",
+                "decoder"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "B5",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DB",
+              "condition": "CB1",
+              "conditionVersion": 2,
+              "evidence": "EB3",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: decoder, flac, opus",
+                "Trigger words also present: decoder"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EB3",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DB",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EB3",
+              "matchedVersion": 1,
+              "shared": [
+                "decoder",
+                "flac"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "B6",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EB4",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": []
+        }
+      ],
+      "finalCandidates": [
+        {
+          "condition": "CB1",
+          "conditionVersion": 2,
+          "decision": "DB",
+          "evidence": "EB1",
+          "status": "pending"
+        },
+        {
+          "condition": "CB1",
+          "conditionVersion": 2,
+          "decision": "DB",
+          "evidence": "EB2",
+          "status": "pending"
+        },
+        {
+          "condition": "CB1",
+          "conditionVersion": 2,
+          "decision": "DB",
+          "evidence": "EB3",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "records": [
+        {
+          "step": "C1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "C2",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DC",
+              "condition": "CC1",
+              "conditionVersion": 1,
+              "evidence": "EC1",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: sqlite, corrupt",
+                "Trigger words also present: sqlite, library, database, corrupt"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EC1",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DC",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EC1",
+              "matchedVersion": 1,
+              "shared": [
+                "sqlite",
+                "library"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "C3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DC",
+              "condition": "CC1",
+              "conditionVersion": 1,
+              "evidence": "EC2",
+              "status": "duplicate",
+              "reasons": [
+                "Cue terms matched: sqlite, corrupt",
+                "Trigger words also present: sqlite, library, database, corrupt"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EC2",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DC",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EC2",
+              "matchedVersion": 1,
+              "shared": [
+                "sqlite",
+                "library"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "C4",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EC3",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DC",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EC3",
+              "matchedVersion": 1,
+              "shared": [
+                "library",
+                "file"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "C5",
+          "type": "withdraw",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "C6",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EC4",
+              "outcome": "no candidate",
+              "considered": 0
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DC",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EC4",
+              "matchedVersion": 1,
+              "shared": [
+                "corruption",
+                "database"
+              ]
+            }
+          ]
+        }
+      ],
+      "finalCandidates": [
+        {
+          "condition": "CC1",
+          "conditionVersion": 1,
+          "decision": "DC",
+          "evidence": "EC1",
+          "status": "withdrawn"
+        },
+        {
+          "condition": "CC1",
+          "conditionVersion": 1,
+          "decision": "DC",
+          "evidence": "EC2",
+          "status": "duplicate"
+        }
+      ]
+    },
+    {
+      "records": [
+        {
+          "step": "D1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "D2",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DD",
+              "condition": "CD1",
+              "conditionVersion": 1,
+              "evidence": "ED1",
+              "status": "withdrawn",
+              "reasons": [
+                "Cue terms matched: sync, conflicts",
+                "Trigger words also present: desktop, users, edits, conflicts"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "ED1",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DD",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "ED1",
+              "matchedVersion": 1,
+              "shared": [
+                "sync",
+                "desktop"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "D3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DD",
+              "condition": "CD1",
+              "conditionVersion": 1,
+              "evidence": "ED2",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: sync, conflicts",
+                "Trigger words also present: desktop, users, conflicts"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "ED2",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DD",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "ED2",
+              "matchedVersion": 1,
+              "shared": [
+                "sync",
+                "desktop"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "D4",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DD",
+              "condition": "CD1",
+              "conditionVersion": 1,
+              "evidence": "ED3",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: sync, conflicts",
+                "Trigger words also present: desktop, users, edits, conflicts"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "ED3",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DD",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "ED3",
+              "matchedVersion": 1,
+              "shared": [
+                "desktop",
+                "sync"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "D5",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DD",
+              "condition": "CD1",
+              "conditionVersion": 1,
+              "evidence": "ED4",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: sync, conflicts",
+                "Trigger words also present: desktop, edits, conflicts"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "ED4",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DD",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "ED4",
+              "matchedVersion": 1,
+              "shared": [
+                "sync",
+                "desktop"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "D6",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "ED5",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DD",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "ED5",
+              "matchedVersion": 1,
+              "shared": [
+                "desktop",
+                "losing"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "D7",
+          "type": "advance",
+          "notices": [
+            {
+              "decision": "DD",
+              "condition": "CD2",
+              "conditionVersion": 1,
+              "evidence": "clock:2026-12-10"
+            }
+          ],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        }
+      ],
+      "finalCandidates": [
+        {
+          "condition": "CD1",
+          "conditionVersion": 1,
+          "decision": "DD",
+          "evidence": "ED1",
+          "status": "withdrawn"
+        },
+        {
+          "condition": "CD1",
+          "conditionVersion": 1,
+          "decision": "DD",
+          "evidence": "ED2",
+          "status": "pending"
+        },
+        {
+          "condition": "CD1",
+          "conditionVersion": 1,
+          "decision": "DD",
+          "evidence": "ED3",
+          "status": "pending"
+        },
+        {
+          "condition": "CD1",
+          "conditionVersion": 1,
+          "decision": "DD",
+          "evidence": "ED4",
+          "status": "pending"
+        }
+      ]
+    },
+    {
+      "records": [
+        {
+          "step": "E1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "E2",
+          "type": "edit-condition",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "E3",
+          "type": "advance",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "E4",
+          "type": "advance",
+          "notices": [
+            {
+              "decision": "DE",
+              "condition": "CE2",
+              "conditionVersion": 1,
+              "evidence": "clock:2026-11-30"
+            }
+          ],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "E5",
+          "type": "advance",
+          "notices": [
+            {
+              "decision": "DE",
+              "condition": "CE1",
+              "conditionVersion": 2,
+              "evidence": "clock:2026-12-15"
+            }
+          ],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        }
+      ],
+      "finalCandidates": []
+    },
+    {
+      "records": [
+        {
+          "step": "F1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "F2",
+          "type": "edit-condition",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "F3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DF",
+              "condition": "CF1",
+              "conditionVersion": 2,
+              "evidence": "EF1",
+              "status": "pending",
+              "reasons": [
+                "Cue terms matched: skip rate, shuffle",
+                "Trigger words also present: history, ranked, shuffle"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EF1",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DF",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EF1",
+              "matchedVersion": 1,
+              "shared": [
+                "history",
+                "shuffle"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "F4",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [
+            {
+              "decision": "DF",
+              "condition": "CF1",
+              "conditionVersion": 2,
+              "evidence": "EF2",
+              "status": "withdrawn",
+              "reasons": [
+                "Cue terms matched: skip rate, shuffle",
+                "Trigger words also present: history, ranked, shuffle"
+              ]
+            }
+          ],
+          "events": [
+            {
+              "evidence": "EF2",
+              "outcome": "candidates",
+              "considered": 1
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DF",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EF2",
+              "matchedVersion": 1,
+              "shared": [
+                "history",
+                "shuffle"
+              ]
+            }
+          ]
+        },
+        {
+          "step": "F5",
+          "type": "withdraw",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "F6",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EF3",
+              "outcome": "no candidate",
+              "considered": 0
+            }
+          ],
+          "baseline": [
+            {
+              "decision": "DF",
+              "condition": null,
+              "conditionVersion": null,
+              "evidence": "EF3",
+              "matchedVersion": 1,
+              "shared": [
+                "history",
+                "shuffle"
+              ]
+            }
+          ]
+        }
+      ],
+      "finalCandidates": [
+        {
+          "condition": "CF1",
+          "conditionVersion": 2,
+          "decision": "DF",
+          "evidence": "EF1",
+          "status": "withdrawn"
+        },
+        {
+          "condition": "CF1",
+          "conditionVersion": 2,
+          "decision": "DF",
+          "evidence": "EF2",
+          "status": "withdrawn"
+        }
+      ]
+    },
+    {
+      "records": [
+        {
+          "step": "N1-1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "N1-2",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EN1",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": []
+        },
+        {
+          "step": "N1-3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EN2",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": []
+        },
+        {
+          "step": "N1-4",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EN3",
+              "outcome": "no candidate",
+              "considered": 1
+            }
+          ],
+          "baseline": []
+        },
+        {
+          "step": "N1-5",
+          "type": "advance",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        }
+      ],
+      "finalCandidates": []
+    },
+    {
+      "records": [
+        {
+          "step": "N2-1",
+          "type": "decision",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        },
+        {
+          "step": "N2-2",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EN4",
+              "outcome": "no candidate",
+              "considered": 0
+            }
+          ],
+          "baseline": []
+        },
+        {
+          "step": "N2-3",
+          "type": "evidence",
+          "notices": [],
+          "candidates": [],
+          "events": [
+            {
+              "evidence": "EN5",
+              "outcome": "no candidate",
+              "considered": 0
+            }
+          ],
+          "baseline": []
+        },
+        {
+          "step": "N2-4",
+          "type": "advance",
+          "notices": [],
+          "candidates": [],
+          "events": [],
+          "baseline": []
+        }
+      ],
+      "finalCandidates": []
+    }
+  ]
+}
