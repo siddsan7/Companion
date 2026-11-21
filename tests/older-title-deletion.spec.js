@@ -385,7 +385,7 @@ test('normal A-title B-title C intake deletion proves both older admission group
   await expect(preview).toBeHidden(); expect(await files(state.base)).toEqual(before);
   await page.getByRole('button', { name: 'Delete capture', exact: true }).click();
   await preview.getByRole('button', { name: 'Confirm capture deletion', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Capture deleted');
+  await expect(page.getByRole('status')).toContainText('Capture deleted', { timeout: 20000 }); // measured 4.2-5.4 s on Windows
   const deleted = JSON.parse(await fs.readFile(state.ledgerFile, 'utf8')), authority = deleted.sourceAuthority[state.captureA.id];
   const proofs = [
     { before: relative(adjacentA), after: relative(state.terminalA), snapshot: relative(snapshotA), revisionId: state.revisionA, sourceGeneration: Object.values(completed.attempts).find(item => item.revision === state.revisionA).sourceGeneration || null },

@@ -16,9 +16,14 @@ concurrency:
 
 jobs:
   checks:
-    name: Windows checks
+    # The desktop suite outgrew one 45-minute job, so it runs in four shards.
+    name: Windows checks (${{ matrix.shard }}/4)
     runs-on: windows-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     defaults:
       run:
         shell: pwsh
@@ -40,4 +45,9 @@ jobs:
         run: npm.cmd run prepare:electron
       # Tests use disposable roots and controlled provider/OS fixtures, not live readiness gates.
       - name: Test desktop workflows
-        run: npm.cmd test
+        # The runner's default TEMP is an 8.3 short path (C:\Users\RUNNER~1\...). Its real
+        # path differs, so the app's alias guards correctly refuse test roots made there.
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: npm.cmd test -- --shard=${{ matrix.shard }}/4
