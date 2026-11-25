@@ -80,6 +80,14 @@ class Schedule {
     }
     return (await this.snapshot(guard))?.state || null;
   }
+  async removeInstalledTask() {
+    try { await fs.lstat(path.dirname(this.file)); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    await this.change(async guard => {
+      const current = await this.snapshot(guard);
+      if (current) await this.tasks.apply('uninstall', current.state, this.file);
+    });
+  }
   async assertConfiguration(settingsPath) {
     const file = await optionalExact(settingsPath, this.directoryGuard());
     let selected;

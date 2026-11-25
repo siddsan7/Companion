@@ -10,6 +10,7 @@ class TaskScheduler {
   constructor({ testRoot, executable = process.execPath, appPath = path.resolve(__dirname, '..'), packaged = false } = {}) { Object.assign(this, { testRoot, executable, appPath, packaged }); }
   request(operation, state, file) {
     const args = [...(this.packaged ? [] : [this.appPath]), '--intake-worker', '--schedule-file', file];
+    if (this.packaged) args.push('--user-data-dir=' + path.dirname(file));
     if (state.launchBinding === 1) args.push('--schedule-id', state.id);
     // Task Scheduler truncates subsecond boundaries. Round upward so its
     // launch cannot precede the exact application deadline. Preserve the anchor.

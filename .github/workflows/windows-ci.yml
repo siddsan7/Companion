@@ -15,6 +15,35 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  installer:
+    name: Windows installer lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm.cmd ci
+      - run: npm.cmd run prepare:electron
+      - name: Prepare pinned WiX compiler
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist
+          Invoke-WebRequest 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile dist/wix.zip
+          if ((Get-FileHash dist/wix.zip).Hash -ne '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31') { throw 'WiX archive digest differs.' }
+          Expand-Archive dist/wix.zip dist/wix
+      - run: npm.cmd run package:windows
+      - run: npm.cmd run package:windows -- 0.0.9
+      - name: Install, launch, upgrade and uninstall
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: npm.cmd run test:installer
+
   checks:
     # The desktop suite outgrew one 45-minute job, so it runs in four shards.
     name: Windows checks (${{ matrix.shard }}/4)
