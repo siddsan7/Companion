@@ -39,20 +39,28 @@ input.on('line', line => {
   if (method === 'skills/list') result = { data: [{ cwd: process.cwd(), errors: [], skills: [] }] };
   if (method === 'mcpServerStatus/list') result = { data: [], nextCursor: null };
   if (method === 'command/exec') {
+    if (scenario.accountUpdateDuringProbe) notify('account/updated', { authMode: 'chatgpt' });
     const file = params.command.at(-1);
     // Real unrestricted child-process reads emulate a broken sandbox. The production gate must detect it.
     result = scenario.isolation === 'denied' && !file.includes('positive-') ? { exitCode: 73, stdout: 'COMPANION_OS_DENIED', stderr: '' } : { exitCode: 0, stdout: fs.readFileSync(file, 'utf8'), stderr: '' };
   }
-  if (method === 'thread/start') result = { cwd: process.cwd(), runtimeWorkspaceRoots: [process.cwd()], approvalPolicy: 'never', activePermissionProfile: { id: 'companion-context' }, instructionSources: [], model: scenario.model || 'fixture', thread: { id: `fixture-thread-${process.pid}-${++sequence}` }, ...(scenario.modelProvider === undefined ? {} : { modelProvider: scenario.modelProvider }), ...(scenario.reasoningEffort === undefined ? {} : { reasoningEffort: scenario.reasoningEffort }), ...(scenario.serviceTier === undefined ? {} : { serviceTier: scenario.serviceTier }) };
+  if (method === 'thread/start') result = { cwd: process.cwd(), runtimeWorkspaceRoots: [process.cwd()], approvalPolicy: 'never', activePermissionProfile: { id: 'companion-context' }, instructionSources: [], model: scenario.model || (conversation ? 'fixture' : 'gpt-6.2-sol'), ...(conversation ? {} : { modelProvider: 'openai' }), thread: { id: `fixture-thread-${process.pid}-${++sequence}` }, ...(scenario.modelProvider === undefined ? {} : { modelProvider: scenario.modelProvider }), ...(scenario.reasoningEffort === undefined ? {} : { reasoningEffort: scenario.reasoningEffort }), ...(scenario.serviceTier === undefined ? {} : { serviceTier: scenario.serviceTier }) };
   if (method === 'turn/start') {
     if (conversation) fs.appendFileSync(path.join(root, 'conversation-submissions.jsonl'), JSON.stringify({ threadId: params.threadId, text: params.input[0].text }) + '\n');
     if (scenario.turn === 'exit-before-ack') { process.exit(23); return; }
     active = { threadId: params.threadId, turnId: `fixture-turn-${sequence}` }; result = { turn: turn('inProgress') };
   }
   if (method === 'turn/interrupt') setTimeout(() => notify('turn/completed', { threadId: active.threadId, turn: turn('interrupted') }), 30);
+  if (method === 'thread/start' && scenario.accountUpdateAtThreadStart) notify('account/updated', { authMode: 'chatgpt' });
   send({ id, result });
   if (method === 'turn/start') notify('turn/started', { threadId: active.threadId, turn: turn('inProgress') });
   if (method === 'turn/start') setTimeout(() => {
+    if (scenario.requestUserInput) {
+      send({ id: 'fixture-input-request', method: 'item/tool/requestUserInput', params: {
+        ...active, itemId: 'fixture-input', questions: [{ id: 'private', header: 'Fixture', question: 'UNREVIEWED_INPUT_QUESTION', options: null, isOther: false, isSecret: false }]
+      } });
+      return;
+    }
     const messages = conversation && scenario.messages || [{ text: conversation ? scenario.reply || 'Authored synthetic response.' : scenario.turn === 'pending' ? 'Incomplete fixture reply 🎸' : 'Companion context received.', phase: null }];
     const completedItems = [];
     messages.forEach((message, index) => {

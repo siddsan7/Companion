@@ -46,13 +46,18 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
   const rpc = setup.rpc;
   const started = await rpc.request('thread/start', { cwd: setup.work, runtimeWorkspaceRoots: [setup.work], permissions: PROFILE, approvalPolicy: 'never', ephemeral: true, environments: [], selectedCapabilityRoots: [], dynamicTools: [], baseInstructions: INSTRUCTIONS, developerInstructions: '',
     ...(comparisonPin ? { model: comparisonPin.model, modelProvider: comparisonPin.modelProvider, serviceTier: comparisonPin.serviceTier, config: { model_reasoning_effort: comparisonPin.reasoningEffort } } : {}) });
-  if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !Array.isArray(started.runtimeWorkspaceRoots) || started.runtimeWorkspaceRoots.length !== 1 || !samePath(started.runtimeWorkspaceRoots[0], setup.work) || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
+  // Codex 0.170 returns an empty root list when the only requested root is cwd.
+  const roots = started.runtimeWorkspaceRoots;
+  const rootsMatch = Array.isArray(roots) && roots.length <= 1 && roots.every(root => samePath(root, setup.work));
+  if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !rootsMatch || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
+  if (setup.policy && (started.model !== setup.policy.model || started.modelProvider !== setup.policy.model_provider)) throw Error('Codex selected a different model or provider. Check setup again.');
   const threadId = started.thread?.id;
   if (typeof threadId !== 'string' || !threadId.trim() || setup.threads.has(threadId)) throw Error('Codex did not create a fresh thread.');
   setup.threads.add(threadId);
   setup.state.reply = ''; setup.state.turnActive = true; setup.state.status = 'running';
   const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null, usage: null, usageEvidence: USAGE_UNAVAILABLE };
-  if (comparisonPin) record.effective = { model: typeof started.model === 'string' ? started.model : null, modelProvider: typeof started.modelProvider === 'string' ? started.modelProvider : null, reasoningEffort: typeof started.reasoningEffort === 'string' ? started.reasoningEffort : null, serviceTier: typeof started.serviceTier === 'string' ? started.serviceTier : null };
+  const effective = Object.fromEntries(['model', 'modelProvider', 'reasoningEffort', 'serviceTier'].map(key => [key, typeof started[key] === 'string' && started[key].trim() ? started[key] : null]));
+  if (comparisonPin || Object.values(effective).every(Boolean)) record.effective = effective;
   setup.turnHistory.push(record);
   let turnId, terminal, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
   const messages = new Map();
