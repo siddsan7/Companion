@@ -13,7 +13,7 @@ function buildPackage({ decision, condition, candidate, history }) {
   const passages = candidate.passages.map((p, index) => [
     `Passage ${index + 1}, lines ${p.start}-${p.end}:`, '<<<', p.text, '>>>'
   ].join('\n')).join('\n\n');
-  const earlier = history.length ? history.map(item => `- ${item.at}: ${item.outcome}. ${item.reason}`).join('\n') : 'None.';
+  const earlier = history.length ? history.map(item => `- ${item.at}: ${item.outcome}. Earlier matched passage (untrusted): ${item.passage}`).join('\n') : 'None.';
   return [
     'Companion revisit gate.',
     'Decide whether the evidence below meets the revisit condition. Relevance alone is not enough: answer "meets" only if the evidence actually satisfies the trigger. If the same point was already raised in an earlier outcome, answer "does not meet".',
@@ -72,12 +72,12 @@ class ControlledGate {
     if (mode === 'automatic' && !fixture.workerIsolation) return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
     return { open: true, rule: fixture.rule === 'match' ? 'match' : null };
   }
-  async send(text, mode, status, beforeStart) {
+  async send(text, mode, status, beforeStart, passages) {
     const fixture = await this.fixture();
     if (!fixture?.chatReady || (mode === 'automatic' && !fixture.workerIsolation)) throw Error('Revisit gate unavailable. Candidates stay pending.');
     (await beforeStart())();
     await fs.appendFile(path.join(this.testRoot, 'revisit-gate-requests.jsonl'), JSON.stringify({ at: Date.now(), mode, text }) + '\n');
-    const rule = (fixture?.replies || []).find(item => !item.contains || text.includes(item.contains)) || {};
+    const rule = (fixture?.replies || []).find(item => !item.contains || passages.some(passage => passage.text.includes(item.contains))) || {};
     if (rule.fail) throw Error(rule.fail === 'usage-limit' ? 'Codex usage limit reached.' : rule.fail === 'offline' ? 'Codex is offline.' : `Gate request failed: ${rule.fail}`);
     const reply = typeof rule.reply === 'string' ? rule.reply : JSON.stringify(rule.reply || { outcome: 'cannot tell', reason: 'No controlled reply matched.', quote: '' });
     return { reply, model: 'controlled-fixture', usage: null, evidence: 'controlled-fixture-not-live' };
