@@ -29,6 +29,7 @@ function evidenceId(item) {
 const sameAdmission = (a, b) => sameEvidence(a, b) && a.revisionId === b.revisionId;
 const conditionId = condition => `${condition.id}@${condition.version}`;
 const open = status => ['pending', 'sending', 'held', 'held-oversize'].includes(status);
+const removedNoticeCandidates = state => new Set(state.notices.filter(notice => notice.removedAt || notice.status === 'evidence removed').map(notice => notice.candidateId));
 // Gate runs in progress in this process. A request owned by one of them, or by another
 // live process, is still in flight and must not be settled as interrupted.
 const activeRuns = new Set();
@@ -139,8 +140,9 @@ class Revisit {
   // D49-I02: removed evidence withdraws open candidates and marks unresolved notices.
   markRemoved(state, sources, now) {
     const unavailable = evidence => !sources.has(evidence.key) || !sameGenerations(evidence, sources.get(evidence.key));
-    for (const candidate of state.candidates) if (open(candidate.status) && unavailable(candidate.evidence)) {
-      Object.assign(candidate, { status: 'withdrawn', withdrawnReason: 'Evidence removed, rejected or deleted.', withdrawnAt: now });
+    for (const candidate of state.candidates) if (unavailable(candidate.evidence)) {
+      if (candidate.outcome) candidate.sourceRemovedAt ||= now;
+      if (open(candidate.status)) Object.assign(candidate, { status: 'withdrawn', withdrawnReason: 'Evidence removed, rejected or deleted.', withdrawnAt: now });
     }
     for (const notice of state.notices) if (notice.kind === 'evidence' && notice.status === 'open' && unavailable(notice.evidence)) {
       Object.assign(notice, { status: 'evidence removed', removedAt: now });
@@ -158,18 +160,29 @@ class Revisit {
   match(state, ledger, items, now, trigger) {
     const conditions = ledger.decisions.flatMap(activeConditions).filter(({ condition }) => condition.kind === 'evidence');
     const current = new Set(conditions.map(({ condition }) => conditionId(condition)));
-    const eligible = new Set(items.map(evidenceId)), prior = new Map();
+    const sources = new Map(items.map(item => [item.key, item]));
+    const prior = new Map(), judged = new Map();
+    const removed = removedNoticeCandidates(state);
+    const repeatFor = (key, sourceKey) => prior.get(key) || judged.get(key + '/' + sourceKey);
     for (const candidate of state.candidates) {
-      if (!current.has(conditionId(candidate.condition)) || !eligible.has(evidenceId(candidate.evidence)) || candidate.historyWithdrawnAt) continue;
+      const source = sources.get(candidate.evidence.key);
+      if (!current.has(conditionId(candidate.condition)) || !source || candidate.sourceRemovedAt || removed.has(candidate.id) || !sameGenerations(source, candidate.evidence)) continue;
+      const exact = sameAdmission(source, candidate.evidence);
+      if (!exact && !candidate.outcome) continue;
       const legacy = !candidate.fingerprint.startsWith('v2:');
       if (legacy) candidate.fingerprint = fingerprint(candidate.passages);
       const key = conditionId(candidate.condition) + '/' + candidate.fingerprint;
+      // A verdict can suppress the same point in a later edit of this source.
+      // Only its local id is reused. Prompt history still requires the exact admission.
+      if (outcomes.includes(candidate.outcome) && candidate.status !== 'withdrawn') judged.set(key + '/' + source.key, candidate.id);
+      if (!exact || candidate.historyWithdrawnAt) continue;
       if (legacy && candidate.status === 'duplicate') {
-        const repeat = prior.get(key);
-        if (repeat) candidate.duplicateOf = repeat.id;
+        const repeat = repeatFor(key, source.key);
+        if (repeat) candidate.duplicateOf = repeat;
         else { candidate.status = 'pending'; delete candidate.duplicateOf; }
       }
-      if (!['withdrawn', 'duplicate'].includes(candidate.status) && !prior.has(key)) prior.set(key, candidate);
+      if (candidate.status === 'duplicate' && judged.get(key + '/' + source.key) === candidate.duplicateOf) prior.set(key, candidate.duplicateOf);
+      if (!['withdrawn', 'duplicate'].includes(candidate.status) && !prior.has(key)) prior.set(key, candidate.id);
     }
     for (const item of items) {
       const id = evidenceId(item);
@@ -181,17 +194,17 @@ class Revisit {
       for (const { decision, condition, found } of ranked) {
         const print = fingerprint(found.passages);
         const key = conditionId(condition) + '/' + print;
-        const repeat = prior.get(key);
+        const repeat = repeatFor(key, item.key);
         const candidate = {
           id: randomUUID(), createdAt: now, eventId: event.id,
           decision: { id: decision.decision_id, version: decision.version, title: decision.title },
           condition: { id: condition.id, version: condition.version, label: condition.label, trigger: condition.trigger, action: condition.action },
           evidence: { ...evidence, provenance: item.provenance },
           passages: found.passages, reasons: found.reasons, fingerprint: print, attempts: [],
-          status: repeat ? 'duplicate' : 'pending', ...(repeat ? { duplicateOf: repeat.id } : {})
+          status: repeat ? 'duplicate' : 'pending', ...(repeat ? { duplicateOf: repeat } : {})
         };
         state.candidates.push(candidate); event.candidates.push(candidate.id);
-        if (!repeat) prior.set(key, candidate);
+        prior.set(key, repeat || candidate.id);
       }
       event.outcome = event.candidates.length ? 'candidates' : 'no candidate';
       state.events.push(event);
@@ -213,7 +226,7 @@ class Revisit {
     }
   }
   history(state, condition) {
-    const removed = new Set(state.notices.filter(notice => notice.removedAt || notice.status === 'evidence removed').map(notice => notice.candidateId));
+    const removed = removedNoticeCandidates(state);
     return state.candidates.filter(other => conditionId(other.condition) === conditionId(condition) && outcomes.includes(other.outcome)
       && other.status !== 'withdrawn' && !other.historyWithdrawnAt && !removed.has(other.id))
       .map(other => ({ at: other.decidedAt, outcome: other.outcome, evidence: other.evidence, passage: other.passages[0]?.text || '' }));

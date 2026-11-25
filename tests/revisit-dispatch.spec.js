@@ -106,6 +106,29 @@ test('opposite threshold operators remain distinct, including cached duplicates 
   expect(f.inputs).toHaveLength(2);
 });
 
+test('unrelated edits preserve the local duplicate marker without admitting stale history, while a changed threshold gets a new judgment', async ({}, info) => {
+  const f = await fixture(info), file = await f.capture('Threshold < 5');
+  await f.check();
+  const [original] = f.state().candidates;
+  await fs.appendFile(file, '\nAn unrelated editorial note.\n');
+  await f.check();
+  await f.check();
+  const edited = f.state().candidates.at(-1);
+  expect(edited.evidence.digest).not.toBe(original.evidence.digest);
+  expect(edited).toMatchObject({ status: 'duplicate', duplicateOf: original.id, fingerprint: original.fingerprint });
+  await f.capture('Threshold < 5'); await f.check();
+  expect(f.state().candidates.at(-1)).toMatchObject({ status: 'duplicate', duplicateOf: original.id });
+  expect(f.inputs).toHaveLength(1);
+  expect(f.state().notices).toHaveLength(1);
+  const text = await fs.readFile(file, 'utf8');
+  await fs.writeFile(file, text.replaceAll('Threshold < 5', 'Threshold > 5'));
+  await f.check();
+  expect(f.inputs).toHaveLength(2);
+  expect(f.inputs[1]).toContain('Threshold > 5');
+  expect(f.inputs[1]).not.toMatch(/Threshold < 5|CANARY-REASON|Earlier matched passage/);
+  expect(f.state().notices).toHaveLength(2);
+});
+
 test('same-byte manual restoration cannot revive a prior verdict or a current reviewed package', async ({}, info) => {
   const f = await fixture(info), file = await f.capture('Threshold original reading.');
   const backup = info.outputPath('manual-backup.md');
@@ -177,7 +200,8 @@ test('withdrawal after submission retains reply and usage locally and suppresses
   expect(candidate.attempts[0].reply).toContain('CANARY-REASON');
   expect(f.state().notices).toHaveLength(0);
   f.gate.afterSend = undefined;
-  await f.capture('Threshold new observation.'); await f.check();
-  expect(f.inputs[1]).not.toMatch(/CANARY/);
+  await f.capture('Threshold CANARY-SOURCE was measured.'); await f.check();
+  expect(f.inputs).toHaveLength(2);
+  expect(f.inputs[1]).not.toMatch(/CANARY-REASON|Earlier matched passage/);
   expect(f.state().notices).toHaveLength(1);
 });
