@@ -47,6 +47,37 @@ function inFlight(owner) {
 }
 const processStarted = Math.round(Date.now() - process.uptime() * 1000);
 
+function recordedPassageFingerprint(candidate) {
+  const passages = candidate.passages;
+  if (!Array.isArray(passages) || !passages.length || passages.some(p => typeof p?.text !== 'string')) return null;
+  return fingerprint(passages);
+}
+
+// Older duplicates recorded a representative ID, including before it had answered.
+// Recover a local marker only from unique retained records with the same exact point.
+function recoverDuplicateJudgment(peer, source, condition, records) {
+  if (records.get(peer.id) !== peer || !peer.duplicateOf) return null;
+  if (recordedPassageFingerprint(peer) !== peer.fingerprint) return null;
+  const matched = matchCondition(condition, source);
+  if (!matched?.passages.length || fingerprint(matched.passages) !== peer.fingerprint) return null;
+  const visited = new Set([peer.id]);
+  let id = peer.duplicateOf;
+  while (id && !visited.has(id)) {
+    visited.add(id);
+    const original = records.get(id);
+    if (!original || original.decision?.id !== peer.decision.id || !original.condition ||
+        conditionId(original.condition) !== conditionId(condition) || !original.evidence ||
+        (original.evidence.key === source.key && !sameGenerations(original.evidence, source)) ||
+        recordedPassageFingerprint(original) !== peer.fingerprint ||
+        (original.fingerprint?.startsWith('v2:') && original.fingerprint !== peer.fingerprint)) return null;
+    if (original.status === 'duplicate') { id = original.duplicateOf; continue; }
+    if (!outcomes.includes(original.outcome) || original.status !== original.outcome || !Array.isArray(original.attempts)) return null;
+    const answers = original.attempts.filter(attempt => attempt?.status === 'answered');
+    return answers.length === 1 && !answers[0].suppressed && answers[0].outcome === original.outcome ? original.id : null;
+  }
+  return null;
+}
+
 function localDate(instant, timezone) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: timezone || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(instant));
 }
@@ -190,17 +221,24 @@ class Revisit {
   // contributes only a judgment ID, and only through an eligible match of the same
   // source generation. Its text and verdict are never admitted to prompt history here.
   selectRepresentatives(state, conditions, items) {
-    const current = new Set(conditions.map(({ condition }) => conditionId(condition)));
+    const current = new Map(conditions.map(entry => [conditionId(entry.condition), entry]));
+    const records = new Map();
+    for (const candidate of state.candidates) records.set(candidate.id, records.has(candidate.id) ? null : candidate);
     const sources = new Map(items.map(item => [item.key, item])), removed = removedNoticeCandidates(state);
     const groups = new Map();
     for (const candidate of state.candidates) {
       const source = sources.get(candidate.evidence.key);
-      if (!source || !current.has(conditionId(candidate.condition)) || candidate.status === 'withdrawn' ||
+      const entry = current.get(conditionId(candidate.condition));
+      if (!source || !entry || entry.decision.decision_id !== candidate.decision.id || candidate.status === 'withdrawn' ||
           candidate.sourceRemovedAt || removed.has(candidate.id) || !sameGenerations(source, candidate.evidence)) continue;
       const exact = sameAdmission(source, candidate.evidence);
+      if (!candidate.fingerprint.startsWith('v2:')) candidate.fingerprint = fingerprint(candidate.passages);
+      if (candidate.status === 'duplicate' && !candidate.judgedBy) {
+        const recovered = recoverDuplicateJudgment(candidate, source, entry.condition, records);
+        if (recovered) candidate.judgedBy = recovered;
+      }
       const judgmentId = outcomes.includes(candidate.outcome) ? candidate.id : candidate.judgedBy;
       if (!exact && !judgmentId) continue;
-      if (!candidate.fingerprint.startsWith('v2:')) candidate.fingerprint = fingerprint(candidate.passages);
       const key = conditionId(candidate.condition) + '/' + candidate.fingerprint;
       if (!groups.has(key)) groups.set(key, { members: [], judgments: new Map() });
       const group = groups.get(key);

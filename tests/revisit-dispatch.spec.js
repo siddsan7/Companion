@@ -1,6 +1,8 @@
 const { test, expect } = require('@playwright/test');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { createHash } = require('node:crypto');
+const { normalize } = require('../app/revisit-match');
 const { Vault } = require('../app/vault');
 const { Context } = require('../app/context');
 const { Revisit } = require('../app/revisit');
@@ -141,6 +143,96 @@ test('a surviving peer retains completed local judgment coverage until its own s
   expect(f.inputs[1]).not.toMatch(/Earlier matched passage|CANARY-REASON/);
   expect(f.state().notices).toHaveLength(2);
 });
+
+// Main used word-normalized hashes. The next writer retained operators but still
+// stored only duplicateOf. Neither writer recorded whether its representative answered.
+async function legacyDuplicate(info, writer, alter = () => {}) {
+  const f = await fixture(info);
+  const file = await f.capture('Threshold < 5');
+  await f.check();
+  const survivingFile = await f.capture('Threshold < 5');
+  await f.check();
+  await fs.unlink(file);
+  await f.revisit.decisions.lock(async () => {
+    const { state, proof } = f.revisit.readState();
+    const [original, peer] = state.candidates;
+    delete peer.judgedBy;
+    if (writer === 'main') {
+      for (const c of state.candidates) {
+        c.fingerprint = createHash('sha256').update(c.passages.map(p => normalize(p.text)).join('\n')).digest('hex');
+        delete c.evidence.sourceGenerations;
+      }
+    }
+    alter(state, original, peer);
+    await f.revisit.writeState(state, proof);
+  });
+  return { ...f, survivingFile };
+}
+
+for (const writer of ['main', '7beacf7']) {
+  test(`upgrade preserves a surviving duplicate's completed judgment from ${writer} after original removal`, async ({}, info) => {
+    const f = await legacyDuplicate(info, writer);
+    const [original, peer] = f.state().candidates;
+    expect(peer.duplicateOf).toBe(original.id);
+    expect(peer.judgedBy).toBeUndefined();
+    await f.check(); await f.check();
+    expect(f.inputs).toHaveLength(1);
+    expect(f.state().notices).toHaveLength(1);
+    expect(f.state().notices[0].status).toBe('evidence removed');
+    const survivor = f.state().candidates.find(c => c.id === peer.id);
+    expect(survivor).toMatchObject({ status: 'duplicate', judgedBy: original.id, attempts: [] });
+    expect(survivor.outcome).toBeUndefined();
+    await fs.appendFile(f.survivingFile, '\nUnrelated editorial note.\n');
+    await f.check();
+    expect(f.inputs).toHaveLength(1);
+    await f.capture('Threshold > 5'); await f.check(); await f.check();
+    expect(f.inputs).toHaveLength(2);
+    expect(f.inputs[1]).not.toMatch(/Earlier matched passage|CANARY-REASON|Threshold < 5/);
+    expect(f.state().notices).toHaveLength(2);
+  });
+}
+
+test('upgrade cannot transfer a historical duplicate marker to a restored peer generation', async ({}, info) => {
+  const f = await legacyDuplicate(info, 'main');
+  const peer = f.state().candidates[1], id = peer.evidence.key.slice('capture:'.length);
+  const backup = info.outputPath('peer-backup.md');
+  await fs.copyFile(f.survivingFile, backup);
+  await restore(f.vault, info, { id, file: backup });
+  await f.check(); await f.check();
+  const fresh = f.state().candidates.at(-1);
+  expect(fresh.evidence.sourceGenerations[0].captureId).toBe(id);
+  expect(fresh.evidence.digest).toBe(peer.evidence.digest);
+  expect(fresh.id).not.toBe(peer.id);
+  expect(fresh.status).toBe('meets');
+  expect(fresh.judgedBy).toBeUndefined();
+  expect(f.inputs).toHaveLength(2);
+  expect(f.inputs[1]).not.toMatch(/Earlier matched passage|CANARY-REASON/);
+});
+
+const unproven = [
+  ['missing retained passage', (_state, original) => { delete original.passages; }],
+  ['missing answered receipt', (_state, original) => { original.attempts = []; }],
+  ['missing representative', (_state, _original, peer) => { peer.duplicateOf = 'absent'; }],
+  ['pending representative', (_state, original) => { original.status = 'pending'; delete original.outcome; original.attempts = []; }],
+  ['ambiguous representative ID', (state, original) => { state.candidates.push(structuredClone(original)); }],
+  ['conflicting answered receipts', (_state, original) => { original.attempts.push({ status: 'answered', outcome: 'does not meet' }); }],
+  ['suppressed answer', (_state, original) => { original.attempts[0].suppressed = true; }],
+  ['different condition version', (_state, original) => { original.condition.version++; }],
+  ['opposite historical threshold', (_state, original) => { original.passages = original.passages.map(p => ({ ...p, text: p.text.replace('<', '>') })); }],
+  ['circular duplicate', (_state, _original, peer) => { peer.duplicateOf = peer.id; }]
+];
+for (const [label, alter] of unproven) {
+  test(`upgrade requires verifiable duplicate coverage: ${label}`, async ({}, info) => {
+    const f = await legacyDuplicate(info, 'main', alter);
+    await f.check(); await f.check();
+    const peer = f.state().candidates[1];
+    expect(peer.status).toBe('meets');
+    expect(peer.judgedBy).toBeUndefined();
+    expect(f.inputs).toHaveLength(2);
+    expect(f.inputs[1]).not.toMatch(/Earlier matched passage|CANARY-REASON/);
+    expect(f.state().notices.filter(n => n.candidateId === peer.id)).toHaveLength(1);
+  });
+}
 
 test('a later identical copy cannot bypass a held representative’s retry budget', async ({}, info) => {
   const f = await fixture(info);
