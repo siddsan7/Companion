@@ -318,6 +318,8 @@ test('duplicate annotations preserve both copies and pause relationship repair u
   await page.getByLabel('New annotation').fill('Canonical annotation writing.');
   await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Annotation saved');
+  expect(await page.getByLabel('Source inspection').locator('pre').allTextContents()).toEqual(
+    expect.arrayContaining([expect.stringContaining('Canonical annotation writing.')]));
   const base = path.join(root, 'vault', 'Companion'), folder = path.join(base, 'Annotations');
   const name = (await fs.readdir(folder)).find(x => x.endsWith('.md')), original = path.join(folder, name);
   const before = await fs.readFile(original, 'utf8'), copy = path.join(root, 'vault', 'Projects', 'Copied annotation.md');
@@ -348,6 +350,108 @@ test('duplicate annotations preserve both copies and pause relationship repair u
   await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
   expect(await fs.readFile(copy, 'utf8')).toBe(copied + '\nLater duplicate change.\n');
 });
+
+for (const [boundary, selectOriginal] of [
+  ['annotation scan', false], ['link intent', false], ['backup link', true],
+  ['withdrawal', false], ['withdrawal', true], ['stage proof', true], ['live stage proof', false],
+  ['stage cleanup', true], ['replaced stage cleanup', false]
+]) {
+  test(`relationship repair preserves a duplicate created after the ${boundary} and repairs the selected ${selectOriginal ? 'original' : 'copy'}`, async () => {
+    const { Vault } = require('../app/vault'), { Intake } = require('../app/intake');
+    const directory = path.join(root, 'vault'), producer = path.dirname(await artifact());
+    await fs.mkdir(directory);
+    const now = '2026-11-08T06:59:00Z';
+    const vault = new Vault(await fs.realpath(directory), 'Companion', { checkpoint: async name => {
+      if (boundary === 'link intent' && name === 'link-intent-published') await createCopy();
+    } });
+    await vault.setup();
+    const intake = new Intake(vault), connected = await intake.connect(producer, true, now);
+    const capture = connected.captures[sha], id = require('node:crypto').randomUUID();
+    await intake.addAnnotation({ id, captureId: capture.id, text: 'Independent writing.' }, now);
+    const original = path.join(vault.root, 'Annotations', id + '.md'), before = await fs.readFile(original, 'utf8');
+    const copy = path.join(directory, 'Copy.md'), copied = before + '\nWriting in the copy.\n';
+    const moved = path.join(directory, 'Moved.md');
+    let created = false;
+    async function createCopy() {
+      if (created) return;
+      await fs.writeFile(copy, copied, { flag: 'wx' });
+      created = true;
+    }
+    if (boundary === 'annotation scan') {
+      const annotations = intake.annotations.bind(intake);
+      intake.annotations = async (...args) => {
+        const snapshot = await annotations(...args);
+        if (!created) {
+          await createCopy();
+          await fs.rename(intake.destination(capture), moved);
+        }
+        return snapshot;
+      };
+    } else await fs.rename(intake.destination(capture), moved);
+    const native = require('node:fs');
+    let independentStage;
+    if (!['annotation scan', 'link intent'].includes(boundary)) {
+      const method = { 'backup link': 'linkSync', withdrawal: 'unlinkSync' }[boundary] || 'renameSync';
+      const operation = native[method], stop = Error('Interrupted relationship repair');
+      native[method] = (...args) => {
+        const result = operation(...args);
+        const hit = method === 'renameSync' ? args[1] === path.join(intake.dir, 'link-intent.json') :
+          args[0] === original && (method === 'unlinkSync' || args[1].endsWith('.before.md'));
+        if (!hit) return result;
+        if (boundary !== 'live stage proof') throw stop;
+        native.writeFileSync(copy, copied, { flag: 'wx' });
+        created = true;
+        return result;
+      };
+      try {
+        if (boundary === 'live stage proof') await intake.reconcile({ now });
+        else await expect(intake.reconcile({ now })).rejects.toThrow(stop.message);
+      } finally { native[method] = operation; }
+      if (!created) {
+        const intent = JSON.parse(await fs.readFile(path.join(intake.dir, 'link-intent.json'), 'utf8'));
+        expect(await fs.readFile(path.join(intake.dir, `link-${intent.id}.before.md`), 'utf8')).toBe(before);
+        if (boundary === 'backup link') expect(await fs.readFile(original, 'utf8')).toBe(before);
+        else await expect(fs.stat(original)).rejects.toMatchObject({ code: 'ENOENT' });
+        if (boundary === 'stage proof') expect(intent.stageProof).toBeDefined();
+        await createCopy();
+        if (boundary.endsWith('stage cleanup')) {
+          const stage = path.join(intake.dir, `link-${intent.id}.stage`), journal = path.join(intake.dir, 'link-intent.json');
+          const unlink = native.unlinkSync;
+          native.unlinkSync = file => {
+            unlink(file);
+            if (file === stage || file === journal) throw stop;
+          };
+          try { await expect(intake.reconcile({ now })).rejects.toThrow(stop.message); }
+          finally { native.unlinkSync = unlink; }
+          expect(JSON.parse(await fs.readFile(journal, 'utf8')).stageProof).toEqual(intent.stageProof);
+          await expect(fs.stat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
+          if (boundary === 'replaced stage cleanup') {
+            independentStage = stage;
+            await fs.writeFile(stage, 'Unrelated replacement writing.\n', { flag: 'wx' });
+          }
+        }
+      }
+    } else await intake.reconcile({ now });
+    expect(created).toBe(true);
+    let restarted, issue;
+    for (let restart = 0; restart < 2; restart++) {
+      restarted = new Intake(new Vault(vault.vault, 'Companion'));
+      await restarted.reconcile({ now });
+      expect(await fs.readFile(original, 'utf8')).toBe(before);
+      expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+      expect((await fs.readdir(intake.dir)).filter(name => /^link-/.test(name))).toEqual(independentStage ? [path.basename(independentStage)] : []);
+      if (independentStage) expect(await fs.readFile(independentStage, 'utf8')).toBe('Unrelated replacement writing.\n');
+      issue = (await restarted.repairs()).find(item => item.id === 'annotation:' + id);
+      expect(issue?.kind).toBe('duplicate');
+    }
+    const selected = selectOriginal ? original : copy;
+    await restarted.chooseIdentity({ id: issue.id, file: path.relative(vault.vault, selected), token: issue.token });
+    const repaired = (selectOriginal ? before : copied).replace(/^Source: .*$/m,
+      selectOriginal ? 'Source: [Capture](../../Moved.md)' : 'Source: [Capture](Moved.md)');
+    expect(await fs.readFile(selected, 'utf8')).toBe(repaired);
+    expect(await fs.readFile(selectOriginal ? copy : original, 'utf8')).toBe(selectOriginal ? copied : before);
+  });
+}
 
 test('custom annotation headers preserve user-owned Source links after the first frontmatter block', async () => {
   await artifact(); await launch(); await setup(); await connect(true);
