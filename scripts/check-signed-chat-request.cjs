@@ -6,6 +6,7 @@ const path = require('node:path');
 const { CodexSetup, SYNTHETIC_PROMPT } = require('../app/codex');
 const { audit } = require('../app/codex-isolation');
 const { canonical } = require('../app/codex-policy');
+const { openTrace, observe, retireTrace } = require('./chat-trace-retirement.cjs');
 const { inspectModelInput } = require('./check-chat-request.cjs');
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -45,18 +46,53 @@ function inspectSignedRequest(body, record, text) {
   return inspectModelInput({ ...body, input }, text).toolDefinitionsSha256;
 }
 
-async function inspectTrace(traceRoot, record) {
-  const bundles = await fs.readdir(traceRoot, { withFileTypes: true });
+async function inspectTrace(trace, record) {
+  const bundles = await fs.readdir(trace.root, { withFileTypes: true });
   assert(bundles.length === 1 && bundles[0].isDirectory());
-  const bundle = path.join(traceRoot, bundles[0].name);
-  const events = (await fs.readFile(path.join(bundle, 'trace.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  const name = bundles[0].name;
+  assert(name.startsWith('trace-') && name.endsWith('-' + record.threadId));
+  const traceId = name.slice(6, -37);
+  assert(uuid.test(traceId));
+  // Build the candidate plan separately. A partial or unverified bundle grants no leaf removal.
+  const plan = { root: trace.root, entries: [trace.entries[0]] };
+  observe(plan, name, true);
+  observe(plan, path.join(name, 'payloads'), true);
+  const manifest = JSON.parse(observe(plan, path.join(name, 'manifest.json')));
+  assert(manifest.trace_id === traceId && manifest.root_thread_id === record.threadId && manifest.rollout_id === record.threadId);
+  assert(manifest.schema_version === 2 && manifest.raw_event_log === 'trace.jsonl' && manifest.payloads_dir === 'payloads');
+  const events = observe(plan, path.join(name, 'trace.jsonl')).toString('utf8').trim().split('\n').map(JSON.parse);
   const starts = events.filter(event => event.payload.type === 'inference_started');
   assert(starts.length === 1 && starts[0].thread_id === record.threadId && starts[0].codex_turn_id === record.turnId);
-  const ref = starts[0].payload.request_payload;
-  assert(ref.kind.type === 'inference_request' && /^payloads\/[0-9]+\.json$/.test(ref.path));
-  const requestPath = path.join(bundle, ref.path);
-  assert(await fs.realpath(requestPath) === requestPath);
-  return inspectSignedRequest(JSON.parse(await fs.readFile(requestPath, 'utf8')), record, SYNTHETIC_PROMPT);
+  assert(starts[0].payload.model === record.model && starts[0].payload.provider_name === 'OpenAI');
+  const completed = events.filter(event => event.payload.type === 'inference_completed');
+  assert(completed.length === 1 && completed[0].payload.inference_call_id === starts[0].payload.inference_call_id);
+  let toolDigest;
+  const seen = new Set();
+  for (const event of events) {
+    assert((event.thread_id === null || event.thread_id === record.threadId) && event.rollout_id === record.threadId);
+    for (const ref of Object.values(event.payload)) {
+      if (!ref?.raw_payload_id) continue;
+      const match = /^payloads\/([1-9][0-9]*)\.json$/.exec(ref.path);
+      assert(match && ref.raw_payload_id === 'raw_payload:' + match[1] && !seen.has(ref.path));
+      seen.add(ref.path);
+      const value = JSON.parse(observe(plan, path.join(name, 'payloads', match[1] + '.json')));
+      if (ref.kind.type === 'inference_request') {
+        assert(event === starts[0]);
+        toolDigest = inspectSignedRequest(value, record, SYNTHETIC_PROMPT);
+      } else if (ref.kind.type === 'inference_response') {
+        assert(event === completed[0] && Array.isArray(value.output_items));
+      } else if (ref.kind.type === 'session_metadata') {
+        assert(event.payload.type === 'thread_started' && value.thread_id === record.threadId);
+      } else {
+        const legacyTypes = { turn_started: 'task_started', turn_complete: 'task_complete' };
+        assert(ref.kind.type === 'protocol_event' && event.payload.type === 'protocol_event_observed');
+        assert(value.type === (legacyTypes[event.payload.event_type] ?? event.payload.event_type));
+      }
+    }
+  }
+  assert(toolDigest);
+  trace.entries = plan.entries;
+  return toolDigest;
 }
 
 async function main(staging, consent) {
@@ -67,11 +103,11 @@ async function main(staging, consent) {
   const cfg = JSON.parse(await fs.readFile(path.join(dataRoot, 'setup.json')));
   assert(cfg.sandbox === 'mxc' && cfg.project === path.join(root, 'project') && cfg.vault === path.join(root, 'vault', 'Companion'));
   for (const directory of [root, dataRoot, cfg.project, cfg.vault, path.join(dataRoot, 'managed-home')]) assert(await fs.realpath(directory) === directory);
-  const trace = await fs.mkdtemp(path.join(root, 'synthetic-trace-'));
+  const trace = openTrace(await fs.mkdtemp(path.join(root, 'synthetic-trace-')));
   const setup = new CodexSetup({ dataRoot });
   // This diagnostic child traces only a fixed synthetic prompt. Production processes use their ordinary allowlisted environment.
   const startServer = setup.startServer.bind(setup);
-  setup.startServer = () => { setup.launch.env.CODEX_ROLLOUT_TRACE_ROOT = trace; return startServer(); };
+  setup.startServer = () => { setup.launch.env.CODEX_ROLLOUT_TRACE_ROOT = trace.root; return startServer(); };
   try {
     assert((await setup.action({ ...cfg, action: 'connect' }, { vault: cfg.vault })).authenticated);
     assert((await setup.action({ action: 'verify' })).isolationPassed);
@@ -90,11 +126,22 @@ async function main(staging, consent) {
     assert(setup.generation === generation && setup.rpc === rpc && !rpc.closed);
     console.log(JSON.stringify({ model: record.model, toolDigest, currentAccountConfigAndRootsVerified: true, productionReady: false }));
   } finally {
+    const child = setup.rpc?.child;
     setup.close();
-    // Remove only this process's trace directory, never follow a replacement junction.
-    assert(path.dirname(trace) === root && await fs.realpath(trace) === trace && (await fs.lstat(trace)).isDirectory());
-    await fs.rm(trace, { recursive: true, force: false });
+    try {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(Error('Trace writer still active.')), 5000);
+          child.once('exit', () => { clearTimeout(timer); resolve(); });
+        });
+      }
+      retireTrace(trace);
+    }
+    catch {
+      console.error('Trace cleanup incomplete. Inspect the disposable staging directory for ' + path.basename(trace.root) + ' or its moved contents.');
+      process.exitCode = 1;
+    }
   }
 }
-module.exports = { inspectSignedRequest };
+module.exports = { inspectSignedRequest, inspectTrace };
 if (require.main === module) main(...process.argv.slice(2)).catch(() => { console.error('Signed-in qualification failed. Production readiness remains closed.'); process.exitCode = 1; });
