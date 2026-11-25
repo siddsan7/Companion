@@ -50,11 +50,19 @@ input.on('line', line => {
     if (scenario.turn === 'exit-before-ack') { process.exit(23); return; }
     active = { threadId: params.threadId, turnId: `fixture-turn-${sequence}` }; result = { turn: turn('inProgress') };
   }
-  if (method === 'turn/interrupt') setTimeout(() => notify('turn/completed', { threadId: active.threadId, turn: turn('interrupted') }), 30);
+  if (method === 'turn/interrupt') {
+    if (scenario.interruptOutcome === 'rejected') { send({ id, error: { code: -32603, message: 'PRIVATE_INTERRUPT_FAILURE' } }); return; }
+    const finish = () => notify('turn/completed', { threadId: active.threadId, turn: { ...turn('interrupted'), ...(scenario.interruptOutcome === 'mismatched' ? { id: 'another-turn' } : {}) } });
+    if (scenario.interruptOutcome === 'held') {
+      const timer = setInterval(() => { if (fs.existsSync(path.join(root, 'release-interrupt'))) { clearInterval(timer); finish(); } }, 20);
+      holds.add(() => clearInterval(timer));
+    } else if (scenario.interruptOutcome !== 'missing') setTimeout(finish, 30);
+  }
   if (method === 'thread/start' && scenario.accountUpdateAtThreadStart) notify('account/updated', { authMode: 'chatgpt' });
   send({ id, result });
   if (method === 'turn/start') notify('turn/started', { threadId: active.threadId, turn: turn('inProgress') });
   if (method === 'turn/start') setTimeout(() => {
+    if (scenario.interruptOutcome) return;
     if (scenario.requestUserInput) {
       send({ id: 'fixture-input-request', method: 'item/tool/requestUserInput', params: {
         ...active, itemId: 'fixture-input', questions: [{ id: 'private', header: 'Fixture', question: 'UNREVIEWED_INPUT_QUESTION', options: null, isOther: false, isSecret: false }]

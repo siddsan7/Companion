@@ -262,8 +262,7 @@ class CodexSetup {
   async interrupt() {
     if (!this.state.turnActive) return this.snapshot();
     this.cancelRequested = true; this.certificate = null; this.state.ready = false; this.state.status = 'interrupting'; this.state.message = 'Waiting for Codex to confirm interruption.';
-    if (this.activeTurn) await this.rpc.request('turn/interrupt', this.activeTurn);
-    this.interruptTimer = setTimeout(() => { this.rpc?.close('Interruption was not confirmed. The turn is incomplete.'); this.settleTurn?.('interrupted'); }, 5000);
+    await this.turnLease?.interrupt?.();
     return this.snapshot();
   }
   invalidate(message = 'Vault or project configuration changed. Check Codex setup and verify isolation again.') { this.close(); this.fail(message); }

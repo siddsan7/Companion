@@ -11,6 +11,55 @@ const { once } = require('node:events');
 const { spawnSync } = require('node:child_process');
 const { holdReadSharing } = require('./fixtures/windows-sharing');
 
+for (const outcome of ['held', 'rejected', 'mismatched', 'missing']) {
+  test(`history failure after acknowledgement keeps ownership until interruption or teardown: ${outcome}`, async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-ack-save-'));
+    const evidence = { dispatchEnabled: true, binding: 'fixture', capacity: null };
+    const provider = new ConversationProvider({ testRoot: root, getEvidence: async () => evidence });
+    const send = () => provider.turn('Disposable source', { capacityBinding: evidence.binding, beforeStart: async () => {}, onState: () => {} });
+    const open = fs.open;
+    try {
+      await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ interruptOutcome: outcome }));
+      await provider.preflight();
+      const setup = provider.controlled;
+      let injected = false;
+      fs.open = async (file, ...args) => {
+        if (!injected && setup.activeTurn && path.dirname(file) === setup.dataRoot && args[0] === 'wx') {
+          injected = true;
+          throw Object.assign(Error('PRIVATE_ACK_STORAGE_PATH'), { code: 'ENOSPC' });
+        }
+        return open(file, ...args);
+      };
+      const result = send().then(() => null, error => error);
+      const requests = async () => (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+      if (outcome === 'held') {
+        await expect.poll(async () => (await requests()).some(call => call.method === 'turn/interrupt')).toBe(true);
+        expect(setup.snapshot().busy).toBe(true);
+        expect(setup.activeTurn.turnId).toBe(setup.turnHistory.at(-1).turnId);
+        await setup.interrupt();
+        await expect(send()).rejects.toThrow('still finishing');
+        await fs.writeFile(path.join(root, 'release-interrupt'), '');
+      }
+      const error = await result;
+      expect(injected).toBe(true);
+      expect(error?.message).toContain('(ENOSPC)');
+      expect(error.message).not.toMatch(/PRIVATE_|cancelled|canceled/i);
+      if (outcome !== 'held') expect(error.message).toContain('without a confirmed terminal');
+      expect(error.terminalStatus).toBe('interrupted');
+      expect(setup.rpc.closed).toBe(outcome !== 'held');
+      expect(setup.turnLease).toBeNull();
+      const calls = await requests(), starts = calls.filter(call => call.method === 'turn/start'), interrupts = calls.filter(call => call.method === 'turn/interrupt');
+      expect(starts).toHaveLength(1); expect(interrupts).toHaveLength(1);
+      expect(interrupts[0].params).toEqual({ threadId: starts[0].params.threadId, turnId: setup.turnHistory.at(-1).turnId });
+      expect(setup.turnHistory.at(-1).status).toBe('interrupted');
+    } finally {
+      fs.open = open;
+      provider.close();
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+}
+
 test('a partial readiness write removes its owned stage and reports only the storage error code', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-partial-save-'));
   const setup = new CodexSetup({ dataRoot: root });
@@ -46,7 +95,8 @@ for (const persistent of [false, true]) {
     const evidence = { dispatchEnabled: true, binding: 'fixture', capacity: null };
     const provider = new ConversationProvider({ testRoot: root, getEvidence: async () => evidence });
     const send = () => provider.turn('Disposable source', { capacityBinding: evidence.binding, beforeStart: async () => {}, onState: () => {} });
-    let hold, timer;
+    const finalSave = Promise.withResolvers(), readerReady = Promise.withResolvers();
+    let hold, timer, turn;
     try {
       await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Fixture answer.' }));
       await provider.preflight();
@@ -54,15 +104,20 @@ for (const persistent of [false, true]) {
       const save = setup.persist.bind(setup);
       setup.persist = async () => {
         if (!hold && setup.state.status === 'completed') {
-          hold = holdReadSharing(path.join(setup.dataRoot, 'readiness.json'));
-          await hold.ready();
-          if (!persistent) timer = setTimeout(() => hold.release(), 125);
+          finalSave.resolve();
+          await readerReady.promise;
         }
         return save();
       };
-      if (persistent) await expect(send()).rejects.toThrow(/history could not be saved.*\((EPERM|EACCES|EBUSY)\)/);
-      else expect((await send()).reply).toBe('Fixture answer.');
-      expect(hold).toBeDefined();
+      turn = send().then(value => ({ value }), error => ({ error }));
+      await Promise.race([finalSave.promise, turn.then(() => { throw Error('Turn ended before its final save.'); })]);
+      hold = holdReadSharing(path.join(setup.dataRoot, 'readiness.json'));
+      await hold.ready();
+      if (!persistent) timer = setTimeout(() => hold.release(), 125);
+      readerReady.resolve();
+      const result = await turn;
+      if (persistent) expect(result.error?.message).toMatch(/history could not be saved.*\((EPERM|EACCES|EBUSY)\)/);
+      else expect(result.value?.reply).toBe('Fixture answer.');
       expect(setup.turnLease).toBeNull();
       expect(setup.snapshot().busy).toBe(false);
       expect(setup.state.status).toBe(persistent ? 'interrupted' : 'completed');
@@ -77,7 +132,7 @@ for (const persistent of [false, true]) {
       const saved = JSON.parse(await fs.readFile(path.join(setup.dataRoot, 'readiness.json'), 'utf8'));
       expect(saved.turns.map(turn => turn.status)).toEqual([persistent ? 'interrupted' : 'completed', 'completed']);
     } finally {
-      clearTimeout(timer); hold?.release(); await hold?.closed; provider.close();
+      readerReady.resolve(); clearTimeout(timer); hold?.release(); await hold?.closed; await turn; provider.close();
       await fs.rm(root, { recursive: true, force: true, maxRetries: 3 });
     }
   });

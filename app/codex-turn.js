@@ -70,7 +70,7 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
   const effective = Object.fromEntries(['model', 'modelProvider', 'reasoningEffort', 'serviceTier'].map(key => [key, typeof started[key] === 'string' && started[key].trim() ? started[key] : null]));
   if (comparisonPin || Object.values(effective).every(Boolean)) record.effective = effective;
   setup.turnHistory.push(record);
-  let turnId, terminal, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
+  let turnId, terminal, observedTerminal, acknowledged, interruptRequest, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
   const messages = new Map();
   let sinkTail = Promise.resolve(), sinkFailure;
   const preserve = () => {
@@ -82,6 +82,16 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     return sinkTail;
   };
   const completed = new Promise(resolve => { resolveTerminal = resolve; });
+  // Manual interruption and failure cleanup share one request on the owning transport.
+  const interrupt = () => {
+    if (rpc.closed || observedTerminal) return;
+    if (!setup.interruptTimer) setup.interruptTimer = setTimeout(() => rpc.close('Interruption was not confirmed. The turn is incomplete.'), 5000);
+    if (acknowledged && !interruptRequest) {
+      interruptRequest = rpc.request('turn/interrupt', acknowledged, 5000).catch(() => rpc.close('Interruption request failed. The turn is incomplete.'));
+    }
+    return interruptRequest;
+  };
+  setup.turnLease.interrupt = interrupt;
   const recordFailure = error => {
     const kind = failureKind(error?.codexErrorInfo);
     fatalFailure = failureMessage(kind); setup.state.message = fatalFailure;
@@ -155,7 +165,8 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
         rejectContext('Codex did not supply a complete final reply. The retained text is incomplete. Check setup and retry explicitly.'); return;
       }
       if (params.turn.status === 'failed' && !fatalFailure) recordFailure(params.turn.error);
-      setup.settleTurn(params.turn.status);
+      observedTerminal = params.turn.status;
+      setup.settleTurn(observedTerminal);
     }
     if (method === 'error' && params.willRetry !== true) {
       recordFailure(params.error);
@@ -175,10 +186,11 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     startAttempted = true;
     const response = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text }], environments: [] });
     if (!bindTurn(response.turn?.id)) throw Error(unexpected);
-    setup.activeTurn = { threadId, turnId };
+    acknowledged = { threadId, turnId };
+    setup.activeTurn = acknowledged;
     record.turnId = turnId; await setup.persist();
     await preserve();
-    if (setup.cancelRequested) await rpc.request('turn/interrupt', setup.activeTurn);
+    if (setup.cancelRequested) await interrupt();
     const reported = terminal || await completed;
     await sinkTail;
     if (sinkFailure) throw Error('Conversation history could not preserve the complete reply. The retained reply is incomplete.');
@@ -192,17 +204,28 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     if (!setup.state.reply.trim()) throw Error('Codex completed without an assistant reply.');
     return setup.state.reply;
   } catch (error) {
-    // Once turn/start can have reached the server, a lost acknowledgement is ambiguous.
-    // Preserve an interrupted local terminal; never call it completed or replay it.
-    const interrupted = startAttempted && (record.status === 'interrupted' || rpc.closed);
+    const originalViolation = unexpected, alreadyClosed = rpc.closed;
+    if (startAttempted && !observedTerminal && !rpc.closed) {
+      if (!acknowledged || setup.rpc !== rpc) rpc.close('The active turn could not be confirmed. The turn is incomplete.');
+      else {
+        setup.state.status = 'interrupting'; setup.state.message = 'Waiting for Codex to settle the incomplete turn.';
+        await interrupt();
+        if (!rpc.closed && !observedTerminal) await completed;
+      }
+    }
+    const interrupted = startAttempted && (record.status === 'inProgress' || record.status === 'interrupted' || alreadyClosed);
     Object.assign(record, { turnId: turnId || null, status: interrupted ? 'interrupted' : 'failed', completedAt: new Date().toISOString() });
     if (!error.terminalStatus) error.terminalStatus = record.status;
     if (!historySaved) error.message = `Codex history could not be saved${error.historyCode ? ` (${error.historyCode})` : ''}. No model request was sent. Check application-data access and retry explicitly.`;
-    else if (unexpected) error.message = unexpected;
-    else if (startAttempted && rpc.closed) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
+    else if (originalViolation && !Object.hasOwn(error, 'historyCode')) error.message = originalViolation;
+    else if (startAttempted && alreadyClosed && !Object.hasOwn(error, 'historyCode') && !sinkFailure) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
+    else if (acknowledged && !observedTerminal && rpc.closed) error.message += ' The private connection closed without a confirmed terminal.';
     throw error;
   } finally {
-    clearTimeout(timeout); clearTimeout(setup.interruptTimer);
+    // An interrupt acknowledgement can arrive after its terminal notification.
+    // Its bounded RPC must settle before another turn may reuse this transport.
+    await interruptRequest;
+    clearTimeout(timeout); clearTimeout(setup.interruptTimer); setup.interruptTimer = null;
     clearTimeout(setup.replySaveTimer); setup.replySaveTimer = null;
     rpc.off('notification', handler); setup.activeTurn = null; setup.settleTurn = null; setup.cancelRequested = false; setup.state.turnActive = false;
     await sinkTail;
