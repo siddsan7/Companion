@@ -6,7 +6,7 @@ const { PROFILE, INSTRUCTIONS, policy, toToml, canonical, samePath, inside } = r
 const { audit, probeIsolation } = require('./codex-isolation');
 const { runTurn } = require('./codex-turn');
 const { prepareProbe } = require('./codex-probe');
-const { ordinaryDirectories, readExact } = require('./staged-publication');
+const { ordinaryDirectories, readExact, writeStage, publishReplacement, removeStageIfPresentSync } = require('./staged-publication');
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
 class CodexSetup {
   constructor({ dataRoot, testRoot } = {}) {
@@ -52,14 +52,38 @@ class CodexSetup {
       if (generation !== this.generation) return;
       await fs.mkdir(this.dataRoot, { recursive: true });
       const temporary = path.join(this.dataRoot, `readiness-${crypto.randomUUID()}.pending`);
+      const destination = path.join(this.dataRoot, 'readiness.json');
+      const { guard } = ordinaryDirectories([this.dataRoot], 'Codex history folder changed.');
+      let stage, created;
       try {
-        await fs.writeFile(temporary, text, { flag: 'wx' });
+        stage = await writeStage(temporary, identity => { created = identity; return text; }, guard);
         if (generation !== this.generation) return;
-        await fs.rename(temporary, path.join(this.dataRoot, 'readiness.json'));
-      } finally { await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+        try { await fs.rename(temporary, destination); }
+        catch (error) {
+          if (process.platform !== 'win32' || error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) throw error;
+          const previous = await readExact(destination, guard);
+          // Retry only this write against these same files, within the shared one-second deadline.
+          await publishReplacement(temporary, destination, guard, stage, previous.proof, { verifyRelated: () => {
+            if (generation !== this.generation) throw Error('Codex setup changed during history publication.');
+          } });
+        }
+      } finally {
+        if (stage) removeStageIfPresentSync(temporary, guard, stage);
+        else if (created) {
+          // A failed write can leave part of our payload. Preserve a replaced or foreign file.
+          const partial = await readExact(temporary, guard).catch(() => null);
+          if (partial && partial.proof.dev === created.dev && partial.proof.ino === created.ino &&
+              Buffer.from(text).subarray(0, partial.bytes.length).equals(partial.bytes)) removeStageIfPresentSync(temporary, guard, partial.proof);
+        }
+      }
     };
     this.saveTail = this.saveTail.catch(() => {}).then(write);
-    await this.saveTail;
+    try { await this.saveTail; }
+    catch (error) {
+      if (generation !== this.generation) return;
+      const code = ['EPERM', 'EACCES', 'EBUSY', 'ENOSPC', 'EROFS', 'ENOENT', 'EIO', 'EMFILE', 'ENFILE', 'STAGING_CHANGED'].includes(error.code) ? error.code : null;
+      throw Object.assign(Error(`Codex setup history could not be saved${code ? ` (${code})` : ''}. Check application-data access and retry explicitly.`), { historyCode: code });
+    }
   }
   async action(input = {}, roots = {}) {
     await this.loaded;
@@ -78,7 +102,13 @@ class CodexSetup {
       else throw Error('Unknown Codex setup action.');
       if (this.generation === generation) this.state.busy = false;
     } catch (error) { if (this.generation === generation) this.fail(error.message, error.terminalStatus || 'incomplete'); }
-    if (this.generation === generation) await this.persist(); return this.snapshot();
+    if (this.generation === generation) {
+      try { await this.persist(); }
+      catch (error) {
+        if (this.generation === generation) this.fail(error.message, this.state.status === 'interrupted' ? 'interrupted' : 'failed');
+      }
+    }
+    return this.snapshot();
   }
   async connect(input, roots) {
     this.close(); this.checks = [];
@@ -209,6 +239,7 @@ class CodexSetup {
   }
   async synthetic() {
     const generation = this.generation, certificate = this.certificate;
+    this.state.status = 'verifying'; this.state.message = 'Checking isolation before starting the synthetic turn.';
     const guard = () => {
       if (!certificate || this.certificate !== certificate || Date.now() >= certificate.expires || generation !== this.generation || !this.state.authenticated) throw Error('Isolation verification changed or expired. Verify again before sending.');
     };

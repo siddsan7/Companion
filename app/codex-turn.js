@@ -36,13 +36,17 @@ async function runTurn(setup, text, options = {}) {
   } finally {
     try {
       if (setup.generation === lease.generation) await setup.persist();
-    } catch {
+    } catch (error) {
       if (setup.generation === lease.generation) {
         setup.certificate = null; setup.state.ready = false; setup.state.isolationPassed = false;
+        const detail = error.historyCode ? ` (${error.historyCode})` : '';
         if (!failure) {
-          failure = Object.assign(Error('Codex setup history could not be saved. The retained reply is incomplete. Check setup and retry explicitly.'), { terminalStatus: 'interrupted' });
-          setup.fail(failure.message, failure.terminalStatus);
+          setup.turnHistory.at(-1).status = 'interrupted';
+          failure = Object.assign(Error(`Codex setup history could not be saved${detail}. The retained reply is incomplete. Check setup and retry explicitly.`), { terminalStatus: 'interrupted' });
+        } else if (!failure.historyCode) {
+          failure.message += ` Codex setup history could not be saved${detail}.`;
         }
+        setup.fail(failure.message, failure.terminalStatus || 'failed');
       }
     } finally { if (setup.turnLease === lease) setup.turnLease = null; }
   }
@@ -61,7 +65,7 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
   const threadId = started.thread?.id;
   if (typeof threadId !== 'string' || !threadId.trim() || setup.threads.has(threadId)) throw Error('Codex did not create a fresh thread.');
   setup.threads.add(threadId);
-  setup.state.reply = ''; setup.state.turnActive = true; setup.state.status = 'running';
+  Object.assign(setup.state, { reply: '', turnActive: true, status: 'running', message: 'Waiting for Codex to finish the current turn.' });
   const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null, usage: null, usageEvidence: USAGE_UNAVAILABLE };
   const effective = Object.fromEntries(['model', 'modelProvider', 'reasoningEffort', 'serviceTier'].map(key => [key, typeof started[key] === 'string' && started[key].trim() ? started[key] : null]));
   if (comparisonPin || Object.values(effective).every(Boolean)) record.effective = effective;
@@ -193,7 +197,7 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     const interrupted = startAttempted && (record.status === 'interrupted' || rpc.closed);
     Object.assign(record, { turnId: turnId || null, status: interrupted ? 'interrupted' : 'failed', completedAt: new Date().toISOString() });
     if (!error.terminalStatus) error.terminalStatus = record.status;
-    if (!historySaved) error.message = 'Codex history could not be saved. No model request was sent. Check application-data access and retry explicitly.';
+    if (!historySaved) error.message = `Codex history could not be saved${error.historyCode ? ` (${error.historyCode})` : ''}. No model request was sent. Check application-data access and retry explicitly.`;
     else if (unexpected) error.message = unexpected;
     else if (startAttempted && rpc.closed) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
     throw error;

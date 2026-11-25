@@ -9,6 +9,109 @@ const { ConversationProvider } = require('../app/conversation-provider');
 const { CodexRpc } = require('../app/codex-rpc');
 const { once } = require('node:events');
 const { spawnSync } = require('node:child_process');
+const { holdReadSharing } = require('./fixtures/windows-sharing');
+
+test('a partial readiness write removes its owned stage and reports only the storage error code', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-partial-save-'));
+  const setup = new CodexSetup({ dataRoot: root });
+  const open = fs.open;
+  try {
+    await setup.loaded;
+    await setup.persist();
+    const report = path.join(root, 'readiness.json'), before = await fs.readFile(report);
+    fs.open = async (file, ...args) => {
+      const handle = await open(file, ...args);
+      if (path.dirname(file) === root && args[0] === 'wx') {
+        const write = handle.writeFile.bind(handle);
+        handle.writeFile = async bytes => {
+          await write(bytes.subarray(0, 17));
+          throw Object.assign(Error('PRIVATE_STORAGE_PATH'), { code: 'ENOSPC' });
+        };
+      }
+      return handle;
+    };
+    const state = await setup.action({ action: 'invalidate' });
+    expect(state).toMatchObject({ status: 'failed', ready: false, busy: false });
+    expect(state.message).toContain('(ENOSPC)');
+    expect(state.message).not.toContain('PRIVATE_STORAGE_PATH');
+    expect(await fs.readdir(root)).toEqual(['readiness.json']);
+    expect(await fs.readFile(report)).toEqual(before);
+  } finally { fs.open = open; setup.close(); await fs.rm(root, { recursive: true, force: true }); }
+});
+
+for (const persistent of [false, true]) {
+  test(`a ${persistent ? 'persistent' : 'brief'} Windows reader at final history publication releases the turn lease without replay`, async () => {
+    test.skip(process.platform !== 'win32', 'Requires a Windows reader denying delete sharing.');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-final-save-'));
+    const evidence = { dispatchEnabled: true, binding: 'fixture', capacity: null };
+    const provider = new ConversationProvider({ testRoot: root, getEvidence: async () => evidence });
+    const send = () => provider.turn('Disposable source', { capacityBinding: evidence.binding, beforeStart: async () => {}, onState: () => {} });
+    let hold, timer;
+    try {
+      await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ reply: 'Fixture answer.' }));
+      await provider.preflight();
+      const setup = provider.controlled;
+      const save = setup.persist.bind(setup);
+      setup.persist = async () => {
+        if (!hold && setup.state.status === 'completed') {
+          hold = holdReadSharing(path.join(setup.dataRoot, 'readiness.json'));
+          await hold.ready();
+          if (!persistent) timer = setTimeout(() => hold.release(), 125);
+        }
+        return save();
+      };
+      if (persistent) await expect(send()).rejects.toThrow(/history could not be saved.*\((EPERM|EACCES|EBUSY)\)/);
+      else expect((await send()).reply).toBe('Fixture answer.');
+      expect(hold).toBeDefined();
+      expect(setup.turnLease).toBeNull();
+      expect(setup.snapshot().busy).toBe(false);
+      expect(setup.state.status).toBe(persistent ? 'interrupted' : 'completed');
+      expect(setup.turnHistory.at(-1).status).toBe(setup.state.status);
+      expect(setup.state.message).not.toContain(root);
+      expect(await fs.readdir(setup.dataRoot)).toEqual(['readiness.json']);
+      const calls = await fs.readFile(path.join(root, 'conversation-submissions.jsonl'), 'utf8');
+      expect(calls.trim().split('\n')).toHaveLength(1);
+      hold.release(); await hold.closed;
+      setup.persist = save;
+      expect((await send()).reply).toBe('Fixture answer.');
+      const saved = JSON.parse(await fs.readFile(path.join(setup.dataRoot, 'readiness.json'), 'utf8'));
+      expect(saved.turns.map(turn => turn.status)).toEqual([persistent ? 'interrupted' : 'completed', 'completed']);
+    } finally {
+      clearTimeout(timer); hold?.release(); await hold?.closed; provider.close();
+      await fs.rm(root, { recursive: true, force: true, maxRetries: 3 });
+    }
+  });
+}
+
+test('a second synthetic turn stops reporting the previous completion before it receives a terminal', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-synthetic-state-'));
+  const project = path.join(root, 'project'), vault = path.join(root, 'vault');
+  const fixture = path.join(root, 'codex-fixture.json');
+  const scenario = { login: 'complete', isolation: 'denied', turn: 'completed' };
+  const setup = new CodexSetup({ dataRoot: path.join(root, 'data'), testRoot: root });
+  let pending;
+  try {
+    await Promise.all([fs.mkdir(project), fs.mkdir(vault), fs.writeFile(fixture, JSON.stringify(scenario))]);
+    await setup.action({ action: 'connect', executable: 'controlled-fixture', project, sandbox: 'mxc' }, { vault });
+    await setup.action({ action: 'login' });
+    await expect.poll(() => setup.snapshot().authenticated).toBe(true);
+    await setup.action({ action: 'verify' });
+    expect((await setup.action({ action: 'synthetic' })).status).toBe('fixture-completed');
+    await fs.writeFile(fixture, JSON.stringify({ ...scenario, holdCompletion: true }));
+    pending = setup.action({ action: 'synthetic' });
+    await expect.poll(() => setup.snapshot().turnActive).toBe(true);
+    expect(setup.snapshot()).toMatchObject({ status: 'running', message: 'Waiting for Codex to finish the current turn.' });
+    expect(setup.turnHistory.map(turn => turn.status)).toEqual(['completed', 'inProgress']);
+    await fs.writeFile(path.join(root, 'conversation-release.json'), '');
+    expect((await pending).status).toBe('fixture-completed');
+    expect(setup.turnHistory.map(turn => turn.status)).toEqual(['completed', 'completed']);
+  } finally {
+    await fs.writeFile(path.join(root, 'conversation-release.json'), '');
+    await pending;
+    setup.close();
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
 
 test('the production UI smoke requires hosted Windows or explicit local permission before touching Electron', () => {
   test.skip(process.platform !== 'win32', 'The production UI smoke runs on Windows.');

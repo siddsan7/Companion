@@ -104,7 +104,10 @@ test('fresh synthetic turns finish only on terminal completion and retain an int
   await expect(page.getByRole('button', { name: 'Verify isolation', exact: true })).toBeEnabled(); await page.getByRole('button', { name: 'Verify isolation', exact: true }).click();
   for (let index = 0; index < 2; index++) {
     await page.getByRole('button', { name: 'Send synthetic turn', exact: true }).click();
-    await expect.poll(async () => JSON.parse(await fs.readFile(path.join(root, 'codex', 'readiness.json'), 'utf8')).turns.length).toBe(index + 1);
+    await expect.poll(async () => {
+      const report = JSON.parse(await fs.readFile(path.join(root, 'codex', 'readiness.json'), 'utf8'));
+      return { count: report.turns.length, terminal: report.turns[index]?.status, status: report.status };
+    }).toEqual({ count: index + 1, terminal: 'completed', status: 'fixture-completed' });
     await expect(page.locator('#codex-status')).toContainText('Synthetic turn completed');
   }
   const before = JSON.parse(await fs.readFile(path.join(root, 'codex', 'readiness.json'), 'utf8'));
