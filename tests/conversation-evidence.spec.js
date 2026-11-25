@@ -9,6 +9,28 @@ const { ConversationProvider } = require('../app/conversation-provider');
 const { CodexRpc } = require('../app/codex-rpc');
 const { once } = require('node:events');
 
+test('terminal-only HTTP errors preserve the provider failure category without its private message', async () => {
+  const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-terminal-failure-'));
+  const evidence = { dispatchEnabled: true, capacity: null, binding: 'controlled' };
+  const provider = new ConversationProvider({ testRoot, getEvidence: async () => evidence });
+  try {
+    for (const [info, reason] of [
+      [{ httpConnectionFailed: { httpStatusCode: 401 } }, /sign-in expired or was rejected/],
+      [{ responseTooManyFailedAttempts: { httpStatusCode: 429 } }, /usage limit reached/],
+      [{ httpConnectionFailed: { httpStatusCode: 503 } }, /temporarily unavailable/]
+    ]) {
+      await fs.writeFile(path.join(testRoot, 'conversation-provider.json'), JSON.stringify({ turn: 'failed', terminalErrorInfo: info }));
+      await provider.preflight();
+      await expect(provider.turn('Disposable question', { capacityBinding: evidence.binding, beforeStart: async () => {}, onState: () => {} })).rejects.toThrow(reason);
+      expect(provider.controlled.state.message).not.toContain('PRIVATE_PROVIDER_DETAIL');
+      expect(provider.controlled.turnHistory.at(-1).status).toBe('failed');
+    }
+  } finally {
+    provider.close();
+    await fs.rm(testRoot, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
 test('the App Server receives only a method refusal for a request to solicit user input', async () => {
   const child = [
     "process.stdin.once('data', bytes => console.log(JSON.stringify({method:'fixture/received', params:JSON.parse(bytes)})));",

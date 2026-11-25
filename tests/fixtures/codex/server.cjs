@@ -81,7 +81,11 @@ input.on('line', line => {
       if (scenario.holdCompletion) completedItems.forEach((item, index) => notify('item/completed', { threadId: active.threadId, turnId: active.turnId, item, completedAtMs: 1794139200000 + index }));
       for (const update of scenario.usageUpdates || []) notify('thread/tokenUsage/updated', { threadId: update.otherThread ? 'fixture-unrelated-thread' : active.threadId, turnId: update.otherTurn ? 'fixture-unrelated-turn' : active.turnId, tokenUsage: update.tokenUsage });
       if (scenario.turn === 'usage-limit') notify('error', { threadId: active.threadId, turnId: active.turnId, willRetry: false, error: { message: 'PRIVATE_PROVIDER_DETAIL', codexErrorInfo: 'usageLimitExceeded' } });
-      if (scenario.turn !== 'pending') notify('turn/completed', { threadId: active.threadId, turn: turn(scenario.turn === 'usage-limit' ? 'failed' : scenario.turn || 'completed', scenario.terminalView === 'notLoaded' ? [] : completedItems, scenario.terminalView || 'full') });
+      if (scenario.turn !== 'pending') {
+        const result = turn(scenario.turn === 'usage-limit' ? 'failed' : scenario.turn || 'completed', scenario.terminalView === 'notLoaded' ? [] : completedItems, scenario.terminalView || 'full');
+        if (scenario.terminalErrorInfo) result.error = { message: 'PRIVATE_PROVIDER_DETAIL', codexErrorInfo: scenario.terminalErrorInfo };
+        notify('turn/completed', { threadId: active.threadId, turn: result });
+      }
     };
     // Controlled provider boundary: keep the turn open until the test releases final output.
     if (scenario.holdCompletion) {

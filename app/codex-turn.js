@@ -16,6 +16,13 @@ function failureMessage(info) {
   if (['serverOverloaded', 'flexUnavailable'].includes(info)) return 'Codex is temporarily unavailable. Retry explicitly when the service is available.';
   return 'Codex turn failed. The partial reply is incomplete. Check setup and retry explicitly.';
 }
+function failureKind(info) {
+  const status = info?.httpConnectionFailed?.httpStatusCode ?? info?.responseTooManyFailedAttempts?.httpStatusCode;
+  if (status === 401) return 'unauthorized';
+  if (status === 429) return 'rateLimitExceeded';
+  if (status === 503) return 'serverOverloaded';
+  return info;
+}
 async function runTurn(setup, text, options = {}) {
   if (setup.turnLease) throw Error('Codex is still finishing a reply. Wait for it to finish, then retry explicitly.');
   const lease = { generation: setup.generation }; setup.turnLease = lease;
@@ -71,6 +78,11 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     return sinkTail;
   };
   const completed = new Promise(resolve => { resolveTerminal = resolve; });
+  const recordFailure = error => {
+    const kind = failureKind(error?.codexErrorInfo);
+    fatalFailure = failureMessage(kind); setup.state.message = fatalFailure;
+    if (kind === 'unauthorized') setup.state.authenticated = false;
+  };
   setup.settleTurn = status => { terminal = status; resolveTerminal(status); };
   const validId = id => typeof id === 'string' && id.trim().length > 0;
   const rejectContext = message => { unexpected = message; rpc.close(message); setup.settleTurn?.('interrupted'); return false; };
@@ -138,12 +150,11 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
       if (params.turn.status === 'completed' && [...messages.values()].some(message => !message.completed)) {
         rejectContext('Codex did not supply a complete final reply. The retained text is incomplete. Check setup and retry explicitly.'); return;
       }
+      if (params.turn.status === 'failed' && !fatalFailure) recordFailure(params.turn.error);
       setup.settleTurn(params.turn.status);
     }
     if (method === 'error' && params.willRetry !== true) {
-      fatalFailure = failureMessage(params.error?.codexErrorInfo);
-      setup.state.message = fatalFailure;
-      if (params.error?.codexErrorInfo === 'unauthorized') setup.state.authenticated = false;
+      recordFailure(params.error);
       // The error notification is not a terminal event. Wait for turn/completed or bounded timeout.
     }
   };

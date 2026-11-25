@@ -42,7 +42,7 @@ async function main(executable) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-chat-request-'));
   const setup = new CodexSetup({ dataRoot: path.join(root, 'data') });
   const observed = [];
-  let refusal;
+  let refusal, responseStatus;
   const server = http.createServer(async (request, response) => {
     try {
       assert(request.method === 'POST' && request.url === '/v1/responses', 'Unexpected local request.');
@@ -55,8 +55,8 @@ async function main(executable) {
       }
       observed.push(inspect(request.headers, JSON.parse(Buffer.concat(chunks)), root));
     } catch (error) { refusal = error; }
-    response.writeHead(400, { 'content-type': 'application/json' });
-    response.end('{"error":{"message":"Local request inspection complete."}}');
+    response.writeHead(responseStatus, { 'content-type': 'application/json' });
+    response.end('{"error":{"message":"PRIVATE_LOCAL_PROVIDER_DETAIL"}}');
   });
   try {
     const vault = path.join(root, 'vault'), project = path.join(root, 'project');
@@ -74,10 +74,16 @@ async function main(executable) {
     await audit(setup);
     await probeIsolation(setup);
     // The ordinary turn path checks the returned provider before writing turn/start.
-    await assert.rejects(runTurn(setup, prompt));
-    if (refusal) throw refusal;
-    assert.equal(observed.length, 1, 'Expected exactly one local model request.');
-    console.log(JSON.stringify({ target: 'unsigned-loopback', hostedInference: false, ...observed[0] }));
+    for (const [status, expected] of [[401, /sign-in expired or was rejected/], [429, /usage limit reached/], [503, /temporarily unavailable/]]) {
+      responseStatus = status;
+      const before = observed.length;
+      await assert.rejects(runTurn(setup, prompt), expected);
+      if (refusal) throw refusal;
+      assert.equal(observed.length, before + 1, 'Expected exactly one local request per explicit turn.');
+      assert.equal(setup.turnHistory.at(-1).status, 'failed');
+      assert(!setup.state.message.includes('PRIVATE_LOCAL_PROVIDER_DETAIL') && !setup.snapshot().ready);
+    }
+    console.log(JSON.stringify({ target: 'unsigned-loopback', hostedInference: false, checkedStatus: [401, 429, 503], ...observed[0] }));
   } finally {
     setup.close();
     if (server.listening) await new Promise(resolve => server.close(resolve));
