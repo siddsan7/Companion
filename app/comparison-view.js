@@ -47,7 +47,8 @@
         const result = await window.companion['comparison-preview']({ id: current, displayIndex });
         if (observedEpoch !== epoch) return;
         token = result.packageId; byId('comparison-package').value = result.text;
-        byId('comparison-preview-summary').textContent = `${result.notice} ${result.count} Unicode code points. Model/settings: ${JSON.stringify(result.requested)}. Evidence: ${result.evidence.settings.evidence}.`;
+        const { capacity, settings } = result.evidence;
+        byId('comparison-preview-summary').textContent = `${result.notice} ${result.count} of ${Math.min(32000, capacity.maxCodePoints)} Unicode code points. Model/settings: ${JSON.stringify(result.requested)}. Settings evidence: ${settings.evidence}. Capacity evidence: ${capacity.evidence}. Harness and output allowance: ${capacity.harnessAndOutputEvidence}.`;
         byId('comparison-send').disabled = false;
       });
       article.append(heading, state, preview);

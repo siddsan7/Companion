@@ -13,8 +13,9 @@ const { ControlledGate, ProductionGate } = require('./revisit-gate');
 function installDecisions({ ipcMain, getVault, getContext, orderEvidence, clock, checkpoint, testRoot, provider, getEvidence }) {
   const gate = testRoot ? new ControlledGate(testRoot) : new ProductionGate({ provider, getEvidence });
   const previews = new Map();
+  const gatePreviews = new Map();
   const selected = () => { const vault = getVault(); if (!vault) throw Error('Choose a vault first.'); return vault; };
-  const corpus = target => orderEvidence(target, async () => (await getContext(target)).corpus());
+  const corpus = (target, options) => orderEvidence(target, async () => (await getContext(target)).corpus(options));
   const revisitFor = vault => new Revisit(vault, { getEvidence: corpus, gate, checkpoint });
   const now = () => clock();
 
@@ -84,8 +85,20 @@ function installDecisions({ ipcMain, getVault, getContext, orderEvidence, clock,
   });
   ipcMain.handle('revisit-settings', async (_, { automatic, cap }) => revisitFor(selected()).settings({ automatic, cap, now: now().now }));
   ipcMain.handle('revisit-retry', async (_, { candidate }) => revisitFor(selected()).retry({ candidate, now: now().now }));
-  ipcMain.handle('revisit-package', async (_, { candidate }) => revisitFor(selected()).previewPackage({ candidate }));
-  ipcMain.handle('revisit-send', async (_, { candidate, text }) => revisitFor(selected()).sendReviewed({ candidate, text, now: now().now }));
+  ipcMain.handle('revisit-package', async (_, { candidate }) => {
+    const vault = selected(), preview = await revisitFor(vault).previewPackage({ candidate });
+    if (preview.blocked) return preview;
+    const previewId = randomUUID();
+    if (gatePreviews.size >= 32) gatePreviews.delete(gatePreviews.keys().next().value);
+    gatePreviews.set(previewId, { vault, preview });
+    return { ...preview, previewId };
+  });
+  ipcMain.handle('revisit-send', async (_, { previewId }) => {
+    const approved = gatePreviews.get(previewId);
+    gatePreviews.delete(previewId);
+    if (!approved || approved.vault !== selected()) throw Error('Review the current gate package before sending.');
+    return revisitFor(approved.vault).sendReviewed({ ...approved.preview, now: now().now });
+  });
 
   // Runs after capture or intake has finished and released its lock. Failures never fail
   // the capture or intake that triggered them; they show in the Revisit status instead.

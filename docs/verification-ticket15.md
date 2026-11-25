@@ -100,3 +100,9 @@ One low, nonblocking heuristic: `app/comparisons.js` repeats the feedback-bindin
 Independent reviewer `review15_spec` approved the same exact tip with no blocking findings or material scope creep. Matched package/model/settings pins, durable one-attempt slots, retained full outcomes and qualified effort, separate blind mapping, candidate-bound four-dimension feedback and explicit reveal satisfy D21, D34 and D39. Versioned prompts share grounding/output requirements; only analogy requests mapping. Active writer baselines and guarded local recovery preserve external edits without generation replay.
 
 These are ticket approvals. They do not establish live inference, reasoning quality, release readiness or final whole-PR approval. Review totals: Standards zero hard violations and one low heuristic; Spec zero findings.
+
+## Production comparison readiness
+
+Each slot shares an approved brief and one authored case with the signed-in Codex model after an explicit preview and send. Local creation and review work independently of inference. A live comparison requires current chat readiness and separate evidence for the selected model's provider, reasoning effort, service tier, input capacity, harness and output allowance. The provider checks returned settings before it submits the reviewed text. A proof change after a completed slot requires a separate comparison to preserve matched conditions.
+
+Controlled comparisons exercise this protocol. A live target-machine settings observation and matched signed-in turns remain outstanding. Provider usage updates record observed consumption only. They cannot establish capacity or guarantee equal cost across methods.

@@ -268,7 +268,7 @@ class Comparisons {
     const fixture = fixtures.find(item => item.id === slot.fixtureId);
     if (!fixture || JSON.stringify(slot.prompt) !== JSON.stringify(prompts[slot.method]) || JSON.stringify(slot.package) !== JSON.stringify(makePackage(record.brief, fixture, slot.method))) throw Error('Comparison package or prompt changed. No request was sent.');
     const evidence = await this.getEvidence(), capacity = evidence.capacity, settings = evidence.comparisonSettings;
-    if (!evidence.dispatchEnabled || !capacity || !capacity.harnessAndOutputEvidence || !settings) throw Error('Comparison unavailable: independent model, settings, input capacity and harness/output evidence are required. Production readiness remains closed without proof.');
+    if (evidence.dispatchEnabled !== true || !evidence.binding || !capacity?.harnessAndOutputEvidence || !settings) throw Error('Comparison unavailable: independent model, settings, input capacity and harness/output evidence are required. Production readiness remains closed without proof.');
     const requested = { model: capacity.model, modelProvider: settings.modelProvider, reasoningEffort: settings.reasoningEffort, serviceTier: settings.serviceTier };
     const pin = { requested, capacity, settings, binding: evidence.binding, bindingEvidence: 'Random process-local evidence binding, not portable capacity or authentication proof.' };
     const count = [...slot.package.text].length, limit = Math.min(32000, capacity.maxCodePoints);
@@ -293,7 +293,7 @@ class Comparisons {
       const packageId = randomUUID();
       if (this.tokens.size >= 64) this.tokens.delete(this.tokens.keys().next().value);
       this.tokens.set(packageId, { id: record.id, snapshot });
-      return { packageId, text: slot.package.text, count: slot.package.count, requested: snapshot.pin.requested, evidence: snapshot.pin, notice: 'Review the exact synthetic package. One explicit send consumes this slot; failure or restart never rerolls it.' };
+      return { packageId, text: slot.package.text, count: slot.package.count, requested: snapshot.pin.requested, evidence: snapshot.pin, notice: 'Sending shares the approved brief, its saved source snapshots and this synthetic case with the signed-in Codex model. Each slot allows one attempt.' };
     });
   }
   selectCandidate(slot) {

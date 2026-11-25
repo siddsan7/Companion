@@ -17,6 +17,7 @@ const evidencePrefixes = ['capture:', 'annotation:', 'idea:', 'brief:'];
 const maxAttempts = 3;
 const stateChanged = () => Error('Revisit records changed during this check. Run the check again.');
 const defaultCap = 10;
+const validCap = cap => Number.isSafeInteger(cap) && cap >= 1 && cap <= 100;
 const emptyState = () => ({ schema: 1, settings: { automatic: false, cap: defaultCap, changedAt: null }, seen: {}, events: [], candidates: [], notices: [], lastRun: null });
 const evidenceId = item => `${item.key}#${item.digest}`;
 const conditionId = condition => `${condition.id}@${condition.version}`;
@@ -95,8 +96,8 @@ class Revisit {
       return createHash('sha256').update(bytes).digest('hex') === attempt.packageDigest ? bytes.toString('utf8') : null;
     } catch { return null; }
   }
-  async evidence() {
-    const corpus = await this.getEvidence(this.vault);
+  async evidence(dispatch) {
+    const corpus = await this.getEvidence(this.vault, { dispatch });
     return { items: corpus.all.filter(item => evidencePrefixes.some(prefix => item.key.startsWith(prefix))), issues: corpus.issues || [] };
   }
   // Records a user's resolution from the ledger note into the notice records, so a crash
@@ -118,11 +119,15 @@ class Revisit {
       const sent = candidate.attempts.filter(attempt => attempt.status === 'sent');
       if (sent.some(attempt => inFlight(attempt.owner))) continue;
       for (const attempt of sent) Object.assign(attempt, { status: 'interrupted', error: 'Request interrupted before a reply was recorded. It will not be replayed.' });
-      candidate.status = this.failedAttempts(candidate) >= maxAttempts ? 'held' : 'pending';
+      candidate.status = this.afterFailure(candidate);
     }
   }
   failedAttempts(candidate) {
-    return candidate.attempts.filter(attempt => attempt.mode === 'automatic' && ['failed', 'interrupted'].includes(attempt.status) && attempt.at >= (candidate.retryGrantedAt || '')).length;
+    return candidate.attempts.filter(attempt => attempt.mode === 'automatic' && ['failed', 'interrupted'].includes(attempt.status)).length;
+  }
+  afterFailure(candidate) {
+    const failures = this.failedAttempts(candidate);
+    return failures < maxAttempts || candidate.retryAfterFailures === failures ? 'pending' : 'held';
   }
   // D49-I02: removed evidence withdraws open candidates and marks unresolved notices.
   markRemoved(state, present, now) {
@@ -183,7 +188,7 @@ class Revisit {
     }
   }
   history(state, condition) {
-    return state.candidates.filter(other => other.condition.id === condition.id && other.outcome)
+    return state.candidates.filter(other => conditionId(other.condition) === conditionId(condition) && other.outcome)
       .map(other => ({ at: other.decidedAt, outcome: other.outcome, reason: other.outcomeReason }));
   }
   packageFor(state, ledger, candidate) {
@@ -211,18 +216,40 @@ class Revisit {
     for (const candidate of queue) {
       if (chosen.length >= cap) break;
       const text = this.packageFor(state, ledger, candidate);
-      if (codePoints(text) > packageLimit) {
+      const limit = status.limit ?? packageLimit;
+      if (codePoints(text) > limit) {
         // Never shortened silently (D46-I04, D36-I03).
-        Object.assign(candidate, { status: 'held-oversize', heldReason: `Package is ${codePoints(text)} characters, over the ${packageLimit}-character limit, and is never shortened automatically. Shorten this decision's choice or reasons in a new version; the candidate is then checked again.` });
+        Object.assign(candidate, { status: 'held-oversize', heldReason: `Package is ${codePoints(text)} characters, over the ${limit}-character limit, and is never shortened automatically. Shorten this decision's choice or reasons in a new version; the candidate is then checked again.` });
         if (mode === 'manual') throw Error(candidate.heldReason);
         continue;
       }
       const attemptId = randomUUID();
       const attempt = { id: attemptId, at: now, mode: status.rule === 'match' ? 'rule' : mode, status: 'sent', owner: { pid: process.pid, started: processStarted, run, sentAt: Date.now() }, ...this.writePackage(attemptId, text) };
       candidate.attempts.push(attempt); candidate.status = 'sending';
-      chosen.push({ candidate: candidate.id, attempt: attempt.id, text });
+      chosen.push({ candidate: candidate.id, attempt: attempt.id, text, evidence: candidate.evidence, settings: state.settings });
     }
     return chosen;
+  }
+  // The provider calls the returned synchronous check immediately before turn/start.
+  async beforeStart(item, mode) {
+    let verifySource;
+    const { items } = await this.evidence({
+      dependencies: new Map([[item.evidence.key, item.evidence.digest]]),
+      observe: verify => { verifySource = verify; }
+    });
+    const source = items.find(value => value.key === item.evidence.key && value.digest === item.evidence.digest);
+    return () => {
+      if (!source || !verifySource) throw Error('Matched evidence is unavailable. Check decisions again.');
+      verifySource();
+      const { state } = this.readState(), ledger = this.decisions.load();
+      const candidate = state.candidates.find(entry => entry.id === item.candidate);
+      if (candidate?.status !== 'sending' || !candidate.attempts.some(entry => entry.id === item.attempt && entry.status === 'sent')) throw Error('Revisit candidate is unavailable.');
+      if (mode === 'automatic' && (state.settings.automatic !== true || JSON.stringify(state.settings) !== JSON.stringify(item.settings))) throw Error('Automatic revisit consent is unavailable or the cap changed. Check decisions again.');
+      const decision = ledger.decisions.find(entry => entry.id === candidate.decision.id);
+      const current = decision && activeConditions(decision).find(entry => conditionId(entry.condition) === conditionId(candidate.condition));
+      const match = current && matchCondition(current.condition, source);
+      if (!match || buildPackage({ ...current, candidate: { evidence: source, passages: match.passages }, history: this.history(state, current.condition) }) !== item.text) throw Error('Reviewed revisit package is unavailable. Preview again.');
+    };
   }
   async send(chosen, mode, status) {
     const results = [];
@@ -230,13 +257,20 @@ class Revisit {
     for (const item of chosen) {
       if (stop) { results.push({ ...item, skipped: true }); continue; }
       await this.checkpoint('revisit-before-gate-request', { candidate: item.candidate });
-      if (status.rule === 'match') { results.push({ ...item, rule: true }); continue; }
-      try { results.push({ ...item, response: await this.gate.send(item.text, mode) }); }
+      let dispatched = false;
+      const beforeStart = async () => {
+        const verify = await this.beforeStart(item, mode);
+        return () => { verify(); dispatched = true; };
+      };
+      try {
+        if (status.rule === 'match') { (await beforeStart())(); results.push({ ...item, rule: true }); }
+        else results.push({ ...item, response: await this.gate.send(item.text, mode, status, beforeStart) });
+      }
       catch (error) {
         // Usage, offline and sign-in failures stop the run and are not the candidate's
         // fault, so they do not count toward its three attempts (D46-I07, D46-I08).
-        const stopped = stopPattern.test(error.message);
-        results.push({ ...item, error: error.message, stopped });
+        const stopped = !dispatched || stopPattern.test(error.message);
+        results.push({ ...item, error: error.message, stopped, beforeSend: !dispatched });
         if (stopped) stop = error.message;
       }
     }
@@ -248,7 +282,8 @@ class Revisit {
       const candidate = state.candidates.find(item => item.id === result.candidate);
       const attempt = candidate?.attempts.find(item => item.id === result.attempt);
       if (!attempt || attempt.status !== 'sent') continue;
-      if (result.skipped) { candidate.attempts = candidate.attempts.filter(item => item !== attempt); candidate.status = 'pending'; continue; }
+      if (candidate.status === 'withdrawn') { Object.assign(attempt, { status: 'withdrawn', finishedAt: now }); continue; }
+      if (result.skipped) { Object.assign(attempt, { status: 'not sent', finishedAt: now }); candidate.status = 'pending'; continue; }
       if (result.rule) {
         Object.assign(attempt, { status: 'answered', outcome: 'meets', reason: 'Test rule: notify on any match (D50-I02).', model: 'rule:notify-on-match' });
         const before = state.notices.length;
@@ -257,18 +292,18 @@ class Revisit {
       }
       if (result.error) {
         Object.assign(attempt, { status: result.stopped ? 'stopped' : 'failed', error: result.error, finishedAt: now });
-        candidate.status = attempt.mode === 'automatic' && this.failedAttempts(candidate) >= maxAttempts ? 'held' : 'pending';
-        if (candidate.status === 'held') candidate.heldReason = `Gate request failed ${maxAttempts} times. Retry explicitly.`;
+        candidate.status = this.afterFailure(candidate);
+        if (candidate.status === 'held') candidate.heldReason = 'Automatic attempts exhausted. Retry explicitly.';
         continue;
       }
       let parsed;
       try { parsed = parseReply(result.response.reply, candidate.passages); }
       catch (error) {
         Object.assign(attempt, { status: 'failed', error: error.message, reply: String(result.response.reply).slice(0, 4000), model: result.response.model, finishedAt: now });
-        candidate.status = attempt.mode === 'automatic' && this.failedAttempts(candidate) >= maxAttempts ? 'held' : 'pending';
+        candidate.status = this.afterFailure(candidate);
         continue;
       }
-      Object.assign(attempt, { status: 'answered', ...parsed, reply: result.response.reply, model: result.response.model, usage: result.response.usage, evidence: result.response.evidence, finishedAt: now });
+      Object.assign(attempt, { status: 'answered', ...parsed, reply: result.response.reply, model: result.response.model, effective: result.response.effective ?? null, usage: result.response.usage, evidence: result.response.evidence, finishedAt: now });
       const before = state.notices.length;
       this.raise(state, candidate, parsed, now);
       raised += state.notices.length - before;
@@ -284,6 +319,10 @@ class Revisit {
     if (items) {
       const present = new Set(items.map(item => item.key));
       this.markRemoved(state, present, now);
+      const revisions = new Set(items.map(evidenceId));
+      for (const candidate of state.candidates) if (open(candidate.status) && !revisions.has(evidenceId(candidate.evidence))) {
+        Object.assign(candidate, { status: 'withdrawn', withdrawnReason: 'The matched evidence revision is no longer available.', withdrawnAt: now });
+      }
       // Kept so the read-only list can warn about missing references without reading
       // the corpus, which would contend with intake for the source lock.
       state.presentKeys = [...present].sort();
@@ -311,13 +350,14 @@ class Revisit {
       const { state, proof } = this.readState();
       const ledger = this.reconcile(state, { now, timezone, trigger, items: evidence?.items });
       let chosen = [], status = null;
-      if (gate && state.settings.automatic) {
-        status = await this.gate.status('automatic');
+      if (gate && evidence && state.settings.automatic) {
+        status = state.settings.automatic === true && validCap(state.settings.cap)
+          ? await this.gate.status('automatic') : { open: false, reason: 'Choose a valid automatic revisit setting and request cap.' };
         if (status.open) chosen = this.prepare(state, ledger, { mode: 'automatic', now, status, run });
       }
       const pending = state.candidates.filter(candidate => candidate.status === 'pending').length;
       state.lastRun = {
-        at: now, trigger, sent: chosen.length, pending, cap: state.settings.cap,
+        run, at: now, trigger, sent: 0, pending, cap: state.settings.cap,
         status: evidenceError ? 'evidence unavailable' : !state.settings.automatic ? 'automatic checks off' : status && !status.open ? 'gate closed' : 'complete',
         message: evidenceError ? `Evidence could not be read: ${evidenceError}` : !state.settings.automatic ? 'Automatic gate checks are off. Candidates stay pending until you enable them or send a reviewed package.' : status && !status.open ? status.reason : `${chosen.length} gate request(s) prepared.`
       };
@@ -329,8 +369,8 @@ class Revisit {
       await this.decisions.lock(async () => {
         const { state, proof } = this.readState();
         const raised = this.apply(state, results, now);
-        Object.assign(state.lastRun, {
-          status: stop ? 'stopped' : 'complete', raised,
+        if (state.lastRun?.run === run) Object.assign(state.lastRun, {
+          status: stop ? 'stopped' : 'complete', raised, sent: results.filter(result => !result.skipped && !result.beforeSend).length,
           pending: state.candidates.filter(candidate => candidate.status === 'pending').length,
           message: stop ? `Gate run stopped: ${stop} Remaining candidates stay pending.` : `${results.filter(r => !r.skipped).length} gate request(s) finished; ${raised} notice(s) raised.`
         });
@@ -373,7 +413,7 @@ class Revisit {
   }
   async settings({ automatic, cap, now }) {
     if (typeof automatic !== 'boolean') throw Error('Choose whether automatic revisit checks are on.');
-    if (!Number.isSafeInteger(cap) || cap < 1 || cap > 100) throw Error('The automatic gate cap must be a whole number from 1 to 100.');
+    if (!validCap(cap)) throw Error('The automatic gate cap must be a whole number from 1 to 100.');
     return this.decisions.lock(async () => {
       const { state, proof } = this.readState();
       state.settings = { automatic, cap, changedAt: now };
@@ -388,7 +428,7 @@ class Revisit {
       const candidate = state.candidates.find(item => item.id === id);
       if (!candidate || !['held', 'held-oversize'].includes(candidate.status)) throw Error('This candidate is not held for retry.');
       if (candidate.status === 'held-oversize') throw Error('An oversized package can only be checked manually after you review it.');
-      Object.assign(candidate, { status: 'pending', retryGrantedAt: now, heldReason: null });
+      Object.assign(candidate, { status: 'pending', retryGrantedAt: now, retryAfterFailures: this.failedAttempts(candidate), heldReason: null });
       await this.writeState(state, proof);
       return true;
     });
@@ -401,12 +441,14 @@ class Revisit {
       const candidate = state.candidates.find(item => item.id === id);
       if (!candidate || !['pending', 'held', 'held-oversize'].includes(candidate.status)) throw Error('This candidate is not waiting for a gate check.');
       const text = this.packageFor(state, ledger, candidate);
-      return { candidate: id, text, length: codePoints(text), limit: packageLimit, blocked: codePoints(text) > packageLimit };
+      const status = await this.gate.status('manual'), limit = status.limit ?? packageLimit;
+      return { candidate: id, text, length: codePoints(text), limit, binding: status.binding, blocked: !status.open || codePoints(text) > limit };
     });
   }
-  async sendReviewed({ candidate: id, text: reviewed, now }) {
+  async sendReviewed({ candidate: id, text: reviewed, binding, now }) {
     const status = await this.gate.status('manual');
     if (!status.open) throw Error(status.reason);
+    if (binding !== status.binding) throw Error('Revisit gate evidence changed. Preview again.');
     const run = randomUUID();
     activeRuns.add(run);
     try { return await this.sendReviewedRun({ id, reviewed, now, status, run }); }

@@ -106,6 +106,14 @@ Each row is a finding I read in the paper and the design choice it leads to here
 - **D46-I09**. The gate runs after reconciliation releases the intake lock, so a slow model call cannot block or overlap intake (ADR 0004).
 - **D46-I10**. The gate depends on the production chat readiness gate, plus a real check that an automatic request from the scheduled worker is isolated in the same way. While either is closed, candidates accumulate as pending and no notice is raised from evidence. Time-based conditions need no model and still work.
 
+### Production evidence
+
+Review-by dates use the local clock during a check. Local retrieval records matched evidence as pending while hosted inference is unavailable. A manual send needs a single-use preview from the selected vault and current chat readiness. Immediately before submission, Companion checks the verified model capacity, eligible source revision, active condition and exact package. Automatic sends additionally require current opt-in and a valid per-check request cap. After three automatic failures, each explicit retry grants one further attempt. Service outages stop the batch.
+
+On 2026-11-25, Windows Task Scheduler launched the production worker at an accelerated trigger with the desktop closed. The disposable vault had automatic consent enabled and a cap of one. Intake imported one synthetic capture. Revisit recorded one pending evidence candidate, one due notice and zero gate attempts. The task exited with code zero and cleanup verified its removal. To repeat, use `scripts/probe-scheduled-intake.cjs` with `prepare`, `arm`, `observe`, and `cleanup` against one fresh disposable directory. Pass `--revisit` to both `prepare` and `observe` and wait for the armed trigger before observing.
+
+The production worker performs local checks only. Enabling hosted requests requires a separate implementation and target-machine evidence. Run the registered task under its normal Windows principal with the desktop closed and a disposable vault. Verify the executable, arguments, working directory, protected roots and tool inventory against the approved isolation policy. Observe one fresh isolated thread for one authorized candidate, the exact submitted package, effective model settings, observed usage, and completion after intake releases its lock. Repeat with consent revoked and with readiness unavailable, and verify zero submissions. Target-machine inference isolation and a signed-in worker turn remain outstanding.
+
 ### D47 · Raise at most one notice, and default to silence
 
 - **D47-I01**. A **revisit notice** shows the decision, the condition, the evidence passage with its source revision, and the gate's reason.

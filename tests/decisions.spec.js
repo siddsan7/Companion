@@ -335,10 +335,80 @@ test('D46-I08: a candidate whose request fails three times is held and is not se
   for (let index = 0; index < 4; index++) await checkDecisions();
   expect(await requests()).toHaveLength(3);
   expect((await state()).candidates[0].status).toBe('held');
+  await clock('2026-11-08T07:00:00Z');
   await page.getByRole('button', { name: 'Allow another automatic attempt', exact: true }).click();
   await expect.poll(async () => (await state()).candidates[0].status).toBe('pending');
+  await gate({ chatReady: true, workerIsolation: true, replies: [{ fail: 'offline' }] });
   await checkDecisions();
-  expect(await requests()).toHaveLength(4);
+  expect((await state()).candidates[0].status).toBe('pending');
+  await gate({ chatReady: true, workerIsolation: true, replies: [{ fail: 'malformed transport frame' }] });
+  await checkDecisions();
+  expect((await state()).candidates[0].status).toBe('held');
+  await checkDecisions();
+  expect(await requests()).toHaveLength(5);
+});
+
+test('revoking automatic consent after preparation stops the batch before its first submission', async () => {
+  await gate({ chatReady: true, workerIsolation: true, replies: [{ reply: meets('Lexical search') }] });
+  await launch(); await setup();
+  await save(decision([evidenceCondition(['lexical search'])]));
+  await capture('Lexical search first sample.'); await capture('Lexical search second sample.');
+  await enableAutomatic(2);
+  await fs.writeFile(path.join(root, 'faults.json'), JSON.stringify({ pause: 'revisit-before-gate-request' }));
+  const checking = call('revisit-check');
+  try {
+    await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('revisit-before-gate-request');
+    await call('revisit-settings', { automatic: false, cap: 2 });
+  } finally { await fs.writeFile(path.join(root, 'release.txt'), ''); }
+  const { lastRun } = await checking;
+  expect(lastRun).toMatchObject({ status: 'stopped', sent: 0, pending: 2 });
+  expect(await requests()).toHaveLength(0);
+  expect((await state()).notices).toHaveLength(0);
+});
+
+test('reviewed gate packages require a single-use preview and current matched source bytes', async () => {
+  await gate({ chatReady: true, workerIsolation: false, replies: [{ reply: meets('Lexical search') }] });
+  await launch(); await setup();
+  await save(decision([evidenceCondition(['lexical search'])]));
+  await capture('Lexical search in this controlled capture.');
+  const [candidate] = (await state()).candidates;
+  const preview = await call('revisit-package', { candidate: candidate.id });
+  await expect(call('revisit-send', { candidate: candidate.id, text: preview.text })).rejects.toThrow(/Review the current gate package/);
+  const captures = path.join(base(), 'Captures');
+  const [name] = (await fs.readdir(captures)).filter(name => name.endsWith('.md'));
+  await fs.appendFile(path.join(captures, name), '\nChanged after preview.\n');
+  const result = await call('revisit-send', { previewId: preview.previewId });
+  expect(result.error).toContain('unavailable');
+  await expect(call('revisit-send', { previewId: preview.previewId })).rejects.toThrow(/Review the current gate package/);
+  expect(await requests()).toHaveLength(0);
+  expect((await state()).notices).toHaveLength(0);
+});
+
+test('production reminder requires chat and capacity proof, pins manual approval, and keeps automatic isolation closed', async () => {
+  const { ProductionGate, parseReply } = require('../app/revisit-gate');
+  let evidence = { dispatchEnabled: true, binding: 'controlled' };
+  const submissions = [];
+  const provider = { preflight: async () => {}, turn: async (text, options) => {
+    (await options.beforeStart())();
+    submissions.push({ text, binding: options.capacityBinding });
+    return { model: 'fixture', reply: 'fixture reply' };
+  } };
+  const gate = new ProductionGate({ getEvidence: async () => evidence, provider });
+  expect((await gate.status('manual')).open).toBe(false);
+  evidence.capacity = { maxCodePoints: 4, model: 'fixture', evidence: 'controlled input', harnessAndOutputEvidence: 'controlled allowance' };
+  const manual = await gate.status('manual');
+  expect(manual).toMatchObject({ open: true, limit: 4 });
+  expect((await gate.status('automatic')).open).toBe(false);
+  const beforeStart = async () => () => {};
+  await expect(gate.send('test', 'automatic', manual, beforeStart)).rejects.toThrow(/unavailable/);
+  await expect(gate.send('longer', 'manual', manual, beforeStart)).rejects.toThrow(/unavailable/);
+  await gate.send('test', 'manual', manual, beforeStart);
+  evidence.binding = 'changed';
+  await expect(gate.send('test', 'manual', manual, beforeStart)).rejects.toThrow(/unavailable/);
+  evidence.dispatchEnabled = false;
+  expect((await gate.status('manual')).open).toBe(false);
+  expect(submissions).toEqual([{ text: 'test', binding: 'controlled' }]);
+  expect(() => parseReply(JSON.stringify(meets('3.14')), [{ text: 'Observed 3-14.' }])).toThrow(/quote does not appear/);
 });
 
 test('D46-I03: with automatic checks off, one reviewed package can be sent by the user', async () => {
@@ -423,8 +493,8 @@ function worker() {
   let output = ''; child.stderr.on('data', bytes => { output += bytes; });
   return new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', code => { children.delete(child); resolve({ code, output }); }); });
 }
-test('D46-I02: a scheduled check with the window closed imports a matching reel and raises one notice with no user action', async () => {
-  await gate({ chatReady: true, workerIsolation: true, replies: [{ reply: meets('The narration specifies three retries.') }] });
+test('D46-I02: the closed-window worker keeps a match pending through isolation and quota stops, then raises one notice', async () => {
+  await gate({ chatReady: true, workerIsolation: false });
   await fs.mkdir(path.join(root, 'producer'));
   await launch(); await setup();
   await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
@@ -441,11 +511,23 @@ test('D46-I02: a scheduled check with the window closed imports a matching reel 
   await fs.writeFile(path.join(dir, 'first-pass-target.json'), JSON.stringify(fixture.target));
   await fs.copyFile(path.join(__dirname, 'fixtures/reel-draft/notes.md'), path.join(dir, 'notes.md'));
   await clock('2026-11-09T07:00:00Z');
+  const gated = await worker();
+  expect(gated.code, gated.output).toBe(0);
+  expect((await state()).lastRun).toMatchObject({ status: 'gate closed', pending: 1, sent: 0 });
+  expect(await requests()).toHaveLength(0);
+  await gate({ chatReady: true, workerIsolation: true, replies: [{ fail: 'usage-limit' }] });
+  await clock('2026-11-10T07:00:00Z');
+  const stopped = await worker();
+  expect(stopped.code, stopped.output).toBe(1);
+  expect((await state()).lastRun).toMatchObject({ status: 'stopped', pending: 1, sent: 1 });
+  expect((await state()).notices).toHaveLength(0);
+  await gate({ chatReady: true, workerIsolation: true, replies: [{ reply: meets('The narration specifies three retries.') }] });
+  await clock('2026-11-11T07:00:00Z');
   const result = await worker();
   expect(result.code, result.output).toBe(0);
   const records = await state();
   expect(records.lastRun).toMatchObject({ trigger: 'scheduled' });
   expect(records.notices).toHaveLength(1);
   expect(records.notices[0].passage).toBe('The narration specifies three retries.');
-  expect((await requests()).map(request => request.mode)).toEqual(['automatic']);
+  expect((await requests()).map(request => request.mode)).toEqual(['automatic', 'automatic']);
 });

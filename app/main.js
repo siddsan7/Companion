@@ -62,7 +62,7 @@ async function scheduledRevisit(selected, dataRoot) {
   const { createHash } = require('node:crypto');
   const scopeFile = path.join(dataRoot, `context-settings-${createHash('sha256').update(selected.root).digest('hex')}`, 'notes.json');
   const gate = testRoot ? new ControlledGate(testRoot) : { status: async () => ({ open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' }), send: async () => { throw Error('Revisit gate is closed.'); } };
-  const revisit = new Revisit(selected, { getEvidence: target => new Context(target, { scopeFile }).corpus(), gate, checkpoint });
+  const revisit = new Revisit(selected, { getEvidence: (target, options) => new Context(target, { scopeFile }).corpus(options), gate, checkpoint });
   const { now, timezone } = clock();
   return revisit.check({ now, timezone, trigger: 'scheduled' });
 }
@@ -89,8 +89,12 @@ app.whenReady().then(async () => {
       // D46-I02: the scheduled worker checks new evidence against active revisit
       // conditions after intake has released its lock. Automatic gate requests from this
       // worker stay closed outside controlled tests until their isolation is verified.
-      if (result && !result.skipped) await scheduledRevisit(selected, path.dirname(workerFile)).catch(error => console.error('Revisit check:', error.message));
-      app.exit(result && !result.skipped && result.lastCheck.status !== 'complete' ? 1 : 0);
+      if (result && !result.skipped) {
+        const revisit = await scheduledRevisit(selected, path.dirname(workerFile));
+        if (['stopped', 'evidence unavailable'].includes(revisit.lastRun?.status)) throw Error(revisit.lastRun.message);
+        if (result.lastCheck.status !== 'complete') { app.exit(1); return; }
+      }
+      app.exit(0);
     } catch (error) { console.error(error.message); app.exit(1); }
     return;
   }
