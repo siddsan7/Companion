@@ -15,6 +15,24 @@ const prompt = 'Companion inventory probe. No reply is needed.';
 const hash = value => crypto.createHash('sha256').update(canonical(value)).digest('hex');
 // Full reviewed namespace, function description and parameter schema. Per-request item IDs vary.
 const toolDigest = 'bea3af5e12e25a7cc6033838fa1c1af998e8d91fc32a61cc51211410c8f0cb8a';
+const toolCall = { type: 'function_call', id: 'fc_local', call_id: 'call_local', status: 'completed', namespace: 'functions', name: 'request_user_input',
+  arguments: JSON.stringify({ questions: [{ id: 'color', header: 'Color', question: 'Choose a fixture color.', options: [
+    { label: 'Blue', description: 'Blue fixture' }, { label: 'Red', description: 'Red fixture' }
+  ] }] }) };
+
+function sendToolCall(response) {
+  const metadata = { id: 'resp_local', object: 'response', created_at: 1795636800, model: 'gpt-6.2-sol' };
+  const events = [
+    { type: 'response.created', response: { ...metadata, status: 'in_progress', output: [] } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...toolCall, status: 'in_progress', arguments: '' } },
+    { type: 'response.function_call_arguments.delta', item_id: toolCall.id, output_index: 0, delta: toolCall.arguments },
+    { type: 'response.function_call_arguments.done', item_id: toolCall.id, output_index: 0, arguments: toolCall.arguments },
+    { type: 'response.output_item.done', output_index: 0, item: toolCall },
+    { type: 'response.completed', response: { ...metadata, status: 'completed', output: [toolCall] } }
+  ];
+  response.writeHead(200, { 'content-type': 'text/event-stream' });
+  response.end(events.map((event, sequence_number) => `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`).join(''));
+}
 
 function inspect(headers, body, root) {
   assert(!['authorization', 'cookie', 'chatgpt-account-id', 'openai-organization', 'x-api-key'].some(key => Object.hasOwn(headers, key)), 'Unexpected credential header.');
@@ -42,7 +60,7 @@ async function main(executable) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-chat-request-'));
   const setup = new CodexSetup({ dataRoot: path.join(root, 'data') });
   const observed = [];
-  let refusal, responseStatus;
+  let refusal, responseStatus, expectToolResult = false;
   const server = http.createServer(async (request, response) => {
     try {
       assert(request.method === 'POST' && request.url === '/v1/responses', 'Unexpected local request.');
@@ -53,9 +71,23 @@ async function main(executable) {
         assert(size <= 1024 * 1024, 'Request exceeds diagnostic limit.');
         chunks.push(chunk);
       }
-      observed.push(inspect(request.headers, JSON.parse(Buffer.concat(chunks)), root));
+      const body = JSON.parse(Buffer.concat(chunks));
+      if (expectToolResult) {
+        assert(body.input.length === 5 && canonical(body.input[3]) === canonical(toolCall), 'Follow-up differs from the local tool call.');
+        const { id, ...result } = body.input[4];
+        assert(/^fco_[0-9a-f-]{36}$/i.test(id) && canonical(result) === canonical({ type: 'function_call_output', call_id: toolCall.call_id, output: 'request_user_input is unavailable in Default mode' }), 'Unexpected response to the request for user input.');
+        body.input = body.input.slice(0, 3);
+        expectToolResult = false;
+      }
+      observed.push(inspect(request.headers, body, root));
+      if (responseStatus === 200) {
+        expectToolResult = true;
+        responseStatus = 503;
+        sendToolCall(response);
+        return;
+      }
     } catch (error) { refusal = error; }
-    response.writeHead(responseStatus, { 'content-type': 'application/json' });
+    response.writeHead(refusal ? 400 : responseStatus, { 'content-type': 'application/json' });
     response.end('{"error":{"message":"PRIVATE_LOCAL_PROVIDER_DETAIL"}}');
   });
   try {
@@ -83,7 +115,11 @@ async function main(executable) {
       assert.equal(setup.turnHistory.at(-1).status, 'failed');
       assert(!setup.state.message.includes('PRIVATE_LOCAL_PROVIDER_DETAIL') && !setup.snapshot().ready);
     }
-    console.log(JSON.stringify({ target: 'unsigned-loopback', hostedInference: false, checkedStatus: [401, 429, 503], ...observed[0] }));
+    responseStatus = 200;
+    await assert.rejects(runTurn(setup, prompt), /temporarily unavailable/);
+    if (refusal) throw refusal;
+    assert(!expectToolResult && observed.length === 5, 'Expected one automatic follow-up containing only the known tool refusal.');
+    console.log(JSON.stringify({ target: 'unsigned-loopback', hostedInference: false, checkedStatus: [401, 429, 503], refusedTool: toolCall.name, ...observed[0] }));
   } finally {
     setup.close();
     if (server.listening) await new Promise(resolve => server.close(resolve));
