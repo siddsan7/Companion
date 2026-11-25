@@ -1,6 +1,5 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { normalize } = require('./revisit-match');
 
 // D46: the gate answers one question per candidate. This module builds the fixed-shape
 // package, parses the reply strictly, and talks to the model provider. It has no access
@@ -14,7 +13,7 @@ function buildPackage({ decision, condition, candidate, history }) {
   const passages = candidate.passages.map((p, index) => [
     `Passage ${index + 1}, lines ${p.start}-${p.end}:`, '<<<', p.text, '>>>'
   ].join('\n')).join('\n\n');
-  const earlier = history.length ? history.map(item => `- ${item.at}: ${item.outcome}. ${item.reason}`).join('\n') : 'None.';
+  const earlier = history.length ? history.map(item => `- ${item.at}: ${item.outcome}. Earlier matched passage (untrusted): ${item.passage}`).join('\n') : 'None.';
   return [
     'Companion revisit gate.',
     'Decide whether the evidence below meets the revisit condition. Relevance alone is not enough: answer "meets" only if the evidence actually satisfies the trigger. If the same point was already raised in an earlier outcome, answer "does not meet".',
@@ -53,8 +52,8 @@ function parseReply(reply, passages) {
   if (!outcomes.includes(value.outcome)) throw Error('Gate reply outcome is not one of the allowed outcomes.');
   if (typeof value.reason !== 'string' || !value.reason.trim() || codePoints(value.reason) > 1000) throw Error('Gate reply reason is missing or too long.');
   if (typeof value.quote !== 'string' || codePoints(value.quote) > 2000) throw Error('Gate reply quote is invalid.');
-  const quote = normalize(value.quote);
-  if ((value.outcome === 'meets' || quote) && (!quote || !passages.some(p => ` ${normalize(p.text)} `.includes(` ${quote} `)))) throw Error('Gate reply quote does not appear in the evidence passages.');
+  const quote = value.quote.trim();
+  if ((value.outcome === 'meets' || quote) && (!quote || !passages.some(p => p.text.includes(quote)))) throw Error('Gate reply quote does not appear in the evidence passages.');
   return { outcome: value.outcome, reason: value.reason.trim(), quote: value.quote.trim() };
 }
 
@@ -73,10 +72,12 @@ class ControlledGate {
     if (mode === 'automatic' && !fixture.workerIsolation) return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
     return { open: true, rule: fixture.rule === 'match' ? 'match' : null };
   }
-  async send(text, mode) {
+  async send(text, mode, status, beforeStart, passages) {
     const fixture = await this.fixture();
+    if (!fixture?.chatReady || (mode === 'automatic' && !fixture.workerIsolation)) throw Error('Revisit gate unavailable. Candidates stay pending.');
+    (await beforeStart())();
     await fs.appendFile(path.join(this.testRoot, 'revisit-gate-requests.jsonl'), JSON.stringify({ at: Date.now(), mode, text }) + '\n');
-    const rule = (fixture?.replies || []).find(item => !item.contains || text.includes(item.contains)) || {};
+    const rule = (fixture?.replies || []).find(item => !item.contains || passages.some(passage => passage.text.includes(item.contains))) || {};
     if (rule.fail) throw Error(rule.fail === 'usage-limit' ? 'Codex usage limit reached.' : rule.fail === 'offline' ? 'Codex is offline.' : `Gate request failed: ${rule.fail}`);
     const reply = typeof rule.reply === 'string' ? rule.reply : JSON.stringify(rule.reply || { outcome: 'cannot tell', reason: 'No controlled reply matched.', quote: '' });
     return { reply, model: 'controlled-fixture', usage: null, evidence: 'controlled-fixture-not-live' };
@@ -85,20 +86,22 @@ class ControlledGate {
 
 // Production gate. Automatic requests also need the scheduled-worker isolation check
 // (D46-I10), which has not been run on the target machine, so they stay closed.
-const workerIsolationVerified = false;
 class ProductionGate {
   constructor({ provider, getEvidence }) { Object.assign(this, { provider, getEvidence }); }
   async status(mode) {
     let evidence;
     try { evidence = await this.getEvidence(); } catch { evidence = null; }
-    if (!evidence?.dispatchEnabled) return { open: false, reason: 'Revisit gate is closed: production chat readiness has not passed. Candidates stay pending.' };
-    if (mode === 'automatic' && !workerIsolationVerified) return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
-    return { open: true, rule: null };
+    const capacity = evidence?.capacity;
+    if (evidence?.dispatchEnabled !== true || !evidence.binding || !capacity?.model || !capacity.evidence || !capacity.harnessAndOutputEvidence || !Number.isSafeInteger(capacity.maxCodePoints) || capacity.maxCodePoints < 1) return { open: false, reason: 'Revisit gate is closed: production chat readiness has not passed. Candidates stay pending.' };
+    if (mode !== 'manual') return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
+    return { open: true, rule: null, limit: Math.min(packageLimit, capacity.maxCodePoints), binding: evidence.binding };
   }
-  async send(text) {
-    const evidence = await this.getEvidence();
-    const result = await this.provider.turn(text, { capacityBinding: evidence.binding, beforeStart: async () => () => {}, onState: () => {} });
-    return { reply: result.reply, model: result.model, usage: result.usage, evidence: result.evidence };
+  async send(text, mode, approved, beforeStart) {
+    const status = await this.status(mode);
+    if (!status.open || status.binding !== approved.binding || codePoints(text) > status.limit) throw Error('Revisit gate unavailable with the reviewed capacity. Preview again.');
+    await this.provider.preflight();
+    const result = await this.provider.turn(text, { capacityBinding: status.binding, beforeStart, onState: () => {} });
+    return { reply: result.reply, model: result.model, effective: result.effective ?? null, usage: result.usage, evidence: result.evidence };
   }
 }
 module.exports = { buildPackage, parseReply, packageLimit, codePoints, stopPattern, ControlledGate, ProductionGate, outcomes };

@@ -1,5 +1,5 @@
 // Root-owned disposable native gate. Never called by application startup or tests.
-// Usage: node scripts/probe-scheduled-intake.cjs prepare|arm|observe|cleanup <evidence-directory>
+// Usage: node scripts/probe-scheduled-intake.cjs prepare|arm|observe|cleanup <evidence-directory> [--revisit]
 // prepare uses normal desktop setup; arm is a clearly accelerated test trigger.
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -8,6 +8,7 @@ const { _electron: electron } = require('@playwright/test');
 const { TaskScheduler } = require('../app/task-scheduler');
 const repository = path.resolve(__dirname, '..');
 const [operation, directory] = process.argv.slice(2);
+const revisitProbe = process.argv.includes('--revisit');
 if (!directory || !path.isAbsolute(directory)) throw Error('Supply an absolute disposable evidence directory.');
 const scheduleFile = path.join(directory, 'schedule.json');
 const tasks = new TaskScheduler({ executable: require('electron'), appPath: repository });
@@ -39,6 +40,17 @@ async function main() {
       await page.getByLabel('Draft source folder').fill(path.dirname(producer));
       await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
       await page.getByRole('status').filter({ hasText: 'Source connected' }).waitFor();
+      if (revisitProbe) {
+        await page.evaluate(async () => {
+          const draft = { title: 'Disposable retry policy', choice: 'Keep three retries.', project: 'Fixture', reasons: [], alternatives: [], reliedOn: [], conditions: [
+            { kind: 'evidence', label: 'Retry rule', trigger: 'New retry evidence.', action: 'Review retries.', cueTerms: ['retries'] },
+            { kind: 'time', label: 'Due review', trigger: 'Review date reached.', action: 'Review retries.', reviewBy: '2000-01-01' }
+          ] };
+          const preview = await window.decisions['decision-preview']({ expectedVersion: 0, draft });
+          await window.decisions['decision-confirm']({ previewId: preview.previewId });
+          await window.decisions['revisit-settings']({ automatic: true, cap: 1 });
+        });
+      }
       await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
       await page.getByRole('status').filter({ hasText: 'Daily intake enabled' }).waitFor();
       const state = await load(), effective = await tasks.apply('inspect', state, scheduleFile);
@@ -79,6 +91,12 @@ async function main() {
     const ledger = JSON.parse(await fs.readFile(ledgerFile, 'utf8'));
     const evidence = { observedAt: new Date().toISOString(), state, effective, ledger, captures: await fs.readdir(path.join(state.vault, state.parent, 'Captures')), revisions: await fs.readdir(path.join(state.vault, state.parent, 'Revisions')) };
     await fs.writeFile(path.join(directory, 'observed.json'), JSON.stringify(evidence, null, 2));
+    if (revisitProbe) {
+      const records = JSON.parse(await fs.readFile(path.join(state.vault, state.parent, '.revisit', 'state.json'), 'utf8'));
+      const summary = { automatic: records.settings.automatic, cap: records.settings.cap, run: records.lastRun, attempts: records.candidates.flatMap(candidate => candidate.attempts).length, notices: records.notices.map(notice => notice.kind) };
+      await fs.writeFile(path.join(directory, 'observed-revisit.json'), JSON.stringify(summary, null, 2));
+      if (summary.automatic !== true || summary.cap !== 1 || summary.run?.trigger !== 'scheduled' || summary.run.status !== 'gate closed' || !summary.run.message.includes('scheduled worker') || summary.run.pending !== 1 || summary.attempts !== 0 || summary.notices.join() !== 'due') throw Error('Scheduled revisit evidence differed from the expected closed gate, pending match and local due notice.');
+    }
     console.log(JSON.stringify({ operation, worker: state.worker, handledSlot: state.handledSlot, lastCheck: ledger.lastCheck, captures: evidence.captures.length, revisions: evidence.revisions.length, lastTaskResult: effective.lastResult }));
   } else if (operation === 'cleanup') {
     const state = await load(); await tasks.apply('disable', state, scheduleFile);
