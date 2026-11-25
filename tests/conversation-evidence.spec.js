@@ -8,6 +8,24 @@ const { runTurn } = require('../app/codex-turn');
 const { ConversationProvider } = require('../app/conversation-provider');
 const { CodexRpc } = require('../app/codex-rpc');
 const { once } = require('node:events');
+const { spawnSync } = require('node:child_process');
+
+test('the production UI smoke requires hosted Windows or explicit local permission before touching Electron', () => {
+  test.skip(process.platform !== 'win32', 'The production UI smoke runs on Windows.');
+  const script = path.resolve(__dirname, '../scripts/check-unsigned-chat.cjs');
+  const base = { ...process.env, GITHUB_ACTIONS: 'true', RUNNER_OS: 'Windows', RUNNER_ENVIRONMENT: 'self-hosted' };
+  for (const [env, options, expected] of [
+    [base, [], 'opens a visible window'],
+    [{ ...base, GITHUB_ACTIONS: '', RUNNER_ENVIRONMENT: 'github-hosted' }, [], 'opens a visible window'],
+    [{ ...base, RUNNER_ENVIRONMENT: 'github-hosted' }, [], 'absolute Codex executable path'],
+    [base, ['--allow-visible-window'], 'absolute Codex executable path']
+  ]) {
+    // A relative executable fails before profile creation even on allowed paths.
+    const result = spawnSync(process.execPath, [script, 'relative', ...options], { env, encoding: 'utf8', windowsHide: true });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(expected);
+  }
+});
 
 test('terminal-only HTTP errors preserve the provider failure category without its private message', async () => {
   const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-terminal-failure-'));

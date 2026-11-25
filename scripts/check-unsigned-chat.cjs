@@ -5,7 +5,11 @@ const os = require('node:os');
 const path = require('node:path');
 const { _electron: electron, expect } = require('@playwright/test');
 
-async function main(executable) {
+async function main(executable, ...options) {
+  assert(process.platform === 'win32', 'Use Windows for this Electron check.');
+  assert(options.length === 0 || (options.length === 1 && options[0] === '--allow-visible-window'), 'Unexpected unsigned chat check option.');
+  const hosted = process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_OS === 'Windows' && process.env.RUNNER_ENVIRONMENT === 'github-hosted';
+  assert(hosted || options[0] === '--allow-visible-window', 'This check opens a visible window. Use hosted Windows CI or explicitly pass --allow-visible-window on a coordinated local desktop.');
   assert(executable && path.isAbsolute(executable), 'Supply an absolute Codex executable path.');
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-unsigned-chat-'));
   const profile = path.join(root, 'profile'), vault = path.join(root, 'vault'), project = path.join(root, 'project');
@@ -58,4 +62,4 @@ async function main(executable) {
     finally { await fs.rm(root, { recursive: true, force: true, maxRetries: 3 }); }
   }
 }
-main(process.argv[2]).catch(error => { console.error(error.message); process.exitCode = 1; });
+main(...process.argv.slice(2)).catch(error => { console.error(error.message); process.exitCode = 1; });
