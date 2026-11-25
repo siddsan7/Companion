@@ -163,6 +163,7 @@ class Vault {
   }
   // Publication uses a synchronous walk so another application action cannot
   // run between the last identity observation and the filesystem operation.
+  // External editors can still change an already visited directory.
   annotationCopiesForPublication(id, reserved) {
     const matches = [];
     const visit = folder => {

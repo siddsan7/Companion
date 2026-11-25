@@ -346,14 +346,21 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         verifyIntent();
         verifyStageSync(file, guard, intent.originalProof);
         verifyAbsentSync(backup, guard);
-        if (intent.stageProof) verifyStageSync(stage, guard, intent.stageProof);
-        else verifyAbsentSync(stage, guard);
-        if (ledger && identity.issue?.files.length) ledger.identityIssues[id] = identity.issue;
-        native.unlinkSync(journal);
         if (intent.stageProof) {
-          verifyStageSync(stage, guard, intent.stageProof);
-          native.unlinkSync(stage);
-        }
+          // Once the original is restored, only the recorded stage belongs to
+          // cleanup. A restart can find it already gone or the name reused.
+          try {
+            verifyStageSync(stage, guard, intent.stageProof);
+            native.unlinkSync(stage);
+          } catch (error) {
+            if (error.code !== 'STAGING_CHANGED') throw error;
+          }
+        } else verifyAbsentSync(stage, guard);
+        verifyIntent();
+        verifyStageSync(file, guard, intent.originalProof);
+        verifyAbsentSync(backup, guard);
+        if (ledger && identity?.issue?.files.length) ledger.identityIssues[id] = identity.issue;
+        native.unlinkSync(journal);
       };
       const restoreOriginal = () => {
         backupProof ||= exactOriginal(backup, 1, backupInfo);
@@ -390,6 +397,12 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       };
       if (current !== intent.content) {
         if (!intent.originalProof) throw changed('This earlier relationship repair needs explicit review. Its writing was preserved.');
+        // Staging requires a withdrawn original. Its exact return with no
+        // backup proves rollback reached cleanup, even after the stage unlink.
+        if (intent.stageProof && before === null && current === intent.before) {
+          retireUnpublished();
+          return;
+        }
         if (intent.stageProof) verifyPublicationStage(intent.stageProof);
         if (before === null) {
           if (current !== intent.before) throw changed('Annotation changed during move repair. Its writing was preserved.');

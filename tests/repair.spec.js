@@ -353,7 +353,8 @@ test('duplicate annotations preserve both copies and pause relationship repair u
 
 for (const [boundary, selectOriginal] of [
   ['annotation scan', false], ['link intent', false], ['backup link', true],
-  ['withdrawal', false], ['withdrawal', true], ['stage proof', true], ['live stage proof', false]
+  ['withdrawal', false], ['withdrawal', true], ['stage proof', true], ['live stage proof', false],
+  ['stage cleanup', true], ['replaced stage cleanup', false]
 ]) {
   test(`relationship repair preserves a duplicate created after the ${boundary} and repairs the selected ${selectOriginal ? 'original' : 'copy'}`, async () => {
     const { Vault } = require('../app/vault'), { Intake } = require('../app/intake');
@@ -388,8 +389,9 @@ for (const [boundary, selectOriginal] of [
       };
     } else await fs.rename(intake.destination(capture), moved);
     const native = require('node:fs');
-    if (['backup link', 'withdrawal', 'stage proof', 'live stage proof'].includes(boundary)) {
-      const method = { 'backup link': 'linkSync', withdrawal: 'unlinkSync', 'stage proof': 'renameSync', 'live stage proof': 'renameSync' }[boundary];
+    let independentStage;
+    if (!['annotation scan', 'link intent'].includes(boundary)) {
+      const method = { 'backup link': 'linkSync', withdrawal: 'unlinkSync' }[boundary] || 'renameSync';
       const operation = native[method], stop = Error('Interrupted relationship repair');
       native[method] = (...args) => {
         const result = operation(...args);
@@ -412,6 +414,22 @@ for (const [boundary, selectOriginal] of [
         else await expect(fs.stat(original)).rejects.toMatchObject({ code: 'ENOENT' });
         if (boundary === 'stage proof') expect(intent.stageProof).toBeDefined();
         await createCopy();
+        if (boundary.endsWith('stage cleanup')) {
+          const stage = path.join(intake.dir, `link-${intent.id}.stage`), journal = path.join(intake.dir, 'link-intent.json');
+          const unlink = native.unlinkSync;
+          native.unlinkSync = file => {
+            unlink(file);
+            if (file === stage || file === journal) throw stop;
+          };
+          try { await expect(intake.reconcile({ now })).rejects.toThrow(stop.message); }
+          finally { native.unlinkSync = unlink; }
+          expect(JSON.parse(await fs.readFile(journal, 'utf8')).stageProof).toEqual(intent.stageProof);
+          await expect(fs.stat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
+          if (boundary === 'replaced stage cleanup') {
+            independentStage = stage;
+            await fs.writeFile(stage, 'Unrelated replacement writing.\n', { flag: 'wx' });
+          }
+        }
       }
     } else await intake.reconcile({ now });
     expect(created).toBe(true);
@@ -421,7 +439,8 @@ for (const [boundary, selectOriginal] of [
       await restarted.reconcile({ now });
       expect(await fs.readFile(original, 'utf8')).toBe(before);
       expect(await fs.readFile(copy, 'utf8')).toBe(copied);
-      expect((await fs.readdir(intake.dir)).filter(name => /^link-/.test(name))).toEqual([]);
+      expect((await fs.readdir(intake.dir)).filter(name => /^link-/.test(name))).toEqual(independentStage ? [path.basename(independentStage)] : []);
+      if (independentStage) expect(await fs.readFile(independentStage, 'utf8')).toBe('Unrelated replacement writing.\n');
       issue = (await restarted.repairs()).find(item => item.id === 'annotation:' + id);
       expect(issue?.kind).toBe('duplicate');
     }
