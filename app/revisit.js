@@ -28,6 +28,9 @@ function evidenceId(item) {
 }
 const sameAdmission = (a, b) => sameEvidence(a, b) && a.revisionId === b.revisionId;
 const conditionId = condition => `${condition.id}@${condition.version}`;
+const candidateOrder = (a, b) => a.createdAt.localeCompare(b.createdAt) || a.evidence.key.localeCompare(b.evidence.key) ||
+  conditionId(a.condition).localeCompare(conditionId(b.condition)) || a.id.localeCompare(b.id);
+const held = candidate => ['held', 'held-oversize'].includes(candidate.status) || !!candidate.heldBeforeDuplicate;
 const open = status => ['pending', 'sending', 'held', 'held-oversize'].includes(status);
 const removedNoticeCandidates = state => new Set(state.notices.filter(notice => notice.removedAt || notice.status === 'evidence removed').map(notice => notice.candidateId));
 // Gate runs in progress in this process. A request owned by one of them, or by another
@@ -123,11 +126,10 @@ class Revisit {
   // A failed or interrupted request is terminal and never replayed (D46-I08).
   settleInterrupted(state) {
     for (const candidate of state.candidates) {
-      if (candidate.status !== 'sending') continue;
       const sent = candidate.attempts.filter(attempt => attempt.status === 'sent');
-      if (sent.some(attempt => inFlight(attempt.owner))) continue;
+      if (!sent.length || sent.some(attempt => inFlight(attempt.owner))) continue;
       for (const attempt of sent) Object.assign(attempt, { status: 'interrupted', error: 'Request interrupted before a reply was recorded. It will not be replayed.' });
-      candidate.status = this.afterFailure(candidate);
+      if (candidate.status === 'sending') candidate.status = this.afterFailure(candidate);
     }
   }
   failedAttempts(candidate) {
@@ -142,6 +144,7 @@ class Revisit {
     const unavailable = evidence => !sources.has(evidence.key) || !sameGenerations(evidence, sources.get(evidence.key));
     for (const candidate of state.candidates) if (unavailable(candidate.evidence)) {
       if (candidate.outcome) candidate.sourceRemovedAt ||= now;
+      if (candidate.status === 'duplicate') { delete candidate.duplicateOf; delete candidate.judgedBy; }
       if (open(candidate.status)) Object.assign(candidate, { status: 'withdrawn', withdrawnReason: 'Evidence removed, rejected or deleted.', withdrawnAt: now });
     }
     for (const notice of state.notices) if (notice.kind === 'evidence' && notice.status === 'open' && unavailable(notice.evidence)) {
@@ -159,31 +162,6 @@ class Revisit {
   sweep(state, items, now) { for (const item of items) state.seen[evidenceId(item)] ||= now; }
   match(state, ledger, items, now, trigger) {
     const conditions = ledger.decisions.flatMap(activeConditions).filter(({ condition }) => condition.kind === 'evidence');
-    const current = new Set(conditions.map(({ condition }) => conditionId(condition)));
-    const sources = new Map(items.map(item => [item.key, item]));
-    const prior = new Map(), judged = new Map();
-    const removed = removedNoticeCandidates(state);
-    const repeatFor = (key, sourceKey) => prior.get(key) || judged.get(key + '/' + sourceKey);
-    for (const candidate of state.candidates) {
-      const source = sources.get(candidate.evidence.key);
-      if (!current.has(conditionId(candidate.condition)) || !source || candidate.sourceRemovedAt || removed.has(candidate.id) || !sameGenerations(source, candidate.evidence)) continue;
-      const exact = sameAdmission(source, candidate.evidence);
-      if (!exact && !candidate.outcome) continue;
-      const legacy = !candidate.fingerprint.startsWith('v2:');
-      if (legacy) candidate.fingerprint = fingerprint(candidate.passages);
-      const key = conditionId(candidate.condition) + '/' + candidate.fingerprint;
-      // A verdict can suppress the same point in a later edit of this source.
-      // Only its local id is reused. Prompt history still requires the exact admission.
-      if (outcomes.includes(candidate.outcome) && candidate.status !== 'withdrawn') judged.set(key + '/' + source.key, candidate.id);
-      if (!exact || candidate.historyWithdrawnAt) continue;
-      if (legacy && candidate.status === 'duplicate') {
-        const repeat = repeatFor(key, source.key);
-        if (repeat) candidate.duplicateOf = repeat;
-        else { candidate.status = 'pending'; delete candidate.duplicateOf; }
-      }
-      if (candidate.status === 'duplicate' && judged.get(key + '/' + source.key) === candidate.duplicateOf) prior.set(key, candidate.duplicateOf);
-      if (!['withdrawn', 'duplicate'].includes(candidate.status) && !prior.has(key)) prior.set(key, candidate.id);
-    }
     for (const item of items) {
       const id = evidenceId(item);
       if (state.seen[id]) continue;
@@ -193,21 +171,63 @@ class Revisit {
       const ranked = conditions.map(entry => ({ ...entry, found: matchCondition(entry.condition, item) })).filter(entry => entry.found).sort((a, b) => b.found.score - a.found.score);
       for (const { decision, condition, found } of ranked) {
         const print = fingerprint(found.passages);
-        const key = conditionId(condition) + '/' + print;
-        const repeat = repeatFor(key, item.key);
         const candidate = {
           id: randomUUID(), createdAt: now, eventId: event.id,
           decision: { id: decision.decision_id, version: decision.version, title: decision.title },
           condition: { id: condition.id, version: condition.version, label: condition.label, trigger: condition.trigger, action: condition.action },
           evidence: { ...evidence, provenance: item.provenance },
           passages: found.passages, reasons: found.reasons, fingerprint: print, attempts: [],
-          status: repeat ? 'duplicate' : 'pending', ...(repeat ? { duplicateOf: repeat } : {})
+          status: 'pending'
         };
         state.candidates.push(candidate); event.candidates.push(candidate.id);
-        prior.set(key, repeat || candidate.id);
       }
       event.outcome = event.candidates.length ? 'candidates' : 'no candidate';
       state.events.push(event);
+    }
+    this.selectRepresentatives(state, conditions, items);
+  }
+  // Group the complete current corpus before electing a candidate. A stale revision
+  // contributes only a judgment ID, and only through an eligible match of the same
+  // source generation. Its text and verdict are never admitted to prompt history here.
+  selectRepresentatives(state, conditions, items) {
+    const current = new Set(conditions.map(({ condition }) => conditionId(condition)));
+    const sources = new Map(items.map(item => [item.key, item])), removed = removedNoticeCandidates(state);
+    const groups = new Map();
+    for (const candidate of state.candidates) {
+      const source = sources.get(candidate.evidence.key);
+      if (!source || !current.has(conditionId(candidate.condition)) || candidate.status === 'withdrawn' ||
+          candidate.sourceRemovedAt || removed.has(candidate.id) || !sameGenerations(source, candidate.evidence)) continue;
+      const exact = sameAdmission(source, candidate.evidence);
+      const judgmentId = outcomes.includes(candidate.outcome) ? candidate.id : candidate.judgedBy;
+      if (!exact && !judgmentId) continue;
+      if (!candidate.fingerprint.startsWith('v2:')) candidate.fingerprint = fingerprint(candidate.passages);
+      const key = conditionId(candidate.condition) + '/' + candidate.fingerprint;
+      if (!groups.has(key)) groups.set(key, { members: [], judgments: new Map() });
+      const group = groups.get(key);
+      if (judgmentId) group.judgments.set(source.key, judgmentId);
+      if (exact) group.members.push(candidate);
+    }
+    for (const { members, judgments } of groups.values()) {
+      if (!members.length) continue;
+      // Preserve an in-flight request, then its existing retry budget. Stable source
+      // identity breaks ties for unattempted peers regardless of directory/scan order.
+      members.sort((a, b) => (b.status === 'sending') - (a.status === 'sending') ||
+        held(b) - held(a) || b.attempts.length - a.attempts.length || candidateOrder(a, b));
+      const judgedSource = members.find(member => judgments.has(member.evidence.key));
+      const representative = judgedSource ? judgments.get(judgedSource.evidence.key) : members[0].id;
+      for (const member of members) {
+        if (member.outcome) continue;
+        if (member.id === representative) {
+          if (member.status === 'duplicate') member.status = member.heldBeforeDuplicate || this.afterFailure(member);
+          delete member.heldBeforeDuplicate;
+          delete member.duplicateOf;
+        } else {
+          if (member.status === 'held' || member.status === 'held-oversize') member.heldBeforeDuplicate = member.status;
+          member.status = 'duplicate';
+          member.duplicateOf = representative;
+          if (judgedSource) member.judgedBy = representative;
+        }
+      }
     }
   }
   // D44-I03: one due notice per time condition version, however many checks were missed.
@@ -238,6 +258,9 @@ class Revisit {
   }
   raise(state, candidate, result, now) {
     candidate.status = result.outcome; candidate.outcome = result.outcome; candidate.outcomeReason = result.reason; candidate.decidedAt = now;
+    // Peers already grouped under this request retain only its local judgment ID.
+    // They never acquire its passages, reply or permission to send that reply.
+    for (const peer of state.candidates) if (peer.status === 'duplicate' && peer.duplicateOf === candidate.id && !peer.sourceRemovedAt) peer.judgedBy = candidate.id;
     if (result.outcome !== 'meets') return;
     // One notice per condition version and evidence revision (D47-I02).
     if (state.notices.some(notice => notice.kind === 'evidence' && notice.condition.id === candidate.condition.id && notice.condition.version === candidate.condition.version && sameAdmission(notice.evidence, candidate.evidence))) return;
@@ -251,7 +274,7 @@ class Revisit {
   // Chooses candidates for this run and records their packages before anything is sent.
   prepare(state, ledger, { mode, only, now, status, run }) {
     const chosen = [];
-    const queue = only ? state.candidates.filter(candidate => candidate.id === only) : state.candidates.filter(candidate => candidate.status === 'pending').sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const queue = only ? state.candidates.filter(candidate => candidate.id === only) : state.candidates.filter(candidate => candidate.status === 'pending').sort(candidateOrder);
     const cap = mode === 'automatic' ? state.settings.cap : 1;
     for (const candidate of queue) {
       if (chosen.length >= cap) break;
@@ -332,19 +355,19 @@ class Revisit {
       const candidate = state.candidates.find(item => item.id === result.candidate);
       const attempt = candidate?.attempts.find(item => item.id === result.attempt);
       if (!attempt || attempt.status !== 'sent') continue;
-      const withdrawn = candidate.status === 'withdrawn';
-      if (withdrawn) attempt.suppressed = 'candidate withdrawn';
-      if (result.skipped) { Object.assign(attempt, { status: 'not sent', finishedAt: now }); if (!withdrawn) candidate.status = 'pending'; continue; }
+      const suppressed = ['withdrawn', 'duplicate'].includes(candidate.status);
+      if (suppressed) attempt.suppressed = 'candidate ' + candidate.status;
+      if (result.skipped) { Object.assign(attempt, { status: 'not sent', finishedAt: now }); if (!suppressed) candidate.status = 'pending'; continue; }
       if (result.rule) {
         Object.assign(attempt, { status: 'answered', outcome: 'meets', reason: 'Test rule: notify on any match (D50-I02).', model: 'rule:notify-on-match' });
-        if (withdrawn) continue;
+        if (suppressed) continue;
         const before = state.notices.length;
         this.raise(state, candidate, { outcome: 'meets', reason: attempt.reason, quote: candidate.passages[0]?.text || '' }, now);
         raised += state.notices.length - before; continue;
       }
       if (result.error) {
         Object.assign(attempt, { status: result.stopped ? 'stopped' : 'failed', error: result.error, finishedAt: now });
-        if (withdrawn) continue;
+        if (suppressed) continue;
         candidate.status = this.afterFailure(candidate);
         if (candidate.status === 'held') candidate.heldReason = 'Automatic attempts exhausted. Retry explicitly.';
         continue;
@@ -355,11 +378,11 @@ class Revisit {
       try { parsed = parseReply(result.response.reply, candidate.passages); }
       catch (error) {
         Object.assign(attempt, { status: 'failed', error: error.message, reply: String(result.response.reply).slice(0, 4000) });
-        if (!withdrawn) candidate.status = this.afterFailure(candidate);
+        if (!suppressed) candidate.status = this.afterFailure(candidate);
         continue;
       }
       Object.assign(attempt, { status: 'answered', ...parsed, reply: result.response.reply });
-      if (withdrawn) continue;
+      if (suppressed) continue;
       const before = state.notices.length;
       this.raise(state, candidate, parsed, now);
       raised += state.notices.length - before;

@@ -45,6 +45,62 @@ async function restore(vault, info, selection) {
   await deletion.confirmRestoration((await deletion.previewRestoration(selection)).token);
 }
 
+function orderCorpus(f, firstKey, originalFirst) {
+  const read = f.revisit.getEvidence;
+  f.revisit.getEvidence = async (...args) => {
+    const corpus = await read(...args);
+    corpus.all.sort((a, b) => ((b.key === firstKey) - (a.key === firstKey)) * (originalFirst ? 1 : -1) || a.key.localeCompare(b.key));
+    return corpus;
+  };
+}
+
+for (const incremental of [false, true]) for (const originalFirst of [false, true]) {
+  const ordering = `${incremental ? 'incremental' : 'batched'}, original ${originalFirst ? 'first' : 'last'}`;
+  test(`a current judgment suppresses all matching members across a changed digest (${ordering})`, async ({}, info) => {
+    const f = await fixture(info), original = await f.capture('Threshold < 5');
+    await f.check();
+    const [judged] = f.state().candidates;
+    orderCorpus(f, judged.evidence.key, originalFirst);
+    await fs.appendFile(original, '\nIndependent editorial note.\n');
+    if (incremental) await f.check();
+    await f.capture('Threshold < 5');
+    await f.check(); await f.check();
+    const peers = f.state().candidates.filter(candidate => candidate.id !== judged.id);
+    expect(peers).toHaveLength(2);
+    for (const peer of peers) expect(peer).toMatchObject({ status: 'duplicate', duplicateOf: judged.id });
+    expect(f.inputs).toHaveLength(1);
+    expect(f.state().notices).toHaveLength(1);
+  });
+
+  test(`loss of an unjudged representative promotes exactly one surviving match (${ordering})`, async ({}, info) => {
+    const f = await fixture(info);
+    f.gate.status = async () => ({ open: false, reason: 'Closed for controlled intake.' });
+    const first = await f.capture('Threshold < 5'), id = (await f.vault.list()).find(note => note.file === first).id;
+    orderCorpus(f, 'capture:' + id, originalFirst);
+    if (incremental) await f.check();
+    await f.capture('Threshold < 5'); await f.capture('Threshold < 5'); await f.check();
+    const before = f.state().candidates;
+    const representatives = before.filter(candidate => candidate.status === 'pending');
+    expect(representatives).toHaveLength(1);
+    const [representative] = representatives;
+    expect(representative.evidence.key).toBe(before.map(candidate => candidate.evidence.key).sort()[0]);
+    const file = (await f.vault.find(representative.evidence.key.slice('capture:'.length))).file;
+    await fs.unlink(file);
+    await f.check(); await f.check();
+    const after = f.state().candidates;
+    expect(after.find(candidate => candidate.id === representative.id).status).toBe('withdrawn');
+    const survivors = after.filter(candidate => candidate.status === 'pending');
+    expect(survivors).toHaveLength(1);
+    expect(after.find(candidate => candidate.status === 'duplicate').duplicateOf).toBe(survivors[0].id);
+    expect(f.inputs).toHaveLength(0);
+    f.gate.status = async () => ({ open: true });
+    await f.check(); await f.check();
+    expect(f.inputs).toHaveLength(1);
+    expect(f.state().notices.map(n => n.candidateId)).toEqual([survivors[0].id]);
+    expect(f.inputs[0]).not.toMatch(/Earlier matched passage/);
+  });
+}
+
 test('a prior result contributes only its eligible source passage and its revision is checked at dispatch', async ({}, info) => {
   const f = await fixture(info);
   const old = await f.capture('Threshold CANARY-SOURCE was measured.');
@@ -64,6 +120,42 @@ test('a prior result contributes only its eligible source passage and its revisi
   expect(f.state().notices[0].status).toBe('evidence removed');
   expect(f.inputs).toHaveLength(2);
   expect(f.inputs[1]).not.toMatch(/CANARY|Earlier matched passage/);
+});
+
+test('a surviving peer retains completed local judgment coverage until its own source is withdrawn', async ({}, info) => {
+  const f = await fixture(info);
+  await f.capture('Threshold < 5'); await f.capture('Threshold < 5');
+  await f.check(); await f.check();
+  const judged = f.state().candidates.find(candidate => candidate.status === 'meets');
+  const covered = f.state().candidates.find(candidate => candidate.status === 'duplicate');
+  expect(covered.judgedBy).toBe(judged.id);
+  await fs.unlink((await f.vault.find(judged.evidence.key.slice('capture:'.length))).file);
+  await f.check(); await f.check();
+  expect(f.inputs).toHaveLength(1);
+  expect(f.state().notices).toHaveLength(1);
+  expect(f.state().notices[0].status).toBe('evidence removed');
+  await fs.unlink((await f.vault.find(covered.evidence.key.slice('capture:'.length))).file);
+  await f.check();
+  await f.capture('Threshold < 5'); await f.check(); await f.check();
+  expect(f.inputs).toHaveLength(2);
+  expect(f.inputs[1]).not.toMatch(/Earlier matched passage|CANARY-REASON/);
+  expect(f.state().notices).toHaveLength(2);
+});
+
+test('a later identical copy cannot bypass a held representative’s retry budget', async ({}, info) => {
+  const f = await fixture(info);
+  f.gate.afterSend = async () => { throw Error('Controlled malformed response.'); };
+  await f.capture('Threshold < 5');
+  for (let i = 0; i < 3; i++) await f.check();
+  const [held] = f.state().candidates;
+  expect(held.status).toBe('held');
+  await f.capture('Threshold < 5'); await f.check(); await f.check();
+  expect(f.inputs).toHaveLength(3);
+  expect(f.state().candidates.at(-1)).toMatchObject({ status: 'duplicate', duplicateOf: held.id });
+  await f.revisit.retry({ candidate: held.id, now });
+  await f.check(); await f.check();
+  expect(f.inputs).toHaveLength(4);
+  expect(f.state().candidates.find(c => c.id === held.id).status).toBe('held');
 });
 
 test('an overlapping successful check cannot replace a scheduled quota stop returned to its worker', async ({}, info) => {
