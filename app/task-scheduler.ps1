@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 try {
   $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
   if ($request.name -notmatch '^Companion-[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$') { throw 'Invalid Companion task identity.' }
-  if ($request.operation -notin @('enable','inspect','pause','resume','disable','repair')) { throw 'Unsupported task operation.' }
+  if ($request.operation -notin @('enable','inspect','pause','resume','disable','repair','uninstall')) { throw 'Unsupported task operation.' }
   $scheduler = New-Object -ComObject Schedule.Service
   $scheduler.Connect()
   $folder = $scheduler.GetFolder('\')
@@ -19,11 +19,17 @@ try {
     $registeredUser = $definition.Principal.UserId
     if ($registeredUser -match '^S-\d+(?:-\d+)+$') { $registeredSid = [System.Security.Principal.SecurityIdentifier]::new($registeredUser).Value }
     else { $registeredSid = [System.Security.Principal.NTAccount]::new($registeredUser).Translate([System.Security.Principal.SecurityIdentifier]).Value }
-    if ($definition.RegistrationInfo.Description -cne $request.owner -or $registeredSid -ne $sid -or $definition.Principal.LogonType -ne 3 -or $definition.Principal.RunLevel -ne 0 -or $definition.Actions.Count -ne 1) { throw 'Task ownership or principal differs. Preserve the task for explicit repair.' }
-    $action = $definition.Actions.Item(1)
-    if ($action.Type -ne 0 -or $action.Path -ine $request.executable -or $action.Arguments -cne $request.arguments -or $action.WorkingDirectory -ine $request.directory) { throw 'Task launch action differs. Preserve the task for explicit repair.' }
+    $ownershipDiffers = $definition.RegistrationInfo.Description -cne $request.owner -or $registeredSid -ne $sid -or $definition.Principal.LogonType -ne 3 -or $definition.Principal.RunLevel -ne 0 -or $definition.Actions.Count -ne 1
+    $action = if ($definition.Actions.Count -eq 1) { $definition.Actions.Item(1) }
+    $actionDiffers = $action.Type -ne 0 -or $action.Path -ine $request.executable -or $action.Arguments -cne $request.arguments -or $action.WorkingDirectory -ine $request.directory
+    if ($request.operation -eq 'uninstall' -and ($ownershipDiffers -or $actionDiffers)) {
+      @{ task = $null; preserved = $true } | ConvertTo-Json -Compress
+      exit 0
+    }
+    if ($ownershipDiffers) { throw 'Task ownership or principal differs. Preserve the task for explicit repair.' }
+    if ($actionDiffers) { throw 'Task launch action differs. Preserve the task for explicit repair.' }
   }
-  if ($request.operation -eq 'disable') {
+  if ($request.operation -in @('disable','uninstall')) {
     if ($null -ne $task) { $folder.DeleteTask($request.name, 0) }
     @{ task = $null } | ConvertTo-Json -Compress
     exit 0

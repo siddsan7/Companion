@@ -5,6 +5,8 @@
   "main": "app/main.js",
   "scripts": {
     "start": "electron .",
+    "package:windows": "node scripts/build-windows.cjs",
+    "test:installer": "node scripts/test-windows-installer.cjs",
     "test": "playwright test",
     "check": "node scripts/check-source.cjs",
     "prepare:electron": "node scripts/prepare-electron.cjs"

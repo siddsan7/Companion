@@ -1,5 +1,7 @@
 # Spec #1 working state
 
+The Windows installer is a separate review candidate. Its build, native acceptance command, data boundaries and distribution steps are in the [installer guide](../docs/windows-installer.md). Release publication requires separate review and approval.
+
 Goal: complete [Companion #1](https://github.com/siddsan7/Companion/issues/1) and tickets #2–#16. See [publishing and final checkpoint](publishing.md) for history, review, and the pause after remote merge verification. [PR #17](https://github.com/siddsan7/Companion/pull/17) targets `main`. Original base `04ed4fb6`. Planning commits `e030e51` and `5a7f0c7` precede implementation worktrees.
 
 ## Pre-merge evidence checkpoint

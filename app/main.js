@@ -24,7 +24,7 @@ const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
 const { ordinaryDirectories, readExactSync, verifyAbsentSync, writeStage, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication } = require('./staged-publication');
 let codex, conversationProvider, decisions;
-let testRoot = process.env.COMPANION_TEST_ROOT;
+let testRoot = app.isPackaged ? undefined : process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
 const workerFile = process.argv[process.argv.indexOf('--schedule-file') + 1];
@@ -71,6 +71,14 @@ function clock() {
   return { now: new Date().toISOString(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
 }
 app.whenReady().then(async () => {
+  if (app.isPackaged && process.argv.includes('--uninstall-daily-intake')) {
+    try {
+      const schedule = new Schedule(path.join(app.getPath('userData'), 'schedule.json'), null, scheduleOptions());
+      await schedule.removeInstalledTask();
+      app.exit(0);
+    } catch (error) { console.error(error.message); app.exit(1); }
+    return;
+  }
   if (testRoot) testRoot = await resolveDataRoot(testRoot);
   if (workerMode) {
     try {
