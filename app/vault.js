@@ -13,6 +13,7 @@ const { captureOwners, comparable, ownerWarning, parentOf, storeName } = require
 const hash = text => createHash('sha256').update(text).digest('hex');
 const missing = error => { if (error.code === 'ENOENT') return null; throw error; };
 const artifactAreas = ['Captures', 'Annotations', 'Ideas', 'Briefs', 'Revisions'];
+const excludedScanNames = new Set(['.intake', '.obsidian', '.git', '.codex', 'managed-home', storeName]);
 const comparableRelative = value => comparable(process.platform === 'win32' ? value.replace(/\\/g, '/') : value);
 const stagingHeld = () => Error('Staging ownership could not be verified. Files were preserved for inspection.');
 const titleHeld = () => Object.assign(stagingHeld(), { code: 'TITLE_PUBLICATION_HELD' });
@@ -146,7 +147,7 @@ class Vault {
     const visit = async dir => {
       await this.contained(dir);
       for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
-        if (['.intake', '.obsidian', '.git', '.codex', 'managed-home', storeName].includes(entry.name.toLowerCase())) continue;
+        if (excludedScanNames.has(entry.name.toLowerCase())) continue;
         const file = path.join(dir, entry.name);
         if (entry.isDirectory() && !entry.isSymbolicLink()) await visit(file);
         else if (entry.isFile() && entry.name.endsWith('.md')) {
@@ -159,6 +160,33 @@ class Vault {
     };
     try { await visit(this.vault); } catch (error) { throw Error('Vault access failure. Restore access to all vault folders before identity reconciliation. Notes and history were preserved; no missing-note removal was inferred.', { cause: error }); }
     return notes;
+  }
+  // Publication uses a synchronous walk so another application action cannot
+  // run between the last identity observation and the filesystem operation.
+  // External editors can still change an already visited directory.
+  annotationCopiesForPublication(id, reserved) {
+    const matches = [];
+    const visit = folder => {
+      const { guard } = this.publicationFolders(folder);
+      for (const entry of local.readdirSync(folder, { withFileTypes: true })) {
+        if (excludedScanNames.has(entry.name.toLowerCase())) continue;
+        const file = path.join(folder, entry.name);
+        if (entry.isDirectory() && !entry.isSymbolicLink()) visit(file);
+        else if (entry.isFile() && entry.name.endsWith('.md') &&
+            !reserved.paths.has(comparableRelative(path.relative(this.vault, file)))) {
+          const links = Number(local.lstatSync(file, { bigint: true }).nlink);
+          const note = parseAnnotation(readExactSync(file, guard, links).bytes.toString('utf8'));
+          if (note?.id === id) {
+            if (links !== 1) throw Error('Annotation has unproved aliases. Relationship repair is paused.');
+            matches.push({ ...note, file });
+          }
+        }
+      }
+      guard();
+    };
+    visit(this.vault);
+    reserved.verify();
+    return matches;
   }
   async list() {
     return sourceMutation(this.root, () => this.listOwned());

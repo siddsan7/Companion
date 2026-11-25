@@ -277,14 +277,20 @@ app.whenReady().then(async () => {
   decisions = installDecisions({ ipcMain, getVault: () => vault, getContext: context.store, orderEvidence: orderVaultWork, clock, checkpoint, testRoot, provider: conversationProvider, getEvidence });
   // Revisit runs after the startup catch-up above has admitted any missed evidence.
   await decisions.afterEvidence(vault, 'catch-up');
-  const fixtureRendering = testRoot ? { backgroundThrottling: false } : {};
-  const window = new BrowserWindow({ width: 1000, height: 780, show: !testRoot, webPreferences: { ...fixtureRendering, preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
+  const debugFixture = testRoot && process.env.COMPANION_TEST_SHOW_WINDOW === '1';
+  const hidden = process.argv.includes('--companion-hidden-window') || Boolean(testRoot && !debugFixture);
+  const window = new BrowserWindow({
+    width: 1000, height: 780,
+    ...(hidden && { show: false, focusable: false, skipTaskbar: true }),
+    webPreferences: {
+      ...(hidden && { offscreen: true, backgroundThrottling: false }),
+      preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true,
+    },
+  });
   window.webContents.session.webRequest.onBeforeRequest(({ url }, callback) => callback({ cancel: !url.startsWith('file:') && !url.startsWith('devtools:') }));
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', event => event.preventDefault());
   await window.loadFile(path.join(__dirname, 'index.html'));
-  // Give disposable desktop fixtures normal frame cadence without taking focus.
-  if (testRoot) window.showInactive();
 });
 app.on('before-quit', () => { codex?.close(); conversationProvider?.close(); });
 app.on('window-all-closed', () => app.quit());

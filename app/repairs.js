@@ -68,6 +68,17 @@ function sourceLink(content, relative, previous) {
   return line.prefix + 'Source: [Capture](' + urlPath(relative) + ')' + content.slice(line.end);
 }
 function install(Intake, { hash, read, noteText, acceptedOutcome }) {
+  function annotationIdentity(vault, id, matches, choice) {
+    if (matches.length === 1) {
+      const file = path.relative(vault.vault, matches[0].file);
+      if (!choice?.copies.some(copy => copy.file === file)) return { file };
+    }
+    const files = matches.map(note => ({ file: path.relative(vault.vault, note.file), hash: hash(note.content) }))
+      .sort((a, b) => a.file.localeCompare(b.file));
+    if (choice && files.some(item => item.file === choice.file) &&
+        isDeepStrictEqual(files.filter(item => item.file !== choice.file), choice.copies)) return { file: choice.file };
+    return { issue: { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) } };
+  }
   function knownLink(intake, ledger, annotation, capture, previousCapture, currentCapture, previousLink) {
     const target = relationshipLine(annotation.content, true)?.target;
     if (target === undefined) return;
@@ -145,12 +156,9 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       if (reserved.annotations.has(annotationId)) continue;
       // Annotation choices never confer authority over a capture with the same UUID.
       const id = 'annotation:' + annotationId;
-      const choice = ledger.identityChoices[id];
-      if (matches.length === 1 && !choice?.copies.some(copy => copy.file === path.relative(this.vault.vault, matches[0].file))) { annotationPaths.add(matches[0].file); continue; }
-      const files = matches.map(note => ({ file: path.relative(this.vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
-      const copies = choice && files.filter(item => item.file !== choice.file);
-      if (choice && files.some(item => item.file === choice.file) && JSON.stringify(copies) === JSON.stringify(choice.copies)) annotationPaths.add(path.join(this.vault.vault, choice.file));
-      else ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) };
+      const identity = annotationIdentity(this.vault, id, matches, ledger.identityChoices[id]);
+      if (identity.file) annotationPaths.add(path.join(this.vault.vault, identity.file));
+      else ledger.identityIssues[id] = identity.issue;
     }
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
       // An output hold may deliberately retain a hardlinked capture stage.
@@ -320,6 +328,40 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
     };
     try {
       let current = await read(file), before = await read(backup), backupProof, outputProof;
+      const id = 'annotation:' + annotationId;
+      const currentIdentity = (owner, withdrawn = false) => {
+        assertAnnotationPublication(owner, annotationId);
+        const reserved = this.vault.reservedRestorationIdentities(owner);
+        const matches = this.vault.annotationCopiesForPublication(annotationId, reserved);
+        if (reserved.annotations.has(annotationId)) return {};
+        if (withdrawn) {
+          // The private backup stands for the original at its logical path.
+          verifyStageSync(backup, guard, backupProof);
+          verifyAbsentSync(file, guard, () => changed('Annotation destination was recreated during relationship publication. Both files were preserved.'));
+          matches.push({ ...annotation, file });
+        }
+        return annotationIdentity(this.vault, id, matches, owner.identityChoices?.[id]);
+      };
+      const retireUnpublished = identity => {
+        verifyIntent();
+        verifyStageSync(file, guard, intent.originalProof);
+        verifyAbsentSync(backup, guard);
+        if (intent.stageProof) {
+          // Once the original is restored, only the recorded stage belongs to
+          // cleanup. A restart can find it already gone or the name reused.
+          try {
+            verifyStageSync(stage, guard, intent.stageProof);
+            native.unlinkSync(stage);
+          } catch (error) {
+            if (error.code !== 'STAGING_CHANGED') throw error;
+          }
+        } else verifyAbsentSync(stage, guard);
+        verifyIntent();
+        verifyStageSync(file, guard, intent.originalProof);
+        verifyAbsentSync(backup, guard);
+        if (ledger && identity?.issue?.files.length) ledger.identityIssues[id] = identity.issue;
+        native.unlinkSync(journal);
+      };
       const restoreOriginal = () => {
         backupProof ||= exactOriginal(backup, 1, backupInfo);
         const occupied = () => changed('Annotation destination was recreated during relationship repair. Both files were preserved.');
@@ -333,6 +375,18 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         native.unlinkSync(backup);
         verifyStageSync(file, guard, backupProof);
       };
+      const mayPublishWithdrawn = owner => {
+        let identity;
+        try { identity = currentIdentity(owner, true); }
+        catch (error) {
+          if (!native.lstatSync(file, { throwIfNoEntry: false })) restoreOriginal();
+          throw error;
+        }
+        if (identity.file === intent.file) return true;
+        restoreOriginal();
+        retireUnpublished(identity);
+        return false;
+      };
       const verifyPublicationStage = proof => {
         try { verifyStageSync(stage, guard, proof); }
         catch (error) {
@@ -343,14 +397,25 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       };
       if (current !== intent.content) {
         if (!intent.originalProof) throw changed('This earlier relationship repair needs explicit review. Its writing was preserved.');
+        // Staging requires a withdrawn original. Its exact return with no
+        // backup proves rollback reached cleanup, even after the stage unlink.
+        if (intent.stageProof && before === null && current === intent.before) {
+          retireUnpublished();
+          return;
+        }
         if (intent.stageProof) verifyPublicationStage(intent.stageProof);
         if (before === null) {
           if (current !== intent.before) throw changed('Annotation changed during move repair. Its writing was preserved.');
           backupProof = exactOriginal(file, 1, currentInfo);
-          assertAnnotationPublication(await annotationAuthority(this), annotationId);
+          // Discovery can precede a copy, even when recovering a durable intent.
+          const identity = currentIdentity(await annotationAuthority(this));
           verifyIntent();
           verifyStageSync(file, guard, backupProof);
           verifyAbsentSync(backup, guard, () => changed('An independent annotation relationship backup appeared. Both files were preserved.'));
+          if (identity.file !== intent.file) {
+            retireUnpublished(identity);
+            return;
+          }
           try { native.linkSync(file, backup); }
           catch (error) {
             if (error.code !== 'EEXIST') throw error;
@@ -378,7 +443,9 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
         }
         if (current !== null) throw changed('Annotation destination was recreated during relationship repair. Both files were preserved.');
         backupProof ||= exactOriginal(backup, 1, backupInfo);
-        assertAnnotationPublication(await annotationAuthority(this), annotationId);
+        const stageAuthority = await annotationAuthority(this);
+        assertAnnotationPublication(stageAuthority, annotationId);
+        if (backupInfo && !mayPublishWithdrawn(stageAuthority)) return;
         outputProof = intent.stageProof;
         if (!outputProof) {
           try { outputProof = await writeStage(stage, intent.content, guard); }
@@ -394,7 +461,7 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
             throw changed('The relationship proof could not be saved. Existing writing was preserved.');
           }
         }
-        assertAnnotationPublication(await annotationAuthority(this), annotationId);
+        if (!mayPublishWithdrawn(await annotationAuthority(this))) return;
         verifyIntent();
         verifyStageSync(backup, guard, backupProof);
         verifyPublicationStage(outputProof);
