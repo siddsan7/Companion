@@ -341,7 +341,9 @@ test('same-byte manual restoration cannot revive a prior verdict or a current re
   const newest = f.state().candidates.at(-1);
   expect(newest.status).toBe('meets');
   expect(newest.evidence.sourceGenerations[0].generation).not.toBe(generation);
-  expect(f.state().notices.at(-1).evidence.sourceGenerations).toEqual(newest.evidence.sourceGenerations);
+  const notices = f.state().notices.filter(notice => notice.candidateId === newest.id);
+  expect(notices).toHaveLength(1);
+  expect(notices[0]).toMatchObject({ status: 'open', evidence: newest.evidence });
 });
 
 test('restored imported evidence retains its fresh revision admission and rejects legacy attribution', async ({}, info) => {
