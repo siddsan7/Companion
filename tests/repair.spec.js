@@ -318,6 +318,8 @@ test('duplicate annotations preserve both copies and pause relationship repair u
   await page.getByLabel('New annotation').fill('Canonical annotation writing.');
   await page.getByRole('button', { name: 'Save annotation', exact: true }).click();
   await expect(page.getByRole('status')).toContainText('Annotation saved');
+  expect(await page.getByLabel('Source inspection').locator('pre').allTextContents()).toEqual(
+    expect.arrayContaining([expect.stringContaining('Canonical annotation writing.')]));
   const base = path.join(root, 'vault', 'Companion'), folder = path.join(base, 'Annotations');
   const name = (await fs.readdir(folder)).find(x => x.endsWith('.md')), original = path.join(folder, name);
   const before = await fs.readFile(original, 'utf8'), copy = path.join(root, 'vault', 'Projects', 'Copied annotation.md');
@@ -348,6 +350,52 @@ test('duplicate annotations preserve both copies and pause relationship repair u
   await expect(page.getByLabel('Vault repairs')).toContainText('Duplicate identity');
   expect(await fs.readFile(copy, 'utf8')).toBe(copied + '\nLater duplicate change.\n');
 });
+
+for (const boundary of ['annotation scan', 'link intent']) {
+  test(`relationship repair preserves a duplicate created after the ${boundary}`, async () => {
+    const { Vault } = require('../app/vault'), { Intake } = require('../app/intake');
+    const directory = path.join(root, 'vault'), producer = path.dirname(await artifact());
+    await fs.mkdir(directory);
+    const now = '2026-11-08T06:59:00Z';
+    const vault = new Vault(await fs.realpath(directory), 'Companion', { checkpoint: async name => {
+      if (boundary === 'link intent' && name === 'link-intent-published') await createCopy();
+    } });
+    await vault.setup();
+    const intake = new Intake(vault), connected = await intake.connect(producer, true, now);
+    const capture = connected.captures[sha], id = require('node:crypto').randomUUID();
+    await intake.addAnnotation({ id, captureId: capture.id, text: 'Independent writing.' }, now);
+    const original = path.join(vault.root, 'Annotations', id + '.md'), before = await fs.readFile(original, 'utf8');
+    const copy = path.join(directory, 'Copy.md'), copied = before + '\nWriting in the copy.\n';
+    const moved = path.join(directory, 'Moved.md');
+    let created = false;
+    async function createCopy() {
+      if (created) return;
+      await fs.writeFile(copy, copied, { flag: 'wx' });
+      created = true;
+    }
+    if (boundary === 'annotation scan') {
+      const annotations = intake.annotations.bind(intake);
+      intake.annotations = async (...args) => {
+        const snapshot = await annotations(...args);
+        if (!created) {
+          await createCopy();
+          await fs.rename(intake.destination(capture), moved);
+        }
+        return snapshot;
+      };
+    } else await fs.rename(intake.destination(capture), moved);
+    await intake.reconcile({ now });
+    expect(created).toBe(true);
+    expect(await fs.readFile(original, 'utf8')).toBe(before);
+    expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+    const restarted = new Intake(new Vault(vault.vault, 'Companion'));
+    const issue = (await restarted.repairs()).find(item => item.id === 'annotation:' + id);
+    expect(issue?.kind).toBe('duplicate');
+    await restarted.chooseIdentity({ id: issue.id, file: path.basename(copy), token: issue.token });
+    expect(await fs.readFile(copy, 'utf8')).toBe(copied.replace(/^Source: .*$/m, 'Source: [Capture](Moved.md)'));
+    expect(await fs.readFile(original, 'utf8')).toBe(before);
+  });
+}
 
 test('custom annotation headers preserve user-owned Source links after the first frontmatter block', async () => {
   await artifact(); await launch(); await setup(); await connect(true);

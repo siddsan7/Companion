@@ -83,7 +83,7 @@ window.intakeView = {
     document.getElementById('source-inspection').hidden = true;
     document.getElementById('source-details').replaceChildren();
   },
-  async inspect(id) {
+  async inspect(id, completionMessage) {
     const request = this.inspectionEpoch = (this.inspectionEpoch || 0) + 1, location = state.location, configuration = configurationEpoch;
     const current = () => request === this.inspectionEpoch && location === state.location && configuration === configurationEpoch && !configurationBusy;
     const run = work => action(async () => {
@@ -135,8 +135,12 @@ window.intakeView = {
     for (const annotation of info.annotations) { const text = document.createElement('pre'); text.textContent = annotation.content; annotations.append(text); }
     const label = document.createElement('label'), input = document.createElement('textarea'), save = document.createElement('button'), annotationId = crypto.randomUUID();
     label.textContent = 'New annotation'; label.append(input); save.textContent = 'Save annotation';
-    save.onclick = () => run(async () => { await window.companion['add-annotation']({ id: annotationId, captureId: id, text: input.value }); if (!current()) return; status('Annotation saved. Source content remains managed separately.'); await this.inspect(id); });
+    save.onclick = () => run(async () => {
+      await window.companion['add-annotation']({ id: annotationId, captureId: id, text: input.value });
+      if (current()) await action(() => this.inspect(id, 'Annotation saved. Source content remains managed separately.'));
+    });
     details.append(annotations, label, save);
     section.scrollIntoView();
+    if (completionMessage) status(completionMessage);
   }
 };

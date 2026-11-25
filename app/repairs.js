@@ -68,6 +68,17 @@ function sourceLink(content, relative, previous) {
   return line.prefix + 'Source: [Capture](' + urlPath(relative) + ')' + content.slice(line.end);
 }
 function install(Intake, { hash, read, noteText, acceptedOutcome }) {
+  function annotationIdentity(vault, id, matches, choice) {
+    if (matches.length === 1) {
+      const file = path.relative(vault.vault, matches[0].file);
+      if (!choice?.copies.some(copy => copy.file === file)) return { file };
+    }
+    const files = matches.map(note => ({ file: path.relative(vault.vault, note.file), hash: hash(note.content) }))
+      .sort((a, b) => a.file.localeCompare(b.file));
+    if (choice && files.some(item => item.file === choice.file) &&
+        isDeepStrictEqual(files.filter(item => item.file !== choice.file), choice.copies)) return { file: choice.file };
+    return { issue: { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) } };
+  }
   function knownLink(intake, ledger, annotation, capture, previousCapture, currentCapture, previousLink) {
     const target = relationshipLine(annotation.content, true)?.target;
     if (target === undefined) return;
@@ -145,12 +156,9 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
       if (reserved.annotations.has(annotationId)) continue;
       // Annotation choices never confer authority over a capture with the same UUID.
       const id = 'annotation:' + annotationId;
-      const choice = ledger.identityChoices[id];
-      if (matches.length === 1 && !choice?.copies.some(copy => copy.file === path.relative(this.vault.vault, matches[0].file))) { annotationPaths.add(matches[0].file); continue; }
-      const files = matches.map(note => ({ file: path.relative(this.vault.vault, note.file), hash: hash(note.content) })).sort((a, b) => a.file.localeCompare(b.file));
-      const copies = choice && files.filter(item => item.file !== choice.file);
-      if (choice && files.some(item => item.file === choice.file) && JSON.stringify(copies) === JSON.stringify(choice.copies)) annotationPaths.add(path.join(this.vault.vault, choice.file));
-      else ledger.identityIssues[id] = { kind: 'duplicate', id, reason: 'Duplicate identity in annotations. Both files are preserved; choose the linked file explicitly. Relationship updates are paused for these copies. Other copies remain excluded while their bytes are unchanged.', files, token: hash(JSON.stringify(files)) };
+      const identity = annotationIdentity(this.vault, id, matches, ledger.identityChoices[id]);
+      if (identity.file) annotationPaths.add(path.join(this.vault.vault, identity.file));
+      else ledger.identityIssues[id] = identity.issue;
     }
     for (const [sourceHash, capture] of Object.entries(ledger.captures)) {
       // An output hold may deliberately retain a hardlinked capture stage.
@@ -348,9 +356,20 @@ function install(Intake, { hash, read, noteText, acceptedOutcome }) {
           if (current !== intent.before) throw changed('Annotation changed during move repair. Its writing was preserved.');
           backupProof = exactOriginal(file, 1, currentInfo);
           assertAnnotationPublication(await annotationAuthority(this), annotationId);
+          // Discovery can precede a copy, even when recovering a durable intent.
+          // Check the complete identity again before withdrawing the original.
+          const id = 'annotation:' + annotationId;
+          const matches = (await this.annotations()).filter(note => note.id === annotationId);
+          const identity = annotationIdentity(this.vault, id, matches, authority.identityChoices?.[id]);
           verifyIntent();
           verifyStageSync(file, guard, backupProof);
           verifyAbsentSync(backup, guard, () => changed('An independent annotation relationship backup appeared. Both files were preserved.'));
+          if (identity.file !== intent.file) {
+            verifyAbsentSync(stage, guard);
+            if (ledger && matches.length && identity.issue) ledger.identityIssues[id] = identity.issue;
+            native.unlinkSync(journal);
+            return;
+          }
           try { native.linkSync(file, backup); }
           catch (error) {
             if (error.code !== 'EEXIST') throw error;
