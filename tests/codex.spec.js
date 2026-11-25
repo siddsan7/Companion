@@ -12,6 +12,9 @@ test('account updates and a changed model catalog revoke isolation before a synt
   await fs.writeFile(fixtureFile, JSON.stringify({ ...scenario, accountUpdateDuringProbe: true }));
   await fs.mkdir(path.join(root, 'project'));
   await launch();
+  const disclosure = page.getByRole('region', { name: 'Project conversations', exact: true }).locator('.codex-disclosure');
+  await disclosure.locator('summary').click();
+  await expect(disclosure).toContainText('installation, session, thread, turn and window identifiers');
   await page.getByRole('button', { name: 'Choose vault' }).click();
   await page.getByRole('button', { name: 'Use this folder' }).click();
   await page.getByLabel('Codex executable').fill('controlled-fixture');

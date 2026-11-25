@@ -4,7 +4,35 @@ Goal: connect managed App Server sign-in without token access; keep capture avai
 
 The approved acceptance seam is the desktop workflow plus resulting files/history. Tests use a child process at the external Codex stdio boundary. Fixture outcomes never establish live readiness. The installed CLI is 0.163.0; its generated experimental JSON schemas were inspected before implementation.
 
-## November 25 production qualification
+## November 25 signed-in follow-up
+
+Managed account verification and Windows isolation passed on the staged disposable project and vault. Production chat, comparisons, and scheduled AI reminders remain closed.
+
+| Qualification | Observation |
+| --- | --- |
+| Managed account and isolation | Private App Server `account/read` confirmed ChatGPT sign-in. The effective configuration, disabled skills and connectors, positive read control, and direct, child, case, extended-path and junction denials passed for both protected roots. |
+| Exact signed-in request | The installed 0.170.0 App Server recorded one serialized inference request on a fresh ephemeral thread. Its input contained the reviewed tool namespace and definition, the exact Companion developer instructions, and the exact synthetic user text. The definition digest matched `bea3af5e12e25a7cc6033838fa1c1af998e8d91fc32a61cc51211410c8f0cb8a`. No protected path or extra source occurred in the request. The fixed setup reply contained the requested sentence with additional text. |
+| Provider metadata | Each message carried a turn ID, creation time, content kind and harness/user provenance. The outer request carried correlation and installation identifiers, the root agent label, timing, model and reasoning settings, sandbox and review flags, connector attribution, and an analytics setting. The setup and conversation preview disclose these fields. The observed analytics setting does not establish a separate telemetry upload. |
+| Disposable citation | One isolated diagnostic turn sent 32,000 Unicode code points, including musical symbols and one authored source. The trace matched the complete text. The reply quoted “The kestrel rehearsal uses exactly seven violet counters.”, cited [QF-19], and correctly stated that the source supplied no tempo. Counters reported 63,867 input and 28 output tokens. |
+| Output sample | A separate 18,000-code-point package included supplementary private-use characters and a numbered source. The reply reproduced all 72 requested rows, using 58,861 input and 723 output tokens. This measures one successful input/output pair. |
+| Interruption | After the real signed-in turn started, Companion requested interruption, observed a matching interrupted terminal, retained one incomplete turn and cleared the isolation certificate. No automatic retry occurred. |
+| Faults | The installed App Server processed controlled local HTTP 401, 429, and 503 responses. Closing the local HTTP socket produced the unclassified App Server error `other`. Companion reported an incomplete failed turn, advised checking connectivity and setup, and offered explicit retry. No hosted outage, rejected hosted credential or exhausted subscription quota was observed. |
+
+### Capacity decision
+
+D36-I04 requires separate room for instructions, reasoning and output. The 475,000-token context window in the App Server report equals the bundled catalog’s 500,000 multiplied by 95%. The independent published model specification lists 1,050,000 context tokens, 922,000 input tokens and 128,000 output tokens for the API. Those limits do not establish the effective limits of this managed ChatGPT route. [OpenAI model specification](https://developers.openai.com/api/docs/models/gpt-6.2-sol)
+
+The proposed 12,000-code-point bound allows at most 48,000 bytes of UTF-8 text before JSON escaping. The three compact serialized request bodies contained 3,981 bytes each after replacing the user text with an empty string. Quotes, control characters and unpaired surrogates can increase wire length. Provider tokenization also accounts for message framing. Neither UTF-8 byte length nor wire length proves the input token count for this model. OpenAI’s public tokenizer mapping at the inspected revision has no GPT-6.2 Sol entry. The App Server schema inspected here has no pre-dispatch token-count method. The independent Responses API token-count endpoint would require a separately supported integration. [Tokenizer model mapping](https://github.com/openai/tiktoken/blob/79dc2c0533685b893616c78160b5d9e40876e724/tiktoken/model.py) · [Responses token counting](https://developers.openai.com/api/docs/guides/token-counting)
+
+The 723 reported output tokens include any model framing and reasoning. The request fixed low reasoning effort and low verbosity and supplied no enforced output reserve. The 12,000-code-point proposal therefore remains unverified. To open chat, establish a route-specific supported bound on the complete framed input and a separate reasoning/output allowance, then bind both to the same live certificate and check them before dispatch. A change in account, model, settings, tool schema, catalog, configuration, roots or executable invalidates the evidence. Comparison qualification additionally requires independent confirmation of provider, reasoning effort and service tier. The ordinary thread reported null effort and tier. Scheduled reminders still require a real scheduled-worker isolation and lifecycle check.
+
+### Repeating the checks
+
+On Windows, `node scripts/check-signed-chat-request.cjs <disposable-staging-root> --send-one-synthetic-turn` uses the existing interactive sign-in and sends one fixed setup prompt. Use the Companion qualification directory under Temp with its own profile, project and vault. The script verifies available primary subscription capacity, rechecks the account and effective configuration against the same in-memory isolation certificate, and verifies the actual model, thread, turn, full input, tool digest and metadata. It prints a redacted result and removes its own local trace. The result grants no production readiness. The release tracer stores local request bodies and responses during the check. [Pinned upstream trace implementation](https://github.com/openai/codex/blob/rust-v0.170.0/codex-rs/rollout-trace/src/inference.rs)
+
+For fault handling, `node scripts/check-chat-request.cjs <absolute-codex-executable>` uses an unsigned local stand-in without hosted inference. D07-I04 and D35-I05 require actionable failures and preserved local work. The integration verification instructions call for simulated auth failure, offline operation, limits, partial replies, cancellation and restart. A genuine quota or service failure can be recorded if it occurs naturally. The spec does not require inducing one. [Companion spec](local-second-brain-spec.md)
+
+## Earlier unsigned production qualification
 
 Production chat remains closed. Electron 45.2.3 started the installed Codex 0.170.0 App Server in a new disposable profile and reported `sign-in-required`. The installed executable SHA-256 was `8d06dc231dba649c7d48d3eecab239c452a1ac498c41dd6492a6f301b90a22ce`.
 

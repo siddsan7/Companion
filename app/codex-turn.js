@@ -14,7 +14,7 @@ function failureMessage(info) {
   if (info && typeof info === 'object' && ['httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected'].some(key => Object.hasOwn(info, key))) return 'Codex is offline or its connection failed. Check your connection, then retry explicitly.';
   if (info === 'sandboxError') return 'Codex isolation failed. Check Windows setup and verify isolation again.';
   if (['serverOverloaded', 'flexUnavailable'].includes(info)) return 'Codex is temporarily unavailable. Retry explicitly when the service is available.';
-  return 'Codex turn failed. The partial reply is incomplete. Check setup and retry explicitly.';
+  return 'Codex turn failed. The partial reply is incomplete. Check your connection and Codex setup, then retry explicitly.';
 }
 function failureKind(info) {
   const status = info?.httpConnectionFailed?.httpStatusCode ?? info?.responseTooManyFailedAttempts?.httpStatusCode;
