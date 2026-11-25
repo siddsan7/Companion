@@ -5,6 +5,7 @@ const {
   readExactSync, verifyAbsentSync, writeStage, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication
 } = require('./staged-publication');
 const { Decisions, activeConditions } = require('./decisions');
+const { generations, generationFields, sameEvidence, sameGenerations } = require('./source-generations');
 const { matchCondition, fingerprint } = require('./revisit-match');
 const { buildPackage, parseReply, packageLimit, codePoints, stopPattern, outcomes } = require('./revisit-gate');
 
@@ -19,7 +20,13 @@ const stateChanged = () => Error('Revisit records changed during this check. Run
 const defaultCap = 10;
 const validCap = cap => Number.isSafeInteger(cap) && cap >= 1 && cap <= 100;
 const emptyState = () => ({ schema: 1, settings: { automatic: false, cap: defaultCap, changedAt: null }, seen: {}, events: [], candidates: [], notices: [], lastRun: null });
-const evidenceId = item => `${item.key}#${item.digest}`;
+// Preserve the original key for corpus entries with no generation authority.
+// A restoration or a changed dependency generation is a new admission.
+function evidenceId(item) {
+  const ids = generations(item.sourceGenerations);
+  return `${item.key}#${item.digest}` + (ids.length ? '#' + JSON.stringify(ids) : '');
+}
+const sameAdmission = (a, b) => sameEvidence(a, b) && a.revisionId === b.revisionId;
 const conditionId = condition => `${condition.id}@${condition.version}`;
 const open = status => ['pending', 'sending', 'held', 'held-oversize'].includes(status);
 // Gate runs in progress in this process. A request owned by one of them, or by another
@@ -130,11 +137,12 @@ class Revisit {
     return failures < maxAttempts || candidate.retryAfterFailures === failures ? 'pending' : 'held';
   }
   // D49-I02: removed evidence withdraws open candidates and marks unresolved notices.
-  markRemoved(state, present, now) {
-    for (const candidate of state.candidates) if (open(candidate.status) && !present.has(candidate.evidence.key)) {
+  markRemoved(state, sources, now) {
+    const unavailable = evidence => !sources.has(evidence.key) || !sameGenerations(evidence, sources.get(evidence.key));
+    for (const candidate of state.candidates) if (open(candidate.status) && unavailable(candidate.evidence)) {
       Object.assign(candidate, { status: 'withdrawn', withdrawnReason: 'Evidence removed, rejected or deleted.', withdrawnAt: now });
     }
-    for (const notice of state.notices) if (notice.kind === 'evidence' && notice.status === 'open' && !present.has(notice.evidence.key)) {
+    for (const notice of state.notices) if (notice.kind === 'evidence' && notice.status === 'open' && unavailable(notice.evidence)) {
       Object.assign(notice, { status: 'evidence removed', removedAt: now });
     }
   }
@@ -152,10 +160,11 @@ class Revisit {
     const current = new Set(conditions.map(({ condition }) => conditionId(condition)));
     const eligible = new Set(items.map(evidenceId)), prior = new Map();
     for (const candidate of state.candidates) {
+      if (!current.has(conditionId(candidate.condition)) || !eligible.has(evidenceId(candidate.evidence)) || candidate.historyWithdrawnAt) continue;
       const legacy = !candidate.fingerprint.startsWith('v2:');
       if (legacy) candidate.fingerprint = fingerprint(candidate.passages);
       const key = conditionId(candidate.condition) + '/' + candidate.fingerprint;
-      if (legacy && candidate.status === 'duplicate' && current.has(conditionId(candidate.condition)) && eligible.has(evidenceId(candidate.evidence))) {
+      if (legacy && candidate.status === 'duplicate') {
         const repeat = prior.get(key);
         if (repeat) candidate.duplicateOf = repeat.id;
         else { candidate.status = 'pending'; delete candidate.duplicateOf; }
@@ -166,7 +175,8 @@ class Revisit {
       const id = evidenceId(item);
       if (state.seen[id]) continue;
       state.seen[id] = now;
-      const event = { id: randomUUID(), at: now, trigger, evidence: { key: item.key, digest: item.digest, title: item.title }, candidates: [], considered: conditions.length };
+      const evidence = { key: item.key, digest: item.digest, title: item.title, ...generationFields(item.sourceGenerations), ...(item.revisionId ? { revisionId: item.revisionId } : {}) };
+      const event = { id: randomUUID(), at: now, trigger, evidence, candidates: [], considered: conditions.length };
       const ranked = conditions.map(entry => ({ ...entry, found: matchCondition(entry.condition, item) })).filter(entry => entry.found).sort((a, b) => b.found.score - a.found.score);
       for (const { decision, condition, found } of ranked) {
         const print = fingerprint(found.passages);
@@ -176,7 +186,7 @@ class Revisit {
           id: randomUUID(), createdAt: now, eventId: event.id,
           decision: { id: decision.decision_id, version: decision.version, title: decision.title },
           condition: { id: condition.id, version: condition.version, label: condition.label, trigger: condition.trigger, action: condition.action },
-          evidence: { key: item.key, digest: item.digest, title: item.title, provenance: item.provenance, ...(item.revisionId ? { revisionId: item.revisionId } : {}) },
+          evidence: { ...evidence, provenance: item.provenance },
           passages: found.passages, reasons: found.reasons, fingerprint: print, attempts: [],
           status: repeat ? 'duplicate' : 'pending', ...(repeat ? { duplicateOf: repeat.id } : {})
         };
@@ -217,7 +227,7 @@ class Revisit {
     candidate.status = result.outcome; candidate.outcome = result.outcome; candidate.outcomeReason = result.reason; candidate.decidedAt = now;
     if (result.outcome !== 'meets') return;
     // One notice per condition version and evidence revision (D47-I02).
-    if (state.notices.some(notice => notice.kind === 'evidence' && notice.condition.id === candidate.condition.id && notice.condition.version === candidate.condition.version && notice.evidence.key === candidate.evidence.key && notice.evidence.digest === candidate.evidence.digest)) return;
+    if (state.notices.some(notice => notice.kind === 'evidence' && notice.condition.id === candidate.condition.id && notice.condition.version === candidate.condition.version && sameAdmission(notice.evidence, candidate.evidence))) return;
     const notice = {
       id: randomUUID(), kind: 'evidence', raisedAt: now, status: 'open', candidateId: candidate.id,
       decision: candidate.decision, condition: candidate.condition, evidence: candidate.evidence,
@@ -255,10 +265,10 @@ class Revisit {
       dependencies: new Map([item.evidence, ...item.history.map(entry => entry.evidence)].map(source => [source.key, source.digest])),
       observe: verify => { verifySource = verify; }
     });
-    const sources = new Map(items.map(source => [evidenceId(source), source]));
-    const source = sources.get(evidenceId(item.evidence));
+    const sources = new Map(items.map(source => [source.key, source]));
+    const source = sources.get(item.evidence.key);
     return () => {
-      if (!source || !verifySource) throw Error('Matched evidence is unavailable. Check decisions again.');
+      if (!sameAdmission(source, item.evidence) || !verifySource) throw Error('Matched evidence is unavailable. Check decisions again.');
       verifySource();
       const { state } = this.readState(), ledger = this.decisions.load();
       const candidate = state.candidates.find(entry => entry.id === item.candidate);
@@ -271,8 +281,8 @@ class Revisit {
       const history = this.history(state, current.condition);
       if (JSON.stringify(history) !== JSON.stringify(item.history)) throw Error('Earlier outcomes changed. Preview again.');
       for (const entry of history) {
-        const earlier = sources.get(evidenceId(entry.evidence));
-        const passages = earlier && matchCondition(current.condition, earlier)?.passages;
+        const earlier = sources.get(entry.evidence.key);
+        const passages = sameAdmission(earlier, entry.evidence) && matchCondition(current.condition, earlier)?.passages;
         if (!passages || passages[0]?.text !== entry.passage) throw Error('Earlier matched evidence is unavailable. Preview again.');
       }
       if (buildPackage({ ...current, candidate: { evidence: source, passages: match.passages }, history }) !== item.text) throw Error('Reviewed revisit package is unavailable. Preview again.');
@@ -350,8 +360,8 @@ class Revisit {
     this.reconcileResolutions(state, ledger);
     this.settleInterrupted(state);
     if (items) {
-      const present = new Set(items.map(item => item.key));
-      this.markRemoved(state, present, now);
+      const sources = new Map(items.map(item => [item.key, item]));
+      this.markRemoved(state, sources, now);
       const revisions = new Set(items.map(evidenceId));
       for (const candidate of state.candidates) if (!revisions.has(evidenceId(candidate.evidence))) {
         if (candidate.outcome) candidate.historyWithdrawnAt ||= now;
@@ -359,7 +369,7 @@ class Revisit {
       }
       // Kept so the read-only list can warn about missing references without reading
       // the corpus, which would contend with intake for the source lock.
-      state.presentKeys = [...present].sort();
+      state.presentKeys = [...sources.keys()].sort();
     }
     const current = new Set(ledger.decisions.flatMap(activeConditions).map(({ condition }) => conditionId(condition)));
     this.retireStale(state, current, now);
