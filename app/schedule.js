@@ -80,6 +80,23 @@ class Schedule {
     }
     return (await this.snapshot(guard))?.state || null;
   }
+  async removeInstalledTask() {
+    try { await fs.lstat(path.dirname(this.file)); }
+    catch (error) { if (error.code === 'ENOENT') return; throw error; }
+    await intakeLock(path.dirname(this.file), async () => {
+      let current;
+      try {
+        const guard = this.directoryGuard();
+        // Uninstall never repairs or rewrites an uncertain ownership record.
+        if (initialPublicationPending(this.file, guard) || statIfPresent(this.legacyReceipt, guard)) return;
+        current = await this.snapshot(guard);
+      } catch (error) {
+        console.warn('Daily intake ownership could not be verified. Preserving the task.', error.message);
+        return;
+      }
+      if (current) await this.tasks.apply('uninstall', current.state, this.file);
+    });
+  }
   async assertConfiguration(settingsPath) {
     const file = await optionalExact(settingsPath, this.directoryGuard());
     let selected;
