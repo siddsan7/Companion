@@ -351,8 +351,11 @@ test('duplicate annotations preserve both copies and pause relationship repair u
   expect(await fs.readFile(copy, 'utf8')).toBe(copied + '\nLater duplicate change.\n');
 });
 
-for (const boundary of ['annotation scan', 'link intent']) {
-  test(`relationship repair preserves a duplicate created after the ${boundary}`, async () => {
+for (const [boundary, selectOriginal] of [
+  ['annotation scan', false], ['link intent', false], ['backup link', true],
+  ['withdrawal', false], ['withdrawal', true], ['stage proof', true], ['live stage proof', false]
+]) {
+  test(`relationship repair preserves a duplicate created after the ${boundary} and repairs the selected ${selectOriginal ? 'original' : 'copy'}`, async () => {
     const { Vault } = require('../app/vault'), { Intake } = require('../app/intake');
     const directory = path.join(root, 'vault'), producer = path.dirname(await artifact());
     await fs.mkdir(directory);
@@ -384,16 +387,50 @@ for (const boundary of ['annotation scan', 'link intent']) {
         return snapshot;
       };
     } else await fs.rename(intake.destination(capture), moved);
-    await intake.reconcile({ now });
+    const native = require('node:fs');
+    if (['backup link', 'withdrawal', 'stage proof', 'live stage proof'].includes(boundary)) {
+      const method = { 'backup link': 'linkSync', withdrawal: 'unlinkSync', 'stage proof': 'renameSync', 'live stage proof': 'renameSync' }[boundary];
+      const operation = native[method], stop = Error('Interrupted relationship repair');
+      native[method] = (...args) => {
+        const result = operation(...args);
+        const hit = method === 'renameSync' ? args[1] === path.join(intake.dir, 'link-intent.json') :
+          args[0] === original && (method === 'unlinkSync' || args[1].endsWith('.before.md'));
+        if (!hit) return result;
+        if (boundary !== 'live stage proof') throw stop;
+        native.writeFileSync(copy, copied, { flag: 'wx' });
+        created = true;
+        return result;
+      };
+      try {
+        if (boundary === 'live stage proof') await intake.reconcile({ now });
+        else await expect(intake.reconcile({ now })).rejects.toThrow(stop.message);
+      } finally { native[method] = operation; }
+      if (!created) {
+        const intent = JSON.parse(await fs.readFile(path.join(intake.dir, 'link-intent.json'), 'utf8'));
+        expect(await fs.readFile(path.join(intake.dir, `link-${intent.id}.before.md`), 'utf8')).toBe(before);
+        if (boundary === 'backup link') expect(await fs.readFile(original, 'utf8')).toBe(before);
+        else await expect(fs.stat(original)).rejects.toMatchObject({ code: 'ENOENT' });
+        if (boundary === 'stage proof') expect(intent.stageProof).toBeDefined();
+        await createCopy();
+      }
+    } else await intake.reconcile({ now });
     expect(created).toBe(true);
-    expect(await fs.readFile(original, 'utf8')).toBe(before);
-    expect(await fs.readFile(copy, 'utf8')).toBe(copied);
-    const restarted = new Intake(new Vault(vault.vault, 'Companion'));
-    const issue = (await restarted.repairs()).find(item => item.id === 'annotation:' + id);
-    expect(issue?.kind).toBe('duplicate');
-    await restarted.chooseIdentity({ id: issue.id, file: path.basename(copy), token: issue.token });
-    expect(await fs.readFile(copy, 'utf8')).toBe(copied.replace(/^Source: .*$/m, 'Source: [Capture](Moved.md)'));
-    expect(await fs.readFile(original, 'utf8')).toBe(before);
+    let restarted, issue;
+    for (let restart = 0; restart < 2; restart++) {
+      restarted = new Intake(new Vault(vault.vault, 'Companion'));
+      await restarted.reconcile({ now });
+      expect(await fs.readFile(original, 'utf8')).toBe(before);
+      expect(await fs.readFile(copy, 'utf8')).toBe(copied);
+      expect((await fs.readdir(intake.dir)).filter(name => /^link-/.test(name))).toEqual([]);
+      issue = (await restarted.repairs()).find(item => item.id === 'annotation:' + id);
+      expect(issue?.kind).toBe('duplicate');
+    }
+    const selected = selectOriginal ? original : copy;
+    await restarted.chooseIdentity({ id: issue.id, file: path.relative(vault.vault, selected), token: issue.token });
+    const repaired = (selectOriginal ? before : copied).replace(/^Source: .*$/m,
+      selectOriginal ? 'Source: [Capture](../../Moved.md)' : 'Source: [Capture](Moved.md)');
+    expect(await fs.readFile(selected, 'utf8')).toBe(repaired);
+    expect(await fs.readFile(selectOriginal ? copy : original, 'utf8')).toBe(selectOriginal ? copied : before);
   });
 }
 
