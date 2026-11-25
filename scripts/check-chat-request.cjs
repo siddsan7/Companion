@@ -37,6 +37,10 @@ function sendToolCall(response) {
 function inspect(headers, body, root) {
   assert(!['authorization', 'cookie', 'chatgpt-account-id', 'openai-organization', 'x-api-key'].some(key => Object.hasOwn(headers, key)), 'Unexpected credential header.');
   assert(!JSON.stringify(body).includes(path.basename(root)), 'Request includes a disposable local path.');
+  return inspectModelInput(body, prompt);
+}
+
+function inspectModelInput(body, expectedText) {
   const { input, client_metadata, prompt_cache_key, ...parameters } = body;
   const reviewed = { model: 'gpt-6.2-sol', stream: true, tool_choice: 'auto', parallel_tool_calls: false,
     reasoning: { effort: 'low', context: 'all_turns' }, store: false, include: ['reasoning.encrypted_content'], text: { verbosity: 'low' } };
@@ -46,7 +50,7 @@ function inspect(headers, body, root) {
   const [inventory, ...messages] = input;
   assert(Object.keys(inventory).sort().join(',') === 'id,role,tools,type' && inventory.type === 'additional_tools' && inventory.role === 'developer', 'Unexpected inventory message.');
   assert.equal(hash({ tools: body.tools ?? [], additional: inventory.tools }), toolDigest, 'Model-visible tool definitions changed.');
-  const expected = [['developer', INSTRUCTIONS], ['user', prompt]];
+  const expected = [['developer', INSTRUCTIONS], ['user', expectedText]];
   for (const [index, item] of messages.entries()) {
     const { id, ...visible } = item;
     const [role, text] = expected[index];
@@ -80,6 +84,7 @@ async function main(executable) {
         expectToolResult = false;
       }
       observed.push(inspect(request.headers, body, root));
+      if (responseStatus === 'disconnect') { response.destroy(); return; }
       if (responseStatus === 200) {
         expectToolResult = true;
         responseStatus = 503;
@@ -119,11 +124,16 @@ async function main(executable) {
     await assert.rejects(runTurn(setup, prompt), /temporarily unavailable/);
     if (refusal) throw refusal;
     assert(!expectToolResult && observed.length === 5, 'Expected one automatic follow-up containing only the known tool refusal.');
-    console.log(JSON.stringify({ target: 'unsigned-loopback', hostedInference: false, checkedStatus: [401, 429, 503], refusedTool: toolCall.name, ...observed[0] }));
+    responseStatus = 'disconnect';
+    await assert.rejects(runTurn(setup, prompt), /Check your connection/);
+    if (refusal) throw refusal;
+    assert(observed.length === 6 && setup.turnHistory.at(-1).status === 'failed' && !setup.snapshot().ready);
+    console.log(JSON.stringify({ disconnectedSocket: true, target: 'unsigned-loopback', hostedInference: false, checkedStatus: [401, 429, 503], refusedTool: toolCall.name, ...observed[0] }));
   } finally {
     setup.close();
     if (server.listening) await new Promise(resolve => server.close(resolve));
     await fs.rm(root, { recursive: true, force: true, maxRetries: 3 });
   }
 }
-main(process.argv[2]).catch(error => { console.error(error.message); process.exitCode = 1; });
+module.exports = { inspectModelInput };
+if (require.main === module) main(process.argv[2]).catch(error => { console.error(error.message); process.exitCode = 1; });

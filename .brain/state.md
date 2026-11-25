@@ -1,5 +1,7 @@
 # Spec #1 working state
 
+Signed-in qualification observed exact tool and message inventory, grounded disposable citations, a 723-token output sample and a matching interruption. Production remains closed pending a verified managed-route capacity and reserve. See docs/verification-ticket8.md.
+
 The Windows installer is a separate review candidate. Its build, native acceptance command, data boundaries and distribution steps are in the [installer guide](../docs/windows-installer.md). Release publication requires separate review and approval.
 
 Goal: complete [Companion #1](https://github.com/siddsan7/Companion/issues/1) and tickets #2–#16. See [publishing and final checkpoint](publishing.md) for history, review, and the pause after remote merge verification. [PR #17](https://github.com/siddsan7/Companion/pull/17) targets `main`. Original base `04ed4fb6`. Planning commits `e030e51` and `5a7f0c7` precede implementation worktrees.

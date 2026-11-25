@@ -8,6 +8,7 @@ const { runTurn } = require('./codex-turn');
 const { prepareProbe } = require('./codex-probe');
 const { ordinaryDirectories, readExact, writeStage, publishReplacement, removeStageIfPresentSync } = require('./staged-publication');
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
+const SYNTHETIC_PROMPT = 'Synthetic Companion setup check. Reply with exactly: Companion context received. No files or tools are needed.';
 class CodexSetup {
   constructor({ dataRoot, testRoot } = {}) {
     this.dataRoot = dataRoot; this.testRoot = testRoot; this.generation = 0; this.accountRevision = 0;
@@ -251,7 +252,7 @@ class CodexSetup {
       return guard;
     };
     await verify();
-    await runTurn(this, 'Synthetic Companion setup check. Reply with exactly: Companion context received. No files or tools are needed.', { beforeStart: verify });
+    await runTurn(this, SYNTHETIC_PROMPT, { beforeStart: verify });
     if (generation !== this.generation) return;
     // A completed turn and absence of tool events do not establish the model-visible tool inventory.
     // Keep the live gate closed until that inventory has independent installed-integration evidence.
@@ -268,4 +269,4 @@ class CodexSetup {
   invalidate(message = 'Vault or project configuration changed. Check Codex setup and verify isolation again.') { this.close(); this.fail(message); }
   close() { this.generation++; this.clearLogin(); this.certificate = null; this.rpc?.close(); this.rpc = null; Object.assign(this.state, { ready: false, isolationPassed: false, connected: false, authenticated: false, turnActive: false }); }
 }
-module.exports = { CodexSetup };
+module.exports = { CodexSetup, SYNTHETIC_PROMPT };
