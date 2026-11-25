@@ -46,7 +46,9 @@ function inspectSignedRequest(body, record, text) {
   return inspectModelInput({ ...body, input }, text).toolDefinitionsSha256;
 }
 
-async function inspectTrace(trace, record) {
+async function inspectTrace(trace, record, reply) {
+  trace.entries = [trace.entries[0]];
+  assert(record.status === 'completed' && typeof reply === 'string' && reply.trim());
   const bundles = await fs.readdir(trace.root, { withFileTypes: true });
   assert(bundles.length === 1 && bundles[0].isDirectory());
   const name = bundles[0].name;
@@ -61,36 +63,52 @@ async function inspectTrace(trace, record) {
   assert(manifest.trace_id === traceId && manifest.root_thread_id === record.threadId && manifest.rollout_id === record.threadId);
   assert(manifest.schema_version === 2 && manifest.raw_event_log === 'trace.jsonl' && manifest.payloads_dir === 'payloads');
   const events = observe(plan, path.join(name, 'trace.jsonl')).toString('utf8').trim().split('\n').map(JSON.parse);
-  const starts = events.filter(event => event.payload.type === 'inference_started');
-  assert(starts.length === 1 && starts[0].thread_id === record.threadId && starts[0].codex_turn_id === record.turnId);
-  assert(starts[0].payload.model === record.model && starts[0].payload.provider_name === 'OpenAI');
-  const completed = events.filter(event => event.payload.type === 'inference_completed');
-  assert(completed.length === 1 && completed[0].payload.inference_call_id === starts[0].payload.inference_call_id);
-  let toolDigest;
+  const inference = events.filter(event => event.payload.type.startsWith('inference_'));
+  same(inference.map(event => event.payload.type), ['inference_started', 'inference_completed']);
+  const [start, completion] = inference;
+  same(Object.keys(start.payload).sort(), ['codex_turn_id', 'inference_call_id', 'model', 'provider_name', 'request_payload', 'thread_id', 'type']);
+  same(Object.keys(completion.payload).sort(), ['inference_call_id', 'response_id', 'response_payload', 'type', 'upstream_request_id']);
+  assert(start.payload.request_payload?.kind?.type === 'inference_request' && completion.payload.response_payload?.kind?.type === 'inference_response');
+  assert(inference.every(event => event.thread_id === record.threadId && event.codex_turn_id === record.turnId));
+  assert(start.payload.thread_id === record.threadId && start.payload.codex_turn_id === record.turnId);
+  assert(start.payload.model === record.model && start.payload.provider_name === 'OpenAI');
+  assert(uuid.test(start.payload.inference_call_id) && completion.payload.inference_call_id === start.payload.inference_call_id);
+  assert(typeof completion.payload.response_id === 'string' && completion.payload.response_id.trim());
+  assert(completion.payload.upstream_request_id === null || typeof completion.payload.upstream_request_id === 'string' && completion.payload.upstream_request_id.trim());
+  let toolDigest, verifiedReply = false;
   const seen = new Set();
   for (const event of events) {
     assert((event.thread_id === null || event.thread_id === record.threadId) && event.rollout_id === record.threadId);
-    for (const ref of Object.values(event.payload)) {
+    for (const [field, ref] of Object.entries(event.payload)) {
       if (!ref?.raw_payload_id) continue;
       const match = /^payloads\/([1-9][0-9]*)\.json$/.exec(ref.path);
       assert(match && ref.raw_payload_id === 'raw_payload:' + match[1] && !seen.has(ref.path));
       seen.add(ref.path);
       const value = JSON.parse(observe(plan, path.join(name, 'payloads', match[1] + '.json')));
       if (ref.kind.type === 'inference_request') {
-        assert(event === starts[0]);
+        assert(event === start && field === 'request_payload' && !toolDigest);
         toolDigest = inspectSignedRequest(value, record, SYNTHETIC_PROMPT);
       } else if (ref.kind.type === 'inference_response') {
-        assert(event === completed[0] && Array.isArray(value.output_items));
+        assert(event === completion && field === 'response_payload' && !verifiedReply);
+        assert(value.response_id === completion.payload.response_id && value.upstream_request_id === completion.payload.upstream_request_id);
+        assert(Array.isArray(value.output_items) && value.output_items.every(item => item.type === 'reasoning' || item.type === 'message'));
+        const messages = value.output_items.filter(item => item.type === 'message');
+        assert(messages.length && messages.every(item => item.role === 'assistant' && item.status === 'completed' &&
+          Array.isArray(item.content) && item.content.every(part => part.type === 'output_text' && typeof part.text === 'string')));
+        assert(messages.map(item => item.content.map(part => part.text).join('')).join('\n\n') === reply);
+        assert(Number.isSafeInteger(record.usage?.last?.totalTokens) && record.usage.last.totalTokens > 0);
+        assert(value.token_usage?.total_tokens === record.usage.last.totalTokens);
+        verifiedReply = true;
       } else if (ref.kind.type === 'session_metadata') {
-        assert(event.payload.type === 'thread_started' && value.thread_id === record.threadId);
+        assert(field === 'metadata_payload' && event.payload.type === 'thread_started' && value.thread_id === record.threadId);
       } else {
         const legacyTypes = { turn_started: 'task_started', turn_complete: 'task_complete' };
-        assert(ref.kind.type === 'protocol_event' && event.payload.type === 'protocol_event_observed');
+        assert(field === 'event_payload' && ref.kind.type === 'protocol_event' && event.payload.type === 'protocol_event_observed');
         assert(value.type === (legacyTypes[event.payload.event_type] ?? event.payload.event_type));
       }
     }
   }
-  assert(toolDigest);
+  assert(toolDigest && verifiedReply);
   trace.entries = plan.entries;
   return toolDigest;
 }
@@ -119,7 +137,7 @@ async function main(staging, consent) {
     const result = await setup.action({ action: 'synthetic' });
     const record = setup.turnHistory.at(-1);
     assert(result.status === 'inventory-unverified' && !result.ready && setup.turnHistory.length === count + 1 && record.status === 'completed');
-    const toolDigest = await inspectTrace(trace, record);
+    const toolDigest = await inspectTrace(trace, record, result.reply);
     await setup.readAccount();
     const fingerprint = await audit(setup);
     assert(setup.state.authenticated && setup.certificate === cert && cert.fingerprint === fingerprint && Date.now() < cert.expires);
