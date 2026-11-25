@@ -43,6 +43,16 @@ jobs:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: npm.cmd run test:installer
+      - name: Retain verified installer for review
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Companion-windows-x64
+          path: |
+            dist/Companion-*-windows-x64.msi*
+            !dist/Companion-0.0.9-windows-x64.msi*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
   checks:
     # The desktop suite outgrew one 45-minute job, so it runs in four shards.

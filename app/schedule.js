@@ -83,8 +83,17 @@ class Schedule {
   async removeInstalledTask() {
     try { await fs.lstat(path.dirname(this.file)); }
     catch (error) { if (error.code === 'ENOENT') return; throw error; }
-    await this.change(async guard => {
-      const current = await this.snapshot(guard);
+    await intakeLock(path.dirname(this.file), async () => {
+      let current;
+      try {
+        const guard = this.directoryGuard();
+        // Uninstall never repairs or rewrites an uncertain ownership record.
+        if (initialPublicationPending(this.file, guard) || statIfPresent(this.legacyReceipt, guard)) return;
+        current = await this.snapshot(guard);
+      } catch (error) {
+        console.warn('Daily intake ownership could not be verified. Preserving the task.', error.message);
+        return;
+      }
       if (current) await this.tasks.apply('uninstall', current.state, this.file);
     });
   }
