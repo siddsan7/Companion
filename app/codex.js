@@ -6,10 +6,11 @@ const { PROFILE, INSTRUCTIONS, policy, toToml, canonical, samePath, inside } = r
 const { audit, probeIsolation } = require('./codex-isolation');
 const { runTurn } = require('./codex-turn');
 const { prepareProbe } = require('./codex-probe');
+const { ordinaryDirectories, readExact, writeStage, publishReplacement, removeStageIfPresentSync } = require('./staged-publication');
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
 class CodexSetup {
   constructor({ dataRoot, testRoot } = {}) {
-    this.dataRoot = dataRoot; this.testRoot = testRoot; this.generation = 0;
+    this.dataRoot = dataRoot; this.testRoot = testRoot; this.generation = 0; this.accountRevision = 0;
     this.state = { status: 'incomplete', message: 'Verify Windows isolation before using Codex. Local capture remains available.', ready: false, isolationPassed: false, busy: false };
     this.threads = new Set(); this.turnHistory = []; this.saveTail = Promise.resolve(); this.turnLease = null;
     this.loaded = this.restore();
@@ -51,14 +52,38 @@ class CodexSetup {
       if (generation !== this.generation) return;
       await fs.mkdir(this.dataRoot, { recursive: true });
       const temporary = path.join(this.dataRoot, `readiness-${crypto.randomUUID()}.pending`);
+      const destination = path.join(this.dataRoot, 'readiness.json');
+      const { guard } = ordinaryDirectories([this.dataRoot], 'Codex history folder changed.');
+      let stage, created;
       try {
-        await fs.writeFile(temporary, text, { flag: 'wx' });
+        stage = await writeStage(temporary, identity => { created = identity; return text; }, guard);
         if (generation !== this.generation) return;
-        await fs.rename(temporary, path.join(this.dataRoot, 'readiness.json'));
-      } finally { await fs.unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+        try { await fs.rename(temporary, destination); }
+        catch (error) {
+          if (process.platform !== 'win32' || error.syscall !== 'rename' || !['EPERM', 'EBUSY', 'EACCES'].includes(error.code)) throw error;
+          const previous = await readExact(destination, guard);
+          // Retry only this write against these same files, within the shared one-second deadline.
+          await publishReplacement(temporary, destination, guard, stage, previous.proof, { verifyRelated: () => {
+            if (generation !== this.generation) throw Error('Codex setup changed during history publication.');
+          } });
+        }
+      } finally {
+        if (stage) removeStageIfPresentSync(temporary, guard, stage);
+        else if (created) {
+          // A failed write can leave part of our payload. Preserve a replaced or foreign file.
+          const partial = await readExact(temporary, guard).catch(() => null);
+          if (partial && partial.proof.dev === created.dev && partial.proof.ino === created.ino &&
+              Buffer.from(text).subarray(0, partial.bytes.length).equals(partial.bytes)) removeStageIfPresentSync(temporary, guard, partial.proof);
+        }
+      }
     };
     this.saveTail = this.saveTail.catch(() => {}).then(write);
-    await this.saveTail;
+    try { await this.saveTail; }
+    catch (error) {
+      if (generation !== this.generation) return;
+      const code = ['EPERM', 'EACCES', 'EBUSY', 'ENOSPC', 'EROFS', 'ENOENT', 'EIO', 'EMFILE', 'ENFILE', 'STAGING_CHANGED'].includes(error.code) ? error.code : null;
+      throw Object.assign(Error(`Codex setup history could not be saved${code ? ` (${code})` : ''}. Check application-data access and retry explicitly.`), { historyCode: code });
+    }
   }
   async action(input = {}, roots = {}) {
     await this.loaded;
@@ -77,7 +102,13 @@ class CodexSetup {
       else throw Error('Unknown Codex setup action.');
       if (this.generation === generation) this.state.busy = false;
     } catch (error) { if (this.generation === generation) this.fail(error.message, error.terminalStatus || 'incomplete'); }
-    if (this.generation === generation) await this.persist(); return this.snapshot();
+    if (this.generation === generation) {
+      try { await this.persist(); }
+      catch (error) {
+        if (this.generation === generation) this.fail(error.message, this.state.status === 'interrupted' ? 'interrupted' : 'failed');
+      }
+    }
+    return this.snapshot();
   }
   async connect(input, roots) {
     this.close(); this.checks = [];
@@ -90,7 +121,16 @@ class CodexSetup {
     await fs.mkdir(this.home, { recursive: true }); await fs.mkdir(this.work, { recursive: true });
     this.work = await fs.realpath(this.work); this.home = await fs.realpath(this.home);
     for (const root of this.roots) if (inside(root, this.work) || inside(root, this.home)) throw Error('The dedicated Codex folders resolve inside a protected root.');
-    this.policy = policy(this.work, this.roots, input.sandbox);
+    // Codex reads the catalog outside Electron's application archive. Reuse a verified copy.
+    const catalog = await fs.readFile(path.join(__dirname, 'codex-model-catalog.json'));
+    const digest = hash(catalog);
+    this.catalogPath = path.join(this.dataRoot, `model-catalog-${digest}.json`);
+    this.catalogGuard = ordinaryDirectories([this.dataRoot], 'Codex data folder changed. Check setup again.').guard;
+    try { await fs.writeFile(this.catalogPath, catalog, { flag: 'wx' }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    this.catalogProof = (await readExact(this.catalogPath, this.catalogGuard)).proof;
+    if (this.catalogProof.digest !== digest) throw Error('The installed Companion model catalog changed. Check setup again.');
+    this.policy = policy(this.work, this.roots, input.sandbox, this.catalogPath);
     this.configText = toToml(this.policy);
     const configPath = path.join(this.home, 'config.toml');
     // This home belongs only to Companion. Never read or change the user Codex home.
@@ -137,9 +177,16 @@ class CodexSetup {
     this.rpc.notify('initialized'); this.state.connected = true;
   }
   async readAccount() {
-    const result = await this.rpc.request('account/read', { refreshToken: false });
+    const rpc = this.rpc;
+    const result = await rpc.request('account/read', { refreshToken: false });
+    if (this.rpc !== rpc || rpc.closed) throw Error('Codex connection changed. Check setup again.');
     this.state.authenticated = result.account?.type === 'chatgpt';
-    this.accountDigest = result.account ? hash(canonical({ account: result.account, routing: result.workspaceRouting || null })) : null;
+    const digest = result.account ? hash(canonical({ account: result.account, routing: result.workspaceRouting || null })) : null;
+    if (this.certificate && digest !== this.accountDigest) {
+      this.certificate = null;
+      Object.assign(this.state, { ready: false, isolationPassed: false, message: 'Account changed. Verify isolation again.' });
+    }
+    this.accountDigest = digest;
     return result;
   }
   async login() {
@@ -161,20 +208,30 @@ class CodexSetup {
     if (method === 'account/login/completed' && params.loginId === this.loginId) {
       this.clearLogin();
       if (!params.success) this.fail('Sign-in expired or failed. Start a new sign-in.', 'expired');
-      else { try { await this.readAccount(); this.state.status = 'signed-in'; this.state.message = 'Managed sign-in complete. Verify isolation next.'; } catch { this.fail('Cannot verify the managed account.'); } }
+      else {
+        try {
+          await this.readAccount();
+          if (!this.state.authenticated) throw Error('Managed account unavailable.');
+          this.state.status = 'signed-in'; this.state.message = 'Managed sign-in complete. Verify isolation next.';
+        } catch { this.fail('Cannot verify the managed account.'); }
+      }
       await this.persist();
     }
-    if (method === 'account/updated') { this.certificate = null; this.state.ready = false; this.state.isolationPassed = false; this.state.authenticated = params.authMode === 'chatgpt'; this.state.message = 'Account changed. Verify isolation again.'; }
+    if (method === 'account/updated') { this.accountRevision++; this.certificate = null; this.state.ready = false; this.state.isolationPassed = false; this.state.authenticated = params.authMode === 'chatgpt'; this.state.message = 'Account changed. Verify isolation again.'; }
   }
   async verify() {
     if (!this.rpc || this.rpc.closed) throw Error('Check Codex setup first.');
     if (!this.vaultRoot) throw Error('Choose a vault before verifying Windows isolation.');
+    const generation = this.generation, accountRevision = this.accountRevision;
     this.certificate = null; this.state.ready = false; this.checks = [];
     this.state.status = 'verifying'; this.state.message = 'Auditing configuration and testing actual Windows read denials.';
     await this.readAccount();
     const fingerprint = await audit(this); this.checks.push({ check: 'effective-configuration-skills-connectors', status: 'passed' });
     await probeIsolation(this);
     if (!this.state.authenticated) throw Error('Windows probes passed. Managed sign-in is still required.');
+    await this.readAccount();
+    const current = await audit(this);
+    if (generation !== this.generation || accountRevision !== this.accountRevision || !this.state.authenticated || current !== fingerprint) throw Error('Codex setup changed during Windows verification. Verify isolation again.');
     // Certificates never load from disk and expire quickly. Every use re-audits account/config/root identity.
     this.certificate = { fingerprint, expires: Date.now() + 10 * 60 * 1000 };
     this.state.ready = false; this.state.isolationPassed = true; this.state.status = 'isolated';
@@ -182,11 +239,19 @@ class CodexSetup {
   }
   async synthetic() {
     const generation = this.generation, certificate = this.certificate;
-    if (!certificate || Date.now() >= certificate.expires) throw Error('Isolation verification expired. Verify again before sending.');
-    await this.readAccount();
-    const fingerprint = await audit(this);
-    if (generation !== this.generation || this.certificate !== certificate || Date.now() >= certificate.expires || !this.state.authenticated || fingerprint !== certificate.fingerprint) throw Error('Account, executable, configuration or protected roots changed. Verify isolation again.');
-    await runTurn(this, 'Synthetic Companion setup check. Reply with exactly: Companion context received. No files or tools are needed.');
+    this.state.status = 'verifying'; this.state.message = 'Checking isolation before starting the synthetic turn.';
+    const guard = () => {
+      if (!certificate || this.certificate !== certificate || Date.now() >= certificate.expires || generation !== this.generation || !this.state.authenticated) throw Error('Isolation verification changed or expired. Verify again before sending.');
+    };
+    const verify = async () => {
+      guard();
+      await this.readAccount();
+      if (await audit(this) !== certificate.fingerprint) throw Error('Account, executable, configuration or protected roots changed. Verify isolation again.');
+      guard();
+      return guard;
+    };
+    await verify();
+    await runTurn(this, 'Synthetic Companion setup check. Reply with exactly: Companion context received. No files or tools are needed.', { beforeStart: verify });
     if (generation !== this.generation) return;
     // A completed turn and absence of tool events do not establish the model-visible tool inventory.
     // Keep the live gate closed until that inventory has independent installed-integration evidence.
@@ -197,8 +262,7 @@ class CodexSetup {
   async interrupt() {
     if (!this.state.turnActive) return this.snapshot();
     this.cancelRequested = true; this.certificate = null; this.state.ready = false; this.state.status = 'interrupting'; this.state.message = 'Waiting for Codex to confirm interruption.';
-    if (this.activeTurn) await this.rpc.request('turn/interrupt', this.activeTurn);
-    this.interruptTimer = setTimeout(() => { this.rpc?.close('Interruption was not confirmed. The turn is incomplete.'); this.settleTurn?.('interrupted'); }, 5000);
+    await this.turnLease?.interrupt?.();
     return this.snapshot();
   }
   invalidate(message = 'Vault or project configuration changed. Check Codex setup and verify isolation again.') { this.close(); this.fail(message); }

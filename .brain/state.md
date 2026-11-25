@@ -4,6 +4,8 @@ The Windows installer is a separate review candidate. Its build, native acceptan
 
 Goal: complete [Companion #1](https://github.com/siddsan7/Companion/issues/1) and tickets #2–#16. See [publishing and final checkpoint](publishing.md) for history, review, and the pause after remote merge verification. [PR #17](https://github.com/siddsan7/Companion/pull/17) targets `main`. Original base `04ed4fb6`. Planning commits `e030e51` and `5a7f0c7` precede implementation worktrees.
 
+Current chat qualification uses Electron 45.2.3 and Codex 0.170.0. The disposable unsigned desktop flow and Windows root-denial checks passed. Production requires current managed sign-in and signed-in request, capacity, citation and provider-failure evidence. The [ticket 8 verification record](../docs/verification-ticket8.md) contains the observed gates.
+
 ## Pre-merge evidence checkpoint
 
 Tickets #2–#16 are integrated and closed. The four handoff scopes and subsequent reviewed corrections retain their individual commits. The complete [verification report](../docs/verification-ticket16.md) records exact source `660b507`, tree `85850e86`. Both independent whole-PR reviewers approved that source. Its Windows gate passed with 752 passes, zero failures, and one actual file-symlink capability skip across 753 cases and 41 files. The source and native probe checks, pinned Electron, actual scheduler reconnect and worker cleanup, and controlled actual-input smoke also passed.

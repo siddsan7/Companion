@@ -16,6 +16,13 @@ function failureMessage(info) {
   if (['serverOverloaded', 'flexUnavailable'].includes(info)) return 'Codex is temporarily unavailable. Retry explicitly when the service is available.';
   return 'Codex turn failed. The partial reply is incomplete. Check setup and retry explicitly.';
 }
+function failureKind(info) {
+  const status = info?.httpConnectionFailed?.httpStatusCode ?? info?.responseTooManyFailedAttempts?.httpStatusCode;
+  if (status === 401) return 'unauthorized';
+  if (status === 429) return 'rateLimitExceeded';
+  if (status === 503) return 'serverOverloaded';
+  return info;
+}
 async function runTurn(setup, text, options = {}) {
   if (setup.turnLease) throw Error('Codex is still finishing a reply. Wait for it to finish, then retry explicitly.');
   const lease = { generation: setup.generation }; setup.turnLease = lease;
@@ -29,13 +36,17 @@ async function runTurn(setup, text, options = {}) {
   } finally {
     try {
       if (setup.generation === lease.generation) await setup.persist();
-    } catch {
+    } catch (error) {
       if (setup.generation === lease.generation) {
         setup.certificate = null; setup.state.ready = false; setup.state.isolationPassed = false;
+        const detail = error.historyCode ? ` (${error.historyCode})` : '';
         if (!failure) {
-          failure = Object.assign(Error('Codex setup history could not be saved. The retained reply is incomplete. Check setup and retry explicitly.'), { terminalStatus: 'interrupted' });
-          setup.fail(failure.message, failure.terminalStatus);
+          setup.turnHistory.at(-1).status = 'interrupted';
+          failure = Object.assign(Error(`Codex setup history could not be saved${detail}. The retained reply is incomplete. Check setup and retry explicitly.`), { terminalStatus: 'interrupted' });
+        } else if (!failure.historyCode) {
+          failure.message += ` Codex setup history could not be saved${detail}.`;
         }
+        setup.fail(failure.message, failure.terminalStatus || 'failed');
       }
     } finally { if (setup.turnLease === lease) setup.turnLease = null; }
   }
@@ -46,15 +57,20 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
   const rpc = setup.rpc;
   const started = await rpc.request('thread/start', { cwd: setup.work, runtimeWorkspaceRoots: [setup.work], permissions: PROFILE, approvalPolicy: 'never', ephemeral: true, environments: [], selectedCapabilityRoots: [], dynamicTools: [], baseInstructions: INSTRUCTIONS, developerInstructions: '',
     ...(comparisonPin ? { model: comparisonPin.model, modelProvider: comparisonPin.modelProvider, serviceTier: comparisonPin.serviceTier, config: { model_reasoning_effort: comparisonPin.reasoningEffort } } : {}) });
-  if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !Array.isArray(started.runtimeWorkspaceRoots) || started.runtimeWorkspaceRoots.length !== 1 || !samePath(started.runtimeWorkspaceRoots[0], setup.work) || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
+  // Codex 0.170 returns an empty root list when the only requested root is cwd.
+  const roots = started.runtimeWorkspaceRoots;
+  const rootsMatch = Array.isArray(roots) && roots.length <= 1 && roots.every(root => samePath(root, setup.work));
+  if (!samePath(started.cwd, setup.work) || started.approvalPolicy !== 'never' || started.activePermissionProfile?.id !== PROFILE || started.activePermissionProfile.extends || !rootsMatch || !Array.isArray(started.instructionSources) || started.instructionSources.length) throw Error('Codex thread widened the controlled context boundary.');
+  if (setup.policy && (started.model !== setup.policy.model || started.modelProvider !== setup.policy.model_provider)) throw Error('Codex selected a different model or provider. Check setup again.');
   const threadId = started.thread?.id;
   if (typeof threadId !== 'string' || !threadId.trim() || setup.threads.has(threadId)) throw Error('Codex did not create a fresh thread.');
   setup.threads.add(threadId);
-  setup.state.reply = ''; setup.state.turnActive = true; setup.state.status = 'running';
+  Object.assign(setup.state, { reply: '', turnActive: true, status: 'running', message: 'Waiting for Codex to finish the current turn.' });
   const record = { threadId, turnId: null, status: 'inProgress', model: started.model, completedAt: null, usage: null, usageEvidence: USAGE_UNAVAILABLE };
-  if (comparisonPin) record.effective = { model: typeof started.model === 'string' ? started.model : null, modelProvider: typeof started.modelProvider === 'string' ? started.modelProvider : null, reasoningEffort: typeof started.reasoningEffort === 'string' ? started.reasoningEffort : null, serviceTier: typeof started.serviceTier === 'string' ? started.serviceTier : null };
+  const effective = Object.fromEntries(['model', 'modelProvider', 'reasoningEffort', 'serviceTier'].map(key => [key, typeof started[key] === 'string' && started[key].trim() ? started[key] : null]));
+  if (comparisonPin || Object.values(effective).every(Boolean)) record.effective = effective;
   setup.turnHistory.push(record);
-  let turnId, terminal, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
+  let turnId, terminal, observedTerminal, acknowledged, interruptRequest, unexpected, resolveTerminal, fatalFailure, historySaved = false, startAttempted = false;
   const messages = new Map();
   let sinkTail = Promise.resolve(), sinkFailure;
   const preserve = () => {
@@ -66,6 +82,21 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     return sinkTail;
   };
   const completed = new Promise(resolve => { resolveTerminal = resolve; });
+  // Manual interruption and failure cleanup share one request on the owning transport.
+  const interrupt = () => {
+    if (rpc.closed || observedTerminal) return;
+    if (!setup.interruptTimer) setup.interruptTimer = setTimeout(() => rpc.close('Interruption was not confirmed. The turn is incomplete.'), 5000);
+    if (acknowledged && !interruptRequest) {
+      interruptRequest = rpc.request('turn/interrupt', acknowledged, 5000).catch(() => rpc.close('Interruption request failed. The turn is incomplete.'));
+    }
+    return interruptRequest;
+  };
+  setup.turnLease.interrupt = interrupt;
+  const recordFailure = error => {
+    const kind = failureKind(error?.codexErrorInfo);
+    fatalFailure = failureMessage(kind); setup.state.message = fatalFailure;
+    if (kind === 'unauthorized') setup.state.authenticated = false;
+  };
   setup.settleTurn = status => { terminal = status; resolveTerminal(status); };
   const validId = id => typeof id === 'string' && id.trim().length > 0;
   const rejectContext = message => { unexpected = message; rpc.close(message); setup.settleTurn?.('interrupted'); return false; };
@@ -133,12 +164,12 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
       if (params.turn.status === 'completed' && [...messages.values()].some(message => !message.completed)) {
         rejectContext('Codex did not supply a complete final reply. The retained text is incomplete. Check setup and retry explicitly.'); return;
       }
-      setup.settleTurn(params.turn.status);
+      if (params.turn.status === 'failed' && !fatalFailure) recordFailure(params.turn.error);
+      observedTerminal = params.turn.status;
+      setup.settleTurn(observedTerminal);
     }
     if (method === 'error' && params.willRetry !== true) {
-      fatalFailure = failureMessage(params.error?.codexErrorInfo);
-      setup.state.message = fatalFailure;
-      if (params.error?.codexErrorInfo === 'unauthorized') setup.state.authenticated = false;
+      recordFailure(params.error);
       // The error notification is not a terminal event. Wait for turn/completed or bounded timeout.
     }
   };
@@ -155,10 +186,11 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     startAttempted = true;
     const response = await rpc.request('turn/start', { threadId, input: [{ type: 'text', text }], environments: [] });
     if (!bindTurn(response.turn?.id)) throw Error(unexpected);
-    setup.activeTurn = { threadId, turnId };
+    acknowledged = { threadId, turnId };
+    setup.activeTurn = acknowledged;
     record.turnId = turnId; await setup.persist();
     await preserve();
-    if (setup.cancelRequested) await rpc.request('turn/interrupt', setup.activeTurn);
+    if (setup.cancelRequested) await interrupt();
     const reported = terminal || await completed;
     await sinkTail;
     if (sinkFailure) throw Error('Conversation history could not preserve the complete reply. The retained reply is incomplete.');
@@ -172,17 +204,28 @@ async function runOwnedTurn(setup, text, { beforeStart = async () => {}, onState
     if (!setup.state.reply.trim()) throw Error('Codex completed without an assistant reply.');
     return setup.state.reply;
   } catch (error) {
-    // Once turn/start can have reached the server, a lost acknowledgement is ambiguous.
-    // Preserve an interrupted local terminal; never call it completed or replay it.
-    const interrupted = startAttempted && (record.status === 'interrupted' || rpc.closed);
+    const originalViolation = unexpected, alreadyClosed = rpc.closed;
+    if (startAttempted && !observedTerminal && !rpc.closed) {
+      if (!acknowledged || setup.rpc !== rpc) rpc.close('The active turn could not be confirmed. The turn is incomplete.');
+      else {
+        setup.state.status = 'interrupting'; setup.state.message = 'Waiting for Codex to settle the incomplete turn.';
+        await interrupt();
+        if (!rpc.closed && !observedTerminal) await completed;
+      }
+    }
+    const interrupted = startAttempted && (record.status === 'inProgress' || record.status === 'interrupted' || alreadyClosed);
     Object.assign(record, { turnId: turnId || null, status: interrupted ? 'interrupted' : 'failed', completedAt: new Date().toISOString() });
     if (!error.terminalStatus) error.terminalStatus = record.status;
-    if (!historySaved) error.message = 'Codex history could not be saved. No model request was sent. Check application-data access and retry explicitly.';
-    else if (unexpected) error.message = unexpected;
-    else if (startAttempted && rpc.closed) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
+    if (!historySaved) error.message = `Codex history could not be saved${error.historyCode ? ` (${error.historyCode})` : ''}. No model request was sent. Check application-data access and retry explicitly.`;
+    else if (originalViolation && !Object.hasOwn(error, 'historyCode')) error.message = originalViolation;
+    else if (startAttempted && alreadyClosed && !Object.hasOwn(error, 'historyCode') && !sinkFailure) error.message = 'Codex turn interrupted because the App Server connection closed. The partial reply is incomplete. Retry explicitly.';
+    else if (acknowledged && !observedTerminal && rpc.closed) error.message += ' The private connection closed without a confirmed terminal.';
     throw error;
   } finally {
-    clearTimeout(timeout); clearTimeout(setup.interruptTimer);
+    // An interrupt acknowledgement can arrive after its terminal notification.
+    // Its bounded RPC must settle before another turn may reuse this transport.
+    await interruptRequest;
+    clearTimeout(timeout); clearTimeout(setup.interruptTimer); setup.interruptTimer = null;
     clearTimeout(setup.replySaveTimer); setup.replySaveTimer = null;
     rpc.off('notification', handler); setup.activeTurn = null; setup.settleTurn = null; setup.cancelRequested = false; setup.state.turnActive = false;
     await sinkTail;

@@ -3,8 +3,11 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { PROFILE, canonical, samePath } = require('./codex-policy');
 const { auditProbe } = require('./codex-probe');
+const { readExact } = require('./staged-publication');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 async function audit(setup) {
+  try { await readExact(setup.catalogPath, setup.catalogGuard, 1, setup.catalogProof); }
+  catch { throw Error('Companion model catalog changed or became unreadable. Check setup again.'); }
   if (hash(await fs.readFile(setup.executable)) !== setup.executableDigest) throw Error('Codex executable changed. Check setup again.');
   if (await fs.readFile(path.join(setup.home, 'config.toml'), 'utf8') !== setup.configText) throw Error('Companion Codex configuration changed. Check setup again.');
   const result = await setup.rpc.request('config/read', { cwd: setup.work, includeLayers: true });
@@ -23,7 +26,7 @@ async function audit(setup) {
   if (!Array.isArray(skills.data) || skills.data.length !== 1 || !samePath(skills.data[0].cwd, setup.work) || skills.data.some(entry => !Array.isArray(entry.skills) || entry.skills.some(skill => skill.enabled !== false) || entry.errors?.length)) throw Error('Enabled unselected skills or skill discovery errors prevent isolation verification.');
   const mcp = await setup.rpc.request('mcpServerStatus/list', {});
   if (!Array.isArray(mcp.data) || mcp.data.length || mcp.nextCursor) throw Error('Unselected connectors prevent isolation verification.');
-  return hash(canonical({ layers: result.layers, origins: result.origins, executable: setup.executableDigest, probe: await auditProbe(setup), roots: await Promise.all([...setup.roots, setup.work, setup.home].map(async root => { const real = await fs.realpath(root), stat = await fs.stat(real); return { real, dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs }; })), account: setup.accountDigest }));
+  return hash(canonical({ layers: result.layers, origins: result.origins, executable: setup.executableDigest, catalog: setup.catalogProof, probe: await auditProbe(setup), roots: await Promise.all([...setup.roots, setup.work, setup.home].map(async root => { const real = await fs.realpath(root), stat = await fs.stat(real); return { real, dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs }; })), account: setup.accountDigest }));
 }
 async function readProbe(setup, target, expected, nested = false) {
   const command = nested ? [setup.probe.executable, '--child', target] : [setup.probe.executable, target];

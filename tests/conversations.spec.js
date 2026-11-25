@@ -1571,6 +1571,20 @@ test('returned model must match the reviewed capacity model before turn start', 
   expect(rpc.filter(call => call.method === 'turn/start')).toEqual([]);
 });
 
+test('a provider request for user input closes the turn before the question reaches the desktop', async () => {
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), JSON.stringify({ requestUserInput: true }));
+  await prepareConversation();
+  await page.getByRole('button', { name: 'Send reviewed package', exact: true }).click();
+  await expect(page.locator('#conversation-history')).toContainText('interrupted');
+  await expect(page.locator('body')).not.toContainText('UNREVIEWED_INPUT_QUESTION');
+  const files = await fs.readdir(path.join(root, 'conversations'));
+  const text = await fs.readFile(path.join(root, 'conversations', files.find(name => name.endsWith('.json'))), 'utf8');
+  expect(text).not.toContain('UNREVIEWED_INPUT_QUESTION');
+  const rpc = await conversationRpc();
+  expect(rpc.filter(message => message.method === 'turn/start')).toHaveLength(1);
+  expect(rpc.some(message => message.method === 'command/exec')).toBe(false);
+});
+
 test('production conversation without verified capacity and isolation proof stays closed while capture works', async () => {
   test.setTimeout(60000);
   await prepareConversation({ COMPANION_TEST_REAL_PROVIDER_GUARD: '1' });

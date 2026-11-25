@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { samePath } = require('./codex-policy');
 
 // Only this main-owned accessor reads private proof. Its public identity is random,
 // process-local and contains no account, credential or certificate-derived value.
@@ -18,6 +19,7 @@ class ConversationEvidence {
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
   async current() {
+    const certificate = this.setup.certificate;
     const settings = await this.optional(this.settingsPath);
     const controlled = this.testRoot ? await this.optional(path.join(this.testRoot, 'conversation-evidence.json')) : null;
     const raw = controlled ? controlled.capacity : this.testRoot ? await this.optional(path.join(this.testRoot, 'context-bound.json')) : await this.getVerifiedCapacity();
@@ -27,18 +29,32 @@ class ConversationEvidence {
       // Whitelist inspectable capacity provenance, never spread a private proof object.
       capacity = { maxCodePoints: raw.maxCodePoints, model: raw.model, evidence: raw.evidence, ...(raw.harnessAndOutputEvidence === undefined ? {} : { harnessAndOutputEvidence: raw.harnessAndOutputEvidence }) };
     }
-    const rawSettings = controlled ? controlled.comparisonSettings : this.testRoot ? null : await this.getVerifiedComparisonSettings();
+    const candidate = controlled ? controlled.comparisonSettings : this.testRoot ? null : await this.getVerifiedComparisonSettings();
+    // Live comparison observations belong to one certificate and one capacity model.
+    const rawSettings = this.testRoot || (certificate && candidate?.certificate === certificate && candidate.model === capacity?.model) ? candidate : null;
     let comparisonSettings = null;
     if (rawSettings !== null && rawSettings !== undefined) {
       if (typeof rawSettings.modelProvider !== 'string' || !rawSettings.modelProvider.trim() || (typeof rawSettings.reasoningEffort !== 'string' || !rawSettings.reasoningEffort.trim()) || typeof rawSettings.serviceTier !== 'string' || !rawSettings.serviceTier.trim() || typeof rawSettings.evidence !== 'string' || !rawSettings.evidence.trim()) throw Error('Verified comparison settings are invalid. Repair their evidence and preview again.');
       comparisonSettings = { modelProvider: rawSettings.modelProvider, reasoningEffort: rawSettings.reasoningEffort, serviceTier: rawSettings.serviceTier, evidence: rawSettings.evidence };
     }
     const state = this.setup.snapshot();
-    const dispatchEnabled = !controlled || controlled.dispatchEnabled === true;
-    const identity = JSON.stringify({ capacity, settings, comparisonSettingsProof: rawSettings, vault: this.getVault()?.root, controlled,
+    const vaultRoot = this.getVault()?.root;
+    const liveProof = state.connected && state.authenticated && state.ready && state.isolationPassed &&
+      certificate && certificate === this.setup.certificate && Date.now() < certificate.expires &&
+      samePath(vaultRoot, this.setup.vaultRoot) && samePath(settings?.vault, vaultRoot);
+    const dispatchEnabled = this.testRoot ? !controlled || controlled.dispatchEnabled === true :
+      Boolean(liveProof && raw?.certificate === certificate && capacity?.harnessAndOutputEvidence);
+    if (!this.testRoot && !dispatchEnabled) {
+      capacity = null;
+      comparisonSettings = null;
+    }
+    const identity = JSON.stringify({ dispatchEnabled, capacityProof: raw, settings, comparisonSettingsProof: rawSettings, vault: vaultRoot, controlled,
+      account: this.setup.accountDigest,
       generation: this.setup.generation, ready: state.ready, isolationPassed: state.isolationPassed,
       authenticated: state.authenticated, certificate: this.setup.certificate || null });
-    if (identity !== this.identity) { this.identity = identity; this.binding = randomUUID(); }
+    if (identity !== this.identity || this.boundCertificate !== this.setup.certificate) {
+      this.identity = identity; this.boundCertificate = this.setup.certificate; this.binding = randomUUID();
+    }
     return { capacity, binding: this.binding, dispatchEnabled, comparisonSettings };
   }
 }

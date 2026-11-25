@@ -38,6 +38,7 @@ class ConversationProvider {
     if (comparisonPin && (Object.keys(comparisonPin).sort().join(',') !== 'model,modelProvider,reasoningEffort,serviceTier' || Object.values(comparisonPin).some(value => typeof value !== 'string' || !value.trim()))) throw Error('Comparison pin is invalid.');
     const setup = this.testRoot ? this.controlled : this.setup;
     const reply = await runTurn(setup, text, { comparisonPin, onState: snapshot => onState({ ...snapshot, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration' }), beforeStart: async metadata => {
+      const certificate = setup.certificate;
       await this.preflight();
       const verifyContext = await beforeStart();
       // Last asynchronous check before the shared transport sends the exact text.
@@ -46,10 +47,13 @@ class ConversationProvider {
       if (capacity && metadata.model !== capacity.model) throw Error('Codex model changed. Verify input and output capacity, then preview again.');
       if (comparisonPin && (!capacity || !capacity.harnessAndOutputEvidence || !evidence.comparisonSettings || comparisonPin.model !== capacity.model || ['modelProvider', 'reasoningEffort', 'serviceTier'].some(key => evidence.comparisonSettings[key] !== comparisonPin[key]))) throw Error('Independent comparison model/settings or capacity evidence changed or are unavailable. Nothing was sent.');
       if ([...text].length > Math.min(32000, capacity?.maxCodePoints || 32000)) throw Error('Package exceeds the context limit. Remove or explicitly shorten sources, then preview again.');
-      return verifyContext;
+      return () => {
+        verifyContext?.();
+        if (!this.testRoot && (setup.certificate !== certificate || !setup.snapshot().ready)) throw Error('Codex isolation changed or expired. Verify setup and preview again.');
+      };
     } });
     const latest = setup.turnHistory.at(-1);
-    return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: latest.usage ? structuredClone(latest.usage) : null, usageEvidence: latest.usageEvidence, ...(comparisonPin ? { effective: { ...latest.effective } } : {}) };
+    return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: latest.usage ? structuredClone(latest.usage) : null, usageEvidence: latest.usageEvidence, ...(latest.effective ? { effective: { ...latest.effective } } : {}) };
   }
   close() { this.controlled?.close(); }
 }

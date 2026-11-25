@@ -4,7 +4,28 @@ Goal: connect managed App Server sign-in without token access; keep capture avai
 
 The approved acceptance seam is the desktop workflow plus resulting files/history. Tests use a child process at the external Codex stdio boundary. Fixture outcomes never establish live readiness. The installed CLI is 0.163.0; its generated experimental JSON schemas were inspected before implementation.
 
-## Current evidence
+## November 25 production qualification
+
+Production chat remains closed. Electron 45.2.3 started the installed Codex 0.170.0 App Server in a new disposable profile and reported `sign-in-required`. The installed executable SHA-256 was `8d06dc231dba649c7d48d3eecab239c452a1ac498c41dd6492a6f301b90a22ce`.
+
+| Check | Observed result |
+| --- | --- |
+| Unsigned Electron workflow | The user could save a disposable capture and review its exact source sentence. Sending the reviewed package failed locally and the provider history contained zero turns. Run `node scripts/check-unsigned-chat.cjs <absolute-codex-executable>` on a GitHub-hosted Windows runner. A coordinated visible run on a local desktop requires the additional `--allow-visible-window` option. The script supplies only the native file-picker selections. |
+| Current Windows isolation | The positive read initially failed. Supplying `SYSTEMROOT` in the otherwise empty command environment let the native probe read its own marker. Direct, child, case, extended-path and junction checks denied access to markers in both protected roots. The unsigned preflight still exited 1. |
+| Thread metadata | A fresh ephemeral App Server thread reported the isolated working folder, no additional workspace roots, zero instruction sources, the named permission profile, and approval policy `never`. It reported model `gpt-6.2-sol`, provider `openai`, and null values for effort and service tier. No model turn was requested. |
+| Initial CLI prompt inspection | Before the profile changes, installed `debug prompt-input` exposed execution and collaboration tools in its developer input. This diagnostic exercises the CLI. The signed-in App Server request and its complete tool definitions remain unverified. |
+| App Server request to a local stand-in | With the default catalog, a credential-free request offered `exec`, `spawn_agent`, `send_message` and seven other unselected tools. With the bundled catalog the initial request advertised one tool, `functions.request_user_input`. The reviewed definition digest covers the namespace, description and complete parameter schema. Run `node scripts/check-chat-request.cjs <absolute-codex-executable>` to repeat the exact message, tool and follow-up checks through the ordinary App Server turn adapter. |
+| Managed sign-in failures | The installed App Server started device sign-in in two fresh profiles. Cancellation and the application's five-minute timeout each left readiness closed. |
+| Provider failure handling | The local stand-in returned HTTP 401, 429 and 503 to three explicit requests. Each real App Server turn failed once. Companion respectively reported a sign-in error, a usage limit and temporary unavailability. The stored messages excluded the provider's private error detail. |
+| Turn status and local history | A held second turn reproduced a stale completion message. The interface now reports the running turn, and acceptance checks wait for its own persisted terminal. Separately, a native Windows reader reproduced `EPERM` on final history replacement. A short lock recovered within the one-second retry deadline. A persistent lock released the turn lease, reported an interrupted reply and required explicit retry. These experiments establish distinct failure modes. |
+| Storage failure during a provider turn | Injected `ENOSPC` on the first save after a successful turn acknowledgement. Companion retained ownership and sent one matching interrupt. A rejected interrupt, a mismatched terminal or a missing terminal closed the private connection. The five-second interruption deadline bounds the wait. The original storage error remained visible, no turn replayed, and an unconfirmed remote outcome stayed unknown. |
+| Harness contents | The initial request exposed the disposable protected paths, local date and time zone. The final profile disables Codex's supplemental permission, environment, collaboration and app instructions. The final local request contained the reviewed tool definition, the exact Companion developer instructions and the exact synthetic user question. Both protected roots still passed the real Windows denial checks. |
+| Capacity and settings | The application has no verified live input bound, harness size, or output reserve. Comparison settings require an independent observation for the same model and current in-memory certificate. An ordinary turn can report complete observed settings only when the provider supplies all four fields. |
+| Release blockers | Managed sign-in, the exact signed-in prompt and tools, live capacity, citations grounded in disposable source material, interruption, and hosted provider failures still require evidence. |
+
+The local check hashes tool definitions separately from runtime item IDs. Its expected SHA-256 is `bea3af5e12e25a7cc6033838fa1c1af998e8d91fc32a61cc51211410c8f0cb8a`. A controlled tool call reaching Companion over RPC received error `-32601` and interrupted the turn without displaying or saving a question. In a separate test, the unsigned installed App Server in Default mode handled the model's tool call internally. Its next request returned the fixed text `request_user_input is unavailable in Default mode` to the model. The turn could continue without soliciting user input. Signed-in behavior remains unverified. The catalog's context-window fields and the synthetic request length supply no verified capacity.
+
+## Original ticket evidence
 
 | Check | Result | Evidence |
 | --- | --- | --- |
