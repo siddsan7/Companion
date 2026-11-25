@@ -24,7 +24,7 @@ const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
 const { ordinaryDirectories, readExactSync, verifyAbsentSync, writeStage, removeStageIfPresentSync, publishReplacement, initialPublicationPending, recoverInitialPublication } = require('./staged-publication');
 let codex, conversationProvider, decisions;
-let testRoot = process.env.COMPANION_TEST_ROOT;
+let testRoot = app.isPackaged ? undefined : process.env.COMPANION_TEST_ROOT;
 let vault, settingsPath;
 const workerMode = process.argv.includes('--intake-worker');
 const workerFile = process.argv[process.argv.indexOf('--schedule-file') + 1];
@@ -62,7 +62,7 @@ async function scheduledRevisit(selected, dataRoot) {
   const { createHash } = require('node:crypto');
   const scopeFile = path.join(dataRoot, `context-settings-${createHash('sha256').update(selected.root).digest('hex')}`, 'notes.json');
   const gate = testRoot ? new ControlledGate(testRoot) : { status: async () => ({ open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' }), send: async () => { throw Error('Revisit gate is closed.'); } };
-  const revisit = new Revisit(selected, { getEvidence: target => new Context(target, { scopeFile }).corpus(), gate, checkpoint });
+  const revisit = new Revisit(selected, { getEvidence: (target, options) => new Context(target, { scopeFile }).corpus(options), gate, checkpoint });
   const { now, timezone } = clock();
   return revisit.check({ now, timezone, trigger: 'scheduled' });
 }
@@ -71,6 +71,14 @@ function clock() {
   return { now: new Date().toISOString(), timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
 }
 app.whenReady().then(async () => {
+  if (app.isPackaged && process.argv.includes('--uninstall-daily-intake')) {
+    try {
+      const schedule = new Schedule(path.join(app.getPath('userData'), 'schedule.json'), null, scheduleOptions());
+      await schedule.removeInstalledTask();
+      app.exit(0);
+    } catch (error) { console.error(error.message); app.exit(1); }
+    return;
+  }
   if (testRoot) testRoot = await resolveDataRoot(testRoot);
   if (workerMode) {
     try {
@@ -89,8 +97,12 @@ app.whenReady().then(async () => {
       // D46-I02: the scheduled worker checks new evidence against active revisit
       // conditions after intake has released its lock. Automatic gate requests from this
       // worker stay closed outside controlled tests until their isolation is verified.
-      if (result && !result.skipped) await scheduledRevisit(selected, path.dirname(workerFile)).catch(error => console.error('Revisit check:', error.message));
-      app.exit(result && !result.skipped && result.lastCheck.status !== 'complete' ? 1 : 0);
+      if (result && !result.skipped) {
+        const revisit = await scheduledRevisit(selected, path.dirname(workerFile));
+        if (['stopped', 'evidence unavailable'].includes(revisit.lastRun?.status)) throw Error(revisit.lastRun.message);
+        if (result.lastCheck.status !== 'complete') { app.exit(1); return; }
+      }
+      app.exit(0);
     } catch (error) { console.error(error.message); app.exit(1); }
     return;
   }

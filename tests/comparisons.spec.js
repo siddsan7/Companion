@@ -145,6 +145,26 @@ for (const replaceStage of [false, true]) {
   });
 }
 
+test('chat readiness alone cannot authorize a comparison or exceed the verified model capacity', async () => {
+  await launch(); await approveBrief();
+  await page.getByRole('button', { name: 'Create comparison', exact: true }).click();
+  const capacity = { model: 'fixture', maxCodePoints: 32000, evidence: 'controlled bound', harnessAndOutputEvidence: 'controlled reserve' };
+  const evidence = { dispatchEnabled: true, capacity };
+  const evidenceFile = path.join(root, 'conversation-evidence.json');
+  const preview = page.getByRole('button', { name: 'Preview Output 1', exact: true });
+  await fs.writeFile(evidenceFile, JSON.stringify(evidence));
+  await preview.click();
+  await expect(page.locator('#comparison-error')).toContainText('independent model, settings');
+  evidence.comparisonSettings = { modelProvider: 'fixture-provider', reasoningEffort: 'medium', serviceTier: 'default', evidence: 'controlled settings' };
+  capacity.maxCodePoints = 10;
+  await fs.writeFile(evidenceFile, JSON.stringify(evidence));
+  await preview.click();
+  await expect(page.locator('#comparison-error')).toContainText('exceeds the verified context limit');
+  await expect(page.getByRole('button', { name: 'Send reviewed comparison slot' })).toBeDisabled();
+  expect((await savedComparison()).slots.every(slot => slot.status === 'pending')).toBe(true);
+  await expect(fs.access(path.join(root, 'conversation-submissions.jsonl'))).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
 test('one reviewed comparison slot retains the authoritative final candidate and never replays on restart', async () => {
   test.setTimeout(60000);
   await fs.writeFile(path.join(root, 'conversation-evidence.json'), JSON.stringify({
@@ -164,6 +184,8 @@ test('one reviewed comparison slot retains the authoritative final candidate and
   await expect(page.locator('#comparison-slots article')).toHaveCount(6);
   await page.getByRole('button', { name: 'Preview Output 1', exact: true }).click();
   await expect(page.getByLabel('Reviewed comparison package', { exact: true })).toHaveValue(/final answer up to 600 words/);
+  await expect(page.locator('#comparison-preview-summary')).toContainText('shares the approved brief, its saved source snapshots and this synthetic case with the signed-in Codex model');
+  await expect(page.locator('#comparison-preview-summary')).toContainText('Harness and output allowance: authored fixture harness and output allowance');
   await expect(page.getByRole('button', { name: 'Send reviewed comparison slot', exact: true })).toBeEnabled();
   const reviewed = await page.getByLabel('Reviewed comparison package', { exact: true }).inputValue();
   expect(reviewed).toContain('final answer up to 600 words');

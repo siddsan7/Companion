@@ -45,6 +45,6 @@ function matchCondition(condition, evidence) {
 }
 // Identical matched text is the same point, even from a re-import or retitled copy (D47-I02).
 function fingerprint(passages) {
-  return createHash('sha256').update(passages.map(p => normalize(p.text)).join('\n')).digest('hex');
+  return 'v2:' + createHash('sha256').update(JSON.stringify(passages.map(p => p.text))).digest('hex');
 }
 module.exports = { matchCondition, fingerprint, normalize, paragraphs };

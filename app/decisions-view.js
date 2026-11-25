@@ -199,7 +199,7 @@
         const area = make('textarea', { rows: 12, readOnly: true, value: result.text });
         area.setAttribute('aria-label', 'Reviewed gate package');
         const send = make('button', { textContent: 'Send reviewed gate package', disabled: result.blocked || !view.gate.manual.open, onclick: () => run(async () => {
-          const sent = await api['revisit-send']({ candidate: candidate.id, text: result.text });
+          const sent = await api['revisit-send']({ previewId: result.previewId });
           say(sent.error ? `Gate request failed: ${sent.error}` : `Gate outcome: ${sent.outcome}.`); await load();
         }) });
         article.append(make('p', { textContent: `${result.length} of ${result.limit} characters.${view.gate.manual.open ? '' : ` ${view.gate.manual.reason}`}` }), area, send);
