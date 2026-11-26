@@ -484,14 +484,109 @@ test('failure and recovery: interrupted decision publication and gate request le
   expect(await decisionFiles(saved.decisionId)).toEqual(['version-1.md', 'version-2.md']);
 });
 
-function worker() {
+function worker(scheduleFile = path.join(root, 'schedule.json')) {
   const { spawn } = require('node:child_process');
-  const scheduleFile = path.join(root, 'schedule.json'), schedule = JSON.parse(readFileSync(scheduleFile, 'utf8'));
+  const schedule = JSON.parse(readFileSync(scheduleFile, 'utf8'));
   const args = ['.', '--intake-worker', '--schedule-file', scheduleFile, ...(schedule.launchBinding === 1 ? ['--schedule-id', schedule.id] : [])];
   const child = spawn(require('electron'), args, { env: { ...process.env, COMPANION_TEST_ROOT: root }, stdio: ['ignore', 'pipe', 'pipe'] });
   children.add(child);
   let output = ''; child.stderr.on('data', bytes => { output += bytes; });
   return new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', code => { children.delete(child); resolve({ code, output }); }); });
+}
+
+for (const change of ['none', 'expiry', 'consent', 'vault selection', 'capacity', 'alternate schedule', 'replaced schedule after intake', 'replaced schedule before submission']) {
+  test(`scheduled stdio provider enforces dispatch boundaries with change: ${change}`, async () => {
+    await fs.mkdir(path.join(root, 'producer'));
+    await launch(); await setup();
+    await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
+    await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+    await save(decision([evidenceCondition(['retries'])]));
+    await capture('Three retries measured in sample A.');
+    await capture('Five retries measured in sample B.');
+    await enableAutomatic(1);
+    await app.close(); app = null;
+
+    const write = (file, value) => fs.writeFile(path.join(root, file), JSON.stringify(value));
+    await gate({ transport: 'stdio', workerIsolation: true, expires: Date.parse('2026-11-12T00:00:00Z') });
+    await write('conversation-provider.json', { holdThreadStart: true, reply: JSON.stringify({
+      outcome: 'cannot tell', quote: '', reason: 'The fixture sample is inconclusive.'
+    }) });
+    await clock('2026-11-09T07:00:00Z');
+    const closed = await worker();
+    expect(closed.code, closed.output).toBe(0);
+    expect((await state()).lastRun).toMatchObject({ status: 'gate closed', pending: 2, sent: 0 });
+    expect(await exists(path.join(root, 'codex-requests.jsonl'))).toBe(false);
+
+    const capacity = { model: 'fixture', maxCodePoints: 32000, evidence: 'Controlled input limit.', harnessAndOutputEvidence: 'Controlled reserve.' };
+    await write('conversation-evidence.json', { capacity, dispatchEnabled: true });
+    await clock('2026-11-10T07:00:00Z');
+    async function replaceSchedule() {
+      const file = path.join(root, 'schedule.json'), original = path.join(root, 'old-schedule.json');
+      await fs.rename(file, original);
+      await fs.copyFile(original, file);
+    }
+    if (change === 'replaced schedule after intake') {
+      await write('faults.json', { pause: 'scheduled-intake-complete' });
+      const running = worker();
+      try {
+        await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('scheduled-intake-complete');
+        await replaceSchedule();
+      } finally { await fs.writeFile(path.join(root, 'release.txt'), ''); }
+      const result = await running;
+      expect(result.code, result.output).toBe(0);
+      expect((await state()).lastRun).toMatchObject({ status: 'gate closed', sent: 0, pending: 2 });
+      expect(await exists(path.join(root, 'codex-requests.jsonl'))).toBe(false);
+      return;
+    }
+    if (change === 'alternate schedule') {
+      const alternate = path.join(root, 'other-schedule.json');
+      const original = await fs.readFile(path.join(root, 'schedule.json'));
+      await fs.writeFile(alternate, original);
+      await write('conversation-provider.json', {});
+      const rejected = await worker(alternate);
+      expect(rejected.code).toBe(1);
+      expect(await fs.readFile(path.join(root, 'schedule.json'))).toEqual(original);
+      expect(await fs.readFile(alternate)).toEqual(original);
+      expect(await exists(path.join(root, 'codex-requests.jsonl'))).toBe(false);
+      return;
+    }
+    const running = worker();
+    let pid;
+    try {
+      const held = path.join(root, 'held-thread.json');
+      await expect.poll(() => exists(held), { timeout: 12000 }).toBe(true);
+      pid = JSON.parse(await fs.readFile(held)).pid;
+      if (change === 'expiry') await clock('2026-11-12T00:00:00Z');
+      if (change === 'replaced schedule before submission') await replaceSchedule();
+      if (change === 'consent') {
+        const { Vault } = require('../app/vault'), { Revisit } = require('../app/revisit');
+        const revisit = new Revisit(new Vault(path.join(root, 'vault'), 'Companion'), {});
+        await revisit.settings({ automatic: false, cap: 1, now: '2026-11-10T07:01:00Z' });
+      }
+      if (change === 'vault selection') await write('settings.json', { vault: path.join(root, 'other-vault'), parent: 'Companion' });
+      if (change === 'capacity') await write('conversation-evidence.json', { capacity: { ...capacity, maxCodePoints: 12 }, dispatchEnabled: true });
+    } finally {
+      await fs.writeFile(path.join(root, 'release-thread'), '');
+      const result = await running;
+      expect(result.code, result.output).toBe(change === 'none' ? 0 : 1);
+    }
+    expect(() => process.kill(pid, 0)).toThrow(/ESRCH/);
+    const calls = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    expect(calls.filter(call => call.method === 'thread/start').map(call => call.params.ephemeral)).toEqual([true]);
+    const turns = calls.filter(call => call.method === 'turn/start');
+    const { lastRun } = await state();
+    if (change === 'none') {
+      expect(turns).toHaveLength(1);
+      expect(turns[0].params.input[0].text).toContain('Companion revisit gate.');
+      expect(lastRun).toMatchObject({ status: 'complete', sent: 1, pending: 1, cap: 1 });
+    } else {
+      expect(turns).toHaveLength(0);
+      expect(lastRun).toMatchObject({ status: 'stopped', sent: 0, pending: 2 });
+    }
+  });
 }
 test('D46-I02: the closed-window worker keeps a match pending through isolation and quota stops, then raises one notice', async () => {
   await gate({ chatReady: true, workerIsolation: false });

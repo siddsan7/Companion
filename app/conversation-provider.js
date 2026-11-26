@@ -37,7 +37,7 @@ class ConversationProvider {
     const fingerprint = await audit(this.setup);
     if (!this.setup.state.authenticated || this.setup.certificate !== certificate || Date.now() >= certificate.expires || fingerprint !== certificate.fingerprint || (await this.getEvidence()).binding !== evidence.binding) throw Error('Codex account, inventory, configuration or protected roots changed. Verify isolation and preview again.');
   }
-  async turn(text, { capacityBinding, beforeStart, onState, comparisonPin }) {
+  async turn(text, { capacityBinding, beforeStart, beforeSubmission, onState, comparisonPin }) {
     if (comparisonPin && (Object.keys(comparisonPin).sort().join(',') !== 'model,modelProvider,reasoningEffort,serviceTier' || Object.values(comparisonPin).some(value => typeof value !== 'string' || !value.trim()))) throw Error('Comparison pin is invalid.');
     const setup = this.testRoot ? this.controlled : this.setup;
     const liveEvidence = this.personal ? 'personal-manual-preview' : 'verified-live-integration';
@@ -55,6 +55,7 @@ class ConversationProvider {
       return () => {
         verifyContext?.();
         if (!this.testRoot && (setup.certificate !== certificate || !(this.personal ? setup.snapshot().isolationPassed : setup.snapshot().ready))) throw Error('Codex isolation changed or expired. Verify setup and preview again.');
+        beforeSubmission?.();
       };
     } });
     const latest = setup.turnHistory.at(-1);

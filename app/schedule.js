@@ -257,17 +257,18 @@ class Schedule {
       if (!this.matches(state) || ownsAttempt && !ownsAttempt(state)) return;
       if (!ownsAttempt) state.lastSuccess = result.lastSuccess;
       retainWorkerResult(state, result);
-      await this.save(state, current.proof, { guard, assertSelected: this.assertSelected, verifyRelated: verifyLatest });
+      const published = await this.save(state, current.proof, { guard, assertSelected: this.assertSelected, verifyRelated: verifyLatest });
+      return { previous: current.proof, published };
     }, { onBusy: verifyLatest, duringIntake: true });
   }
   async enable(now) { return this.control('enable', now); }
-  async run(now, trigger = 'catch-up', expectedId) {
+  async run(now, trigger = 'catch-up', expectedId, onWorkerRecorded) {
     const initial = await this.load(); if (!initial || initial.mode !== 'enabled' || !this.matches(initial)) return { skipped: true };
     if (expectedId !== undefined && initial.id !== expectedId) return { skipped: true };
     await this.assertSelected();
     const currentOwner = state => state?.id === initial.id && this.matches(state);
     const check = { at: now, trigger };
-    let admittedSlot;
+    let admittedSlot, admittedProof, admissionGuard;
     const currentAttempt = state => state.handledSlot === admittedSlot && sameCheck(state.worker, check);
     try {
       return await new Intake(this.vault).reconcile({
@@ -278,10 +279,20 @@ class Schedule {
           const slot = Math.floor((Date.parse(now) - Date.parse(state.anchor)) / DAY);
           if (state.mode !== 'enabled' || slot < 1 || slot <= (state.handledSlot || 0)) return false;
           state.handledSlot = slot; state.worker = { ...check, status: 'running' };
-          await this.save(state, current.proof, { guard, assertSelected: this.assertSelected }); admittedSlot = slot; return true;
+          admittedProof = await this.save(state, current.proof, { guard, assertSelected: this.assertSelected });
+          if (onWorkerRecorded && state.launchBinding === 1 && expectedId === state.id) admissionGuard = guard;
+          admittedSlot = slot;
+          return true;
         }, { duringIntake: true }),
-        onComplete: (result, verifyLatest) => this.record(result, verifyLatest,
-          state => currentOwner(state) && currentAttempt(state) && scheduledRunning(state.worker))
+        onComplete: async (result, verifyLatest) => {
+          const recorded = await this.record(result, verifyLatest,
+            state => currentOwner(state) && currentAttempt(state) && scheduledRunning(state.worker));
+          // Controls can change a schedule during intake. Publish its diagnostics,
+          // but grant dispatch only across this worker's uninterrupted publications.
+          if (admissionGuard && recorded && equalProof(admittedProof, recorded.previous)) {
+            onWorkerRecorded(() => this.requireCurrent(recorded.published, admissionGuard));
+          }
+        }
       });
     } catch (error) {
       // A busy launch was never admitted and must not consume the due slot.

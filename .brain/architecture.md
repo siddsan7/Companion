@@ -89,7 +89,7 @@ Recorded excluded identity paths retain their exclusion after canonical loss, in
 
 ## Decision revisit
 
-Decision revisit uses the same chat readiness and model capacity for reviewed manual sends. The main process binds a single-use preview to the selected vault. The last dispatch check validates the active condition, matched source revision and package. Automatic checks also recheck consent and cap. Production worker inference stays closed pending a separate scheduled-worker isolation implementation and target-machine proof. Review-by dates are local.
+Decision revisit uses the same chat readiness and model capacity for reviewed manual sends. The main process binds a single-use preview to the selected vault. The last dispatch check validates the active condition, matched source revision and package. Automatic checks also recheck consent and cap. The scheduled worker owns a separate Codex setup and provider. At submission it checks the schedule, selected vault, worker certificate and independent worker proof. Production has no worker proof issuer or verified managed-route capacity. Review-by dates are local.
 
 ## Authored reasoning comparison (#15)
 

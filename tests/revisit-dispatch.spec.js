@@ -18,10 +18,10 @@ async function fixture(testInfo) {
   const context = new Context(vault, { scopeFile: testInfo.outputPath('scope.json') });
   const inputs = [], gate = {
     status: async () => ({ open: true }),
-    async send(text, mode, status, beforeStart, passages) {
+    async send(text, mode, status, beforeStart, passages, onDispatch) {
       const verify = await beforeStart();
       await gate.beforeVerify?.();
-      verify(); inputs.push(text);
+      verify(); onDispatch(); inputs.push(text);
       await gate.afterSend?.();
       return { model: 'fixture', usage: { total: 23 }, effective: { modelProvider: 'fixture' }, evidence: 'controlled',
         reply: JSON.stringify({ outcome: 'meets', quote: passages[0].text, reason: 'Controlled model reason CANARY-REASON.' }) };
@@ -46,6 +46,32 @@ async function restore(vault, info, selection) {
   await deletion.confirm((await deletion.preview(selection.id)).token);
   await deletion.confirmRestoration((await deletion.previewRestoration(selection)).token);
 }
+
+test('worker isolation expiring inside the final source check prevents turn/start and records zero sends', async ({}, info) => {
+  const { ProductionGate } = require('../app/revisit-gate');
+  const { ConversationProvider } = require('../app/conversation-provider');
+  const f = await fixture(info), root = info.outputPath();
+  await f.capture('Threshold measured in a new sample.');
+  await fs.writeFile(path.join(root, 'conversation-provider.json'), '{}');
+  const getEvidence = async () => ({ dispatchEnabled: true, binding: 'controlled',
+    capacity: { model: 'fixture', maxCodePoints: 32000, evidence: 'Controlled limit.', harnessAndOutputEvidence: 'Controlled reserve.' } });
+  const provider = new ConversationProvider({ testRoot: root, getEvidence });
+  let current = true;
+  const isolation = () => current;
+  f.revisit.gate = new ProductionGate({ provider, getEvidence, getWorkerIsolation: () => isolation });
+  const beforeStart = f.revisit.beforeStart.bind(f.revisit);
+  f.revisit.beforeStart = async (...args) => {
+    const verify = await beforeStart(...args);
+    return () => { verify(); current = false; };
+  };
+  try {
+    const { lastRun } = await f.check();
+    const methods = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line).method);
+    expect(methods).toContain('thread/start');
+    expect(methods).not.toContain('turn/start');
+    expect(lastRun).toMatchObject({ status: 'stopped', sent: 0, pending: 1 });
+  } finally { provider.close(); }
+});
 
 function orderCorpus(f, firstKey, originalFirst) {
   const read = f.revisit.getEvidence;
