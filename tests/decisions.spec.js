@@ -493,6 +493,70 @@ function worker() {
   let output = ''; child.stderr.on('data', bytes => { output += bytes; });
   return new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', code => { children.delete(child); resolve({ code, output }); }); });
 }
+
+for (const change of ['none', 'expiry', 'consent', 'vault selection', 'capacity']) {
+  test(`scheduled stdio provider disposes its child and checks ${change} before submission`, async () => {
+    await fs.mkdir(path.join(root, 'producer'));
+    await launch(); await setup();
+    await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
+    await page.getByRole('button', { name: 'Connect draft source', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Source connected');
+    await page.getByRole('button', { name: 'Enable daily intake', exact: true }).click();
+    await expect(page.getByRole('status')).toContainText('Daily intake enabled');
+    await save(decision([evidenceCondition(['retries'])]));
+    await capture('Three retries measured in sample A.');
+    await capture('Five retries measured in sample B.');
+    await enableAutomatic(1);
+    await app.close(); app = null;
+
+    const write = (file, value) => fs.writeFile(path.join(root, file), JSON.stringify(value));
+    await gate({ transport: 'stdio', workerIsolation: true, expires: Date.parse('2026-11-12T00:00:00Z') });
+    await write('conversation-provider.json', { holdThreadStart: true, reply: JSON.stringify({
+      outcome: 'cannot tell', quote: '', reason: 'The fixture sample is inconclusive.'
+    }) });
+    await clock('2026-11-09T07:00:00Z');
+    const closed = await worker();
+    expect(closed.code, closed.output).toBe(0);
+    expect((await state()).lastRun).toMatchObject({ status: 'gate closed', pending: 2, sent: 0 });
+    expect(await exists(path.join(root, 'codex-requests.jsonl'))).toBe(false);
+
+    const capacity = { model: 'fixture', maxCodePoints: 32000, evidence: 'Controlled input limit.', harnessAndOutputEvidence: 'Controlled reserve.' };
+    await write('conversation-evidence.json', { capacity, dispatchEnabled: true });
+    await clock('2026-11-10T07:00:00Z');
+    const running = worker();
+    let pid;
+    try {
+      const held = path.join(root, 'held-thread.json');
+      await expect.poll(() => exists(held), { timeout: 12000 }).toBe(true);
+      pid = JSON.parse(await fs.readFile(held)).pid;
+      if (change === 'expiry') await clock('2026-11-12T00:00:00Z');
+      if (change === 'consent') {
+        const { Vault } = require('../app/vault'), { Revisit } = require('../app/revisit');
+        const revisit = new Revisit(new Vault(path.join(root, 'vault'), 'Companion'), {});
+        await revisit.settings({ automatic: false, cap: 1, now: '2026-11-10T07:01:00Z' });
+      }
+      if (change === 'vault selection') await write('settings.json', { vault: path.join(root, 'other-vault'), parent: 'Companion' });
+      if (change === 'capacity') await write('conversation-evidence.json', { capacity: { ...capacity, maxCodePoints: 12 }, dispatchEnabled: true });
+    } finally {
+      await fs.writeFile(path.join(root, 'release-thread'), '');
+      const result = await running;
+      expect(result.code, result.output).toBe(change === 'none' ? 0 : 1);
+    }
+    expect(() => process.kill(pid, 0)).toThrow(/ESRCH/);
+    const calls = (await fs.readFile(path.join(root, 'codex-requests.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    expect(calls.filter(call => call.method === 'thread/start').map(call => call.params.ephemeral)).toEqual([true]);
+    const turns = calls.filter(call => call.method === 'turn/start');
+    const { lastRun } = await state();
+    if (change === 'none') {
+      expect(turns).toHaveLength(1);
+      expect(turns[0].params.input[0].text).toContain('Companion revisit gate.');
+      expect(lastRun).toMatchObject({ status: 'complete', sent: 1, pending: 1, cap: 1 });
+    } else {
+      expect(turns).toHaveLength(0);
+      expect(lastRun).toMatchObject({ status: 'stopped', sent: 0, pending: 2 });
+    }
+  });
+}
 test('D46-I02: the closed-window worker keeps a match pending through isolation and quota stops, then raises one notice', async () => {
   await gate({ chatReady: true, workerIsolation: false });
   await fs.mkdir(path.join(root, 'producer'));

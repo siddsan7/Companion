@@ -87,20 +87,30 @@ class ControlledGate {
 // Production gate. Automatic requests also need the scheduled-worker isolation check
 // (D46-I10), which has not been run on the target machine, so they stay closed.
 class ProductionGate {
-  constructor({ provider, getEvidence }) { Object.assign(this, { provider, getEvidence }); }
+  constructor({ provider, getEvidence, getWorkerIsolation }) { Object.assign(this, { provider, getEvidence, getWorkerIsolation }); }
   async status(mode) {
+    const workerIsolation = mode === 'automatic' && await this.getWorkerIsolation?.();
+    if (mode !== 'manual' && !(workerIsolation && workerIsolation() === true)) {
+      return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
+    }
     let evidence;
     try { evidence = await this.getEvidence(); } catch { evidence = null; }
     const capacity = evidence?.capacity;
     if (evidence?.dispatchEnabled !== true || !evidence.binding || !capacity?.model || !capacity.evidence || !capacity.harnessAndOutputEvidence || !Number.isSafeInteger(capacity.maxCodePoints) || capacity.maxCodePoints < 1) return { open: false, reason: 'Revisit gate is closed: production chat readiness has not passed. Candidates stay pending.' };
-    if (mode !== 'manual') return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
-    return { open: true, rule: null, limit: Math.min(packageLimit, capacity.maxCodePoints), binding: evidence.binding };
+    return { open: true, rule: null, limit: Math.min(packageLimit, capacity.maxCodePoints), binding: evidence.binding, ...(workerIsolation && { workerIsolation }) };
   }
   async send(text, mode, approved, beforeStart) {
     const status = await this.status(mode);
-    if (!status.open || status.binding !== approved.binding || codePoints(text) > status.limit) throw Error('Revisit gate unavailable with the reviewed capacity. Preview again.');
+    if (!status.open || status.binding !== approved.binding || status.workerIsolation !== approved.workerIsolation || codePoints(text) > status.limit) throw Error('Revisit gate unavailable with the reviewed capacity. Preview again.');
     await this.provider.preflight();
-    const result = await this.provider.turn(text, { capacityBinding: status.binding, beforeStart, onState: () => {} });
+    const checkBeforeStart = mode === 'automatic' ? async () => {
+      const verify = await beforeStart();
+      return () => {
+        if (status.workerIsolation() !== true) throw Error('Scheduled worker isolation is unavailable.');
+        verify();
+      };
+    } : beforeStart;
+    const result = await this.provider.turn(text, { capacityBinding: status.binding, beforeStart: checkBeforeStart, onState: () => {} });
     return { reply: result.reply, model: result.model, effective: result.effective ?? null, usage: result.usage, evidence: result.evidence };
   }
 }

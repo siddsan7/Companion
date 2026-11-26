@@ -18,7 +18,7 @@ const { installCaptureDeletion } = require('./capture-deletion');
 const { installAnnotationRemoval } = require('./annotation-removal');
 const { installDecisions } = require('./decisions-ipc');
 const { Revisit } = require('./revisit');
-const { ControlledGate } = require('./revisit-gate');
+const { withScheduledGate } = require('./scheduled-revisit');
 const { Context } = require('./context');
 const { ConversationProvider } = require('./conversation-provider');
 const { ConversationEvidence } = require('./conversation-evidence');
@@ -58,13 +58,14 @@ async function checkpoint(name, detail) {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
 }
-async function scheduledRevisit(selected, dataRoot) {
+async function scheduledRevisit(selected, dataRoot, scheduleId) {
   const { createHash } = require('node:crypto');
   const scopeFile = path.join(dataRoot, `context-settings-${createHash('sha256').update(selected.root).digest('hex')}`, 'notes.json');
-  const gate = testRoot ? new ControlledGate(testRoot) : { status: async () => ({ open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' }), send: async () => { throw Error('Revisit gate is closed.'); } };
-  const revisit = new Revisit(selected, { getEvidence: (target, options) => new Context(target, { scopeFile }).corpus(options), gate, checkpoint });
-  const { now, timezone } = clock();
-  return revisit.check({ now, timezone, trigger: 'scheduled' });
+  return withScheduledGate({ selected, dataRoot, scheduleId, testRoot, clock }, gate => {
+    const revisit = new Revisit(selected, { getEvidence: (target, options) => new Context(target, { scopeFile }).corpus(options), gate, checkpoint });
+    const { now, timezone } = clock();
+    return revisit.check({ now, timezone, trigger: 'scheduled' });
+  });
 }
 function clock() {
   if (testRoot) return JSON.parse(require('node:fs').readFileSync(path.join(testRoot, 'clock.json'), 'utf8'));
@@ -98,7 +99,7 @@ app.whenReady().then(async () => {
       // conditions after intake has released its lock. Automatic gate requests from this
       // worker stay closed outside controlled tests until their isolation is verified.
       if (result && !result.skipped) {
-        const revisit = await scheduledRevisit(selected, path.dirname(workerFile));
+        const revisit = await scheduledRevisit(selected, path.dirname(workerFile), requestedId);
         if (['stopped', 'evidence unavailable'].includes(revisit.lastRun?.status)) throw Error(revisit.lastRun.message);
         if (result.lastCheck.status !== 'complete') { app.exit(1); return; }
       }

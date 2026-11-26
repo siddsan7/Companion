@@ -59,6 +59,15 @@ input.on('line', line => {
     } else if (scenario.interruptOutcome !== 'missing') setTimeout(finish, 30);
   }
   if (method === 'thread/start' && scenario.accountUpdateAtThreadStart) notify('account/updated', { authMode: 'chatgpt' });
+  if (method === 'thread/start' && scenario.holdThreadStart) {
+    fs.writeFileSync(path.join(root, 'held-thread.json'), JSON.stringify({ pid: process.pid }));
+    const timer = setInterval(() => {
+      if (!fs.existsSync(path.join(root, 'release-thread'))) return;
+      clearInterval(timer); send({ id, result });
+    }, 20);
+    holds.add(() => clearInterval(timer));
+    return;
+  }
   send({ id, result });
   if (method === 'turn/start') notify('turn/started', { threadId: active.threadId, turn: turn('inProgress') });
   if (method === 'turn/start') setTimeout(() => {
