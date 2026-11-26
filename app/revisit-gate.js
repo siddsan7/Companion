@@ -72,10 +72,11 @@ class ControlledGate {
     if (mode === 'automatic' && !fixture.workerIsolation) return { open: false, reason: 'Revisit gate is closed: isolation of automatic requests from the scheduled worker is unverified. Candidates stay pending.' };
     return { open: true, rule: fixture.rule === 'match' ? 'match' : null };
   }
-  async send(text, mode, status, beforeStart, passages) {
+  async send(text, mode, status, beforeStart, passages, onDispatch) {
     const fixture = await this.fixture();
     if (!fixture?.chatReady || (mode === 'automatic' && !fixture.workerIsolation)) throw Error('Revisit gate unavailable. Candidates stay pending.');
     (await beforeStart())();
+    onDispatch?.();
     await fs.appendFile(path.join(this.testRoot, 'revisit-gate-requests.jsonl'), JSON.stringify({ at: Date.now(), mode, text }) + '\n');
     const rule = (fixture?.replies || []).find(item => !item.contains || passages.some(passage => passage.text.includes(item.contains))) || {};
     if (rule.fail) throw Error(rule.fail === 'usage-limit' ? 'Codex usage limit reached.' : rule.fail === 'offline' ? 'Codex is offline.' : `Gate request failed: ${rule.fail}`);
@@ -99,18 +100,15 @@ class ProductionGate {
     if (evidence?.dispatchEnabled !== true || !evidence.binding || !capacity?.model || !capacity.evidence || !capacity.harnessAndOutputEvidence || !Number.isSafeInteger(capacity.maxCodePoints) || capacity.maxCodePoints < 1) return { open: false, reason: 'Revisit gate is closed: production chat readiness has not passed. Candidates stay pending.' };
     return { open: true, rule: null, limit: Math.min(packageLimit, capacity.maxCodePoints), binding: evidence.binding, ...(workerIsolation && { workerIsolation }) };
   }
-  async send(text, mode, approved, beforeStart) {
+  async send(text, mode, approved, beforeStart, passages, onDispatch) {
     const status = await this.status(mode);
     if (!status.open || status.binding !== approved.binding || status.workerIsolation !== approved.workerIsolation || codePoints(text) > status.limit) throw Error('Revisit gate unavailable with the reviewed capacity. Preview again.');
     await this.provider.preflight();
-    const checkBeforeStart = mode === 'automatic' ? async () => {
-      const verify = await beforeStart();
-      return () => {
-        if (status.workerIsolation() !== true) throw Error('Scheduled worker isolation is unavailable.');
-        verify();
-      };
-    } : beforeStart;
-    const result = await this.provider.turn(text, { capacityBinding: status.binding, beforeStart: checkBeforeStart, onState: () => {} });
+    const beforeSubmission = () => {
+      if (mode === 'automatic' && status.workerIsolation() !== true) throw Error('Scheduled worker isolation is unavailable.');
+      onDispatch?.();
+    };
+    const result = await this.provider.turn(text, { capacityBinding: status.binding, beforeStart, beforeSubmission, onState: () => {} });
     return { reply: result.reply, model: result.model, effective: result.effective ?? null, usage: result.usage, evidence: result.evidence };
   }
 }

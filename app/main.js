@@ -58,10 +58,10 @@ async function checkpoint(name, detail) {
     await new Promise(resolve => setTimeout(resolve, 30));
   }
 }
-async function scheduledRevisit(selected, dataRoot, scheduleId) {
+async function scheduledRevisit(selected, dataRoot, verifySchedule) {
   const { createHash } = require('node:crypto');
   const scopeFile = path.join(dataRoot, `context-settings-${createHash('sha256').update(selected.root).digest('hex')}`, 'notes.json');
-  return withScheduledGate({ selected, dataRoot, scheduleId, testRoot, clock }, gate => {
+  return withScheduledGate({ selected, dataRoot, verifySchedule, testRoot, clock }, gate => {
     const revisit = new Revisit(selected, { getEvidence: (target, options) => new Context(target, { scopeFile }).corpus(options), gate, checkpoint });
     const { now, timezone } = clock();
     return revisit.check({ now, timezone, trigger: 'scheduled' });
@@ -84,6 +84,8 @@ app.whenReady().then(async () => {
   if (workerMode) {
     try {
       if (!process.argv.includes('--schedule-file') || typeof workerFile !== 'string' || !path.isAbsolute(workerFile)) throw Error('Worker requires its absolute daily intake settings path.');
+      const dataRoot = testRoot || (app.isPackaged ? app.getPath('userData') : path.dirname(workerFile));
+      if (workerFile !== path.join(dataRoot, 'schedule.json')) throw Error('Worker requires the owned daily intake schedule.json.');
       const state = await new Schedule(workerFile, null, scheduleOptions()).load();
       if (!state) throw Error('Daily intake settings are missing.');
       // Old registered tasks may omit the ID only while their unbound record is current.
@@ -94,12 +96,15 @@ app.whenReady().then(async () => {
         ...scheduleOptions(),
         assertSelected: state.launchBinding === 1 ? () => schedule.assertConfiguration(path.join(path.dirname(workerFile), 'settings.json')) : undefined
       });
-      const result = await schedule.run(clock().now, 'scheduled', state.id);
+      let verifySchedule;
+      const onWorkerRecorded = requestedId === state.id ? verify => { verifySchedule = verify; } : undefined;
+      const result = await schedule.run(clock().now, 'scheduled', state.id, onWorkerRecorded);
       // D46-I02: the scheduled worker checks new evidence against active revisit
       // conditions after intake has released its lock. Automatic gate requests from this
       // worker stay closed outside controlled tests until their isolation is verified.
       if (result && !result.skipped) {
-        const revisit = await scheduledRevisit(selected, path.dirname(workerFile), requestedId);
+        await checkpoint('scheduled-intake-complete');
+        const revisit = await scheduledRevisit(selected, dataRoot, verifySchedule);
         if (['stopped', 'evidence unavailable'].includes(revisit.lastRun?.status)) throw Error(revisit.lastRun.message);
         if (result.lastCheck.status !== 'complete') { app.exit(1); return; }
       }

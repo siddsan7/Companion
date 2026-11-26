@@ -8,24 +8,22 @@ const { samePath } = require('./codex-policy');
 
 // Pin the active schedule and selected vault before preparing any requests. Their
 // files and directories must still match when the provider submits each turn.
-function bindWorker(selected, dataRoot, scheduleId, protectedDirectories, isolationValid) {
+function bindWorker(selected, dataRoot, verifySchedule, protectedDirectories, isolationValid) {
   const { guard } = ordinaryDirectories([dataRoot, selected.vault, selected.root, ...protectedDirectories], 'Scheduled worker roots changed.');
-  const settingsFile = path.join(dataRoot, 'settings.json'), scheduleFile = path.join(dataRoot, 'schedule.json');
-  const settings = readExactSync(settingsFile, guard), schedule = readExactSync(scheduleFile, guard);
-  const configuration = JSON.parse(settings.bytes), state = JSON.parse(schedule.bytes);
-  if (!scheduleId || state.id !== scheduleId || state.launchBinding !== 1 || state.mode !== 'enabled' ||
-      ![configuration, state].every(record => samePath(record.vault, selected.vault) &&
-        typeof record.parent === 'string' && samePath(path.join(record.vault, record.parent), selected.root))) return () => false;
+  const settingsFile = path.join(dataRoot, 'settings.json'), settings = readExactSync(settingsFile, guard);
+  const configuration = JSON.parse(settings.bytes);
+  if (!samePath(configuration.vault, selected.vault) || typeof configuration.parent !== 'string' ||
+      !samePath(path.join(configuration.vault, configuration.parent), selected.root)) return () => false;
   return () => {
     try {
       readExactSync(settingsFile, guard, 1, settings.proof);
-      readExactSync(scheduleFile, guard, 1, schedule.proof);
+      verifySchedule();
       return isolationValid() === true;
     } catch { return false; }
   };
 }
 
-async function withScheduledGate({ selected, dataRoot, scheduleId, testRoot, clock, qualifyWorker, getVerifiedCapacity }, check) {
+async function withScheduledGate({ selected, dataRoot, verifySchedule, testRoot, clock, qualifyWorker, getVerifiedCapacity }, check) {
   const now = testRoot ? () => Date.parse(clock().now) : Date.now;
   if (testRoot) {
     const controlled = new ControlledGate(testRoot), fixture = await controlled.fixture();
@@ -47,10 +45,12 @@ async function withScheduledGate({ selected, dataRoot, scheduleId, testRoot, clo
   async function verifyWorker() {
     await setup.loaded;
     try {
+      if (!verifySchedule) return null;
+      verifySchedule();
       const proof = await qualifyWorker?.(setup, selected);
       if (!proof?.certificate || !Number.isSafeInteger(proof.expires)) return null;
       const directories = testRoot ? [] : [...setup.roots, setup.dataRoot, setup.work, setup.home];
-      return bindWorker(selected, dataRoot, scheduleId, directories, () => proof.certificate === setup.certificate &&
+      return bindWorker(selected, dataRoot, verifySchedule, directories, () => proof.certificate === setup.certificate &&
         now() < proof.expires && Date.now() < proof.certificate.expires);
     } catch { return null; }
   }

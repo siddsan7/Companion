@@ -369,13 +369,11 @@ class Revisit {
       if (stop) { results.push({ ...item, skipped: true }); continue; }
       await this.checkpoint('revisit-before-gate-request', { candidate: item.candidate });
       let dispatched = false;
-      const beforeStart = async () => {
-        const verify = await this.beforeStart(item, mode);
-        return () => { verify(); dispatched = true; };
-      };
+      const beforeStart = () => this.beforeStart(item, mode);
+      const onDispatch = () => { dispatched = true; };
       try {
         if (status.rule === 'match') { (await beforeStart())(); results.push({ ...item, rule: true }); }
-        else results.push({ ...item, response: await this.gate.send(item.text, mode, status, beforeStart, item.passages) });
+        else results.push({ ...item, response: await this.gate.send(item.text, mode, status, beforeStart, item.passages, onDispatch) });
       }
       catch (error) {
         // Usage, offline and sign-in failures stop the run and are not the candidate's

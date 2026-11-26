@@ -484,9 +484,9 @@ test('failure and recovery: interrupted decision publication and gate request le
   expect(await decisionFiles(saved.decisionId)).toEqual(['version-1.md', 'version-2.md']);
 });
 
-function worker() {
+function worker(scheduleFile = path.join(root, 'schedule.json')) {
   const { spawn } = require('node:child_process');
-  const scheduleFile = path.join(root, 'schedule.json'), schedule = JSON.parse(readFileSync(scheduleFile, 'utf8'));
+  const schedule = JSON.parse(readFileSync(scheduleFile, 'utf8'));
   const args = ['.', '--intake-worker', '--schedule-file', scheduleFile, ...(schedule.launchBinding === 1 ? ['--schedule-id', schedule.id] : [])];
   const child = spawn(require('electron'), args, { env: { ...process.env, COMPANION_TEST_ROOT: root }, stdio: ['ignore', 'pipe', 'pipe'] });
   children.add(child);
@@ -494,8 +494,8 @@ function worker() {
   return new Promise((resolve, reject) => { child.on('error', reject); child.on('exit', code => { children.delete(child); resolve({ code, output }); }); });
 }
 
-for (const change of ['none', 'expiry', 'consent', 'vault selection', 'capacity']) {
-  test(`scheduled stdio provider disposes its child and checks ${change} before submission`, async () => {
+for (const change of ['none', 'expiry', 'consent', 'vault selection', 'capacity', 'alternate schedule', 'replaced schedule after intake', 'replaced schedule before submission']) {
+  test(`scheduled stdio provider enforces dispatch boundaries with change: ${change}`, async () => {
     await fs.mkdir(path.join(root, 'producer'));
     await launch(); await setup();
     await page.getByLabel('Draft source folder').fill(path.join(root, 'producer'));
@@ -523,6 +523,36 @@ for (const change of ['none', 'expiry', 'consent', 'vault selection', 'capacity'
     const capacity = { model: 'fixture', maxCodePoints: 32000, evidence: 'Controlled input limit.', harnessAndOutputEvidence: 'Controlled reserve.' };
     await write('conversation-evidence.json', { capacity, dispatchEnabled: true });
     await clock('2026-11-10T07:00:00Z');
+    async function replaceSchedule() {
+      const file = path.join(root, 'schedule.json'), original = path.join(root, 'old-schedule.json');
+      await fs.rename(file, original);
+      await fs.copyFile(original, file);
+    }
+    if (change === 'replaced schedule after intake') {
+      await write('faults.json', { pause: 'scheduled-intake-complete' });
+      const running = worker();
+      try {
+        await expect.poll(() => fs.readFile(path.join(root, 'checkpoint.txt'), 'utf8').catch(() => '')).toBe('scheduled-intake-complete');
+        await replaceSchedule();
+      } finally { await fs.writeFile(path.join(root, 'release.txt'), ''); }
+      const result = await running;
+      expect(result.code, result.output).toBe(0);
+      expect((await state()).lastRun).toMatchObject({ status: 'gate closed', sent: 0, pending: 2 });
+      expect(await exists(path.join(root, 'codex-requests.jsonl'))).toBe(false);
+      return;
+    }
+    if (change === 'alternate schedule') {
+      const alternate = path.join(root, 'other-schedule.json');
+      const original = await fs.readFile(path.join(root, 'schedule.json'));
+      await fs.writeFile(alternate, original);
+      await write('conversation-provider.json', {});
+      const rejected = await worker(alternate);
+      expect(rejected.code).toBe(1);
+      expect(await fs.readFile(path.join(root, 'schedule.json'))).toEqual(original);
+      expect(await fs.readFile(alternate)).toEqual(original);
+      expect(await exists(path.join(root, 'codex-requests.jsonl'))).toBe(false);
+      return;
+    }
     const running = worker();
     let pid;
     try {
@@ -530,6 +560,7 @@ for (const change of ['none', 'expiry', 'consent', 'vault selection', 'capacity'
       await expect.poll(() => exists(held), { timeout: 12000 }).toBe(true);
       pid = JSON.parse(await fs.readFile(held)).pid;
       if (change === 'expiry') await clock('2026-11-12T00:00:00Z');
+      if (change === 'replaced schedule before submission') await replaceSchedule();
       if (change === 'consent') {
         const { Vault } = require('../app/vault'), { Revisit } = require('../app/revisit');
         const revisit = new Revisit(new Vault(path.join(root, 'vault'), 'Companion'), {});
