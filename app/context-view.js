@@ -1,7 +1,7 @@
 (() => {
   const byId = id => document.getElementById(id);
   const conversation = document.createElement('section'); conversation.id = 'conversation-section'; conversation.setAttribute('aria-label', 'Project conversations');
-  conversation.innerHTML = '<h2>Project conversations</h2><p id="conversation-location"></p><label for="conversation-select">Retained conversation</label><select id="conversation-select"><option value="">New conversation</option></select><button id="conversation-new">New conversation</button><label>Conversation brief version<input id="conversation-brief" type="number" min="1" value="1"></label><label><input id="conversation-speculation" type="checkbox">Allow beyond-evidence speculation</label><button id="conversation-preview">Preview conversation</button><label>Reviewed conversation package<textarea id="conversation-package" rows="14" readonly></textarea></label><p id="conversation-summary"></p><button id="conversation-send" disabled>Send reviewed package</button><p id="conversation-error" role="alert"></p><div id="conversation-history"></div>';
+  conversation.innerHTML = '<h2>Project conversations</h2><p id="conversation-location"></p><label for="conversation-select">Retained conversation</label><select id="conversation-select"><option value="">New conversation</option></select><button id="conversation-new">New conversation</button><label>Conversation brief version<input id="conversation-brief" type="number" min="1" value="1"></label><label><input id="conversation-speculation" type="checkbox">Allow beyond-evidence speculation</label><label><input type="checkbox" id="conversation-personal">Use personal manual preview for this send</label><p>Personal preview estimates an input limit of 12,000 Unicode code points. Reasoning and output space are not guaranteed. Review the complete package before sending.</p><button id="conversation-preview">Preview conversation</button><label>Reviewed conversation package<textarea id="conversation-package" rows="14" readonly></textarea></label><p id="conversation-summary"></p><button id="conversation-send" disabled>Send reviewed package</button><p id="conversation-error" role="alert"></p><div id="conversation-history"></div>';
   byId('context-section').after(conversation);
   byId('conversation-send').before(document.querySelector('.codex-disclosure').cloneNode(true));
   const priorSearch = document.createElement('section'); priorSearch.setAttribute('aria-label', 'Prior conversation search');
@@ -81,6 +81,7 @@
   const historyRevision = record => JSON.stringify({ requests: record.requests, storageWarning: record.storageWarning });
   let pendingSend;
   const invalidateConversation = () => { conversationGeneration++; conversationToken = null; byId('conversation-send').disabled = true; byId('conversation-package').value = ''; byId('conversation-summary').textContent = 'Preview required. Review the current question, history and sources before sending.'; };
+  byId('conversation-personal').onchange = invalidateConversation;
   function choices() {
     const select = byId('conversation-select');
     const options = [['', 'New conversation'], ...[...retained.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)).map(record => [record.id, `${record.requests[0]?.question.slice(0, 80) || 'Conversation'} · brief ${record.brief.version} · ${record.id.slice(0, 8)}`])];
@@ -92,6 +93,7 @@
     if (select.value !== (conversationId || '')) select.value = conversationId || '';
   }
   function resetView() {
+    byId('conversation-personal').checked = false;
     clearRemoval();
     recoveryList.replaceChildren();
     retireFind(); viewEpoch++; pendingSend = null; conversationId = null; draftMode = true; displayedHistory = ''; historyExclusions = [];
@@ -202,7 +204,7 @@
   let selectionAction = null;
   const selectionControls = () => {
     byId('context-preview').disabled = selectionAction !== null;
-    byId('conversation-preview').disabled = selectionAction !== null;
+    byId('conversation-preview').disabled = selectionAction !== null || Boolean(pendingSend);
   };
   const clearPreview = () => { selectionAction = null; selectionControls(); generation++; invalidateConversation(); byId('context-package').value = ''; byId('context-summary').textContent = 'Preview required. No model request is made.'; };
   const run = async work => {
@@ -366,10 +368,10 @@
     } catch (error) { if (version === conversationGeneration) byId('history-search-status').textContent = error.message; }
   };
   byId('conversation-preview').onclick = async () => {
-    if (switchingVault || selectionAction) return;
+    if (switchingVault || selectionAction || pendingSend) return;
     invalidateConversation(); const version = conversationGeneration; byId('conversation-error').textContent = '';
     try {
-      const preview = await window.companion['conversation-preview'](conversationInput());
+      const preview = await window.companion['conversation-preview']({ ...conversationInput(), personalPreview: byId('conversation-personal').checked });
       if (version !== conversationGeneration) return;
       // A completed restore is one reviewed action, not permission to undo future exclusions.
       restoredSources.clear(); restoredHistory.clear();
@@ -377,17 +379,18 @@
       byId('conversation-package').value = preview.text;
       historyExclusions = preview.historyExclusions; warnHistory();
       byId('conversation-summary').textContent = `${preview.count} / ${preview.limit} Unicode code points. ${preview.blocked ? 'Oversized. Remove or explicitly shorten sources.' : 'Within limit.'} ${conversationId ? 'Reviewed exclusion scope saved locally. ' : ''}${preview.boundEvidence} ${preview.warnings.join(' ')}`;
-      byId('conversation-send').disabled = preview.blocked;
+      byId('conversation-send').disabled = !preview.packageId;
     } catch (error) { if (version === conversationGeneration) byId('conversation-error').textContent = error.message; }
   };
   byId('conversation-send').onclick = async () => {
     if (!conversationToken) return;
     const owner = pendingSend = conversationToken, epoch = viewEpoch;
     const current = () => pendingSend === owner && epoch === viewEpoch;
-    invalidateConversation();
+    byId('conversation-personal').checked = false;
+    selectionControls(); invalidateConversation();
     try { const record = await window.companion['conversation-send']({ packageId: owner.packageId }); if (current()) showConversation(record); }
     catch (error) { if (current()) byId('conversation-error').textContent = error.message; }
-    finally { if (current()) pendingSend = null; }
+    finally { if (current()) { pendingSend = null; selectionControls(); } }
   };
   window.addEventListener('companion-vault-configuring', () => {
     switchingVault = true;

@@ -134,7 +134,7 @@ for (const claim of ['reserved claim', 'new ordinary duplicate', 'new ordinary d
   const getVault = () => vault, clock = () => ({ now }), checkpoint = async () => {};
   const conversations = new Conversations({
     dataRoot: testInfo.outputPath('history'), getVault, getContext: async () => context, clock, checkpoint,
-    provider: { preflight: async () => {}, turn: async () => ({ reply }) }
+    provider: { getEvidence: async () => ({ dispatchEnabled: true }), preflight: async () => {}, turn: async () => ({ reply }) }
   });
   const previewedPackage = await conversations.preview({
     question: 'What practice exercise does this source suggest?', briefVersion: version, speculation: false,

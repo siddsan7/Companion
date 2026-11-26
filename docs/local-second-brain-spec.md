@@ -375,6 +375,7 @@ The following requirements encode all accepted decisions. Later decisions refine
 - **D36-I02**. Display package count, limit, included passages, and proposed reductions before dispatch.
 - **D36-I03**. Reject an oversized package until the user removes material or approves a smaller selection; do not silently drop selected evidence.
 - **D36-I04**. Reserve room separately for harness instructions, reasoning, and output under the verified integration. Enforce any stricter supported input bound and record actual usage where available.
+- **Personal manual chat preview**. For one explicitly selected conversation send, the user may review the complete package under an estimated ceiling of 12,000 Unicode code points. Reasoning and output space cannot be guaranteed. Require a current managed ChatGPT identity, verified Windows isolation and the qualified model, executable and tool inventory. Bind approval to the exact reviewed package and evidence. Reject an oversized or changed package and require a new review. Restart clears authorization. Production, comparisons and workers continue to require their ordinary evidence.
 
 ### D37 · Exclude removed-source derivatives from subsequent requests
 

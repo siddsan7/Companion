@@ -18,6 +18,12 @@ Managed account verification and Windows isolation passed on the staged disposab
 | Interruption | After the real signed-in turn started, Companion requested interruption, observed a matching interrupted terminal, retained one incomplete turn and cleared the isolation certificate. No automatic retry occurred. |
 | Faults | The installed App Server processed controlled local HTTP 401, 429, and 503 responses. Closing the local HTTP socket produced the unclassified App Server error `other`. Companion reported an incomplete failed turn, advised checking connectivity and setup, and offered explicit retry. No hosted outage, rejected hosted credential or exhausted subscription quota was observed. |
 
+### Personal manual preview
+
+The hidden Windows desktop used the existing disposable managed ChatGPT profile. A new conversation started with personal preview off. Choosing personal preview before verifying isolation preserved the draft and selections. After sign-in and MXC verification, a package with 12,000 added characters remained inspectable at full length and could not be sent.
+
+One reviewed 1,771-code-point package included an authored rehearsal capture and the pinned disposable brief. The completed reply quoted "seven violet counters" and cited the selected capture UUID `b8298f86-a4b2-4672-9659-0cee6fc85634`. The stored package matched the reviewed text. Provider counters reported 762 input and 36 output tokens. Restart showed one retained request with the citation, personal preview off and isolation cleared. This sample measures one request. The personal ceiling remains an estimate.
+
 ### Capacity decision
 
 D36-I04 requires separate room for instructions, reasoning and output. The 475,000-token context window in the App Server report equals the bundled catalog’s 500,000 multiplied by 95%. The independent published model specification lists 1,050,000 context tokens, 922,000 input tokens and 128,000 output tokens for the API. Those limits do not establish the effective limits of this managed ChatGPT route. [OpenAI model specification](https://developers.openai.com/api/docs/models/gpt-6.2-sol)
