@@ -1,6 +1,6 @@
 # Spec #1 working state
 
-Signed-in qualification observed exact tool and message inventory, grounded disposable citations, a 723-token output sample and a matching interruption. Production remains closed pending a verified managed-route capacity and reserve. See docs/verification-ticket8.md.
+Signed-in qualification observed exact tool and message inventory, grounded disposable citations, a 723-token output sample and a matching interruption. A per-send personal preview permits a reviewed package of up to 12,000 Unicode code points after managed identity, inventory and isolation checks. Production remains closed pending a verified managed-route capacity and reserve. See docs/verification-ticket8.md.
 
 The Windows installer is a separate review candidate. Its build, native acceptance command, data boundaries and distribution steps are in the [installer guide](../docs/windows-installer.md). Release publication requires separate review and approval.
 

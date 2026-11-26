@@ -8,11 +8,12 @@ const { samePath } = require('./codex-policy');
 // This adapter has no renderer entry point and never runs sign-in or isolation probes.
 // Production uses only evidence already established by the main-owned setup gate.
 class ConversationProvider {
-  constructor({ setup, testRoot, getVault, getEvidence }) {
-    Object.assign(this, { setup, testRoot, getVault, getEvidence });
+  constructor({ setup, testRoot, getVault, getEvidence, personal = false }) {
+    Object.assign(this, { setup, testRoot, getVault, getEvidence, personal });
   }
   async preflight() {
     const evidence = await this.getEvidence();
+    if (this.personal && !evidence.dispatchEnabled) throw Error('Personal preview requires a qualified Codex executable and catalog, an identified ChatGPT account and current MXC isolation for this vault. Check setup and preview again.');
     if (!evidence.dispatchEnabled) throw Error('Codex chat is unavailable. Check setup and preview again. Local capture remains available.');
     if (this.testRoot) {
       await fs.access(path.join(this.testRoot, 'conversation-provider.json'));
@@ -27,7 +28,9 @@ class ConversationProvider {
       return;
     }
     const state = this.setup.snapshot(), capacity = evidence.capacity;
-    if (!state.ready || !state.isolationPassed || !state.authenticated || !this.setup.certificate || Date.now() >= this.setup.certificate.expires || !capacity || !Number.isSafeInteger(capacity.maxCodePoints) || capacity.maxCodePoints < 1 || !capacity.model || !capacity.evidence || !capacity.harnessAndOutputEvidence) throw Error('Codex chat is unavailable: verified isolation, prompt/tool inventory, managed sign-in and input/harness/output capacity evidence are required. Local capture remains available.');
+    const provenCapacity = Number.isSafeInteger(capacity?.maxCodePoints) && capacity.maxCodePoints > 0 && capacity.model && capacity.evidence && capacity.harnessAndOutputEvidence;
+    if (!this.personal && (!state.ready || !provenCapacity)) throw Error('Codex chat is unavailable: verified isolation, prompt/tool inventory, managed sign-in and input/harness/output capacity evidence are required. Local capture remains available.');
+    if (!state.isolationPassed || !state.authenticated || !this.setup.certificate || Date.now() >= this.setup.certificate.expires) throw Error('Verify managed sign-in and isolation, then preview again.');
     if (!samePath(this.setup.vaultRoot, this.getVault()?.root)) throw Error('Codex protected vault changed. Verify isolation again.');
     const certificate = this.setup.certificate;
     await this.setup.readAccount();
@@ -37,23 +40,25 @@ class ConversationProvider {
   async turn(text, { capacityBinding, beforeStart, onState, comparisonPin }) {
     if (comparisonPin && (Object.keys(comparisonPin).sort().join(',') !== 'model,modelProvider,reasoningEffort,serviceTier' || Object.values(comparisonPin).some(value => typeof value !== 'string' || !value.trim()))) throw Error('Comparison pin is invalid.');
     const setup = this.testRoot ? this.controlled : this.setup;
-    const reply = await runTurn(setup, text, { comparisonPin, onState: snapshot => onState({ ...snapshot, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration' }), beforeStart: async metadata => {
+    const liveEvidence = this.personal ? 'personal-manual-preview' : 'verified-live-integration';
+    const turnEvidence = this.testRoot ? 'controlled-fixture-not-live' : liveEvidence;
+    const reply = await runTurn(setup, text, { comparisonPin, onState: snapshot => onState({ ...snapshot, evidence: turnEvidence }), beforeStart: async metadata => {
       const certificate = setup.certificate;
       await this.preflight();
       const verifyContext = await beforeStart();
       // Last asynchronous check before the shared transport sends the exact text.
-      const evidence = await this.getEvidence(), capacity = evidence.capacity;
+      const evidence = await this.getEvidence(), capacity = this.personal ? evidence.estimate : evidence.capacity;
       if (!evidence.dispatchEnabled || evidence.binding !== capacityBinding) throw Error('Codex setup or capacity evidence changed. Check setup and preview again.');
       if (capacity && metadata.model !== capacity.model) throw Error('Codex model changed. Verify input and output capacity, then preview again.');
       if (comparisonPin && (!capacity || !capacity.harnessAndOutputEvidence || !evidence.comparisonSettings || comparisonPin.model !== capacity.model || ['modelProvider', 'reasoningEffort', 'serviceTier'].some(key => evidence.comparisonSettings[key] !== comparisonPin[key]))) throw Error('Independent comparison model/settings or capacity evidence changed or are unavailable. Nothing was sent.');
       if ([...text].length > Math.min(32000, capacity?.maxCodePoints || 32000)) throw Error('Package exceeds the context limit. Remove or explicitly shorten sources, then preview again.');
       return () => {
         verifyContext?.();
-        if (!this.testRoot && (setup.certificate !== certificate || !setup.snapshot().ready)) throw Error('Codex isolation changed or expired. Verify setup and preview again.');
+        if (!this.testRoot && (setup.certificate !== certificate || !(this.personal ? setup.snapshot().isolationPassed : setup.snapshot().ready))) throw Error('Codex isolation changed or expired. Verify setup and preview again.');
       };
     } });
     const latest = setup.turnHistory.at(-1);
-    return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: this.testRoot ? 'controlled-fixture-not-live' : 'verified-live-integration', usage: latest.usage ? structuredClone(latest.usage) : null, usageEvidence: latest.usageEvidence, ...(latest.effective ? { effective: { ...latest.effective } } : {}) };
+    return { reply, threadId: latest.threadId, turnId: latest.turnId, model: latest.model, evidence: turnEvidence, usage: latest.usage ? structuredClone(latest.usage) : null, usageEvidence: latest.usageEvidence, ...(latest.effective ? { effective: { ...latest.effective } } : {}) };
   }
   close() { this.controlled?.close(); }
 }

@@ -1,4 +1,4 @@
-// Run on an isolated Windows desktop. This smoke opens the normal, visible application window.
+// Use --hidden for local verification, or run the visible smoke on an isolated Windows desktop.
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
@@ -7,9 +7,10 @@ const { _electron: electron, expect } = require('@playwright/test');
 
 async function main(executable, ...options) {
   assert(process.platform === 'win32', 'Use Windows for this Electron check.');
-  assert(options.length === 0 || (options.length === 1 && options[0] === '--allow-visible-window'), 'Unexpected unsigned chat check option.');
+  assert(options.length === 0 || (options.length === 1 && ['--hidden', '--allow-visible-window'].includes(options[0])), 'Unexpected unsigned chat check option.');
   const hosted = process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_OS === 'Windows' && process.env.RUNNER_ENVIRONMENT === 'github-hosted';
-  assert(hosted || options[0] === '--allow-visible-window', 'This check opens a visible window. Use hosted Windows CI or explicitly pass --allow-visible-window on a coordinated local desktop.');
+  const hidden = options[0] === '--hidden';
+  assert(hidden || hosted || options[0] === '--allow-visible-window', 'This check opens a visible window. Use hosted Windows CI or explicitly pass --allow-visible-window on a coordinated local desktop.');
   assert(executable && path.isAbsolute(executable), 'Supply an absolute Codex executable path.');
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-unsigned-chat-'));
   const profile = path.join(root, 'profile'), vault = path.join(root, 'vault'), project = path.join(root, 'project');
@@ -21,7 +22,7 @@ async function main(executable, ...options) {
   try {
     await Promise.all([profile, vault, project].map(folder => fs.mkdir(folder)));
     await fs.writeFile(readme, '# MyTune\n\nPractice spaced retrieval.\n');
-    app = await electron.launch({ args: ['--user-data-dir=' + profile, path.resolve(__dirname, '..')], env });
+    app = await electron.launch({ args: ['--user-data-dir=' + profile, ...(hidden ? ['--companion-hidden-window'] : []), path.resolve(__dirname, '..')], env });
     assert.equal(await app.evaluate(({ app }) => app.getPath('userData')), profile);
     // Supply only the two native picker selections. All application checks and the provider are real.
     await app.evaluate(({ dialog }, { vault, readme }) => {
@@ -51,8 +52,18 @@ async function main(executable, ...options) {
     await page.getByLabel('Conversation brief version').fill('1');
     await button('Preview conversation').click();
     await expect(page.getByLabel('Reviewed conversation package')).toHaveValue(/amber chord at noon/);
-    await button('Send reviewed package').click();
-    await expect(page.locator('#conversation-history')).toContainText('Codex chat is unavailable');
+    const draft = page.getByLabel('Context question'), selected = page.locator('#context-selected');
+    const reviewedSelection = await selected.innerText();
+    assert(reviewedSelection.length);
+    await expect(button('Send reviewed package')).toBeDisabled();
+    await expect(page.locator('#conversation-summary')).toContainText('Ordinary chat is unavailable');
+    await page.locator('#conversation-personal').check();
+    await button('Preview conversation').click();
+    await expect(page.locator('#conversation-error')).toContainText('verify isolation');
+    await expect(button('Send reviewed package')).toBeDisabled();
+    await expect(draft).toHaveValue('How could spaced retrieval help MyTune?');
+    assert.equal(await selected.innerText(), reviewedSelection);
+    assert.deepEqual(await page.evaluate(async () => (await window.companion['conversation-list']()).conversations), []);
     const report = JSON.parse(await fs.readFile(path.join(profile, 'codex', 'readiness.json'), 'utf8'));
     assert.equal(report.ready, false);
     assert.deepEqual(report.turns, []);

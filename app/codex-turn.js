@@ -10,6 +10,7 @@ function parseUsage(value) {
 }
 function failureMessage(info) {
   if (['usageLimitExceeded', 'sessionBudgetExceeded', 'rateLimitExceeded'].includes(info)) return 'Codex usage limit reached. Check your account limits, then retry explicitly.';
+  if (info === 'contextWindowExceeded') return 'Codex rejected the package size. Remove or explicitly shorten selected material, verify isolation and review a new package before retrying.';
   if (info === 'unauthorized') return 'Codex sign-in expired or was rejected. Sign in again, verify isolation, then retry explicitly.';
   if (info && typeof info === 'object' && ['httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected'].some(key => Object.hasOwn(info, key))) return 'Codex is offline or its connection failed. Check your connection, then retry explicitly.';
   if (info === 'sandboxError') return 'Codex isolation failed. Check Windows setup and verify isolation again.';

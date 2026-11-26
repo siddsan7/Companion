@@ -182,6 +182,7 @@ class CodexSetup {
     const result = await rpc.request('account/read', { refreshToken: false });
     if (this.rpc !== rpc || rpc.closed) throw Error('Codex connection changed. Check setup again.');
     this.state.authenticated = result.account?.type === 'chatgpt';
+    this.identifiedChatGPT = this.state.authenticated && typeof result.account.email === 'string' && /^[^\s@]+@[^\s@]+$/.test(result.account.email);
     const digest = result.account ? hash(canonical({ account: result.account, routing: result.workspaceRouting || null })) : null;
     if (this.certificate && digest !== this.accountDigest) {
       this.certificate = null;

@@ -3245,3 +3245,23 @@ test('local control guards reject an actual control-folder junction without expo
     if (moved) await fs.rename(retained, controlDirectory);
   }
 });
+
+test('closed personal preview preserves the draft and selections through an explicit new review', async () => {
+  await prepareConversation();
+  const question = page.locator('#context-question'), draft = await question.inputValue();
+  const selected = await page.locator('#context-selected').innerText();
+  await expect(page.locator('#conversation-personal')).not.toBeChecked();
+  await page.locator('#conversation-personal').check();
+  await expect(page.locator('#conversation-send')).toBeDisabled();
+  await page.locator('#conversation-preview').click();
+  await expect(page.locator('#conversation-error')).toContainText('verify isolation');
+  await expect(question).toHaveValue(draft);
+  expect(await page.locator('#context-selected').innerText()).toBe(selected);
+  await noSubmission();
+  await page.locator('#conversation-personal').uncheck();
+  await page.locator('#conversation-preview').click();
+  await expect(page.locator('#conversation-send')).toBeEnabled();
+  await page.locator('#conversation-personal').check();
+  await expect(page.locator('#conversation-send')).toBeDisabled();
+  await noSubmission();
+});
