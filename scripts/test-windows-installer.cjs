@@ -28,7 +28,7 @@ const tasks = new TaskScheduler({ executable: exe, appPath, packaged: true });
 const system32 = path.join(process.env.SystemRoot, 'System32');
 const packageFile = v => path.resolve(__dirname, '../dist', 'Companion-' + v + '-windows-x64.msi');
 const current = packageFile(require('../package.json').version);
-const previous = packageFile('0.0.9');
+const previous = packageFile('0.1.0');
 let app, state, installed, defaultLocations;
 let log = 0;
 function powershell(script, environment = {}) {
@@ -54,7 +54,9 @@ async function launch() {
   delete env.ELECTRON_RUN_AS_NODE;
   app = await electron.launch({ executablePath: exe, args: ['--user-data-dir=' + profile], cwd: root, env });
   const facts = await app.evaluate(({ app }) => [app.isPackaged, app.getAppPath(), app.getPath('userData'), app.getVersion()]);
-  assert.deepEqual(facts, [true, appPath, profile, installed === previous ? '0.0.9' : require('../package.json').version]);
+  assert.deepEqual(facts, [true, appPath, profile, installed === previous ? '0.1.0' : require('../package.json').version]);
+  const catalog = fs.readFileSync(path.join(appPath, 'app/codex-model-catalog.json'));
+  assert.equal(createHash('sha256').update(catalog).digest('hex'), '1fe7b99c44ff65badad9291e2a3a0e7988dbda60d57ee2132105058106282901', 'Installed catalog must match the signed-in inventory qualification.');
   return app.firstWindow();
 }
 async function close() { if (app) await app.close(); app = null; }

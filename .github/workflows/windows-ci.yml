@@ -37,7 +37,7 @@ jobs:
           if ((Get-FileHash dist/wix.zip).Hash -ne '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31') { throw 'WiX archive digest differs.' }
           Expand-Archive dist/wix.zip dist/wix
       - run: npm.cmd run package:windows
-      - run: npm.cmd run package:windows -- 0.0.9
+      - run: npm.cmd run package:windows -- 0.1.0
       - name: Install, launch, upgrade and uninstall
         env:
           TEMP: ${{ runner.temp }}
@@ -49,7 +49,7 @@ jobs:
           name: Companion-windows-x64
           path: |
             dist/Companion-*-windows-x64.msi*
-            !dist/Companion-0.0.9-windows-x64.msi*
+            !dist/Companion-0.1.0-windows-x64.msi*
           if-no-files-found: error
           compression-level: 0
           retention-days: 7

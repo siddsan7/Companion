@@ -372,3 +372,16 @@ test('personal chat requires qualified inventory, identified account, current is
   await fs.writeFile(settingsPath, JSON.stringify({ vault: vault.vault, parent: 'Another' }));
   expect((await reader.read(true)).dispatchEnabled).toBe(false);
 });
+
+test('LF and CRLF Git checkout settings produce the qualified Windows catalog bytes', async ({}, info) => {
+  const source = 'app/codex-model-catalog.json';
+  for (const auto of ['false', 'true', 'input']) {
+    const directory = info.outputPath(auto);
+    await fs.mkdir(directory, { recursive: true });
+    const result = spawnSync('git', ['-c', 'core.autocrlf=' + auto, 'checkout-index',
+      '--prefix=' + directory.replaceAll('\\', '/') + '/', '--', source], { encoding: 'utf8', windowsHide: true });
+    expect(result.status, result.stderr).toBe(0);
+    const bytes = await fs.readFile(path.join(directory, source));
+    expect(require('node:crypto').createHash('sha256').update(bytes).digest('hex')).toBe('1fe7b99c44ff65badad9291e2a3a0e7988dbda60d57ee2132105058106282901');
+  }
+});
