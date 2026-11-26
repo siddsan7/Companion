@@ -32,7 +32,7 @@ The MSI and its `.sha256` file appear under `dist`. The package uses the locked 
 The native acceptance test opens visible Companion windows. It runs by default on GitHub-hosted Windows CI. For a coordinated local run, use an isolated desktop and a disposable, signed-in Windows account with permission to register its own scheduled tasks and no installed copy of Companion. Build the synthetic earlier version, then explicitly opt in.
 
 ```powershell
-npm run package:windows -- 0.0.9
+npm run package:windows -- 0.1.0
 npm run test:installer -- --allow-visible-windows
 ```
 

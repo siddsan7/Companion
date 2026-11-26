@@ -21,9 +21,9 @@ function scopeOf(record) {
 }
 
 class Conversations {
-  constructor({ dataRoot, getContext, getVault, clock, provider, checkpoint, testRoot }) {
+  constructor({ dataRoot, getContext, getVault, clock, provider, personalProvider, checkpoint, testRoot }) {
     this.dataRoot = path.resolve(dataRoot);
-    Object.assign(this, { directory: path.join(this.dataRoot, 'conversations'), getContext, getVault, clock, provider, checkpoint, testRoot });
+    Object.assign(this, { directory: path.join(this.dataRoot, 'conversations'), getContext, getVault, clock, provider, personalProvider, checkpoint, testRoot });
     this.tokens = new Map(); this.running = new Set(); this.unsaved = new Map();
     this.controls = new ConversationControls(this);
     // Storage faults belong to conversation operations; they must not prevent capture startup.
@@ -325,6 +325,13 @@ class Conversations {
     const foreignText = [...selectedDialogue.values()].map(turn => `Historical dialogue from conversation ${turn.ref.conversationId}; request ${turn.ref.requestId}; origin sha256 ${turn.ref.digest}\nOrigin approved brief ${turn.brief.id}; version ${turn.brief.version}; sha256 ${turn.brief.digest}\nSource dependency closure: ${JSON.stringify(turn.dependencies)}\nUser: ${turn.question}\nAssistant: ${turn.reply}`).join('\n\n');
     const authorityText = [...foreign.values()].map(turn => JSON.stringify({ ...turn.ref, brief: turn.brief, dependencies: turn.dependencies })).join('\n');
     const text = `${preview.text}\n\nHistorical dialogue:\n${history.map(item => `Request ${item.id}\nUser: ${item.question}\nAssistant: ${item.reply}`).join('\n\n')}${foreignText ? `\n\nPrior-conversation historical dialogue (retained discussion, not independent evidence):\n${foreignText}` : ''}${authorityText ? `\n\nHistorical dependency authority (provenance only; unselected ancestor dialogue is omitted):\n${authorityText}` : ''}\n\nBeyond-evidence speculation: ${input.speculation ? 'Explicitly permitted; label every beyond-evidence suggestion Speculative and do not invent citations.' : 'Not permitted.'}\n\n${REQUIREMENTS}`.replace(/\r\n?/g, '\n');
+    if (input.personalPreview === true) {
+      const evidence = await this.personalProvider.getEvidence();
+      if (!evidence.dispatchEnabled) throw Error('Personal preview requires a signed-in qualified Codex setup and current isolation. Check setup, verify isolation and preview again.');
+      preview.limit = Math.min(preview.limit, evidence.estimate.maxCodePoints);
+      preview.boundEvidence = evidence.estimate.evidence;
+      preview.capacityBinding = evidence.binding;
+    }
     const count = [...text].length;
     this.safeDirectory(false, directory);
     if (dispatch) {
@@ -348,6 +355,9 @@ class Conversations {
     });
     // Oversized text stays inspectable but cannot occupy an approved-send registry slot.
     if (snapshot.blocked) return { ...snapshot, packageId: null };
+    if (input.personalPreview !== true && !(await this.provider.getEvidence()).dispatchEnabled) {
+      return { ...snapshot, packageId: null, warnings: [...snapshot.warnings, 'Ordinary chat is unavailable. To review one personal send, select personal manual preview.'] };
+    }
     if (this.tokens.size >= 64) this.tokens.delete(this.tokens.keys().next().value);
     const targetId = input.conversationId || randomUUID();
     this.tokens.set(packageId, { snapshot, input: structuredClone(input), targetId });
@@ -371,7 +381,8 @@ class Conversations {
         proof = await this.write(record, proof, directory); // Intent must be durable before the provider boundary.
       } catch (error) { this.running.delete(record.id); throw error; }
       try {
-        await this.provider.preflight();
+        const provider = approved.input.personalPreview === true ? this.personalProvider : this.provider;
+        await provider.preflight();
         await this.checkpoint('conversation-before-dispatch');
         const revalidate = async dispatch => {
           if (JSON.stringify(await this.build(approved.input, request.id, undefined, dispatch)) !== JSON.stringify(approved.snapshot)) throw Error('Context changed during preflight. Preview and approve a new package.');
@@ -390,7 +401,7 @@ class Conversations {
         };
         await revalidate();
         (await intentGuard())();
-        const result = await this.provider.turn(current.text, { capacityBinding: current.capacityBinding, beforeStart: async () => {
+        const result = await provider.turn(current.text, { capacityBinding: current.capacityBinding, beforeStart: async () => {
           await this.checkpoint('conversation-before-turn-start');
           const guards = [];
           const dependencies = new Map(current.dependencies.map(({ key, digest }) => [key, digest]));

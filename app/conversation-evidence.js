@@ -3,6 +3,12 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { samePath } = require('./codex-policy');
 
+// Qualified together by the signed-in request recorded in verification-ticket8.md.
+const personalEstimate = Object.freeze({ model: 'gpt-6.2-sol', maxCodePoints: 12000,
+  evidence: 'Personal manual preview. Estimated input limit of 12,000 Unicode code points. Reasoning and output space are not guaranteed. The provider may reject this package.' });
+const qualifiedExecutable = '8d06dc231dba649c7d48d3eecab239c452a1ac498c41dd6492a6f301b90a22ce';
+const qualifiedCatalog = '1fe7b99c44ff65badad9291e2a3a0e7988dbda60d57ee2132105058106282901';
+
 // Only this main-owned accessor reads private proof. Its public identity is random,
 // process-local and contains no account, credential or certificate-derived value.
 class ConversationEvidence {
@@ -10,15 +16,15 @@ class ConversationEvidence {
     Object.assign(this, { setup, getVault, settingsPath, testRoot, getVerifiedCapacity, getVerifiedComparisonSettings });
     this.chain = Promise.resolve();
   }
-  read() {
-    const next = this.chain.then(() => this.current());
+  read(personal = false) {
+    const next = this.chain.then(() => this.current(personal));
     this.chain = next.catch(() => {}); return next;
   }
   async optional(file) {
     try { return JSON.parse(await fs.readFile(file, 'utf8')); }
     catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   }
-  async current() {
+  async current(personal) {
     const certificate = this.setup.certificate;
     const settings = await this.optional(this.settingsPath);
     const controlled = this.testRoot ? await this.optional(path.join(this.testRoot, 'conversation-evidence.json')) : null;
@@ -38,7 +44,7 @@ class ConversationEvidence {
       comparisonSettings = { modelProvider: rawSettings.modelProvider, reasoningEffort: rawSettings.reasoningEffort, serviceTier: rawSettings.serviceTier, evidence: rawSettings.evidence };
     }
     const state = this.setup.snapshot();
-    const vaultRoot = this.getVault()?.root;
+    const selected = this.getVault(), vaultRoot = selected?.root;
     const liveProof = state.connected && state.authenticated && state.ready && state.isolationPassed &&
       certificate && certificate === this.setup.certificate && Date.now() < certificate.expires &&
       samePath(vaultRoot, this.setup.vaultRoot) && samePath(settings?.vault, vaultRoot);
@@ -54,6 +60,15 @@ class ConversationEvidence {
       authenticated: state.authenticated, certificate: this.setup.certificate || null });
     if (identity !== this.identity || this.boundCertificate !== this.setup.certificate) {
       this.identity = identity; this.boundCertificate = this.setup.certificate; this.binding = randomUUID();
+    }
+    if (personal) {
+      const qualified = !this.testRoot && this.setup.identifiedChatGPT && this.setup.accountDigest &&
+        state.connected && state.authenticated && state.isolationPassed && certificate && this.setup.certificate === certificate &&
+        Date.now() < certificate.expires && samePath(vaultRoot, this.setup.vaultRoot) && samePath(settings?.vault, selected?.vault) &&
+        typeof settings?.parent === 'string' && samePath(path.join(settings.vault, settings.parent), vaultRoot) &&
+        this.setup.executableDigest === qualifiedExecutable && this.setup.catalogProof?.digest === qualifiedCatalog &&
+        this.setup.policy?.model === personalEstimate.model && this.setup.policy.windows?.sandbox === 'mxc';
+      return { estimate: personalEstimate, binding: 'personal-' + this.binding, dispatchEnabled: Boolean(qualified) };
     }
     return { capacity, binding: this.binding, dispatchEnabled, comparisonSettings };
   }

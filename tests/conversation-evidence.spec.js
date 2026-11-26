@@ -193,7 +193,8 @@ test('terminal-only HTTP errors preserve the provider failure category without i
     for (const [info, reason] of [
       [{ httpConnectionFailed: { httpStatusCode: 401 } }, /sign-in expired or was rejected/],
       [{ responseTooManyFailedAttempts: { httpStatusCode: 429 } }, /usage limit reached/],
-      [{ httpConnectionFailed: { httpStatusCode: 503 } }, /temporarily unavailable/]
+      [{ httpConnectionFailed: { httpStatusCode: 503 } }, /temporarily unavailable/],
+      ['contextWindowExceeded', /rejected the package size.*explicitly shorten/]
     ]) {
       await fs.writeFile(path.join(testRoot, 'conversation-provider.json'), JSON.stringify({ turn: 'failed', terminalErrorInfo: info }));
       await provider.preflight();
@@ -280,6 +281,11 @@ test('a managed account change revokes its certificate without waiting for an ac
   await setup.readAccount();
   expect(setup.certificate).toBeNull();
   expect(setup.snapshot()).toMatchObject({ authenticated: true, ready: false, isolationPassed: false });
+  for (const email of [null, '', ' ', 'missing-domain@', 'a b@example.invalid']) {
+    account = { type: 'chatgpt', email };
+    await setup.readAccount();
+    expect(setup.identifiedChatGPT).toBe(false);
+  }
   setup.loginId = 'pending';
   account = null;
   await setup.notification('account/login/completed', { loginId: 'pending', success: true });
@@ -331,4 +337,51 @@ test('live evidence closes dispatch and hides settings when its certificate chan
     setup.certificate.expires = Date.now();
     expect(await reader.read()).toMatchObject({ dispatchEnabled: false, capacity: null, comparisonSettings: null });
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('personal chat requires qualified inventory, identified account, current isolation and matching vault without granting production capacity', async ({}, info) => {
+  const vault = { vault: info.outputPath('vault'), root: info.outputPath('vault', 'Companion') };
+  const settingsPath = info.outputPath('settings.json');
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  await fs.writeFile(settingsPath, JSON.stringify({ vault: vault.vault, parent: 'Companion' }));
+  const state = { connected: true, authenticated: true, isolationPassed: true, ready: false };
+  const setup = {
+    certificate: { fingerprint: 'qualified', expires: Date.now() + 60000 }, accountDigest: 'private',
+    identifiedChatGPT: true, vaultRoot: vault.root, snapshot: () => state,
+    executableDigest: '8d06dc231dba649c7d48d3eecab239c452a1ac498c41dd6492a6f301b90a22ce',
+    catalogProof: { digest: '1fe7b99c44ff65badad9291e2a3a0e7988dbda60d57ee2132105058106282901' },
+    policy: { model: 'gpt-6.2-sol', windows: { sandbox: 'mxc' } },
+  };
+  const reader = new ConversationEvidence({ setup, getVault: () => vault, settingsPath });
+  const personal = await reader.read(true);
+  expect(personal).toMatchObject({ dispatchEnabled: true, estimate: { maxCodePoints: 12000 } });
+  expect(personal).not.toHaveProperty('capacity');
+  expect(await reader.read()).toMatchObject({ dispatchEnabled: false, capacity: null, comparisonSettings: null });
+  for (const [owner, key, value] of [
+    [setup, 'identifiedChatGPT', false], [setup, 'accountDigest', null], [state, 'connected', false],
+    [state, 'authenticated', false], [state, 'isolationPassed', false], [setup, 'vaultRoot', vault.vault],
+    [setup, 'executableDigest', 'changed'], [setup.catalogProof, 'digest', 'changed'], [setup.policy, 'model', 'changed'],
+    [setup.policy.windows, 'sandbox', 'elevated'], [setup.certificate, 'expires', 0], [setup, 'certificate', null],
+  ]) {
+    const old = owner[key]; owner[key] = value;
+    expect((await reader.read(true)).dispatchEnabled).toBe(false);
+    owner[key] = old;
+  }
+  setup.certificate = { ...setup.certificate };
+  expect((await reader.read(true)).binding).not.toBe(personal.binding);
+  await fs.writeFile(settingsPath, JSON.stringify({ vault: vault.vault, parent: 'Another' }));
+  expect((await reader.read(true)).dispatchEnabled).toBe(false);
+});
+
+test('LF and CRLF Git checkout settings produce the qualified Windows catalog bytes', async ({}, info) => {
+  const source = 'app/codex-model-catalog.json';
+  for (const auto of ['false', 'true', 'input']) {
+    const directory = info.outputPath(auto);
+    await fs.mkdir(directory, { recursive: true });
+    const result = spawnSync('git', ['-c', 'core.autocrlf=' + auto, 'checkout-index',
+      '--prefix=' + directory.replaceAll('\\', '/') + '/', '--', source], { encoding: 'utf8', windowsHide: true });
+    expect(result.status, result.stderr).toBe(0);
+    const bytes = await fs.readFile(path.join(directory, source));
+    expect(require('node:crypto').createHash('sha256').update(bytes).digest('hex')).toBe('1fe7b99c44ff65badad9291e2a3a0e7988dbda60d57ee2132105058106282901');
+  }
 });

@@ -273,7 +273,8 @@ app.whenReady().then(async () => {
   } });
   // Controlled desktop tests can exercise the closed production gate without sign-in or probes.
   conversationProvider = new ConversationProvider({ setup: codex, testRoot: testRoot && process.env.COMPANION_TEST_REAL_PROVIDER_GUARD !== '1' ? testRoot : undefined, getVault: () => vault, getEvidence });
-  const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot, clock, checkpoint, provider: conversationProvider, testRoot });
+  const personalProvider = new ConversationProvider({ personal: true, setup: codex, getVault: () => vault, getEvidence: () => evidence.read(true) });
+  const conversations = installConversations({ ipcMain, getContext: context.store, getVault: () => vault, dataRoot, clock, checkpoint, provider: conversationProvider, personalProvider, testRoot });
   // A deletion or removal changes the evidence corpus without an intake check. Once its
   // request has finished, a revisit check updates candidates and notices (D49).
   const afterRemoval = { handle: (channel, listener) => ipcMain.handle(channel, async (...args) => {
