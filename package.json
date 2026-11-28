@@ -12,6 +12,7 @@
     "prepare:electron": "node scripts/prepare-electron.cjs"
   },
   "devDependencies": {
+    "@anthropic-ai/sdk": "1.8.0",
     "@playwright/test": "1.65.0",
     "electron": "45.2.3"
   },

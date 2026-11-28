@@ -9,7 +9,9 @@ const { documentSearch } = require('../app/revisit-replay');
 const appRoot = path.join(__dirname, '..');
 const timezone = 'America/Phoenix';
 
-async function runTimeline(timeline, { electron, gate = null, automatic = false } = {}) {
+// statusTimeoutMs: hosted-model gate replies arrive inside the capture action, so an
+// evaluation run waits longer than the controlled-reply default.
+async function runTimeline(timeline, { electron, gate = null, automatic = false, statusTimeoutMs = 5000 } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'companion-replay-'));
   const base = path.join(root, 'vault', 'Companion');
   const clock = at => fs.writeFile(path.join(root, 'clock.json'), JSON.stringify({ now: at, timezone }));
@@ -22,7 +24,7 @@ async function runTimeline(timeline, { electron, gate = null, automatic = false 
     const page = await app.firstWindow();
     const status = page.getByRole('status');
     const waitStatus = async text => {
-      for (let tries = 0; tries < 200; tries++) { if ((await status.textContent()).includes(text)) return; await page.waitForTimeout(25); }
+      for (let tries = 0; tries < statusTimeoutMs / 25; tries++) { if ((await status.textContent()).includes(text)) return; await page.waitForTimeout(25); }
       throw Error(`Timed out waiting for status "${text}"; saw "${await status.textContent()}".`);
     };
     const clearStatus = () => status.evaluate(node => { node.textContent = ''; });

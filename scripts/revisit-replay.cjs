@@ -22,10 +22,10 @@ function missAttribution(runs) {
   };
 }
 
-async function runReplay(fixture, { electron, gate = null, automatic = false } = {}) {
+async function runReplay(fixture, { electron, gate = null, automatic = false, statusTimeoutMs } = {}) {
   replay.validateFixture(fixture);
   const runs = [];
-  for (const timeline of fixture.timelines) runs.push(await runTimeline(timeline, { electron, gate, automatic }));
+  for (const timeline of fixture.timelines) runs.push(await runTimeline(timeline, { electron, gate, automatic, statusTimeoutMs }));
   return runs;
 }
 
