@@ -1,0 +1,11 @@
+{
+  "purpose": "fixture generation",
+  "out": "tests/fixtures/revisit-replay/fixture-v2.json",
+  "model": "claude-opus-5-5",
+  "effort": "high",
+  "inputTokens": 8431,
+  "outputTokens": 22333,
+  "costUsd": 0.480384,
+  "stopReason": "end_turn",
+  "note": "Written after the run from the generator's console output; later generations write this file themselves."
+}

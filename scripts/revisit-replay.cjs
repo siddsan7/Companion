@@ -22,10 +22,10 @@ function missAttribution(runs) {
   };
 }
 
-async function runReplay(fixture, { electron, gate = null, automatic = false } = {}) {
+async function runReplay(fixture, { electron, gate = null, automatic = false, statusTimeoutMs } = {}) {
   replay.validateFixture(fixture);
   const runs = [];
-  for (const timeline of fixture.timelines) runs.push(await runTimeline(timeline, { electron, gate, automatic }));
+  for (const timeline of fixture.timelines) runs.push(await runTimeline(timeline, { electron, gate, automatic, statusTimeoutMs }));
   return runs;
 }
 
@@ -144,6 +144,7 @@ ${kindTable(result.retrieval)}
 ## Not run
 
 - **Proposed system** and **gate measured alone**: both need the automatic gate (D46, ADR 0007), which needs the signed-in Codex readiness gate. That check is deferred, so these cells are not run and no score is claimed for them (D56-I02). Running them needs approval for model usage (D56-I04).
+- The same two cells measured with Claude models over the Anthropic API, a different setup from the production gate, are in the [gate evaluation report](revisit-gate-eval-report.md) (D58).
 - Harness tests exercise the same scoring and attribution code with controlled gate replies. Those runs verify the code, not model judgment, and are not reported here (D56-I01).
 
 ## Limits

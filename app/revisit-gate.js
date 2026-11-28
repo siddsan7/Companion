@@ -78,6 +78,15 @@ class ControlledGate {
     (await beforeStart())();
     onDispatch?.();
     await fs.appendFile(path.join(this.testRoot, 'revisit-gate-requests.jsonl'), JSON.stringify({ at: Date.now(), mode, text }) + '\n');
+    // Evaluation relay (scripts/revisit-gate-eval.cjs): a loopback server owned by the
+    // evaluation script answers with a hosted-model reply. The app never holds a key.
+    if (fixture.relay !== undefined) {
+      if (typeof fixture.relay !== 'string' || !/^http:\/\/127\.0\.0\.1:\d{1,5}\/gate$/.test(fixture.relay)) throw Error('Gate relay must be a loopback /gate URL.');
+      const response = await fetch(fixture.relay, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text, mode }) });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw Error(`Gate request failed: ${body.error || response.status}`);
+      return { reply: body.reply, model: body.model, usage: body.usage ?? null, evidence: 'api-relay-evaluation-not-production' };
+    }
     const rule = (fixture?.replies || []).find(item => !item.contains || passages.some(passage => passage.text.includes(item.contains))) || {};
     if (rule.fail) throw Error(rule.fail === 'usage-limit' ? 'Codex usage limit reached.' : rule.fail === 'offline' ? 'Codex is offline.' : `Gate request failed: ${rule.fail}`);
     const reply = typeof rule.reply === 'string' ? rule.reply : JSON.stringify(rule.reply || { outcome: 'cannot tell', reason: 'No controlled reply matched.', quote: '' });
