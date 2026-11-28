@@ -115,6 +115,10 @@ async function report() {
   }
   const fixtures = [...new Set(records.map(record => `${record.fixture}|${record.sha256}`))];
   const total = records.reduce((sum, record) => sum + (record.costUsd || 0), 0);
+  const generationDir = path.join(repo, outDir, 'fixture-generation');
+  const generations = [];
+  for (const name of (await fs.readdir(generationDir).catch(() => [])).filter(name => name.endsWith('.json')).sort()) generations.push(JSON.parse(await fs.readFile(path.join(generationDir, name), 'utf8')));
+  const generationCost = generations.reduce((sum, item) => sum + item.costUsd, 0);
   const lines = [];
   for (const fixtureKey of fixtures) {
     const [fixturePath, sha] = fixtureKey.split('|');
@@ -151,11 +155,24 @@ Every number is **on these authored fixtures only**: small, synthetic, written b
 - One model call per package and no rerolls (D56-I04). A run is one pass over the fixture; repeated runs measure how much the result moves between identical runs. Every run is kept, including failed ones (D57).
 - System text is the Codex catalog's \`base_instructions\`. Thinking is the model default (adaptive); effort is set explicitly. No refusal fallback is used, because it would change the model under test.
 - Scoring is the replay's own D54 code. Set-F1 = 2·TP / (2·TP + FP + FN). No composite score or pass threshold (D54-I07).
-- Spend is checked against a cumulative cap before each call; total recorded spend for the runs below is **$${total.toFixed(4)}** (list prices, recomputed from reported usage).
+- Spend is checked against a cumulative cap before each call; recorded spend is **$${total.toFixed(4)}** for the runs below plus **$${generationCost.toFixed(4)}** for ${generations.length} fixture generation call(s), at list prices recomputed from reported usage.
 
 ## Results
 
 ${lines.join('\n')}
+## Findings (runs of 2026-11-28)
+
+Read from the raw replies of the runs above; counts are over 5 runs per model, cell and fixture.
+
+1. **No false alarms.** Every run of every model in both cells had zero false positives. Same-topic, opposite, superseded, withdrawn, deleted, repeat and unrelated notes never raised a notice.
+2. **Retrieval, not the model, sets the proposed system's score.** Every paraphrase trigger in both fixtures was a retrieval miss in every proposed-system run, so the gate never saw it. The proposed system scores the same with all three models (0.800 on v1, 0.833 on v2). This is the known limit of lexical matching (D25).
+3. **v1's paraphrase triggers are ambiguous, not just hard.** All three models rejected all four in every run. The replies say why: each one closely restates an earlier cue trigger, so models applied the prompt's "already raised" rule (EA3, ED5), or it drops the detail that identifies the subject, such as SQLite or FLAC (EC3 "does not meet", EB4 "cannot tell"). The fixture labels them as new due notices. On v2, where each paraphrase reports a new observation, Opus met all of them in every run.
+4. **The prompt's "same point" rule over-applies.** On v2, ED5 reports a different site and incident from the earlier trigger. Sonnet rejected it as an already-raised point in 5 of 5 runs and Haiku in 2 of 5. The rule does not say whether "the same point" means the same observation or the same kind of event.
+5. **Strict parsing fails safe.** Sonnet wrote its arithmetic in prose before the JSON for EA3 and EC4 on v2 in all 5 runs (10 replies); Haiku did so twice on v1. The parser rejected every such reply, so no notice was raised from an unchecked answer, at the cost of recall.
+6. **Runs repeat closely.** Opus and Sonnet gave the same score in every run of a cell; Haiku varied on v2 (0.963–1.000).
+
+Not changed in response: the gate prompt, retrieval and fixtures are untouched, because tuning against frozen fixtures is out of scope. A clarified repeat rule or a JSON-only reply format would need a new fixture version to be measured fairly.
+
 ${failures.length ? `## Failed runs\n\n${failures.map(record => `- \`${record.file}\`: ${record.failure}`).join('\n')}\n` : ''}
 ## Raw outputs
 

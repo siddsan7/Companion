@@ -109,6 +109,14 @@ The timeline mixes **true triggers** (evidence that meets a revisit condition) w
 - **D57-I03**. State the D52 limits in the report itself. Describe a result as "on these authored fixtures", never as general accuracy.
 - **D57-I04**. Link the report from the README beside the paper citations, so that claims about the feature point at evidence.
 
+### D58 · Measure the gate prompt with API models while the Codex gate is deferred
+
+- **D58-I01**. Approved by me on 2026-11-28 under D56-I04: the two gate cells are also run with Claude models over the Anthropic API, paid from API credits. They are reported in a separate [gate evaluation report](revisit-gate-eval-report.md), never in place of the D56-I02 cells, which stay "not run".
+- **D58-I02**. The API run reuses the production package builder, reply parser, retrieval and notice code. The proposed-system cell runs in the desktop app; its controlled test gate forwards packages to a loopback relay owned by the evaluation script, so the app never holds a key.
+- **D58-I03**. Each run is one pass with one call per package and no rerolls. Several identical runs are reported with mean, spread and every raw result, so run-to-run variation is visible.
+- **D58-I04**. A second fixture (version 2) is written by a model and reviewed before any scored run, to reduce the single-author bias of D52. It is reported separately from version 1 (D52-I04).
+- **D58-I05**. Spend is checked against a cumulative cap before every call and recorded per run.
+
 ## Testing Decisions
 
 - **Scoring**. Hand-computed TP, FP, FN and Set-F1 for a three-step toy timeline match the scorer's output, including a step with an empty due set and a repeat notice.
